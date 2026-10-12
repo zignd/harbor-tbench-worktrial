@@ -4,11 +4,20 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 15:54 -03:00 · Correction: OpenRouter usage counters lag
+- My earlier claim that "Harbor's `cost_usd` overstates spend by ~50%" was wrong. The $0.0775 reading was taken 5 s after the Opus trial, before OpenRouter had counted all of it. The settled total ($0.1176) matches Harbor's estimate of $0.1173.
+- OpenRouter's `/api/v1/key` `usage` and `limit_remaining` also update out of sync. At one point they implied $0.118 vs $0.145 spent.
+- **Changes:**
+  - The ledger records Harbor's per-trial `cost_usd`, which is immediate and attributable to a task.
+  - Reconcile against OpenRouter only after the counters settle (~1-2 min).
+  - The budget guard uses the larger of `usage` and `limit − remaining`.
+  - `make usage` now prints both, as `used` and `spent*`.
+- Fixed the earlier entry, `docs/harbor-notes.md` and the plan's credentials note.
+
 ### 15:51 -03:00 · Phase 0: Harbor baseline, first Opus trial, meta-task template
 - **Examples:** oracle 6/6 = 1.0 and nop 6/6 = 0.0, no exceptions. Trials took 9-108 s, the verify step 4-26 s, and no `uvx` install failures across 12 runs. Docker image caching works (env setup ~1 s once built). Details are in `docs/harbor-notes.md`.
-- **First Opus 4.8 trial** (`fix-git`, `max_turns=200`): reward 1.0 in 11 turns and 68 s. **Actual cost $0.0775** (OpenRouter delta), with 85% of input tokens served from the prompt cache.
-  - Harbor's own `cost_usd` reported $0.117, about 50% too high, because it under-applies the cache discount.
-  - **Decision:** the ledger treats OpenRouter's `/api/v1/key` delta as ground truth and Harbor's estimate as an upper bound.
+- **First Opus 4.8 trial** (`fix-git`, `max_turns=200`): reward 1.0 in 11 turns and 68 s, costing **about $0.117**, with 85% of input tokens served from the prompt cache.
+  - *Corrected later the same day:* this entry first said "$0.0775 actual, Harbor overstates by ~50%". That reading was taken 5 s after the run, before OpenRouter had counted it. The settled figure matches Harbor's `cost_usd` ($0.1173). See the 15:54 entry.
   - fix-git is "Easy". Generated Medium/Hard tasks will run longer, so per-trial cost still has to be measured on our own tasks.
 - **Confirmed mechanics:**
   - `--ak max_turns=200` reaches terminus-2 (it's in the trial config, and terminus-2 logs a warning).
@@ -20,7 +29,7 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
   - The in-container `check_package.py` gives the meta-task a "package complete" reward.
   - `artifacts = ["/app/output"]` collects the package.
 - **Fixtures:** sanitized oracle, nop and Opus job dirs in `tests/fixtures/harbor_jobs/` for unit tests (no secrets; absolute paths replaced by `<REPO>`).
-- **Spend:** Opus trial $0.0775. Running total $0.078.
+- **Spend:** Opus trial ~$0.117. Running total ~$0.118.
 
 ### 15:30 -03:00 · Dev mode: cheap model for plumbing iterations
 - `DEV_MODE=1` routes every model call (authoring, judges, red-team, and the terminus-2 eval agent) to `DEV_MODEL`, default `deepseek/deepseek-v4.1-flash`. That's $0.15/$0.60 per M tokens vs Sonnet's $3/$15 and Opus's $5/$25, so ~20-40× cheaper. It's validated through both the OpenAI client and LiteLLM.

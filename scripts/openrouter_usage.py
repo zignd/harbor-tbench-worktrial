@@ -41,6 +41,12 @@ def summarize(info: dict) -> str:
         f"limit      {_usd(limit)}",
         f"used       {_usd(usage)}{used_pct}",
         f"remaining  {_usd(remaining)}",
+    ]
+    if limit is not None and remaining is not None:
+        # OpenRouter updates `usage` and `limit_remaining` with lag, and not in
+        # sync; report both views and read again a minute after a run settles.
+        lines.append(f"spent*     {_usd(limit - remaining)}  (* = limit - remaining)")
+    lines += [
         f"today      {_usd(info.get('usage_daily'))}",
         f"this week  {_usd(info.get('usage_weekly'))}",
         f"this month {_usd(info.get('usage_monthly'))}",

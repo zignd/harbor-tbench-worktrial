@@ -58,6 +58,7 @@ This is what the pass-audit and failure judges read. The command scan works off 
 **First Opus 4.8 trial** (`fix-git`, terminus-2, `max_turns=200`):
 - Reward 1.0 in 11 turns, 1 m 8 s wall time, no summarization.
 - Tokens: 45,180 input (**38,595 cached = 85%**), 2,276 output.
-- **Actual spend (OpenRouter `make usage` delta): $0.0775.** Harbor's `cost_usd` said $0.1173, about 50% high (it doesn't fully apply the cache discount).
-- **So the ledger uses OpenRouter's `/api/v1/key` delta as ground truth**, and Harbor's `cost_usd` only as a conservative upper-bound estimate.
+- **Cost: about $0.117**, which matches Harbor's `cost_usd` ($0.1173). A `make usage` read 5 s after the run showed only $0.0775 because OpenRouter hadn't counted it yet. A later read settled at $0.1176 total.
+- **OpenRouter's `/api/v1/key` counters lag** by seconds to minutes, and `usage` and `limit_remaining` don't update together. At one point they implied $0.118 vs $0.145 spent.
+- **So the ledger records Harbor's per-trial `cost_usd`**, which is available immediately and attributable to a task. Reconcile it against OpenRouter only after the counters settle (re-read after ~1-2 min). `make usage` shows both `used` and `limit − remaining`, and the budget guard uses the larger of the two.
 - fix-git is an "Easy" task. Medium/Hard tasks should run many more turns (TB-style tasks average ~20-40), so expect roughly $0.3-1.5 per Opus trial. That's to be confirmed on generated tasks.

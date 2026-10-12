@@ -43,7 +43,7 @@ Development environment (set up and committed in `e4c095c`):
 - **Inference credentials:** these are in a git-ignored `.env` (mode 600); `.env.example` documents them. Load with `uv run --env-file .env ...`.
   - The key is an **OpenRouter** key with a **$500 limit**. Its base is `https://openrouter.ai/api/v1`, *not* the README's `api.aqinference.com`, which returns 401 for it. `generator/config.py` now defaults to OpenRouter.
   - Validated on 2026-10-12: `anthropic/claude-sonnet-4.6` answered through the OpenAI client, and `openrouter/anthropic/claude-opus-4.8` through LiteLLM (Harbor's path). Both models are listed on `/models`.
-  - Spend can be read from OpenRouter's `GET /api/v1/key` (`usage`, `limit_remaining`). That's a ground truth for the ledger's budget guard.
+  - Spend can be read from OpenRouter's `GET /api/v1/key` (`usage`, `limit_remaining`). Its counters **lag by seconds to minutes** and don't update together, so re-read ~1-2 min after a run, and have the budget guard use the larger of `usage` and `limit − remaining`. Per-trial attribution comes from Harbor's `cost_usd`, which matched OpenRouter once settled (Phase 0).
 
 ## Research that shapes the design
 

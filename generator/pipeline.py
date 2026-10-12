@@ -24,13 +24,16 @@ from analysis import budget
 from analysis.ledger import Event, Ledger, hash_dir
 from evaluator.harbor_runner import run_with_retries
 from evaluator.quality import run_check
-from generator.author import collect_package, render_metatask
+from generator.author import collect_package, make_task_toml, render_metatask
 from generator.blueprint import Blueprint, gate_blueprint, make_blueprint
 from generator.config import (
     CANARY_LINE,
+    DEV_MODE,
     JOBS_DIR,
     METATASK_MAX_TURNS,
+    METATASK_SUMMARIZE_THRESHOLD,
     MODEL,
+    OUTPUT_DIR,
     RUN_MODE,
     RUNS_DIR,
 )
@@ -44,7 +47,8 @@ MAX_REPAIRS = 2
 ORACLE_RUNS = 3
 EXPECTED_AUTHOR_USD = 3.0
 EXPECTED_CHECK_USD = 0.2
-CANDIDATES_DIR = Path(RUNS_DIR) / "candidates"
+# Dev-mode candidates are plumbing only: keep them out of the committed evidence.
+CANDIDATES_DIR = Path(OUTPUT_DIR if DEV_MODE else RUNS_DIR) / "candidates"
 
 
 @dataclass
@@ -129,10 +133,13 @@ def stage_author(
     t0 = time.monotonic()
     name = f"author-{cand.cand_id}-a{attempt}"
     meta_dir = Path(JOBS_DIR) / "metatasks" / name
+    bp = cand.blueprint
+    task_toml = make_task_toml(bp.slug, bp.title, bp.difficulty, bp.category, bp.tags)
     render_metatask(
-        cand.blueprint.to_markdown(cand.spec),
-        cand.blueprint.slug,
+        bp.to_markdown(cand.spec),
+        bp.slug,
         meta_dir,
+        task_toml,
         previous=previous,
         feedback=feedback,
     )
@@ -143,7 +150,10 @@ def stage_author(
         "terminus-2",
         name,
         model=f"openrouter/{MODEL}",
-        agent_kwargs={"max_turns": METATASK_MAX_TURNS},
+        agent_kwargs={
+            "max_turns": METATASK_MAX_TURNS,
+            "proactive_summarization_threshold": METATASK_SUMMARIZE_THRESHOLD,
+        },
     )
     trials = counted + excluded
     cost = sum(t.priced_cost() for t in trials)
@@ -157,7 +167,7 @@ def stage_author(
     ok = False
     if trial is not None:
         try:
-            collect_package(trial.trial_dir, cand.task_dir)
+            collect_package(trial.trial_dir, cand.task_dir, task_toml)
             ok = True
         except FileNotFoundError as e:
             result["error"] = str(e)

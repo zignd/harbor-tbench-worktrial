@@ -13,6 +13,6 @@ RUN curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /app
-COPY reference /app/reference
-# The verifier entry point is pipeline-owned; the author only writes test_outputs.py.
+# Pipeline-owned files, pre-placed: the author writes everything else.
 COPY standard_test.sh /app/output/tests/test.sh
+COPY task.toml /app/output/task.toml

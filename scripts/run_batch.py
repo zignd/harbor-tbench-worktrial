@@ -53,6 +53,10 @@ def _install_dry_run(ledger_path: Path) -> Ledger:
         shutil.copytree(FIXTURE_TASK, cand.task_dir)
         shutil.copy(pipeline.collect_package.__globals__["STANDARD_TEST_SH"],
                     cand.task_dir / "tests" / "test.sh")  # fmt: skip
+        bp = cand.blueprint
+        (cand.task_dir / "task.toml").write_text(
+            pipeline.make_task_toml(bp.slug, bp.title, bp.difficulty, bp.category, bp.tags)
+        )
         return True
 
     pipeline.stage_blueprint = fake_blueprint

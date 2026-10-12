@@ -8,17 +8,70 @@ meta-task for one blueprint.
     uv run python -m generator.author render BLUEPRINT.md SLUG OUT_DIR
 """
 
+import json
 import shutil
 import sys
 from pathlib import Path
 from string import Template
 
-from generator.config import CANARY_LINE, EXAMPLES_DIR
+from generator.config import CANARY_LINE
 
 TEMPLATE_DIR = Path(__file__).parent / "metatask"
 STANDARD_TEST_SH = TEMPLATE_DIR / "standard_test.sh"
 TASK_ORG = "zignd"
-DEFAULT_REFERENCE = "openssl-selfsigned-cert"  # format reference only, never content
+
+TASK_TOML = """schema_version = "1.1"
+artifacts = []
+
+[task]
+name = "{org}/{slug}"
+description = {description}
+keywords = {tags}
+[[task.authors]]
+name = "{org}"
+email = "unknown"
+
+[metadata]
+author_name = "{org}"
+author_email = "unknown"
+difficulty = "{difficulty}"
+category = "{category}"
+tags = {tags}
+
+[verifier]
+timeout_sec = 900.0
+
+[agent]
+timeout_sec = 3600.0
+
+[environment]
+build_timeout_sec = 600.0
+cpus = 1
+memory_mb = 2048
+storage_mb = 10240
+gpus = 0
+allow_internet = true
+mcp_servers = []
+
+[verifier.env]
+
+[environment.env]
+
+[solution.env]
+"""
+
+
+def make_task_toml(slug: str, title: str, difficulty: str, category: str, tags: list[str]) -> str:
+    """The task.toml is pipeline-owned (like tests/test.sh): no author can get it wrong."""
+    difficulty = difficulty if difficulty in {"easy", "medium", "hard"} else "hard"
+    return TASK_TOML.format(
+        org=TASK_ORG,
+        slug=slug,
+        description=json.dumps(title),
+        difficulty=difficulty,
+        category=category,
+        tags=json.dumps(tags),
+    )
 
 
 REPAIR_SECTION = """
@@ -38,7 +91,7 @@ def render_metatask(
     blueprint: str,
     slug: str,
     out_dir: Path,
-    reference: str = DEFAULT_REFERENCE,
+    task_toml: str,
     previous: Path | None = None,
     feedback: list[str] | None = None,
 ) -> Path:
@@ -52,8 +105,8 @@ def render_metatask(
     shutil.copytree(
         TEMPLATE_DIR, out_dir, ignore=shutil.ignore_patterns("*.tmpl", "standard_test.sh")
     )
-    shutil.copytree(Path(EXAMPLES_DIR) / reference, out_dir / "environment" / "reference")
     shutil.copy(STANDARD_TEST_SH, out_dir / "environment" / "standard_test.sh")
+    (out_dir / "environment" / "task.toml").write_text(task_toml)
 
     instruction = Template((TEMPLATE_DIR / "instruction.md.tmpl").read_text())
     (out_dir / "instruction.md").write_text(
@@ -77,7 +130,7 @@ def render_metatask(
     return out_dir
 
 
-def collect_package(trial_dir: Path, dest: Path) -> Path:
+def collect_package(trial_dir: Path, dest: Path, task_toml: str | None = None) -> Path:
     """Copy the authored package out of a finished meta-task trial's artifacts."""
     src = trial_dir / "artifacts" / "app" / "output"
     if not src.is_dir():
@@ -87,8 +140,10 @@ def collect_package(trial_dir: Path, dest: Path) -> Path:
     shutil.copytree(
         src, dest, ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache")
     )
-    # The verifier entry point is pipeline-owned: always replace whatever the author left.
+    # Pipeline-owned files: always replace whatever the author left.
     shutil.copy(STANDARD_TEST_SH, dest / "tests" / "test.sh")
+    if task_toml is not None:
+        (dest / "task.toml").write_text(task_toml)
     return dest
 
 
@@ -96,4 +151,5 @@ if __name__ == "__main__":
     if len(sys.argv) != 5 or sys.argv[1] != "render":
         sys.exit(__doc__)
     _, _, blueprint_path, slug, out = sys.argv
-    print(render_metatask(Path(blueprint_path).read_text(), slug, Path(out)))
+    toml = make_task_toml(slug, slug.replace("-", " "), "hard", "debugging", ["generated"])
+    print(render_metatask(Path(blueprint_path).read_text(), slug, Path(out), toml))

@@ -4,6 +4,15 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:55 -03:00 · First calibration: `ledger-reconcile` is too easy (4/4); Opus costs $0.23 per trial
+- **Calibration** (terminus-2 + Opus 4.8, concurrency 2): **4/4 legit passes → too easy**, stopped after 4 trials (curtailment saved the 5th). Each run took 11-13 turns and 1.3-1.7 min.
+  - **Cost: $0.20-0.26 per Opus trial** and $0.012-0.013 per audit, $0.97 in total. The budget had assumed $1.5 per trial, so Opus is cheaper than planned on tasks like this. Harder tasks will run longer.
+  - The hand review predicted this outcome: the instruction named the bug and the code was small.
+- **`harbor analyze` vs our judge:** on the 2 wave-1 passes, `harbor analyze` (built-in `reward_hacking` + `task_specification` rubrics) agreed with our audit (both pass), at **$0.13 per trial vs $0.012**. Our judges stay primary: they're 10× cheaper and produce the structured labels the tuner and report use.
+- **Stretch B in action:** this too-easy task (all failures valid, i.e. none) is now going through the tuner: a Sonnet mutation plan, a repair-style authoring round, the gates, then recalibration.
+- **Example quality so far:** AfterQuery's own examples score 11-12 of 16 on our rubric and are each blocked on at least one criterion. Our rubric is stricter than the examples' authors were.
+- Progress 46/83.
+
 ### 17:52 -03:00 · Hand review #1: the instruction named the bug; prompts tightened
 - Reviewed the Phase 0 `ledger-reconcile` task side by side with `examples/` (`docs/reviews/hand-review.md`). Every automated gate passed (including `harbor check` 16/16), yet a human read found three problems:
   1. **The instruction states the defect's mechanism** ("not an arbitrary charge of the same amount").

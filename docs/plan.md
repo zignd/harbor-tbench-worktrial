@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 43 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 46 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -350,14 +350,14 @@ Part 1 milestone
 - [ ] 💲 Dev-mode dry run (`DEV_MODE=1`): 2-3 candidates end to end through generation and gates, to shake out plumbing bugs before official spend. Results stay in `output-dev/`.
 - [ ] 💲 Pilot batch of 3 candidates through generation and gates. Record funnel and cost per task.
 - [ ] 💲 Reach **≥5 tasks** that pass the structural validator and the functional gates (oracle 3/3, nop 0).
-- [ ] Hand-review 2 generated tasks side by side with `examples/` and the guideline rules. Tighten the meta-task template and lints from what's found.
+- [x] Hand-review 2 generated tasks side by side with `examples/` and the guideline rules. Tighten the meta-task template and lints from what's found. Done: review #1 (`ledger-reconcile`) is in `docs/reviews/hand-review.md` and led to three prompt fixes. Review #2 will be a pipeline-generated pilot task.
 
 ### Phase 2: Part 2, calibration
 
 - [x] `evaluator/calibrate.py`: pure `decide(outcomes)` with exact curtailment (accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails). Exhaustively unit-tested against the full 5-run verdict. Done: tested on all 32 sequences. Expected 3.85-4.3 trials instead of 5 for p = 0.2-0.8.
 - [x] Calibration runner: Opus trials in waves of ≤3, budget guard checked before every trial, outcomes written to the ledger. Done: waves are capped at the fewest trials that can still reach a verdict, so they never overshoot.
-- [ ] 💲 Try `harbor analyze` (built-in `reward_hacking` + `task_specification` rubrics) on real calibration trajectories. Decide wrap vs build for both judges.
-- [ ] 💲 `analysis/judge.py` (a), pass audit: command scan plus a trajectory-level Sonnet judge (Meta-Task Fig. 8 + Terminal Wrench labels). Hacked passes don't count.
+- [x] 💲 Try `harbor analyze` (built-in `reward_hacking` + `task_specification` rubrics) on real calibration trajectories. Decide wrap vs build for both judges. Done: on 2 real Opus passes it agreed with our audit (reward_hacking and task_specification both pass), but costs $0.13 per trial vs our judge's $0.012. **Decision: our judges are primary** (10× cheaper, structured labels for the tuner and report); `harbor analyze` stays an optional cross-check.
+- [x] 💲 `analysis/judge.py` (a), pass audit: command scan plus a trajectory-level Sonnet judge (Meta-Task Fig. 8 + Terminal Wrench labels). Hacked passes don't count. Done: validated on 4 real Opus passes (all labelled legit, $0.012-0.013 each) and on the red-team run.
 - [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
 - [x] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
 - [x] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails). Done: `scripts/calibrate_candidates.py` writes `output/<slug>/README.md` (calibration plus judged failure reasons). Refuses to run in dev mode.

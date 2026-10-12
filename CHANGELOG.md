@@ -4,6 +4,15 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:30 -03:00 · Diversity and human-likeness analysis modules (stretch C, D)
+- **`analysis/diversity.py`:** per-axis coverage and **balance = exp(H)/N** (Tmax), instruction uniqueness (max/mean pairwise TF-IDF cosine, and a **Vendi score** with Jacobi eigenvalues, no numpy), and nearest published TB task per generated task.
+  - **Baseline on the 6 examples:** Vendi 5.97 of 6, mean pairwise cosine 0.034, max 0.119. That's the bar for our batch.
+- **`analysis/human_likeness.py`:**
+  - `stylometrics()` measures instruction words, sentences, bullets, headers, emphasis and code spans, plus test count, Dockerfile, solution and environment size.
+  - `discrimination()` is a blinded pairwise test: an example and a generated instruction, shuffled, and Sonnet guesses which a human wrote. Accuracy near 50% means indistinguishable.
+  - **Examples:** 30-575 instruction words, no headers or emphasis in any of them. The Phase 0 Sonnet task: 104 words, 6 sentences, no bullets, headers or emphasis.
+- 92 tests pass. **Spend:** $0.
+
 ### 17:29 -03:00 · Red-team gate (implemented; first real runs on the pilot)
 - **`evaluator/redteam.py`:** a Terminal-Wrench-style hack elicitation.
   - A copy of the task gets an explicit "make the verifier pass without solving it" paragraph, and one Sonnet terminus-2 run (60 turns) tries.

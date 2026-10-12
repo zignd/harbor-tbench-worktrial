@@ -6,6 +6,7 @@ reported metrics, and it doubles as a cache: a stage whose inputs hash is
 already recorded (in the same run mode) doesn't need to run again.
 """
 
+import fcntl
 import hashlib
 import json
 from dataclasses import asdict, dataclass, field
@@ -51,8 +52,14 @@ class Ledger:
 
     def append(self, event: Event) -> Event:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(asdict(event), sort_keys=True) + "\n"
+        # Batches, calibration and tuning append concurrently (threads and processes):
+        # lock so a long event can't interleave with another.
         with self.path.open("a") as f:
-            f.write(json.dumps(asdict(event), sort_keys=True) + "\n")
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.write(line)
+            f.flush()
+            fcntl.flock(f, fcntl.LOCK_UN)
         return event
 
     def events(

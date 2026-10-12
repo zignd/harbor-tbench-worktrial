@@ -4,6 +4,14 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:02 -03:00 · Candidates build in parallel (the throughput bottleneck)
+- **Bottleneck:** `run_batch` built one candidate at a time. A Sonnet authoring run takes 25-45 min (up to 80 turns) and is API-bound: its container idles at 0-1% CPU. Two batch processes gave ~2-3 candidates per hour, so the ~25 candidates still needed would have taken 10+ h. Spend was never the limit ($21 of $380).
+- **`run_batch --workers N`** (default 3) builds candidates on a thread pool. Each candidate still runs its stages in order. CPU-heavy work (oracle runs, Opus trials) stays bounded by the gates' and calibrator's own concurrency.
+- **Cross-process claims:** a candidate's `status.json` is `{"status": "building", "pid": N}` while it's in progress. Other batch processes skip it, and a claim whose process is dead (crash, reboot) is taken over and resumed. The two in-flight builds from the pre-fix processes were claimed under their pids, so new parallel processes took the 4 waiting candidates without killing them and without losing any paid authoring. **6 candidates are now building at once** (was 2).
+- **Ledger appends take an exclusive `flock`**, so concurrent writers (threads and processes) can't interleave a long judge event.
+- **Dry-run fix:** every dry-run candidate is the same fixture package, so the novelty gate (correctly) rejected each one as a copy of its dry-run siblings. Dry runs now index only the published corpus. The parallel dry run passes: 2/2 gated, $0.
+- Ticked 4 checklist items whose official runs now exist: blueprint + review, the blueprint novelty gate, the final-package novelty re-check, and the red-team. Progress 51/83.
+
 ### 18:52 -03:00 · Crash recovery: every stage resumes without repaying; tuner sees its own history
 - **What happened:** the machine rebooted at ~21:40 UTC with 4 jobs in flight: pilot repair a2 (Rust), Batch 1 authoring a1 (C), tuning round 2's Opus calibration (2 legit passes recorded, 2 trials in flight), and the dev calibration. Every Docker container died.
 - **Resume gaps found:**

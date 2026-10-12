@@ -7,7 +7,8 @@
 Specs are sampled inverse-frequency against every earlier candidate's spec, so
 successive batches keep spreading across the taxonomy. `--budget` caps what
 this batch may spend (on top of the global authorization and reserve in
-generator/config.py); no new candidate starts once it's used up.
+generator/config.py); no new candidate starts once it's used up. `--workers`
+candidates build in parallel (default 3); a rerun resumes the saved batch plan.
 
 --dry-run replaces every model call with fixtures (the Phase 0 blueprint and
 authored package) but runs the real gates, so the plumbing can be exercised
@@ -16,7 +17,9 @@ for free.
 
 import argparse
 import json
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from analysis.ledger import Event, Ledger
@@ -35,6 +38,23 @@ def _history() -> list[TaskSpec]:
     for path in sorted(pipeline.CANDIDATES_DIR.glob("*/spec.json")):
         specs.append(TaskSpec(**json.loads(path.read_text())))
     return specs
+
+
+def _status(cand: pipeline.Candidate) -> dict:
+    path = cand.dir / "status.json"
+    return json.loads(path.read_text()) if path.exists() else {}
+
+
+def _alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _batch_specs(n: int, seed: int, plan_dir: Path) -> list[TaskSpec]:
@@ -82,6 +102,11 @@ def _install_dry_run(ledger_path: Path) -> Ledger:
     pipeline.novelty.judge_same_task = lambda text, index=None: {
         "novel": True, "verdicts": [], "nearest": [], "cost_usd": 0.0
     }  # fmt: skip
+    # Every dry-run candidate is the same fixture package, so the novelty gate would
+    # (rightly) reject each as a copy of its siblings: index only the published corpus.
+    pipeline.novelty.gate_index = lambda candidates_dir, exclude="": (
+        pipeline.novelty.default_index()
+    )
     pipeline.budget.check = lambda expected: None
     pipeline.redteam = lambda task_dir, name: {
         "hackable": False, "reward": 0.0, "exploit": "", "cost_usd": 0.0, "trial": None
@@ -99,6 +124,7 @@ def main() -> int:
     parser.add_argument("--n", type=int, default=3, help="candidates to generate")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--budget", type=float, default=20.0, help="max spend for this batch")
+    parser.add_argument("--workers", type=int, default=3, help="candidates built in parallel")
     parser.add_argument("--dry-run", action="store_true", help="no model calls (fixtures)")
     args = parser.parse_args()
 
@@ -112,22 +138,27 @@ def main() -> int:
     )
     specs = _batch_specs(args.n, args.seed, plan_dir)
 
-    summary = []
-    for spec in specs:
+    def build(spec: TaskSpec) -> tuple | None:
         spent = ledger.total_cost() - start_cost
         if spent >= args.budget:
-            print(f"batch budget used (${spent:.2f} of ${args.budget:.2f}); stopping")
-            break
+            print(f"batch budget used (${spent:.2f} of ${args.budget:.2f}); skipping", flush=True)
+            return None
         cand = pipeline.Candidate(spec)
-        status_file = cand.dir / "status.json"
-        if status_file.exists():  # resume: this spec already ran to a final status
-            print(f"{cand.cand_id}  (already {json.loads(status_file.read_text())['status']})")
-            continue
+        status = _status(cand)
+        if status.get("status") == "building" and _alive(status.get("pid")):
+            print(f"{cand.cand_id}  (being built by pid {status['pid']})", flush=True)
+            return None
+        if status and status.get("status") != "building":  # resume: already ran to a final status
+            print(f"{cand.cand_id}  (already {status['status']})")
+            return None
+        # Claim it: other batch processes skip a candidate with a status file, and a
+        # claim whose process died (crash, reboot) is taken over and resumed.
+        cand.save("status.json", {"status": "building", "pid": os.getpid()})
         try:
             cand = pipeline.build_candidate(cand, ledger)
         except pipeline.budget.BudgetExceeded as e:
-            print(f"budget guard stopped the batch: {e}")
-            break
+            print(f"budget guard stopped {cand.cand_id}: {e}", flush=True)
+            return None
         except Exception as e:  # noqa: BLE001 - one broken candidate must not stop the batch
             cand.status = "error"
             cand.save("status.json", {"status": "error", "error": f"{type(e).__name__}: {e}"})
@@ -136,8 +167,13 @@ def main() -> int:
             )
         cost = sum(e.cost_usd for e in ledger.events(task=cand.cand_id))
         slug = cand.blueprint.slug if cand.blueprint else "-"
-        summary.append((cand.cand_id, slug, cand.status, cost))
         print(f"{cand.cand_id}  {slug:40}  {cand.status:9}  ${cost:.2f}", flush=True)
+        return cand.cand_id, slug, cand.status, cost
+
+    # Authoring is API-bound (its container idles), so candidates build in parallel;
+    # each still runs its own stages in order.
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        summary = [r for r in pool.map(build, specs) if r]
 
     total = ledger.total_cost() - start_cost
     gated = sum(s[2] == "gated" for s in summary)

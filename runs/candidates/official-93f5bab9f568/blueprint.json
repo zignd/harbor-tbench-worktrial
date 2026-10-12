@@ -1,0 +1,55 @@
+{
+ "slug": "sqlite-etl-pipeline-repair",
+ "title": "SQLite ETL Pipeline Repair",
+ "scenario": "A platform engineering team is migrating a fleet of on-premise data pipelines to a new infrastructure. The ETL service at /app reads raw event records from CSV files, transforms them, and writes aggregated summaries into a SQLite database used downstream by dashboards. After a recent refactor, the pipeline silently produces wrong aggregate values \u2014 the dashboards show plausible numbers, so the regression went unnoticed until a quarterly audit flagged discrepancies. The codebase is ~1,200 lines across several modules (ingestion, transformation, aggregation, storage, a small CLI, and utility helpers).",
+ "instruction_draft": "The ETL pipeline at /app produces incorrect aggregate totals in the SQLite database. Fix it so that for every (region, product_category) pair the `daily_summary` table contains the correct sum of `revenue` and the correct count of distinct `user_id` values from the source records, accurate to within 0.01 on revenue and exactly correct on distinct-user counts, across all input files the verifier supplies.",
+ "requirements": [
+  "For every (region, product_category, date) triple present in the source data, the `daily_summary` table row must have a `revenue_total` equal to the sum of all matching source `revenue` values (within 0.01 absolute tolerance).",
+  "For every (region, product_category, date) triple, the `distinct_users` column must equal the exact count of distinct `user_id` values across all source records for that key.",
+  "The pipeline must be runnable via `python /app/run_pipeline.py <input_dir> <db_path>` and complete without error.",
+  "Rows must not be duplicated in `daily_summary` when the pipeline is run more than once on the same input."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; apt-get install sqlite3; pip install pandas==2.2.2 (pinned).",
+  "~1,200 lines spread across: /app/run_pipeline.py (CLI entry point, ~80 lines), /app/ingest.py (CSV reading, ~150 lines), /app/transform.py (field normalization, ~200 lines), /app/aggregate.py (groupby + accumulation logic, ~220 lines), /app/storage.py (SQLite writer, ~180 lines), /app/utils.py (helpers, ~200 lines), /app/config.py (~80 lines), /app/tests/sample_test.py (a small smoke test that passes, ~90 lines).",
+  "Bug 1 (two_interacting_causes, cause A): In aggregate.py, the distinct-user count is computed as len(group['user_id']) instead of group['user_id'].nunique(). On the provided sample CSV all user_ids happen to be unique per group so the sample test passes, but on hidden inputs with repeated user_ids per group the count is wrong.",
+  "Bug 2 (two_interacting_causes, cause B): In storage.py, the INSERT uses INSERT INTO daily_summary ... without an ON CONFLICT clause, and the upsert logic above it checks for an existing row by (region, product_category) only \u2014 it omits the date column from the WHERE clause. This means when the pipeline runs on multi-day input, rows for later dates silently overwrite (UPDATE) the revenue_total of the first date's row by adding to it, rather than maintaining per-date rows. The sample input is single-day so the smoke test passes.",
+  "The interaction: fixing only Bug A (nunique) still produces wrong revenue_total on multi-day inputs because Bug B accumulates across dates into a single row. Fixing only Bug B still produces wrong distinct_users on inputs with repeated users. Only fixing both yields correct output.",
+  "Provide a sample input directory /app/sample_data/ with two small single-day CSVs where all user_ids are unique per group, so both bugs are invisible to the sample test.",
+  "The sample_test.py runs the pipeline on sample_data and checks that row counts are positive and revenue_total > 0 \u2014 a shallow check that passes with both bugs present.",
+  "SQLite schema for daily_summary: id INTEGER PRIMARY KEY, region TEXT, product_category TEXT, date TEXT, revenue_total REAL, distinct_users INTEGER, UNIQUE(region, product_category, date).",
+  "CSV schema: event_id, user_id, region, product_category, date (YYYY-MM-DD), revenue (float)."
+ ],
+ "internal_hint": "The engineer runs the sample test, sees it pass, then reads aggregate.py and notices len() vs nunique(). After fixing that, they re-run on a multi-day dataset they construct and notice revenue_total is still wrong. They then read storage.py and find the upsert WHERE clause is missing the date column, so all dates for a (region, product_category) pair collapse into one row with accumulated revenue. Fixing the WHERE clause to include date and adding ON CONFLICT(region, product_category, date) DO UPDATE SET ... resolves both issues. The correct fix is: (1) aggregate.py: change len(group['user_id']) to group['user_id'].nunique(); (2) storage.py: fix the upsert key to include date and use proper INSERT OR REPLACE or ON CONFLICT logic.",
+ "trap": "A solver who only reads aggregate.py and fixes the nunique bug will pass the provided single-day samples (because Bug B is invisible there) and may declare the task done. The hidden verifier generates multi-day, multi-user inputs where Bug B causes wrong revenue_total values \u2014 the distinct_users fix alone is insufficient. Conversely, a solver who only notices the storage bug and fixes the date key will still fail hidden inputs with repeated user_ids because distinct_users remains wrong. Only both fixes together clear the threshold.",
+ "tests": [
+  "Test 1 (shallow sample): Run the fixed pipeline on /app/sample_data/; verify daily_summary has the expected rows with correct revenue_total and distinct_users. This is what the planted smoke test checks \u2014 both bugs are invisible here.",
+  "Test 2 (multi-day hidden input): Verifier generates a CSV with 3 regions \u00d7 4 product_categories \u00d7 5 dates = 60 group keys, ~500 rows total, with 3-8 rows per group. Checks that daily_summary has exactly 60 rows (one per triple), revenue_total matches group sum within 0.01, and distinct_users matches exact nunique per group.",
+  "Test 3 (repeated-user hidden input): Verifier generates a single-day CSV where each (region, product_category) group has 10 rows but only 4 distinct user_ids (remainder are repeats). Checks distinct_users == 4 for each group.",
+  "Test 4 (idempotency): Run the pipeline twice on the same multi-day input; check that row counts do not double and revenue_total does not change on the second run.",
+  "Test 5 (combined stress): 10 regions \u00d7 5 categories \u00d7 7 dates, ~2000 rows, ~30% duplicate user_ids per group. Revenue_total accurate within 0.01 and distinct_users exact for all 350 rows."
+ ],
+ "verifier_knob": {
+  "name": "duplicate_user_fraction",
+  "value": "0.30",
+  "effect": "Raising the fraction of duplicate user_ids per group (e.g. to 0.60) makes the distinct_users error larger and easier to detect by inspection, lowering difficulty. Lowering it toward 0 makes the distinct_users error small and easy to miss, raising difficulty. The revenue_total bug is independent of this knob and is controlled by the number of dates in the hidden input."
+ },
+ "expected_failure_modes": [
+  "Agent finds and fixes only Bug A (nunique) by reading aggregate.py, verifies on sample data, sees it pass, and submits \u2014 failing Test 2 and Test 5 due to Bug B.",
+  "Agent finds and fixes only Bug B (date key in upsert) by reading storage.py after noticing the schema has a UNIQUE constraint on (region, product_category, date), verifies on sample data, sees revenue is correct, and submits \u2014 failing Test 3 and Test 5 due to Bug A.",
+  "Agent patches the storage layer to use INSERT OR REPLACE but forgets to also fix the WHERE clause in the pre-existing UPDATE branch, so the idempotency test (Test 4) still fails.",
+  "Agent notices the sample_test.py passes and concludes the pipeline is fine without deeper investigation.",
+  "Agent constructs a multi-day test but uses all-unique user_ids, so Bug A remains hidden and only Bug B is caught."
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "devops",
+ "tags": [
+  "sqlite",
+  "etl",
+  "python",
+  "configuration",
+  "data-pipeline",
+  "sysadmin"
+ ]
+}

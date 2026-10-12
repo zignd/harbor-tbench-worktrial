@@ -1,0 +1,58 @@
+{
+ "slug": "waf-rule-deploy-sync",
+ "title": "WAF Rule Deployment Consistency",
+ "scenario": "A home-grown WAF (Web Application Firewall) rule engine is deployed across three components: a rule compiler that reads YAML rule definitions from /opt/waf/rules/, a deployment script that writes compiled rules to /opt/waf/deployed/, and a runtime filter binary that loads deployed rules and classifies HTTP requests. An on-call SRE was paged at 3am because the filter is passing malicious requests that the YAML rules should catch, while simultaneously blocking legitimate traffic. The environment contains ~1400 lines of Python across the compiler, deployer, and a request-log analyzer, plus ~200 YAML rule files, a SQLite state database tracking rule versions, and a corpus of labeled HTTP request samples in /opt/waf/samples/.",
+ "instruction_draft": "The WAF at /opt/waf is deployed but misclassifying requests: some malicious requests reach the backend and some legitimate requests are blocked. Fix the compiler, deployment pipeline, and runtime filter so every request in /opt/waf/samples/ is classified correctly according to its label, and the rule version recorded in /opt/waf/state.db matches the compiled rule set actually loaded by the filter.",
+ "requirements": [
+  "Every request in /opt/waf/samples/ labeled 'malicious' must be rejected by the filter",
+  "Every request in /opt/waf/samples/ labeled 'benign' must be allowed by the filter",
+  "The rule version hash stored in /opt/waf/state.db under the 'deployed' key must equal the SHA-256 of the concatenated compiled rule files actually loaded by the filter at classify time",
+  "The filter must produce the same classification for a given request regardless of how many times it is invoked (no stale in-memory state)",
+  "The deployment script must atomically update both the deployed rule files and the version entry in state.db in a single transaction"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm; apt-get install -y sqlite3; pip install pyyaml==6.0.2 requests==2.32.3",
+  "/opt/waf/compiler/compile.py (~350 lines): reads YAML rules, compiles to JSON pattern objects, writes to /opt/waf/compiled/; BUG 1: regex anchoring is wrong \u2014 patterns meant to match full URI path are compiled without ^ anchor, so prefix-only matches pass through; BUG 2: rule priority field is silently dropped during compilation",
+  "/opt/waf/deployer/deploy.py (~280 lines): copies /opt/waf/compiled/ to /opt/waf/deployed/ and updates state.db; BUG 3: the SHA-256 hash written to state.db is computed BEFORE the file copy, so if compilation changed any file the hash in state.db reflects the old compiled/ snapshot, not the deployed/ snapshot; the DB update and file copy are not in a transaction",
+  "/opt/waf/filter/classify.py (~420 lines): loads rules from /opt/waf/deployed/, classifies requests; BUG 4: rule list is loaded once at module import and cached in a module-level variable, so if deployed/ changes after first import the stale rules are used; also priority ordering is ignored because the compiled JSON omits the priority field (flows from BUG 2), so a permissive allow-rule can shadow a block-rule",
+  "/opt/waf/rules/ contains 200 YAML files: 180 block rules (SQLi, XSS, path traversal, header injection patterns), 20 allow-rules for known-safe paths; allow-rules have lower numeric priority (should be evaluated last) but due to BUG 2 priority is stripped so they sort before block rules alphabetically",
+  "/opt/waf/samples/ contains 400 labeled HTTP request JSON files: 200 malicious (SQLi, XSS, traversal, header injection), 200 benign; the sample filenames are stable but at verify time an additional hidden corpus of 600 fresh samples is appended, generated deterministically from a seeded generator covering edge cases not in the visible set",
+  "/opt/waf/state.db: SQLite with table rule_state(key TEXT PRIMARY KEY, value TEXT); pre-populated with a stale hash",
+  "/opt/waf/run_filter.sh: bash wrapper that invokes classify.py; used by verifier",
+  "A test harness /opt/waf/test_classify.sh that loops over /opt/waf/samples/ and prints PASS/FAIL per sample \u2014 solver can use this to find failures",
+  "Plausible but uninvolved code: /opt/waf/monitor/metrics.py (~180 lines) for Prometheus metrics export, /opt/waf/utils/logger.py (~120 lines)"
+ ],
+ "internal_hint": "There are four bugs forming two coupled chains. Chain A (false negatives \u2014 malicious passes): BUG1 (missing ^ anchor in compiled regex) + BUG2 (priority stripped) + BUG4 (allow-rule shadows block-rule because priority ordering absent). Chain B (state inconsistency): BUG3 (hash computed before copy) + lack of atomicity. Solver must: (1) read compile.py and notice the regex compilation loop drops the anchor and drops the priority field; (2) fix compile.py to emit ^-anchored patterns and preserve priority; (3) re-run compiler; (4) read deploy.py and notice the hash is computed from compiled/ before shutil.copytree to deployed/; fix to compute hash after copy and wrap both operations in a SQLite transaction using BEGIN IMMEDIATE; (5) re-run deployer; (6) read classify.py and notice the module-level cache; fix to reload rules on each call (or provide a reload mechanism) and sort rules by priority descending before matching. The cross-component consistency requirement means fixing only the compiler without fixing the deployer still fails the hash check, and fixing compiler+deployer without fixing classify.py still fails because stale in-memory rules are used in the verifier's multi-invocation test.",
+ "trap": "A naive agent fixes BUG1 (the most visible regex issue) and re-runs the samples, sees the malicious-pass rate drop, and stops. The hidden corpus includes requests that expose BUG2+BUG4 (allow-rule shadowing): a path like '/api/safe/../admin/passwd' matches an allow-rule alphabetically before the traversal block-rule because priority is stripped, so it passes. The state.db hash check also fails because BUG3 was never fixed \u2014 the hash in state.db still reflects pre-deployment compiled/ not deployed/. The verifier's multi-invocation test catches BUG4 if the agent only fixed the regex but left the module-level cache: the verifier calls the filter twice with different deployed/ states and checks both give consistent results.",
+ "tests": [
+  "For each of the 400 visible samples: invoke /opt/waf/run_filter.sh with the request JSON and assert the exit code matches the label (0=benign allowed, 1=malicious blocked)",
+  "For each of 600 hidden corpus samples generated at verify time (seeded RNG, covering: SQLi with URL encoding, XSS in headers, path traversal with mixed slashes, benign paths that share prefixes with malicious patterns, long query strings, null bytes): same classification assertion",
+  "Hash consistency check: compute SHA-256 of all files in /opt/waf/deployed/ sorted by filename, compare to value stored in state.db under key 'deployed'; must match exactly",
+  "Atomicity check: corrupt /opt/waf/deployed/ mid-deploy by running deploy.py with a SIGINT injected after file copy but before DB update is committed; verify state.db is either fully updated or unchanged (no partial state) \u2014 this is done by inspecting the deploy.py source for BEGIN/COMMIT wrapping via execution, not grep",
+  "Multi-invocation consistency: call /opt/waf/run_filter.sh on the same malicious request 3 times in sequence; assert all three return the same classification",
+  "Priority ordering check: craft a request that matches both an allow-rule path prefix and a block-rule body pattern; assert it is classified as malicious (block wins over allow)"
+ ],
+ "verifier_knob": {
+  "name": "corpus_size",
+  "value": "600 hidden samples at default difficulty",
+  "effect": "Raising to 1200 adds more prefix-overlap edge cases and encoded-payload variants that stress the anchor fix; lowering to 200 makes it possible to pass by fixing only the most obvious regex bug without addressing priority ordering"
+ },
+ "expected_failure_modes": [
+  "Agent fixes BUG1 only, sees visible samples pass, submits \u2014 hidden corpus exposes BUG2+BUG4 (priority/shadowing) causing false negatives on traversal-with-allow-prefix cases",
+  "Agent fixes BUG1+BUG2 in compiler and BUG4 in classifier but misses BUG3 in deployer \u2014 hash consistency test fails because state.db still holds pre-copy hash",
+  "Agent fixes all four bugs but forgets to re-run the compiler and deployer after patching \u2014 deployed/ still contains old compiled rules, hash still stale",
+  "Agent wraps deployer DB update in a transaction but computes hash before the copy rather than after \u2014 hash test fails with a one-off mismatch",
+  "Agent fixes the module-level cache in classify.py by reloading rules but introduces a race (reads deployed/ non-atomically) \u2014 multi-invocation consistency test fails intermittently, except here tests are deterministic so it fails consistently"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "security",
+ "tags": [
+  "waf",
+  "deployment",
+  "bash",
+  "debugging",
+  "constraint-satisfaction",
+  "cross-component"
+ ]
+}

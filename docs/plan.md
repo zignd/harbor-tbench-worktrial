@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 47 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 51 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -330,7 +330,7 @@ Foundations
 
 Generation
 - [x] `generator/spec.py`: `TaskSpec` with the taxonomy axes, difficulty levers, verifier kind and knob, plus an inverse-frequency sampler. Unit-tested for coverage behavior.
-- [ ] 💲 `generator/blueprint.py`: spec → `Blueprint` (instruction draft, internal hint, env checklist, requirements, levers, verifier knob, predicted pass rate) via Sonnet structured output, plus a rubric review returning accept/reject with reasons.
+- [x] 💲 `generator/blueprint.py`: spec → `Blueprint` (instruction draft, internal hint, env checklist, requirements, levers, verifier knob, predicted pass rate) via Sonnet structured output, plus a rubric review returning accept/reject with reasons. Done: official Sonnet blueprints for every pilot and Batch 1 spec; the review's scores are enforced in code (every score ≥3, mean ≥3.6).
 - [x] `generator/metatask/`: meta-task package (instruction template adapted from Meta-Task Fig. 6, synthesis Dockerfile, in-container `tests/test.sh` completeness check, `task.toml` with `artifacts`).
 - [x] 💲 `generator/author.py`: render a meta-task from a blueprint, run it, extract the package from `artifacts/`, stamp canary and metadata; repair mode with previous package + gate logs. Done: repair rounds bake the failed package into `/app/previous` and append the gate findings. The canary is enforced by the in-container check plus lint rather than stamped afterwards.
 - [x] `generator/generate.py`: implement `generate_task(topic, output_dir)` end to end (spec → blueprint → author), keeping the template signature. Done: the topic becomes a hint on a sampled spec.
@@ -340,8 +340,8 @@ Gates
 - [x] `validator/leak_scan.py`: build the image and search its filesystem plus `docker history` for distinctive tokens from `tests/` and `solution/`. Unit-tested on a planted-leak fixture. Done: blocking leaks are answer-like tokens (hashes, long numbers); quoted strings found in the image are non-blocking notes. ~2 s per task.
 - [x] `make tb-reference`: download all published TB sets (latest/4.0, 2.1, Pro, Science = 425 tasks) into git-ignored `data/tb-reference/`, keeping instruction + task.toml only (verified).
 - [x] `validator/novelty.py`: 13-gram + TF-IDF index over the 425-task TB corpus + `examples/`, `nearest(k=3)`, `concept_list()`. Thresholds calibrated on TB-vs-TB similarity. Unit-tested: a lightly reworded TB instruction is caught, and an unrelated one isn't. Done: 425 unique refs after de-duplication. Threshold set at cosine 0.70 (distinct-task p90 = 0.52; known variant pairs ≥ 0.75).
-- [ ] 💲 Novelty gate in blueprint review: TB concept list in the blueprint prompt, plus the Sonnet "same underlying task?" judge on the top-3 nearest TB tasks. A reject resamples the spec. Unit-tested with a planted near-copy blueprint.
-- [ ] 💲 Novelty re-check on the finished package before calibration (instruction can drift from the blueprint).
+- [x] 💲 Novelty gate in blueprint review: TB concept list in the blueprint prompt, plus the Sonnet "same underlying task?" judge on the top-3 nearest TB tasks. A reject resamples the spec. Unit-tested with a planted near-copy blueprint. Done: runs on every official blueprint (TF-IDF + 13-gram over 425 TB tasks and our own candidates, then the Sonnet judge on the top-3); planted copies tested in `test_blueprint.py` / `test_novelty.py`.
+- [x] 💲 Novelty re-check on the finished package before calibration (instruction can drift from the blueprint). Done: `gate_novelty` in `stage_gates`; ran on both official `ledger-reconcile` packages (nearest TB task 0.086).
 - [x] 💲 Alignment check: every test maps to an instruction requirement and every requirement has a test (via `harbor check` with a custom rubric, or direct Sonnet). Done: `harbor check` with `generator/quality_rubric.toml` (11 Harbor + 5 work-trial criteria; 9 blocking). The spike task passes 16/16 for $0.13.
 - [x] Functional gates: Docker build, oracle 3/3, nop 0, chained in order with early exit.
 - [x] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`. Done: resumable via each candidate's `status.json`; `--dry-run` runs the real gates on fixtures for free (37 s).
@@ -369,7 +369,7 @@ Part 1 milestone
 ### Phase 3: stretch B + C and red-team
 
 Red-team (part of "how we know tasks are good")
-- [ ] 💲 `evaluator/redteam.py`: hack-elicitation copy of the task + 1 Sonnet terminus-2 trial + judge. A serious exploit goes to repair, with the exploit trajectory as feedback.
+- [x] 💲 `evaluator/redteam.py`: hack-elicitation copy of the task + 1 Sonnet terminus-2 trial + judge. A serious exploit goes to repair, with the exploit trajectory as feedback. Done: ran officially on 3 packages (all honest, `hackable: false`); a beaten verifier returns the exploit as repair feedback.
 - [ ] Wire the red-team as a gate before Opus calibration, and record the hackable rate per batch.
 
 Stretch B: difficulty tuning

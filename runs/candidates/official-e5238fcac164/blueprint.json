@@ -1,0 +1,57 @@
+{
+ "slug": "settlement-aggregator-consistency-bug",
+ "title": "FX Settlement Aggregator Consistency Bug",
+ "scenario": "A finance-ops team runs an internal Python service (~1,200 lines across five modules) that ingests raw FX trade CSV files, aggregates them into net settlement positions per counterparty per currency pair, and writes results to a SQLite ledger. The service has been silently producing wrong net positions for certain trade patterns \u2014 nobody has filed a repro case yet, just a complaint that the monthly reconciliation numbers don't add up. The data files and service code are all in /app/.",
+ "instruction_draft": "Hey, our settlement aggregator is producing wrong net positions on some inputs \u2014 finance caught a discrepancy during month-end rec but nobody wrote down a specific example. The service lives in /app/ and the raw trade CSVs drop into /app/data/. For every trade file we process, the net position for each (counterparty, currency_pair) in the output ledger must equal the exact sum of all signed notional amounts for that key (buys positive, sells negative), and the total across all counterparties for a given currency_pair must net to zero (the book is fully matched). Both invariants need to hold for any valid input \u2014 can you find what's broken and fix it so those two properties always hold?",
+ "requirements": [
+  "For every processed trade file, the net position recorded in the ledger for each (counterparty, currency_pair) key must equal the algebraic sum of all signed notional amounts (buy = +notional, sell = -notional) for that key.",
+  "For every processed trade file, the sum of net positions across all counterparties for any given currency_pair must equal zero (the book is fully matched, every buy has a counterparty sell)."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y sqlite3; pip install pandas==2.2.2",
+  "/app/pipeline/__init__.py \u2014 empty",
+  "/app/pipeline/ingestor.py (~180 lines) \u2014 reads CSV, validates schema, emits Trade namedtuples; bug #1 planted here: when a trade's side field is 'SELL' it negates the notional, but there is an off-by-one in a rounding step that only fires when notional has more than 6 decimal places \u2014 causing the negated value to be stored as positive for those trades",
+  "/app/pipeline/aggregator.py (~220 lines) \u2014 receives Trade stream, groups by (counterparty, ccy_pair), accumulates net; bug #2 planted here: the accumulator uses a defaultdict that is re-used across multiple file-batch calls without being reset, so state bleeds between files when the service is called on more than one file in a session",
+  "/app/pipeline/ledger.py (~150 lines) \u2014 writes aggregated rows to SQLite, upserts on (counterparty, ccy_pair, trade_date); has plausible but uninvolved reconciliation reporting code",
+  "/app/pipeline/validator.py (~130 lines) \u2014 checks CSV schema and rejects malformed rows; uninvolved in the bugs",
+  "/app/pipeline/reporter.py (~120 lines) \u2014 generates HTML summary reports; uninvolved",
+  "/app/service.py (~200 lines) \u2014 CLI entry point: python service.py <csv_file>; orchestrates ingestor \u2192 aggregator \u2192 ledger pipeline",
+  "/app/data/sample_trades.csv \u2014 a small example file with round-number notionals (\u22646 decimal places, all SELL negations correct) that appears to work fine",
+  "/app/data/sample_trades_2.csv \u2014 a second small example file, also round numbers, also appears fine",
+  "/app/ledger.db \u2014 SQLite database created fresh on first run",
+  "/app/README.md \u2014 describes the service architecture and the two invariants in plain English",
+  "The two bugs interact: bug #1 only manifests with high-precision notionals; bug #2 only manifests on multi-file sessions; a fix to only one bug will pass single-file round-number tests but fail the verifier's generated cases"
+ ],
+ "internal_hint": "Bug #1 is in ingestor.py: the sign-flip for SELL trades uses `round(notional, 6)` before negation instead of after, so `notional = -round(abs_notional, 6)` becomes `notional = round(-abs_notional_raw, 6)` \u2014 for values with >6 decimal places, the rounding of the raw positive value then gets negated correctly, but the code path actually does `val = round(notional_raw, 6); if side=='SELL': val = round(-notional_raw, 6)` where `notional_raw` was already stored positive, making the result positive instead of negative for a specific branch. Tracing the code path reveals the condition is `if side == 'SELL': notional = abs(notional)` buried inside a formatting helper that is called during ingestion. Bug #2 is in aggregator.py: the Aggregator class initialises `self._buckets = defaultdict(Decimal)` in `__init__` but the `process_file()` method never calls `self._buckets.clear()`, so running two files accumulates across both. The fix: reset `_buckets` at the start of each `process_file()` call (or return a fresh aggregator per file). A skilled engineer: (1) reads README for the two invariants, (2) writes a quick script to check sample_trades.csv \u2014 passes, (3) crafts a SELL trade with a high-precision notional \u2014 fails invariant 1, (4) runs two files in sequence \u2014 fails invariant 2, (5) traces ingestor for sign logic, traces aggregator for reset logic.",
+ "trap": "The sample CSV files use round notionals (\u22646 decimal places) and are processed one at a time, so both bugs are invisible on the provided data. An agent that only verifies against the sample files will believe the service is correct. The verifier generates: (a) single-file cases with notionals having 8+ decimal places to catch bug #1, and (b) multi-file session cases (two files processed in one service session) to catch bug #2. A partial fix of only bug #1 passes (a) but fails (b), and vice versa \u2014 the verifier runs both classes of tests.",
+ "tests": [
+  "Test class A \u2014 precision notionals, single file: generate a balanced trade file where half the trades are BUY and half are SELL for the same (counterparty, ccy_pair) with notionals like 1234567.89012345; after processing, assert net position == 0 for each key and book nets to zero across counterparties.",
+  "Test class B \u2014 multi-file session: generate two separate balanced trade files with disjoint trade IDs; process both through a single Aggregator instance (as service.py does); assert the ledger for file 2 contains only file 2's trades, not the accumulated total of both files.",
+  "Test class C \u2014 mixed: generate a file with both high-precision notionals AND process it after another file in the same session; both invariants must hold simultaneously.",
+  "Test class D \u2014 large fuzz: generate N=50 random balanced trade files with random counterparties, currency pairs, and notionals sampled from a seeded RNG with 4-10 decimal places; process each independently and as sequential pairs; check both invariants for every case.",
+  "Verifier knob: N controls the number and variety of generated inputs \u2014 raising N from 10 to 50 to 200 increases confidence and catches edge cases like same counterparty appearing in multiple files."
+ ],
+ "verifier_knob": {
+  "name": "num_generated_cases",
+  "value": "50",
+  "effect": "Raising this number increases the variety of notional precisions, counterparty counts, and multi-file orderings tested; at N=10 a lucky partial fix might squeak by, at N=200 both bugs must be fully fixed"
+ },
+ "expected_failure_modes": [
+  "Agent checks only sample_trades.csv, sees it passes, declares done \u2014 misses both bugs because samples have round notionals and are single-file.",
+  "Agent finds and fixes bug #1 (sign flip) by inspecting ingestor.py but never investigates multi-file state bleed in aggregator.py \u2014 passes precision tests, fails multi-file tests.",
+  "Agent finds and fixes bug #2 (state bleed) but misreads the sign logic in ingestor.py as correct because the branch is buried in a formatting helper \u2014 passes multi-file tests, fails precision tests.",
+  "Agent writes a new aggregator from scratch that is correct in isolation but calls it differently from service.py, leaving the original aggregator still used in the actual pipeline.",
+  "Agent identifies both bugs conceptually but introduces a new bug in the fix (e.g., clearing the wrong dict, or resetting too aggressively), causing tests with accumulated state to fail."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "debugging",
+ "tags": [
+  "finance",
+  "data-pipeline",
+  "python",
+  "debugging",
+  "cross-component",
+  "algorithmic"
+ ]
+}

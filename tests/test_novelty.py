@@ -1,0 +1,72 @@
+from pathlib import Path
+
+from analysis.llm import Reply
+from validator import novelty
+from validator.novelty import Index, RefTask
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _example_index() -> Index:
+    """Index over the 6 examples only, so tests don't need `make tb-reference`."""
+    refs = tuple(
+        RefTask(f"examples/{d.name}", (d / "instruction.md").read_text(), d.name)
+        for d in sorted((ROOT / "examples").iterdir())
+        if d.is_dir()
+    )
+    return Index(refs)
+
+
+LOG_TASK = (ROOT / "examples" / "log-summary-date-ranges" / "instruction.md").read_text()
+
+
+def test_verbatim_copy_is_flagged_by_ngrams_and_cosine():
+    flags = novelty.lexical_flags(LOG_TASK, _example_index())
+    assert any("13-gram" in f for f in flags)
+    assert any("cosine" in f and "log-summary" in f for f in flags)
+
+
+def test_light_rewording_is_still_nearest():
+    reworded = LOG_TASK.replace("log files", "logfiles").replace("severity", "level")
+    ref, score = _example_index().nearest(reworded, k=1)[0]
+    assert ref.ref_id == "examples/log-summary-date-ranges"
+    assert score >= novelty.COSINE_REJECT
+
+
+def test_unrelated_task_is_clean():
+    text = (
+        "The nightly backup job for our Postgres replica silently skips tables created "
+        "after Tuesday's migration. Make the backup script include every table and keep "
+        "existing retention rules."
+    )
+    assert novelty.lexical_flags(text, _example_index()) == []
+
+
+def test_concept_list_has_one_line_per_reference():
+    idx = _example_index()
+    lines = novelty.concept_list(idx).splitlines()
+    assert len(lines) == len(idx.refs) and lines[0].startswith("- examples/")
+
+
+def test_judge_marks_variant_as_not_novel():
+    def fake_chat(prompt, **kwargs):
+        assert "examples/log-summary-date-ranges" in prompt
+        text = (
+            '{"verdicts": [{"ref_id": "examples/log-summary-date-ranges", "verdict": "variant",'
+            ' "reason": "same log aggregation"}, {"ref_id": "a", "verdict": "distinct",'
+            ' "reason": "x"}, {"ref_id": "b", "verdict": "distinct", "reason": "y"}]}'
+        )
+        return Reply(text, "m", 10, 0, 10, 0.01, 0.1)
+
+    result = novelty.judge_same_task(LOG_TASK, _example_index(), chat=fake_chat)
+    assert result["novel"] is False and result["cost_usd"] == 0.01
+
+
+def test_judge_all_distinct_is_novel():
+    def fake_chat(prompt, **kwargs):
+        verdicts = ",".join(
+            '{"ref_id": "r", "verdict": "distinct", "reason": "different"}' for _ in range(3)
+        )
+        return Reply('{"verdicts": [' + verdicts + "]}", "m", 1, 0, 1, 0.0, 0.0)
+
+    assert novelty.judge_same_task("backup job", _example_index(), chat=fake_chat)["novel"]

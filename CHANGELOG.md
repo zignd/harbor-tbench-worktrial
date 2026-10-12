@@ -4,6 +4,17 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 16:45 -03:00 · Spec sampler, LLM client, novelty index
+- **`generator/spec.py`:** `TaskSpec` covers 12 domains, 8 skill types, 11 capabilities (2 per task), 6 pillars, 12 personas, weighted languages, 7 fixture kinds, 5 verifier kinds (each with a difficulty knob), 8 difficulty levers (2 per task) and 4 terse-compatible writing styles.
+  - Sampling is **inverse-frequency** (SkillSynth): weight 1/(count+1) per value, optionally seeded with history. A batch therefore spreads across the taxonomy instead of piling onto common cells.
+  - Deterministic per seed. 5 unit tests.
+- **`analysis/llm.py`:** a minimal OpenAI-compatible `chat()` for direct calls (blueprints, reviews, judges). It retries transient errors, does token-based cost accounting from OpenRouter prices, and has a JSON extractor. The model follows `config.MODEL`, so dev mode swaps it automatically.
+- **`validator/novelty.py`:** a TF-IDF + word-13-gram index over the 425 **unique** reference tasks (the 431 files, de-duplicated by text, since `examples/` and some sets repeat tasks). It provides `nearest()`, `lexical_flags()`, `concept_list()` (8.6k words, for the blueprint prompt) and `judge_same_task()` (a Sonnet same/variant/distinct verdict on the top-3).
+  - **Threshold calibrated on the corpus itself:** among distinct published tasks, the nearest-neighbour cosine has median 0.24 and p90 0.52, and every pair above ~0.75 is a genuine variant. Examples: `polyglot-rust-c`/`polyglot-c-py` 0.83, two broken-pip repairs 0.75, and a TB 4.0 rewording of a 2.1 HTML-filter task 0.97. Lexical reject is at **0.70**; the judge decides below that.
+  - The Phase 0 spike task is clean (nearest 0.08).
+  - 6 unit tests run on the examples only, so CI doesn't need the downloaded corpus.
+- **Spend:** $0. Progress 28/83.
+
 ### 16:41 -03:00 · Phase 1 foundations: runner, ledger, budget guard, pricing
 - **`evaluator/harbor_runner.py`:** runs `harbor run` and parses job dirs into `TrialResult` (reward, tokens, cost, turns, timing, paths). It classifies each trial as **pass / fail / invalid / infra / fatal**:
   - Agent or verifier timeouts, context overflow and hitting the turn cap are *invalid*, never valid failures.

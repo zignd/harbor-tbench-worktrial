@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:18 -03:00 · Sampler steers harder; Batch 2 restarted on a diverse plan
+- Batch 2's first plan (seed 3) drew **"file formats and recovery" 4 of 8 times and SQL 4 of 8**. A simulation over 300 seeds showed this was a ~1.3% draw. Still, plain inverse frequency, `1/(count+1)`, is soft: 18% of 8-spec batches repeat a domain 3+ times, and 38% repeat a language.
+- **`STEER_POWER = 2`**: weights are now `base / (count + 1)^2`. That cuts domain 3+ repeats to 5% and language to 12%, and keeps the draw random.
+- Batch 2 was stopped about a minute in, while its first 4 blueprint calls were in flight. They finished no stage, so there are no ledger events, and the 4 empty claim dirs and the plan file were removed. The OpenRouter spend for those calls (~$0.4) is unrecorded and will show as a small gap in the ledger-vs-gateway reconciliation.
+- The new Batch 2 plan covers 7 domains and 5 languages in 8 specs. It's running with 4 workers.
+
 ### 19:17 -03:00 · First-pass yield: longer authoring, all cheap gates in one round, overgenerate
 No fresh official candidate had passed every gate on its first build. The measured causes and the three fixes:
 1. **Authoring turn cap 80 → 140** (`METATASK_MAX_TURNS`). The pilot's first build hit the 80-turn cap with a broken Dockerfile ($3.86, 42 min), then needed a repair (~$0.9, ~30 min each). Finishing the first build costs less than repairing it. 140 turns can run past an hour, so the **authoring meta-task's** agent timeout goes 3600 → 7200 s. Generated tasks keep `timeout_sec = 3600` (`make_task_toml`, enforced by lint). That rule is the README's, about the tasks Opus is calibrated on.

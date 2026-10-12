@@ -171,6 +171,11 @@ class TaskSpec(BaseModel):
         return "\n".join(lines)
 
 
+# Squared inverse frequency: with plain 1/(count+1), 18% of 8-spec batches repeated a domain
+# 3+ times (a seed-3 batch drew "file formats and recovery" 4 times); squared, 5% (300 seeds).
+STEER_POWER = 2
+
+
 def _pick(
     rng: random.Random,
     values: list[str],
@@ -178,9 +183,11 @@ def _pick(
     k: int = 1,
     base: list[int] | None = None,
 ) -> list[str]:
-    """Draw k distinct values with weight base / (count + 1)."""
+    """Draw k distinct values with weight base / (count + 1) ** STEER_POWER."""
     pool = list(values)
-    weights = [(base[i] if base else 1) / (counts[v] + 1) for i, v in enumerate(values)]
+    weights = [
+        (base[i] if base else 1) / (counts[v] + 1) ** STEER_POWER for i, v in enumerate(values)
+    ]
     chosen = []
     for _ in range(k):
         v = rng.choices(pool, weights=weights)[0]

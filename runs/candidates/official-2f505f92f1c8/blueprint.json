@@ -1,0 +1,63 @@
+{
+ "slug": "wal-log-crypto-audit-service",
+ "title": "WAL Log Cryptographic Audit Service",
+ "scenario": "A database administrator is recovering from a security incident in which tampered write-ahead log entries went undetected. The environment contains a compiled C binary (`/app/bin/logaudit`) that is supposed to serve a simple line-oriented TCP protocol: clients send a hex-encoded log record and receive a cryptographic audit tag, so downstream consumers can verify record integrity. The binary was built from roughly 1,400 lines of C spread across several source files under `/app/src/`, and a PostgreSQL-style WAL parser in SQL (`/app/sql/`) feeds records into it. The service has two known defects planted across different components that together cause incorrect tags to be emitted for certain record shapes.",
+ "instruction_draft": "The audit service at `/app/bin/logaudit` must accept TCP connections on port 7741. For each newline-terminated hex-encoded WAL record it receives, it must respond with a newline-terminated lowercase hex HMAC-SHA256 tag computed over the canonical binary form of the record using the key in `/app/etc/audit.key`. Each refund-type record must carry the transaction ID of the charge it references, and the tag must be computed over the record with that reference field populated. Records of every type and length must be handled correctly, and state must remain consistent when multiple records arrive in the same session.",
+ "requirements": [
+  "The service listens on TCP port 7741.",
+  "Each newline-terminated hex-encoded WAL record sent by a client receives a newline-terminated lowercase hex HMAC-SHA256 response.",
+  "The HMAC key is read from /app/etc/audit.key.",
+  "The HMAC is computed over the canonical binary form of the record (not the hex string).",
+  "For refund-type records, the charge_txid reference field must be populated before the HMAC is computed; if it is absent or zero, the service must look it up via the SQL resolver and insert it.",
+  "State (session context, resolved reference fields) must remain consistent across multiple records within a single TCP session.",
+  "Records with odd-length hex strings, zero-length payloads, and maximum-size payloads (up to 65535 bytes binary) must all be handled without crashing or producing wrong tags."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, libssl-dev, libsqlite3-dev, sqlite3, openssl, netcat-openbsd, python3 with hmac/hashlib.",
+  "/app/src/ contains ~1400 lines of C across: main.c (TCP server loop, ~200 lines), protocol.c (hex decode + HMAC dispatch, ~300 lines), wal_record.c (WAL record struct parsing, ~400 lines), refund_resolver.c (SQLite lookup for charge_txid, ~250 lines), and util.c (shared helpers, ~150 lines). Plausible but uninvolved: metrics.c, config.c.",
+  "Bug 1 (in protocol.c): the hex-decode function silently truncates the input to an internal 512-byte buffer before decoding; records whose binary form exceeds 256 bytes produce a truncated HMAC. The buffer constant is named PROTO_BUF_SZ and is set to 512 (should be 65536+1 for the hex representation of 65535 binary bytes plus newline).",
+  "Bug 2 (in refund_resolver.c): the SQL query that resolves charge_txid for refund records uses `WHERE txid = ?` but binds the parameter as SQLITE_TEXT instead of SQLITE_INTEGER, so the lookup always returns no rows and the charge_txid stays zero, producing a wrong HMAC for any refund record.",
+  "/app/sql/schema.sql creates a SQLite database at /app/var/audit.db with tables: wal_records(id, txid INTEGER, record_type TEXT, payload BLOB) and charges(id, txid INTEGER PRIMARY KEY, amount INTEGER, ts INTEGER).",
+  "/app/sql/seed.sql inserts sample charge and refund records into audit.db so the resolver has data to look up.",
+  "/app/etc/audit.key contains a fixed 32-byte hex-encoded HMAC key (e.g., the ASCII string 'incident-response-hmac-key-2024x' written as hex).",
+  "/app/Makefile builds the binary from /app/src/ into /app/bin/logaudit.",
+  "A sample client script /app/test/sample_client.py sends two short records (one normal, one refund with a short payload) and prints the tags \u2014 it only exercises the short-record path and a refund that happens to have txid=0 in the seed data, so both bugs are invisible to this sample.",
+  "The Dockerfile compiles the binary as part of the build so /app/bin/logaudit exists at start but is buggy."
+ ],
+ "internal_hint": "The solver must: (1) read the source to find PROTO_BUF_SZ=512 in protocol.c and increase it to at least 131073 (2*65535+2 with null terminator), (2) find the SQLITE_TEXT/SQLITE_INTEGER binding mistake in refund_resolver.c and change it to sqlite3_bind_int64, (3) recompile with make, and (4) restart the service. The correct HMAC for any record is: hmac_sha256(key=bytes.fromhex(audit_key_hex), msg=bytes.fromhex(record_hex)). For refund records the binary form must have the charge_txid field filled from the DB before hashing. The solver must discover both bugs by reading source, not by running the sample client.",
+ "trap": "The sample client only sends records shorter than 256 binary bytes, so bug 1 (buffer truncation) is invisible. The sample refund record uses a txid that happens to produce the same tag whether the lookup succeeds or not (txid=0 matches no charge, and the seed data has no charge with txid=0 so the resolver always fails silently). A solver who runs the sample client, gets matching output, and ships the unmodified binary will fail the verifier's long-record tests and all refund-record tests with real txids.",
+ "tests": [
+  "Short normal record (binary length 16 bytes): send hex-encoded bytes, verify response equals Python hmac.new(key, bytes.fromhex(hex_record), hashlib.sha256).hexdigest().",
+  "Long normal record (binary length 300 bytes, exercises the truncation bug): same verification; fails with unpatched binary.",
+  "Maximum-size normal record (binary length 65535 bytes): same verification.",
+  "Refund record with charge_txid=0 in the raw hex but a matching charge row in the DB (txid=42): verify the response equals the HMAC over the record with charge_txid field set to 42; fails with unpatched resolver.",
+  "Refund record referencing a charge txid that is a large integer (e.g., 9999999): verify correct HMAC after lookup; exercises integer binding.",
+  "Session consistency: send three records in one TCP connection (normal short, refund, normal long); verify all three responses are correct and in order.",
+  "Zero-length payload record: service must not crash and must return a valid HMAC.",
+  "Odd-length hex string: service must return an error token (the protocol spec in /app/src/protocol.c defines 'ERR\\n' for malformed input) without crashing, and the next valid record in the same session must still be answered correctly."
+ ],
+ "verifier_knob": {
+  "name": "number_of_request_scenarios",
+  "value": "8",
+  "effect": "Reducing to 3 scenarios (short normal, short refund, session test) makes the task easier because the long-record bug may not be exercised. Increasing to 12 adds more boundary sizes (e.g., exactly 256, 257, 512, 513 binary bytes) and additional refund variants with different txid magnitudes, making it harder to pass all scenarios without fully understanding both bugs."
+ },
+ "expected_failure_modes": [
+  "Agent runs sample_client.py, sees correct output, concludes the service is fine, and submits without fixing anything.",
+  "Agent finds and fixes only the buffer-size bug (the more obvious one from a grep for magic numbers) but misses the SQLITE_TEXT/SQLITE_INTEGER binding mistake in refund_resolver.c, so short refund records still produce wrong tags.",
+  "Agent fixes the binding type but uses SQLITE_INT32 instead of SQLITE_INT64, causing incorrect results for large txid values.",
+  "Agent rewrites the service in Python instead of fixing the C source, but gets the refund logic wrong because the reference field offset in the WAL record binary format is subtle (it's at a non-obvious byte offset that requires reading wal_record.c carefully).",
+  "Agent fixes both bugs but forgets to recompile (make), so the running binary is still broken.",
+  "Agent fixes the buffer size to 1024 (doubling it rather than reading the spec for maximum record size), which passes the 300-byte test but fails the 65535-byte test."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "cryptography",
+  "log-processing",
+  "sql",
+  "compiled-binary",
+  "service-protocol",
+  "refactoring"
+ ]
+}

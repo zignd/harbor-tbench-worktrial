@@ -4,6 +4,21 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:58 -03:00 · Stretch D baseline: AfterQuery's examples on our 16-criterion rubric
+- `harbor check` with `generator/quality_rubric.toml` on all 6 hand-written examples ($0.66; `reports/quality_examples.json`):
+
+  | Example | Passed | Gate |
+  |---|---|---|
+  | chess-best-move | 12/16 | blocked |
+  | configure-git-webserver | 12/16 | blocked |
+  | fix-code-vulnerability | 11/16 | blocked |
+  | fix-git | 8/16 | blocked |
+  | log-summary-date-ranges | 12/16 | blocked |
+  | openssl-selfsigned-cert | 12/16 | ok |
+
+- **Most-failed criteria:** valid_failure_modes (5/6), behavior_in_task_description (4/6), anti_cheating_measures (4/6), verify_time_inputs (4/6), instruction_style (3/6), oracle_investigates (2/6).
+- **Read:** the examples were written to an older, looser bar (TB 1/2-era tasks; HVTB classes all six as "Easy"). Our gate would block 5 of 6. The Phase 0 Sonnet-authored task scored 16/16, yet hand review still found difficulty leaks. So "passes the rubric" is necessary but not sufficient, and stretch D compares on both the rubric and human review.
+
 ### 17:55 -03:00 · First calibration: `ledger-reconcile` is too easy (4/4); Opus costs $0.23 per trial
 - **Calibration** (terminus-2 + Opus 4.8, concurrency 2): **4/4 legit passes → too easy**, stopped after 4 trials (curtailment saved the 5th). Each run took 11-13 turns and 1.3-1.7 min.
   - **Cost: $0.20-0.26 per Opus trial** and $0.012-0.013 per audit, $0.97 in total. The budget had assumed $1.5 per trial, so Opus is cheaper than planned on tasks like this. Harder tasks will run longer.

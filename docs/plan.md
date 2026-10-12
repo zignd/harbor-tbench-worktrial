@@ -254,7 +254,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 10 / 75 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 14 / 75 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -271,10 +271,10 @@ Environment and repo
 - [x] Dev mode: `DEV_MODE=1` → `deepseek/deepseek-v4.1-flash` for plumbing; `output-dev/`; `config.assert_official_models()` guard
 
 Harbor spike (learn the real mechanics before writing pipeline code)
-- [ ] Run `oracle` and `nop` on all 6 examples. Record the pass/fail table, run times, and whether verify-time `uvx` installs ever fail (no API cost).
-- [ ] Inspect a job dir. Document the layout, `result.json` fields (reward, cost/tokens, timing, exceptions), trajectory format and where `artifacts/` lands (in `docs/harbor-notes.md`).
-- [ ] 💲 Run 1 Opus 4.8 terminus-2 trial on one example. Record the **real cost per trial**, the turn count, and whether OpenRouter reports cached prompt tokens.
-- [ ] Confirm `-k`, `-n`, `--ak max_turns=200` behave as expected and Docker image caching works across trials.
+- [x] Run `oracle` and `nop` on all 6 examples. Record the pass/fail table, run times, and whether verify-time `uvx` installs ever fail (no API cost).
+- [x] Inspect a job dir. Document the layout, `result.json` fields (reward, cost/tokens, timing, exceptions), trajectory format and where `artifacts/` lands (in `docs/harbor-notes.md`).
+- [x] 💲 Run 1 Opus 4.8 terminus-2 trial on one example. Record the **real cost per trial**, the turn count, and whether OpenRouter reports cached prompt tokens.
+- [x] Confirm `-k`, `-n`, `--ak max_turns=200` behave as expected and Docker image caching works across trials.
 - [ ] 💲 Dev-mode meta-task spike (`DEV_MODE=1`, DeepSeek): one hand-written meta-task run. Get the wiring right (prompt rendering, `artifacts` collection, in-container test) for cents.
 - [ ] 💲 Meta-task spike: one hand-written meta-task run with Sonnet 4.6. Confirm `artifacts = ["/app/output"]` arrives on the host, record the authoring cost, and check that in-container self-validation works without Docker. **Go/no-go:** if it fails, switch to the custom `docker exec` loop.
 - [ ] 💲 Try `harbor check` on 1 example and `harbor analyze` on the Opus trial, both with Sonnet 4.6 through our gateway. Record whether the default `check` rubric is the TB 19-criterion one, and decide wrap vs build for `analysis/judge.py`.

@@ -9,7 +9,7 @@ Guidance for AI agents (and humans) working in this repo. This is an AfterQuery 
 - **Learnable band:** exactly 1-3 of 5 Opus runs pass all tests. Don't change Opus's agent, sampling or thinking settings, because that changes what "learnable" means.
 - **Agent timeout:** `[agent].timeout_sec = 3600.0` in every task. Timeouts and running out of turns (`max_turns` ≤ 200) are **never** valid failures.
 - **Valid failures only:** a shipped task fails because the model couldn't solve it. It must not fail because of an ambiguous spec, an over-strict test, a broken or flaky env, or a tmux/pager quirk. For every shipped task we must be able to say *why* the model fails it.
-- **Novelty:** don't reuse or adapt public tasks (including `examples/`). Don't clone public repos for the agent to patch. The generator writes every problem, environment and solution itself.
+- **Novelty:** don't reuse or adapt public tasks (including `examples/`). Don't clone public repos for the agent to patch. The generator writes every problem, environment and solution itself. Every candidate is checked against all published Terminal-Bench sets (latest/4.0, 2.1, Pro, Science: 425 tasks, `make tb-reference` → `data/tb-reference/`), both at blueprint time and before calibration. Never copy content from `data/tb-reference/` into a task or prompt beyond the concept list.
 - **Task format:** exactly as `README.md` describes. `tests/test.sh` writes `1`/`0` to `/logs/verifier/reward.txt`. The canary goes in `solve.sh`, the `Dockerfile` and `test_outputs.py`, never in `instruction.md`.
 - **Reward hacking:** nothing answer-bearing in `environment/`. Tests check outcomes on hidden inputs, not source strings or installed packages.
 

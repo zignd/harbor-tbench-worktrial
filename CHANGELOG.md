@@ -4,6 +4,22 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 16:12 -03:00 · Novelty gate against every published Terminal-Bench set; `harbor check` evaluated
+- **Novelty corpus:** `make tb-reference` downloads every Terminal-Bench set on the Harbor hub into git-ignored `data/tb-reference/` (~2 min), keeping only `instruction.md` + `task.toml` (3.6 MB). That's 425 tasks:
+  - `terminal-bench@latest`, 66 tasks. This matches Terminal-Bench **4.0** (Aug 2026), and none of its tasks overlap with 2.x.
+  - 2.1, 89 tasks.
+  - Pro, 200 tasks.
+  - Science, 70 tasks.
+- **Why all of them, and not just the latest:** the README forbids reusing or adapting *any* public task, so newer releases don't replace older ones as things to avoid.
+- **Plan change (delta 11):** novelty moved from a Phase 3 report to an **early gate**. It has three layers:
+  1. The TB concept list goes in the blueprint prompt ("don't build these or variants").
+  2. At blueprint review: 13-gram + TF-IDF, then a Sonnet "same underlying task?" judge on the top-3 nearest TB tasks.
+  3. The same check on the finished package before calibration.
+- **Tradeoff:** text overlap alone only catches copied wording. The semantic judge catches the same task reworded, at about one small Sonnet call per candidate. Thresholds will be calibrated on TB-vs-TB similarity so tasks that merely share a domain aren't rejected.
+- **`harbor check` evaluated:** it runs a reviewer agent in a Harbor job. It works with terminus-2 + Sonnet 4.6 through our gateway, at $0.084 for `fix-git`. Its default rubric has **11 criteria**, not the 19 we assumed. AfterQuery's own `fix-git` fails 4/11, including two instruction↔test alignment criteria (the tests check files the instruction never names).
+  - **Decision:** wrap `harbor check` with a custom rubric as the alignment/quality gate, instead of building a judge.
+- **Spend:** `harbor check` $0.084, plus the meta-task spikes (accounted when they finish).
+
 ### 15:54 -03:00 · Correction: OpenRouter usage counters lag
 - My earlier claim that "Harbor's `cost_usd` overstates spend by ~50%" was wrong. The $0.0775 reading was taken 5 s after the Opus trial, before OpenRouter had counted all of it. The settled total ($0.1176) matches Harbor's estimate of $0.1173.
 - OpenRouter's `/api/v1/key` `usage` and `limit_remaining` also update out of sync. At one point they implied $0.118 vs $0.145 spent.

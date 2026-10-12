@@ -62,3 +62,34 @@ This is what the pass-audit and failure judges read. The command scan works off 
 - **OpenRouter's `/api/v1/key` counters lag** by seconds to minutes, and `usage` and `limit_remaining` don't update together. At one point they implied $0.118 vs $0.145 spent.
 - **So the ledger records Harbor's per-trial `cost_usd`**, which is available immediately and attributable to a task. Reconcile it against OpenRouter only after the counters settle (re-read after ~1-2 min). `make usage` shows both `used` and `limit − remaining`, and the budget guard uses the larger of the two.
 - fix-git is an "Easy" task. Medium/Hard tasks should run many more turns (TB-style tasks average ~20-40), so expect roughly $0.3-1.5 per Opus trial. That's to be confirmed on generated tasks.
+
+## `harbor check` (task-quality review)
+
+```bash
+uv run --env-file .env harbor check <task-dir> -a terminus-2 -m openrouter/anthropic/claude-sonnet-4.6 \
+    --ak max_turns=40 [-r rubric.toml] -o jobs --job-name <name>
+```
+
+- It runs the reviewer as an **agent inside a Harbor job**. The agent inspects the task in a container and writes structured JSON. The report lands in `jobs/<name>/check_report.json` as `results[].checks.<criterion>.{outcome, explanation}`, with outcome `pass` / `fail` / `not_applicable`.
+- The default rubric (`harbor/cli/quality_checker/default-rubric.toml`) has **11 criteria**, *not* the 19-criterion TB review rubric we assumed from the Meta-Task paper:
+  - behavior_in_task_description
+  - behavior_in_tests
+  - informative_test_structure
+  - anti_cheating_measures
+  - structured_data_schema
+  - pinned_dependencies
+  - typos
+  - tests_or_solution_in_image
+  - test_deps_in_image
+  - hardcoded_solution
+  - file_reference_mentioned
+- Works through our gateway with terminus-2 + Sonnet 4.6. On `fix-git` it took ~1.5 min and cost **$0.084**.
+- **The AfterQuery example `fix-git` fails 4/11:**
+  - behavior_in_task_description and file_reference_mentioned, because the tests check `about.md` / `default.html`, which the instruction never names.
+  - anti_cheating_measures
+  - pinned_dependencies
+
+  So the rubric is strict and catches exactly the instruction↔test misalignment SkillSynth flagged.
+- **Decision:** use `harbor check` (default criteria plus our own rubric additions) as the alignment/quality gate, instead of writing a judge from scratch.
+
+`harbor analyze` (trajectory review) ships a built-in rubric (`harbor/analyze/prompts/analyze-rubric.toml`) with `reward_hacking` and `task_specification`. We'll try it on calibration trajectories once there are some.

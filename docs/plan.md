@@ -110,27 +110,39 @@ All eight papers are downloaded to `docs/research/<arxiv-id>.pdf`, with a text c
     - No expected-output files in `environment/`.
     - **No suggestive comments** in env files (`BUG`, `FIXME`, `fix:`, `intentionally`, `hint`).
     - Test helpers live in `tests/`, never in agent-writable paths.
-11. **Novelty and decontamination** (Tmax, Meta-Task).
-    - 13-gram overlap plus TF-IDF cosine against `examples/` and the public TB 2.0 instructions (fetched with `harbor download` if available).
-    - Report this in stretch C.
+11. **Novelty against published Terminal-Bench tasks, enforced early** (README novelty rule; Tmax and Meta-Task decontamination).
+    - **Reference corpus: every published Terminal-Bench set on the Harbor hub, 425 tasks**, plus `examples/`. `make tb-reference` downloads them into git-ignored `data/tb-reference/` (~2 min) and keeps only `instruction.md` + `task.toml` per task (3.6 MB):
+      - `terminal-bench/terminal-bench@latest`: 66 tasks, the current release. That matches Terminal-Bench **4.0** (Aug 2026, 66 tasks) and shares no task with 2.x.
+      - `terminal-bench/terminal-bench-2-1`: 89 tasks (2.1 supersedes 2.0, with the same task names).
+      - `terminal-bench-pro`: 200 tasks.
+      - `terminal-bench-science`: 70 tasks.
+
+      We compare against all of them, not one "target" version, because the README forbids reusing or adapting *any* public task.
+    - **Three layers.** Text overlap alone only catches copied wording, not the same task reworded.
+      1. **Prevent at ideation.** The blueprint prompt includes a compact list of the TB task concepts (name plus one-line gist) with "don't build any of these or a variant of them".
+      2. **Gate the blueprint, before any build or Opus spend.** Run 13-gram overlap and TF-IDF cosine of the blueprint's instruction draft and requirements against every reference instruction. Take the **top-3 nearest** and run a Sonnet **"same underlying task?"** judge on them (same core problem, same environment, same solution path → reject). A reject sends the spec back to resampling. Cheap: one small Sonnet call per blueprint.
+      3. **Re-check the finished package before calibration**, since the authored instruction can drift from the blueprint. Same lexical + top-3 semantic check on the final `instruction.md` and environment summary.
+    - The same semantic judge also runs **within our own batch** (near-duplicate tasks).
+    - **Thresholds** are set on the reference corpus itself (TB tasks vs each other) so they flag real overlap without rejecting tasks that merely share a domain. The 13-gram rule: any shared 13-gram outside boilerplate → reject.
+    - Stretch C reports the max/mean similarity to the TB corpus and the reject counts per layer.
 12. **Stretch A additions.**
     - Log Sonnet's *predicted* pass rate at blueprint time (Foster & Foerster future work) and report its correlation with the observed band.
     - Use it as a pre-filter only if it proves predictive.
     - Expectation set by SkillSynth: ~1/3 of functionally correct tasks land in band before tuning, so plan for ~3 candidates per shipped task.
-13. **Stretch D uses the official TB 19-criterion implementation rubric**. It scores generated tasks and `examples/` with the same rubric (via `harbor check`), alongside the blinded human-vs-generated discrimination test.
+13. **Stretch D scores both sets with the same `harbor check` rubric.** Phase 0 found that Harbor's default rubric has **11 criteria**, not the 19-criterion TB review rubric Meta-Task describes. We use Harbor's 11 plus our additions on generated tasks and `examples/` alike (AfterQuery's `fix-git` already fails 4/11), alongside the blinded human-vs-generated discrimination test.
 
 ## Architecture
 
 Keep the template's structure (`generator/`, `validator/`, `scripts/`, `output/`) and add an evaluator and analysis layer. Every stage is a pure function `TaskDir -> StageResult` and records an event in an append-only ledger.
 
 ```
-spec sampler (inverse-freq) ─► blueprint (Sonnet) ─► blueprint rubric review ──reject──► resample
+spec sampler (inverse-freq) ─► blueprint (Sonnet, TB concept list) ─► rubric review + novelty gate vs 425 TB tasks ──reject──► resample
        ▲                                                     │ pass
        │                                                     ▼
  coverage stats            meta-task authoring: harbor run -a terminus-2 -m sonnet-4.6
        │                   (in-container build + self-validate, artifacts=/app/output)
        │                                                     │
-       │        structural + lint + leak scan + alignment check (harbor check / Sonnet)
+       │        structural + lint + leak scan + alignment check (harbor check) + novelty re-check
        │                                                     │
        │        host gates: docker build, oracle=1 (3/3), nop=0 ──fail──► repair meta-task (≤2) / regenerate
        │                                                     │
@@ -158,6 +170,11 @@ spec sampler (inverse-freq) ─► blueprint (Sonnet) ─► blueprint rubric re
 - **`generator/generate.py`** (implement the stub): keep the `generate_task(topic, output_dir) -> dict` signature. It runs spec/blueprint → author → returns the task dir and status.
 - **`validator/validate.py`** (keep and reuse) plus **`validator/lint.py`**: canary placement, no `docker_image`, agent timeout ≥ 3600, instruction length/style, no source-grep or package-installed tests, `solve.sh` investigates before writing, plus the delta-10 lints.
 - **`validator/leak_scan.py`**: build the image, extract distinctive tokens from `tests/` and `solution/`, and search the container filesystem plus `docker history` for them.
+- **`validator/novelty.py`**:
+  - Builds a cached index (13-gram sets + TF-IDF vectors) over `data/tb-reference/*/instruction.md` and `examples/`.
+  - `nearest(text, k=3)` returns the closest reference tasks with scores. `concept_list()` returns the name + one-line gist list used in the blueprint prompt.
+  - `judge_same_task(candidate, refs)` is the Sonnet semantic check, with structured output: same_task / variant / distinct, plus reasons.
+  - Used by the blueprint gate, the pre-calibration re-check, and the diversity report.
 - **`evaluator/harbor_runner.py`**: wraps `harbor run` for oracle, nop, terminus-2 (Sonnet meta-tasks and Opus calibration), `-k`, and `--ak max_turns=…`. It parses the job dir into `TrialResult` (reward, cost/tokens, duration, exit reason, trajectory path, artifacts path) and retries infra errors twice, then excludes them.
 - **`evaluator/calibrate.py`**: exact **sequential curtailment** of the 5-run band test, run in waves of ≤3. It stops as soon as the verdict can't change:
   - Accept at ≥1 *legit* pass and ≥2 valid fails.
@@ -174,7 +191,7 @@ spec sampler (inverse-freq) ─► blueprint (Sonnet) ─► blueprint rubric re
 - **`analysis/tuner.py`** (stretch B): knob → lever → regenerate (delta 5), ≤2 rounds, per-mutation effects logged.
 - **`analysis/ledger.py`**: `runs/ledger.jsonl` event log (stage, task, cost, tokens, seconds, result) plus a **budget guard**.
 - **`analysis/report.py`**: Part 3 funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, cost and time totals, cost-efficiency vs naive 5×, predicted-vs-observed pass rate, diversity, human-likeness. Writes `reports/summary.md` and JSON.
-- **`analysis/diversity.py`** (stretch C): per-axis coverage and **balance score exp(H)/N**; difficulty spread; instruction uniqueness (TF-IDF cosine max/mean, Vendi over TF-IDF); **decontamination** (13-gram + TF-IDF vs `examples/` and TB 2.0); Sonnet "same underlying task?" check on the closest pairs. No embedding model, since only the two models are allowed.
+- **`analysis/diversity.py`** (stretch C): per-axis coverage and **balance score exp(H)/N**; difficulty spread; instruction uniqueness (TF-IDF cosine max/mean, Vendi over TF-IDF); **novelty report** from `validator/novelty.py` (similarity to the TB corpus and examples, rejects per layer); Sonnet "same underlying task?" check on the closest pairs within our batch. No embedding model, since only the two models are allowed.
 - **`analysis/human_likeness.py`** (stretch D): TB 19-criterion rubric on both sets (via `harbor check`), a blinded "which is human-written?" discrimination test (≈50% means indistinguishable), and stylometrics.
 - **`scripts/run_batch.py`** (+ `scripts/pipeline.sh`): `run_batch --n 12 --budget 150`, resumable from the ledger.
 - **`tests/`** (unit tests for our code, not task tests): `decide()`, ledger and budget guard, lints, leak-scan token extraction, sampler coverage/inverse-frequency, the blueprint schema, and the job-dir and artifacts parser on a recorded fixture.
@@ -254,7 +271,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 14 / 75 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 16 / 80 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -277,7 +294,8 @@ Harbor spike (learn the real mechanics before writing pipeline code)
 - [x] Confirm `-k`, `-n`, `--ak max_turns=200` behave as expected and Docker image caching works across trials.
 - [ ] 💲 Dev-mode meta-task spike (`DEV_MODE=1`, DeepSeek): one hand-written meta-task run. Get the wiring right (prompt rendering, `artifacts` collection, in-container test) for cents.
 - [ ] 💲 Meta-task spike: one hand-written meta-task run with Sonnet 4.6. Confirm `artifacts = ["/app/output"]` arrives on the host, record the authoring cost, and check that in-container self-validation works without Docker. **Go/no-go:** if it fails, switch to the custom `docker exec` loop.
-- [ ] 💲 Try `harbor check` on 1 example and `harbor analyze` on the Opus trial, both with Sonnet 4.6 through our gateway. Record whether the default `check` rubric is the TB 19-criterion one, and decide wrap vs build for `analysis/judge.py`.
+- [x] 💲 Try `harbor check` on 1 example with Sonnet 4.6 through our gateway. Done: it works for $0.084 per task, the default rubric has 11 criteria (not 19), and the decision is to wrap it with a custom rubric.
+- [ ] 💲 Try `harbor analyze` on a real calibration trajectory (deferred to Phase 2, when there are failing Opus runs to analyze). Decide wrap vs build for the failure judge.
 - [ ] Re-plan the budget table from the measured costs (Opus trial, authoring run, judge call).
 - [ ] Save 1 oracle, 1 nop, 1 Opus and 1 meta-task job dir as test fixtures under `tests/fixtures/` (secrets stripped).
 
@@ -299,6 +317,10 @@ Generation
 Gates
 - [ ] `validator/lint.py`: canary placement, no `docker_image`, timeout ≥ 3600, instruction style/length, no source-grep or package-installed tests, `solve.sh` investigates first, no COPY of `solution/`/`tests/`, COPY sources exist, no suggestive comments, test helpers only in `tests/`. Unit-tested on good/bad fixtures.
 - [ ] `validator/leak_scan.py`: build the image and search its filesystem plus `docker history` for distinctive tokens from `tests/` and `solution/`. Unit-tested on a planted-leak fixture.
+- [x] `make tb-reference`: download all published TB sets (latest/4.0, 2.1, Pro, Science = 425 tasks) into git-ignored `data/tb-reference/`, keeping instruction + task.toml only (verified).
+- [ ] `validator/novelty.py`: 13-gram + TF-IDF index over the 425-task TB corpus + `examples/`, `nearest(k=3)`, `concept_list()`. Thresholds calibrated on TB-vs-TB similarity. Unit-tested: a lightly reworded TB instruction is caught, and an unrelated one isn't.
+- [ ] 💲 Novelty gate in blueprint review: TB concept list in the blueprint prompt, plus the Sonnet "same underlying task?" judge on the top-3 nearest TB tasks. A reject resamples the spec. Unit-tested with a planted near-copy blueprint.
+- [ ] 💲 Novelty re-check on the finished package before calibration (instruction can drift from the blueprint).
 - [ ] 💲 Alignment check: every test maps to an instruction requirement and every requirement has a test (via `harbor check` with a custom rubric, or direct Sonnet).
 - [ ] Functional gates: Docker build, oracle 3/3, nop 0, chained in order with early exit.
 - [ ] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`.
@@ -334,7 +356,7 @@ Stretch B: difficulty tuning
 
 Stretch C: diversity
 - [ ] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells.
-- [ ] Decontamination: 13-gram + TF-IDF overlap against `examples/` and the TB 2.0 instructions (fetched with `harbor download` if available).
+- [ ] Novelty report: per-task similarity to the TB corpus (by set) and `examples/` (max/mean, nearest task), plus rejects per novelty layer across all batches.
 - [ ] 💲 Near-duplicate check: Sonnet "same underlying task?" judge on the closest TF-IDF pairs.
 - [ ] `analysis/diversity.py`: per-axis coverage, balance score exp(H)/N, difficulty spread, instruction uniqueness (TF-IDF cosine, Vendi).
 
@@ -397,4 +419,4 @@ Deliverables
 - Already updated for the uv environment: `pyproject.toml`, `uv.lock`, `.python-version`, `scripts/*.sh`, `generator/requirements.txt`, `validator/requirements.txt`.
 - Modify: `generator/generate.py`, `generator/config.py` (read `.env`, price table, budget), `pyproject.toml` (dependencies via `uv add`), `scripts/*.sh` (new entry points), `CHANGELOG.md`, `README.md` (uv-based usage section).
 - Reuse: `validator/validate.py` (`validate_task()`), `generator/config.py` constants (`CANARY_LINE`, band params), `examples/*` (format reference only), the Harbor reward contract (`harbor/src/harbor/verifier/verifier.py`), `strip_canary` (`harbor/src/harbor/models/task/task.py`), Harbor `artifacts` collection (`harbor/trial/artifact_handler.py` in the installed package), and the `harbor check` / `harbor analyze` commands.
-- New: `generator/{spec,blueprint,author}.py`, `generator/metatask/`, `validator/{lint,leak_scan}.py`, `evaluator/{harbor_runner,calibrate,redteam}.py`, `analysis/{judge,tuner,ledger,report,diversity,human_likeness}.py`, `scripts/run_batch.py`, `tests/`, `docs/research/README.md`.
+- New: `generator/{spec,blueprint,author}.py`, `generator/metatask/`, `validator/{lint,leak_scan,novelty}.py`, `evaluator/{harbor_runner,calibrate,redteam}.py`, `analysis/{judge,tuner,ledger,report,diversity,human_likeness}.py`, `scripts/run_batch.py`, `tests/`, `docs/research/README.md`.

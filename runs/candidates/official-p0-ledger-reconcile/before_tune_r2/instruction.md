@@ -1,0 +1,3 @@
+The payment team's reconciliation tool at /app/ledger/ imports daily CSV exports from two payment providers into a SQLite ledger at /data/ledger.db and prints a per-merchant balance report. Finance has flagged that some merchant totals are wrong. The exports are stored under /data/exports/.
+
+Fix the tool so that running `python -m ledger report /data/exports` prints correct per-merchant balances to the cent. Each refund must offset the specific charge it references by provider transaction id, not an arbitrary charge of the same amount. A merchant with two separate charges of identical amounts must reflect both charges in its balance. Running the import twice must produce the same report as running it once.

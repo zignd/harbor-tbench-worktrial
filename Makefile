@@ -6,7 +6,7 @@ UV_RUN := uv run --quiet --env-file .env
 
 TB_REFERENCE_DIR := data/tb-reference
 
-.PHONY: help usage usage-json tb-reference test lint dry-run batch
+.PHONY: help usage usage-json tb-reference test lint dry-run batch status
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -36,6 +36,9 @@ tb-reference: ## Download published Terminal-Bench tasks (latest, 2.1, Pro, Scie
 N ?= 3
 SEED ?= 1
 BUDGET ?= 20
+
+status: ## One-screen view of background work: processes, containers, authoring turns, ledger, spend
+	@uv run --quiet python -m scripts.status
 
 plan: ## Show docs/plan.md checklist progress per phase (ARGS=--remaining lists open items)
 	@bash scripts/track-plan.sh $(ARGS)

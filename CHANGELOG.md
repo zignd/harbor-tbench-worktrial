@@ -4,6 +4,13 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 18:25 -03:00 · Tuning round 1 still too easy; `make status`; pipeline tests; secret audit
+- **Tuning round 1 on `ledger-reconcile`:** the plan added a third interacting bug (an idempotency dedup key). The task re-gated cleanly (quality 15/16, novelty ok, red-team honest in 554 s vs 94 s before, so it was harder for Sonnet), but Opus still went **4/4** (9-12 turns, ~2 min, $0.20-0.37 per trial).
+  - **Lesson:** Opus reads a ~300-line codebase in one pass, so adding bugs to a small codebase doesn't create difficulty. It has to come from how much *investigation* the task needs. This supports the post-review rule for ~800-2,000-line environments. Round 2 is running.
+- **`make status`** (`scripts/status.py`): running pipeline processes, task containers, the current turn of each unfinished authoring run, the last ledger events, and live spend, on one screen. Read-only.
+- **`tests/test_pipeline.py`:** `build_candidate` control flow with every paid stage faked: first-try pass, repair with feedback and the previous package, exhausted repairs → exactly one regeneration from the blueprint → failed, and a rejected blueprint stopping early. 102 tests in total.
+- **Secret audit (final-cleanup item, done early):** 38 commits, no key-shaped strings, the real key absent from history, tracked files and evidence dirs, and no `.env` or PDF ever committed.
+
 ### 18:07 -03:00 · Repair feedback now carries the real build error
 - Pilot candidate 1 failed the static gate: `docker build` died in the author's `setup_repo.sh`. The pipeline sent it to repair, but the feedback was only BuildKit's last 600 characters ("process … did not complete successfully: exit code 1"), which hid the actual cause.
 - **Fix:** the leak-scan build now uses `--progress=plain`, and the failure feedback keeps the last ~60 lines (≤3.5k chars) of the failing step's own output. For this task that reveals the real problem: `git commit` with **"nothing to commit"**, so the repo files were never written where the setup script expected.

@@ -19,7 +19,7 @@ import json
 import shutil
 from pathlib import Path
 
-from analysis.ledger import Ledger
+from analysis.ledger import Event, Ledger
 from generator import pipeline
 from generator.blueprint import Blueprint
 from generator.spec import TaskSpec, sample_specs
@@ -105,7 +105,15 @@ def main() -> int:
         if status_file.exists():  # resume: this spec already ran to a final status
             print(f"{cand.cand_id}  (already {json.loads(status_file.read_text())['status']})")
             continue
-        cand = pipeline.build_candidate(cand, ledger)
+        try:
+            cand = pipeline.build_candidate(cand, ledger)
+        except pipeline.budget.BudgetExceeded as e:
+            print(f"budget guard stopped the batch: {e}")
+            break
+        except Exception as e:  # noqa: BLE001 - one broken candidate must not stop the batch
+            cand.status = "error"
+            cand.save("status.json", {"status": "error", "error": f"{type(e).__name__}: {e}"})
+            ledger.append(Event("error", cand.cand_id, {"error": f"{type(e).__name__}: {e}"[:2000]}))
         cost = sum(e.cost_usd for e in ledger.events(task=cand.cand_id))
         slug = cand.blueprint.slug if cand.blueprint else "-"
         summary.append((cand.cand_id, slug, cand.status, cost))

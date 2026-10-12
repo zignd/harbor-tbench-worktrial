@@ -52,8 +52,14 @@ def distinctive_tokens(task_dir: Path) -> dict[str, str]:
 
 
 def _docker(*args: str, timeout: int = 900) -> subprocess.CompletedProcess:
+    # errors="replace": images contain binary files, and grep can match inside them.
     return subprocess.run(
-        ["docker", *args], capture_output=True, text=True, timeout=timeout, check=False
+        ["docker", *args],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+        check=False,
     )
 
 
@@ -112,7 +118,8 @@ def scan(task_dir: Path, tag: str) -> dict:
                 ],
                 input="\n".join(tokens),
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=600,
             )

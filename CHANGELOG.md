@@ -4,6 +4,16 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 18:26 -03:00 · Dev mode found a crash; per-candidate error isolation
+- **Bug, found by the dev-mode batch:** the leak scan's `grep` matched inside a **binary** file in the image (a SQLite db), and `docker run … cat <file>` output that wasn't UTF-8 made `subprocess.run(text=True)` raise `UnicodeDecodeError`. That took down the whole batch process after 47 minutes of authoring.
+- **Fixes:**
+  1. Docker output is decoded with `errors="replace"`.
+  2. `run_batch` now isolates failures: an exception in one candidate marks it `error` (status + ledger event) and the batch continues. `BudgetExceeded` stops the batch cleanly.
+
+  The rescan of the crashed dev task completes: no blocking leaks, 3 notes from binary db files.
+- The pilot and Batch 1 processes started before this fix and are still exposed until they finish.
+- **This is what dev mode is for:** the crash cost ~$0.03 of DeepSeek instead of a $3-4 Sonnet build. Its gates and a dev-mode calibration loop are now running on the existing package.
+
 ### 18:25 -03:00 · Tuning round 1 still too easy; `make status`; pipeline tests; secret audit
 - **Tuning round 1 on `ledger-reconcile`:** the plan added a third interacting bug (an idempotency dedup key). The task re-gated cleanly (quality 15/16, novelty ok, red-team honest in 554 s vs 94 s before, so it was harder for Sonnet), but Opus still went **4/4** (9-12 turns, ~2 min, $0.20-0.37 per trial).
   - **Lesson:** Opus reads a ~300-line codebase in one pass, so adding bugs to a small codebase doesn't create difficulty. It has to come from how much *investigation* the task needs. This supports the post-review rule for ~800-2,000-line environments. Round 2 is running.

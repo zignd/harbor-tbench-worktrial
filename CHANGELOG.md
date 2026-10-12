@@ -4,6 +4,18 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 15:30 -03:00 · Dev mode: cheap model for plumbing iterations
+- `DEV_MODE=1` routes every model call (authoring, judges, red-team, and the terminus-2 eval agent) to `DEV_MODEL`, default `deepseek/deepseek-v4.1-flash`. That's $0.15/$0.60 per M tokens vs Sonnet's $3/$15 and Opus's $5/$25, so ~20-40× cheaper. It's validated through both the OpenAI client and LiteLLM.
+- **Why:** the README rule is "Generate tasks with `claude-sonnet-4.6` and benchmark difficulty only against `claude-opus-4.8`. Use no other models for either." It restricts *generating* and *benchmarking*, and says nothing about debugging the pipeline. Most early runs only test plumbing (runner parsing, meta-task wiring, calibration loop, ledger), where paying Opus prices buys nothing.
+- **Guardrails:**
+  - Dev output goes to `output-dev/` (git-ignored).
+  - `RUN_MODE` tags ledger entries `dev` vs `official`.
+  - `config.assert_official_models()` makes ship/report steps refuse to run with non-official models.
+  - `OFFICIAL_MODEL` / `OFFICIAL_EVAL_MODEL` are now constants, separate from the env overrides.
+- **Tradeoff:** DeepSeek behaves differently from Opus (and small models are brittle with terminus-2's keystroke interface, per Tmax). So dev runs never inform difficulty, tuning or any reported metric. They only prove the code works. Dev spend will be reported separately here.
+- Checklist: added dev-mode steps before the official meta-task spike, the pilot batch and the first calibration (10/75 items done).
+- **Spend:** ~$0.00002 (two DeepSeek validation calls; still $0.0003 total).
+
 ### 15:19 -03:00 · Plan as a work checklist
 - Replaced the prose "Phases" section of `docs/plan.md` with a **work checklist**: 71 concrete items across Phases 0-4, each naming its output and how we know it's done, with a progress counter (9/71 done).
 - Items that call a model are marked 💲, so spend is visible before work starts. Go/no-go checkpoints are explicit: the meta-task spike, and cost per learnable task after the pilot.

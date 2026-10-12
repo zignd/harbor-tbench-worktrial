@@ -198,8 +198,18 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 - Opus 4.8 + terminus-2 is the only difficulty benchmark.
 - The band is defined on 5 runs.
 - `timeout_sec = 3600`.
-- No other models.
+- No other models for generating, benchmarking, or ship/report decisions. Dev mode (below) is plumbing only.
 - Only valid failures count.
+
+**Dev mode: a cheap model for plumbing iterations**
+- `DEV_MODE=1` routes every call (authoring, judges, red-team, and the terminus-2 eval agent) to `DEV_MODEL`, default **`deepseek/deepseek-v4.1-flash`**. That's $0.15/$0.60 per M tokens, vs Sonnet's $3/$15 and Opus's $5/$25, so ~20-40× cheaper. It's validated through both the OpenAI client and LiteLLM.
+- **Use it for:** debugging the runner, job-dir and artifacts parsing, the meta-task wiring, the calibration loop and early-stop logic, ledger and budget guard, judge prompt plumbing (JSON shape, truncation), and report generation.
+- **Never for:** difficulty or band verdicts, shipping decisions, tuning knobs, Part 3 metrics, or anything in `reports/`. Dev results go to `output-dev/` (git-ignored) and are tagged `dev` in the ledger. `config.assert_official_models()` makes ship/report steps refuse to run in dev mode.
+- **Known limits:**
+  - A different model behaves differently: small models are brittle with terminus-2's keystroke interface (Tmax). So a dev run only shows the plumbing works, not that a task is easy or hard.
+  - It's a reasoning model, so very small `max_tokens` caps can return empty content.
+- **Order of preference while developing:** fixtures and `--dry-run` (free) → `DEV_MODE=1` (cents) → official models (dollars), used only once the plumbing works.
+- Dev spend is reported separately in `CHANGELOG.md`, for transparency. AfterQuery can see which models the key called.
 
 **Tracking**
 - `make usage` (OpenRouter `GET /api/v1/key`) is the source of truth for spend. Run it **before and after every phase and every batch**, and log the delta in `CHANGELOG.md` (the plan's budget table vs actual).
@@ -231,7 +241,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 **Don't pay twice**
 - Each stage result is cached in the ledger under a **content hash of the task directory**. Re-running the pipeline skips stages whose inputs didn't change, so resuming after a crash or code change costs nothing.
-- Development and unit tests use **recorded job-dir fixtures** and a fake runner (`--dry-run`), with no API calls. Only real batches touch the key.
+- Development and unit tests use **recorded job-dir fixtures** and a fake runner (`--dry-run`), with no API calls. End-to-end plumbing checks use `DEV_MODE=1`. Only official batches spend real money.
 - Check in Phase 0 whether OpenRouter reports **cached prompt tokens** for terminus-2 runs. If caching is active, long trajectories are much cheaper than the per-token estimate. Record this in the cost model either way.
 
 **What we must not do to save money**
@@ -244,7 +254,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 9 / 71 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 10 / 75 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -258,12 +268,14 @@ Environment and repo
 - [x] `AGENTS.md` / `CLAUDE.md` with constraints and conventions; timestamped `CHANGELOG.md` (`554fc8c`, `26d6649`)
 - [x] Conventional-commit history
 - [x] Checklist-format plan (this section)
+- [x] Dev mode: `DEV_MODE=1` → `deepseek/deepseek-v4.1-flash` for plumbing; `output-dev/`; `config.assert_official_models()` guard
 
 Harbor spike (learn the real mechanics before writing pipeline code)
 - [ ] Run `oracle` and `nop` on all 6 examples. Record the pass/fail table, run times, and whether verify-time `uvx` installs ever fail (no API cost).
 - [ ] Inspect a job dir. Document the layout, `result.json` fields (reward, cost/tokens, timing, exceptions), trajectory format and where `artifacts/` lands (in `docs/harbor-notes.md`).
 - [ ] 💲 Run 1 Opus 4.8 terminus-2 trial on one example. Record the **real cost per trial**, the turn count, and whether OpenRouter reports cached prompt tokens.
 - [ ] Confirm `-k`, `-n`, `--ak max_turns=200` behave as expected and Docker image caching works across trials.
+- [ ] 💲 Dev-mode meta-task spike (`DEV_MODE=1`, DeepSeek): one hand-written meta-task run. Get the wiring right (prompt rendering, `artifacts` collection, in-container test) for cents.
 - [ ] 💲 Meta-task spike: one hand-written meta-task run with Sonnet 4.6. Confirm `artifacts = ["/app/output"]` arrives on the host, record the authoring cost, and check that in-container self-validation works without Docker. **Go/no-go:** if it fails, switch to the custom `docker exec` loop.
 - [ ] 💲 Try `harbor check` on 1 example and `harbor analyze` on the Opus trial, both with Sonnet 4.6 through our gateway. Record whether the default `check` rubric is the TB 19-criterion one, and decide wrap vs build for `analysis/judge.py`.
 - [ ] Re-plan the budget table from the measured costs (Opus trial, authoring run, judge call).
@@ -292,6 +304,7 @@ Gates
 - [ ] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`.
 
 Part 1 milestone
+- [ ] 💲 Dev-mode dry run (`DEV_MODE=1`): 2-3 candidates end to end through generation and gates, to shake out plumbing bugs before official spend. Results stay in `output-dev/`.
 - [ ] 💲 Pilot batch of 3 candidates through generation and gates. Record funnel and cost per task.
 - [ ] 💲 Reach **≥5 tasks** that pass the structural validator and the functional gates (oracle 3/3, nop 0).
 - [ ] Hand-review 2 generated tasks side by side with `examples/` and the guideline rules. Tighten the meta-task template and lints from what's found.
@@ -304,6 +317,7 @@ Part 1 milestone
 - [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
 - [ ] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
 - [ ] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails).
+- [ ] 💲 Dev-mode calibration loop (`DEV_MODE=1`): exercise waves, early stop, judges and ledger on 1-2 tasks before any Opus spend.
 - [ ] 💲 Calibrate the Phase 1 tasks (pilot). Record cost per learnable task. **Go/no-go:** above $40 per learnable task → fix generation before scaling.
 - [ ] 💲 Batch 1: ~10 new candidates end to end through calibration.
 - [ ] Read every failure-judge summary from Batch 1, and retune lever and knob defaults toward TB Medium/Hard. Record the before/after reasoning in `CHANGELOG.md`.

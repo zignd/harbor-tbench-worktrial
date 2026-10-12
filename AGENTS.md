@@ -4,7 +4,8 @@ Guidance for AI agents (and humans) working in this repo. This is an AfterQuery 
 
 ## Work-trial constraints (never violate)
 
-- **Models:** author tasks with `anthropic/claude-sonnet-4.6` only. Measure difficulty with `terminus-2` + `openrouter/anthropic/claude-opus-4.8` only. No other models anywhere: no cheap proxies, no embedding models. Sonnet also does judging and red-teaming. Opus is used only for calibration.
+- **Models:** anything that **generates a task, measures its difficulty, or decides whether it ships** uses only `anthropic/claude-sonnet-4.6` (authoring, plus judges and red-team) and `terminus-2` + `openrouter/anthropic/claude-opus-4.8` (calibration). No cheap proxies for difficulty, and no embedding models in that path.
+- **Dev mode is the one exception:** `DEV_MODE=1` routes every call to `DEV_MODEL` (default `deepseek/deepseek-v4.1-flash`, ~20-40× cheaper) for **plumbing iterations only**. Dev results go to `output-dev/`, are tagged `dev` in the ledger, and are **never** shipped, calibrated on, or counted in metrics. Shipping and reporting code must call `config.assert_official_models()`. The README rule ("use no other models for either") covers generating and benchmarking; dev runs do neither. Report dev spend separately in `CHANGELOG.md`.
 - **Learnable band:** exactly 1-3 of 5 Opus runs pass all tests. Don't change Opus's agent, sampling or thinking settings, because that changes what "learnable" means.
 - **Agent timeout:** `[agent].timeout_sec = 3600.0` in every task. Timeouts and running out of turns (`max_turns` ≤ 200) are **never** valid failures.
 - **Valid failures only:** a shipped task fails because the model couldn't solve it. It must not fail because of an ambiguous spec, an over-strict test, a broken or flaky env, or a tmux/pager quirk. For every shipped task we must be able to say *why* the model fails it.
@@ -21,7 +22,7 @@ Guidance for AI agents (and humans) working in this repo. This is an AfterQuery 
   - Never let remaining credit drop below the **$75 reserve**.
   - Scale batches in steps.
 - **Ask the user before** any action expected to cost more than ~$10, or any batch of Opus trials.
-- Prefer recorded fixtures and `--dry-run` for development. Only real batches touch the key.
+- For development, prefer the cheapest option that exercises the code: recorded fixtures and `--dry-run` (free), then `DEV_MODE=1` (cents), then official models (dollars), used only once the plumbing works.
 
 ## Environment and commands
 

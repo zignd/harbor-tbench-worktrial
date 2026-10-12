@@ -17,7 +17,8 @@ from pathlib import Path
 from analysis.ledger import Ledger
 from evaluator.calibrate import LEGIT_PASS, VALID_FAIL, calibrate
 from generator.config import OUTPUT_DIR, assert_official_models
-from generator.pipeline import CANDIDATES_DIR
+from generator.pipeline import CANDIDATES_DIR, Candidate, stage_redteam
+from generator.spec import TaskSpec
 
 README = """# {title}
 
@@ -80,6 +81,16 @@ def main() -> int:
             continue
         if (cand_dir / "calibration.json").exists() or done >= args.max:
             continue
+        if not list(cand_dir.glob("redteam_a*.json")):
+            # Gated before the red-team gate existed: run it now, before any Opus spend.
+            cand = Candidate(
+                TaskSpec(**json.loads((cand_dir / "spec.json").read_text())), cand_id=cand_dir.name
+            )
+            problems = stage_redteam(cand, ledger, attempt=0)
+            if problems:
+                status_file.write_text(json.dumps({"status": "hackable", "problems": problems}))
+                print(f"{cand_dir.name}  red-team found an exploit; not calibrated", flush=True)
+                continue
         cal = calibrate(cand_dir / "task", cand_dir.name, ledger)
         record = {
             "verdict": cal.verdict,

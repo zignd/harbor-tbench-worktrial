@@ -68,6 +68,9 @@ def _install_dry_run(ledger_path: Path) -> Ledger:
         "novel": True, "verdicts": [], "nearest": [], "cost_usd": 0.0
     }  # fmt: skip
     pipeline.budget.check = lambda expected: None
+    pipeline.redteam = lambda task_dir, name: {
+        "hackable": False, "reward": 0.0, "exploit": "", "cost_usd": 0.0, "trial": None
+    }  # fmt: skip
     pipeline.CANDIDATES_DIR = ledger_path.parent / "candidates"
     return Ledger(ledger_path)
 

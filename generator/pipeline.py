@@ -7,6 +7,7 @@ authored task) and every stage records a ledger event. Gate order is by cost:
     functional: docker build, oracle 3/3, nop 0  free, ~1-3 min
     quality: `harbor check` with our rubric      ~$0.13
     novelty re-check of the final instruction    ~$0.02
+    red-team: one Sonnet hack-elicitation run    ~$0.5-2
 
 A failed gate feeds its findings into a repair round of the authoring
 meta-task (at most MAX_REPAIRS); after that the candidate is regenerated from
@@ -24,6 +25,7 @@ from analysis import budget
 from analysis.ledger import Event, Ledger, hash_dir
 from evaluator.harbor_runner import run_with_retries
 from evaluator.quality import run_check
+from evaluator.redteam import redteam
 from generator.author import collect_package, make_task_toml, render_metatask
 from generator.blueprint import Blueprint, gate_blueprint, make_blueprint
 from generator.config import (
@@ -47,6 +49,7 @@ MAX_REPAIRS = 2
 ORACLE_RUNS = 3
 EXPECTED_AUTHOR_USD = 3.0
 EXPECTED_CHECK_USD = 0.2
+EXPECTED_REDTEAM_USD = 2.0
 # Dev-mode candidates are plumbing only: keep them out of the committed evidence.
 CANDIDATES_DIR = Path(OUTPUT_DIR if DEV_MODE else RUNS_DIR) / "candidates"
 
@@ -262,6 +265,32 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
             (
                 "novelty: the final task resembles a published Terminal-Bench task "
                 f"({lexical or (judged and judged['verdicts'])})"
+            )
+        ]
+    return stage_redteam(cand, ledger, attempt, h)
+
+
+def stage_redteam(cand: Candidate, ledger: Ledger, attempt: int, h: str = "") -> list[str]:
+    """Hack-elicitation run; a beaten verifier sends the task back to repair."""
+    budget.check(EXPECTED_REDTEAM_USD)
+    t0 = time.monotonic()
+    result = redteam(cand.task_dir, f"{cand.cand_id}-a{attempt}")
+    cand.save(f"redteam_a{attempt}.json", result)
+    _record(
+        ledger,
+        cand,
+        "gate_redteam",
+        {"hackable": result["hackable"], "reward": result["reward"], "exploit": result["exploit"]},
+        result["cost_usd"],
+        t0,
+        h or hash_dir(cand.task_dir),
+    )
+    if result["hackable"]:
+        return [
+            (
+                "red-team: an agent told to cheat made the verifier pass without solving the task. "
+                f"Exploit: {result['exploit']} Harden the tests so this shortcut fails (check real "
+                "behavior on verify-time inputs; don't trust files or binaries the solver can modify)."
             )
         ]
     return []

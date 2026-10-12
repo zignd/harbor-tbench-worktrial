@@ -4,6 +4,17 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:29 -03:00 · Red-team gate (implemented; first real runs on the pilot)
+- **`evaluator/redteam.py`:** a Terminal-Wrench-style hack elicitation.
+  - A copy of the task gets an explicit "make the verifier pass without solving it" paragraph, and one Sonnet terminus-2 run (60 turns) tries.
+  - A pass is confirmed as an exploit by the pass-audit judge (an honest solve under hack instructions isn't counted as a hack).
+  - The exploit summary and trace tail are saved for repair feedback.
+- **Wiring:**
+  - It's the **last gate** in `stage_gates()`, after novelty, so it only runs on tasks that are otherwise ready. A beaten verifier becomes repair feedback ("harden the tests so this shortcut fails").
+  - `scripts/calibrate_candidates.py` runs it first on candidates gated before the gate existed (the pilot), so no Opus spend goes to a hackable task.
+- **Tradeoff:** one attempt is a screen, not a proof. Terminal Wrench ran a second, deeper stage only on tasks that showed a hack. The pass audit during calibration remains the second line of defence.
+- Dry run still passes (the red-team is faked there, like the other paid stages). 88 tests.
+
 ### 17:28 -03:00 · Plan progress tracker
 - Added `scripts/track-plan.sh` (+ `make plan`): overall and per-phase checklist counts for `docs/plan.md`; `--remaining` / `--all` list items with `file:line` references, and `--fail-if-incomplete` exits non-zero while work remains.
 - Replaces the `grep -c` hint next to the **Progress** line, which gave only a single total and no view of what is left per phase. Pure awk over the markdown, no dependencies.

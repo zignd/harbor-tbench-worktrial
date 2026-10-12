@@ -1,102 +1,99 @@
-"""
-CLI entry point for the ETL pipeline.
-
-Usage:
-    python /app/run_pipeline.py <input_dir> <db_path>
-
-Reads CSV event records from <input_dir>, transforms and aggregates them,
-then writes per-(region, product_category, date) summaries to <db_path>.
-"""
-
-from __future__ import annotations
+# CLI entry point for the ETL pipeline
 
 import sys
 import os
+import time
 import argparse
-import traceback
 
-# Ensure the app directory is on sys.path so relative imports work
-_APP_DIR = os.path.dirname(os.path.abspath(__file__))
-if _APP_DIR not in sys.path:
-    sys.path.insert(0, _APP_DIR)
+# Ensure /app is on the path when run directly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from config import get_logger
-from ingest import ingest_directory
-from transform import transform, transform_field_report
-from aggregate import aggregate
-from storage import open_db, init_schema, upsert_summary, row_count
+from config import DEFAULT_INPUT_DIR, DEFAULT_DB_PATH
+from ingest import ingest_pipeline
+from transform import transform
+from aggregate import aggregate, aggregate_summary
+from storage import init_db, write_aggregates, get_row_count, close_db
+from utils import get_logger, format_elapsed
 
 logger = get_logger("run_pipeline")
 
 
-def parse_args(argv=None) -> argparse.Namespace:
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="Run the ETL pipeline: ingest CSV files, aggregate, write to SQLite."
     )
     parser.add_argument(
         "input_dir",
-        help="Directory containing input CSV files.",
+        nargs="?",
+        default=DEFAULT_INPUT_DIR,
+        help="Directory containing input CSV files (default: %(default)s)",
     )
     parser.add_argument(
         "db_path",
-        help="Path to the SQLite database file (created if absent).",
+        nargs="?",
+        default=DEFAULT_DB_PATH,
+        help="Path to the output SQLite database (default: %(default)s)",
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity (default: INFO).",
+        default=None,
+        help="Override log level (DEBUG, INFO, WARNING, ERROR)",
     )
     return parser.parse_args(argv)
 
 
 def run(input_dir: str, db_path: str) -> None:
     """Execute the full ETL pipeline."""
-    logger.info("=== ETL pipeline start ===")
-    logger.info("Input directory : %s", input_dir)
-    logger.info("Database path   : %s", db_path)
+    t0 = time.time()
+    logger.info(f"Pipeline starting: input_dir={input_dir}, db_path={db_path}")
 
-    # --- Ingest ---
-    logger.info("[1/4] Ingesting data from %s", input_dir)
-    raw_df = ingest_directory(input_dir)
-    logger.info("Ingested %d raw rows", len(raw_df))
+    # Step 1: Ingest
+    raw_df = ingest_pipeline(input_dir)
+    if raw_df.empty:
+        logger.warning("No data ingested; pipeline exiting early")
+        return
+    logger.info(f"Ingested {len(raw_df)} raw rows")
 
-    # --- Transform ---
-    logger.info("[2/4] Transforming data")
+    # Step 2: Transform
     clean_df = transform(raw_df)
-    report = transform_field_report(clean_df)
-    logger.info("Transform report: %s", report)
+    if clean_df.empty:
+        logger.warning("No data after transform; pipeline exiting early")
+        return
+    logger.info(f"Transformed to {len(clean_df)} clean rows")
 
-    # --- Aggregate ---
-    logger.info("[3/4] Aggregating data")
+    # Step 3: Aggregate
     agg_df = aggregate(clean_df)
-    logger.info("Aggregated into %d summary rows", len(agg_df))
+    summary = aggregate_summary(agg_df)
+    logger.info(f"Aggregate summary: {summary}")
 
-    # --- Store ---
-    logger.info("[4/4] Writing to database %s", db_path)
-    with open_db(db_path) as conn:
-        init_schema(conn)
-        written = upsert_summary(conn, agg_df)
-        total = row_count(conn)
-    logger.info("Wrote %d row(s); daily_summary now has %d row(s)", written, total)
+    # Step 4: Store
+    conn = init_db(db_path)
+    try:
+        rows_written = write_aggregates(conn, agg_df)
+        total_rows = get_row_count(conn)
+        logger.info(f"Rows written this run: {rows_written}")
+        logger.info(f"Total rows in daily_summary: {total_rows}")
+    finally:
+        close_db(conn)
 
-    logger.info("=== ETL pipeline complete ===")
+    elapsed = time.time() - t0
+    logger.info(f"Pipeline complete in {format_elapsed(elapsed)}")
 
 
-def main(argv=None) -> int:
+def main(argv=None):
     args = parse_args(argv)
 
-    # Apply log level from CLI flag
-    import logging
-    logging.getLogger().setLevel(args.log_level)
+    if args.log_level:
+        import logging
+        level = getattr(logging, args.log_level.upper(), logging.INFO)
+        logging.getLogger().setLevel(level)
 
     try:
         run(args.input_dir, args.db_path)
-        return 0
-    except Exception:  # noqa: BLE001
-        logger.error("Pipeline failed:\n%s", traceback.format_exc())
-        return 1
+    except Exception as exc:
+        logger.error(f"Pipeline failed: {exc}")
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

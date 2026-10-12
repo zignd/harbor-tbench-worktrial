@@ -1,206 +1,150 @@
-"""
-Transformation module: normalises raw ingested data before aggregation.
-Applies field cleaning, validation, filtering, and derived-column logic.
-"""
-
-from __future__ import annotations
-
-import re
-from typing import Dict, List
+# Transformation module: field normalization and cleaning
 
 import pandas as pd
 
-from config import (
-    get_logger,
-    REVENUE_MIN_THRESHOLD,
-    DATE_FORMAT,
-    GROUP_KEYS,
-)
+from config import CSV_COLUMNS
 from utils import (
-    filter_positive,
-    is_valid_date_string,
-    safe_str,
-    strip_string_columns,
-    coerce_numeric,
+    get_logger,
+    normalize_region,
+    normalize_category,
+    drop_invalid_rows,
+    safe_strip,
+    validate_date_string,
 )
 
-logger = get_logger(__name__)
+logger = get_logger("transform")
 
 
-# ---------------------------------------------------------------------------
-# Field normalisation helpers
-# ---------------------------------------------------------------------------
-
-def _normalise_region(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalise the 'region' column:
-    - Strip whitespace (already done in ingestion, but be defensive)
-    - Uppercase the first letter of each word
-    - Replace internal runs of whitespace with a single space
-    """
-    df = df.copy()
-    df["region"] = (
-        df["region"]
-        .str.strip()
-        .str.lower()
-        .str.replace(r"\s+", " ", regex=True)
-        .str.title()
-    )
+def _normalize_string_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip whitespace from string columns."""
+    str_cols = ["event_id", "user_id", "region", "product_category", "date"]
+    for col in str_cols:
+        if col in df.columns:
+            df[col] = df[col].apply(safe_strip)
     return df
 
 
-def _normalise_product_category(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalise 'product_category':
-    - Strip whitespace
-    - Lowercase everything
-    - Replace spaces with underscores for consistency
-    """
-    df = df.copy()
-    df["product_category"] = (
-        df["product_category"]
-        .str.strip()
-        .str.lower()
-        .str.replace(r"\s+", "_", regex=True)
-    )
+def _normalize_region_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize region values."""
+    if "region" in df.columns:
+        df["region"] = df["region"].apply(normalize_region)
     return df
 
 
-def _normalise_user_id(df: pd.DataFrame) -> pd.DataFrame:
-    """Ensure user_id is a clean string with no surrounding whitespace."""
-    df = df.copy()
-    df["user_id"] = df["user_id"].apply(safe_str).str.strip()
+def _normalize_category_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize product_category values."""
+    if "product_category" in df.columns:
+        df["product_category"] = df["product_category"].apply(normalize_category)
     return df
 
 
-def _normalise_date(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Validate and normalise the 'date' column.
-    Rows with unparseable dates are dropped with a warning.
-    """
-    df = df.copy()
-    valid_mask = df["date"].apply(is_valid_date_string)
-    bad_count = (~valid_mask).sum()
-    if bad_count:
-        logger.warning("Dropping %d row(s) with invalid date format", bad_count)
-    df = df[valid_mask].copy()
-    # Re-format dates to ensure canonical YYYY-MM-DD
-    df["date"] = pd.to_datetime(df["date"], format=DATE_FORMAT).dt.strftime(DATE_FORMAT)
+def _validate_and_clean(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop rows with invalid revenue or dates."""
+    df = drop_invalid_rows(df, logger)
     return df
 
 
-def _normalise_revenue(df: pd.DataFrame) -> pd.DataFrame:
-    """Coerce revenue to float and drop rows at or below the minimum threshold."""
-    df = coerce_numeric(df, ["revenue"])
+def _drop_duplicate_events(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop exact duplicate event_id entries (keep first occurrence)."""
     before = len(df)
-    df = df[df["revenue"].notna() & (df["revenue"] > REVENUE_MIN_THRESHOLD)].copy()
-    dropped = before - len(df)
-    if dropped:
-        logger.warning(
-            "Dropped %d row(s) with revenue <= %s", dropped, REVENUE_MIN_THRESHOLD
-        )
+    df = df.drop_duplicates(subset=["event_id"], keep="first")
+    after = len(df)
+    if before - after:
+        logger.info(f"Dropped {before - after} duplicate event_id rows")
     return df
 
 
-# ---------------------------------------------------------------------------
-# Derived columns
-# ---------------------------------------------------------------------------
-
-def _add_year_month(df: pd.DataFrame) -> pd.DataFrame:
-    """Add 'year_month' column (YYYY-MM) derived from 'date'."""
-    df = df.copy()
-    df["year_month"] = df["date"].str[:7]  # fast slice; date already validated
+def _cast_revenue(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure revenue column is float64."""
+    if "revenue" in df.columns:
+        df["revenue"] = df["revenue"].astype(float)
     return df
 
 
-def _add_revenue_band(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Classify each revenue value into a band:
-      low  : revenue < 10
-      mid  : 10 <= revenue < 100
-      high : revenue >= 100
-    """
-    df = df.copy()
-
-    def _band(v: float) -> str:
-        if v < 10:
-            return "low"
-        if v < 100:
-            return "mid"
-        return "high"
-
-    df["revenue_band"] = df["revenue"].apply(_band)
+def _fill_missing_strings(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace empty strings in key columns with a placeholder."""
+    for col in ["region", "product_category"]:
+        if col in df.columns:
+            mask = df[col] == ""
+            if mask.any():
+                logger.warning(f"Filling {mask.sum()} empty '{col}' values with 'UNKNOWN'")
+                df.loc[mask, col] = "UNKNOWN"
     return df
 
 
-# ---------------------------------------------------------------------------
-# Filtering
-# ---------------------------------------------------------------------------
-
-def _filter_known_regions(df: pd.DataFrame, known: List[str]) -> pd.DataFrame:
-    """Keep only rows whose normalised region appears in *known*."""
-    if not known:
+def _standardize_date(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure date column is in YYYY-MM-DD format (drop rows that aren't)."""
+    if "date" not in df.columns:
         return df
+    # Try to parse and reformat dates that may have been read differently
+    def _coerce_date(val):
+        if validate_date_string(val):
+            return val
+        # Try pandas parser
+        try:
+            return pd.Timestamp(val).strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    df["date"] = df["date"].apply(_coerce_date)
     before = len(df)
-    df = df[df["region"].isin(known)].copy()
-    dropped = before - len(df)
-    if dropped:
-        logger.debug("Filtered out %d row(s) from unknown regions", dropped)
+    df = df.dropna(subset=["date"])
+    after = len(df)
+    if before - after:
+        logger.warning(f"Dropped {before - after} rows with unparseable dates")
     return df
 
 
-def _filter_empty_user_ids(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows where user_id is empty or whitespace."""
-    before = len(df)
-    df = df[df["user_id"].str.len() > 0].copy()
-    dropped = before - len(df)
-    if dropped:
-        logger.warning("Dropped %d row(s) with empty user_id", dropped)
+def _add_derived_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Add any derived columns needed downstream."""
+    # Currently no additional derived columns are needed.
+    # This is a hook for future transformations.
     return df
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+def _log_transform_summary(df: pd.DataFrame, stage: str) -> None:
+    """Log summary statistics after a transformation stage."""
+    logger.debug(
+        f"After {stage}: {len(df)} rows, "
+        f"regions={df['region'].nunique() if 'region' in df.columns else 'N/A'}, "
+        f"categories={df['product_category'].nunique() if 'product_category' in df.columns else 'N/A'}"
+    )
+
 
 def transform(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Apply the full transformation pipeline to a raw ingested DataFrame.
+    """Run all transformation steps on the ingested DataFrame."""
+    if df.empty:
+        logger.warning("Transform called on empty DataFrame")
+        return df
 
-    Steps (in order):
-      1. Normalise region, product_category, user_id, date, revenue
-      2. Filter out empty user_ids
-      3. Add derived columns (year_month, revenue_band)
+    logger.info(f"Starting transform: {len(df)} rows")
 
-    Returns a cleaned DataFrame ready for aggregation.
-    """
-    logger.info("Starting transformation on %d rows", len(df))
+    df = _normalize_string_columns(df)
+    _log_transform_summary(df, "normalize_strings")
 
-    df = _normalise_region(df)
-    df = _normalise_product_category(df)
-    df = _normalise_user_id(df)
-    df = _normalise_date(df)
-    df = _normalise_revenue(df)
-    df = _filter_empty_user_ids(df)
-    df = _add_year_month(df)
-    df = _add_revenue_band(df)
+    df = _normalize_region_column(df)
+    _log_transform_summary(df, "normalize_region")
 
-    logger.info("Transformation complete: %d rows remaining", len(df))
+    df = _normalize_category_column(df)
+    _log_transform_summary(df, "normalize_category")
+
+    df = _standardize_date(df)
+    _log_transform_summary(df, "standardize_date")
+
+    df = _cast_revenue(df)
+    _log_transform_summary(df, "cast_revenue")
+
+    df = _validate_and_clean(df)
+    _log_transform_summary(df, "validate_and_clean")
+
+    df = _drop_duplicate_events(df)
+    _log_transform_summary(df, "drop_duplicate_events")
+
+    df = _fill_missing_strings(df)
+    _log_transform_summary(df, "fill_missing_strings")
+
+    df = _add_derived_columns(df)
+    _log_transform_summary(df, "add_derived_columns")
+
+    logger.info(f"Transform complete: {len(df)} rows")
     return df
-
-
-def transform_field_report(df: pd.DataFrame) -> Dict[str, int]:
-    """
-    Return a summary dict of field-level statistics after transformation.
-    Useful for logging and diagnostics.
-    """
-    return {
-        "total_rows": len(df),
-        "unique_regions": df["region"].nunique(),
-        "unique_categories": df["product_category"].nunique(),
-        "unique_dates": df["date"].nunique(),
-        "unique_users": df["user_id"].nunique(),
-        "revenue_band_low": int((df["revenue_band"] == "low").sum()),
-        "revenue_band_mid": int((df["revenue_band"] == "mid").sum()),
-        "revenue_band_high": int((df["revenue_band"] == "high").sum()),
-    }

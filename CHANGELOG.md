@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:55 -03:00 · First task through every gate; checklist catch-up (56/83)
+- **`2f50` (C audit service, Batch 1) passed every gate** after 3 attempts: two repairs for answer tokens leaked into image files. It is the first pipeline-built task to get there and is now calibrating. It's a Phase 1 task, so its result goes into the pilot go/no-go number (cost per learnable task). Batch 2 calibration still waits for that decision.
+- **Migration to the new code:** 5 of 6 old processes moved at attempt boundaries (`ae2e`, `1091`/`3bbd`, `48eb`, `93f5`), and one finished on its own. Cost: `3bbd`'s in-progress quality/novelty/red-team gates restarted, with no authoring lost.
+- **Ticked 5 finished items:** red-team wired as a gate with hackable rate per batch, the novelty report, `diversity.py` difficulty spread, `report.py`, and the README usage section (now also showing `--workers` and `--calibrate`). Most of the 27 left need calibrated or shipped tasks: the go/no-go, Batch 1/2 calibration, tuner runs, report numbers, human-likeness, final verification.
+
 ### 19:43 -03:00 · Tuning round 2 still too easy; a $13 Opus trial explained; first pipeline tasks pass functional gates
 - **Tuning round 2 on `ledger-reconcile`:** a third interacting bug plus nastier verify-time cases. It re-gated cleanly (16/16 quality, novelty ok, red-team honest), then Opus went **4/4 again**. The task has used its 2 tuning rounds and is closed as too easy. Lesson for the presentation: on a ~300-line codebase, more bugs don't make it harder. Opus fixed three interacting bugs in 9-13 turns. Difficulty has to come from investigation depth, which the 800-2,000-line rule is for.
 - **One Opus trial cost $13.45 (48 turns, 48.5 min)**, vs $0.21-0.24 for the other three:

@@ -197,6 +197,7 @@ make usage                   # live spend / remaining credit on the key
 
 ```bash
 make batch N=3 SEED=1 BUDGET=20             # blueprint -> authoring meta-task -> gates, N candidates
+uv run --env-file .env python -m scripts.run_batch --n 8 --seed 3 --workers 4 --calibrate   # parallel builds; calibrate each task as soon as it passes the gates (resumable after a crash)
 uv run --env-file .env python -m scripts.calibrate_candidates   # red-team + Opus calibration; ship learnable tasks to output/
 uv run --env-file .env python -m analysis.report                # reports/summary.md (funnel, cost, distribution, diversity)
 bash scripts/generate.sh "fix a memory bug in a C ring buffer"  # one gated task from a topic (template entry point)

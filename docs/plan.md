@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 51 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 56 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -370,7 +370,7 @@ Part 1 milestone
 
 Red-team (part of "how we know tasks are good")
 - [x] 💲 `evaluator/redteam.py`: hack-elicitation copy of the task + 1 Sonnet terminus-2 trial + judge. A serious exploit goes to repair, with the exploit trajectory as feedback. Done: ran officially on 3 packages (all honest, `hackable: false`); a beaten verifier returns the exploit as repair feedback.
-- [ ] Wire the red-team as a gate before Opus calibration, and record the hackable rate per batch.
+- [x] Wire the red-team as a gate before Opus calibration, and record the hackable rate per batch. Done: last gate in `stage_gates` (runs alongside the quality check); a beaten verifier goes back to repair. `reports/summary.md` shows the hackable rate per batch.
 
 Stretch B: difficulty tuning
 - [x] `analysis/tuner.py`: knob → lever → regenerate (≤2 rounds), with each mutation and its effect logged. Done: `scripts/tune_candidates.py` runs it on near-misses whose failures were all valid, and ships tasks that land in band.
@@ -378,9 +378,9 @@ Stretch B: difficulty tuning
 
 Stretch C: diversity
 - [x] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells. Done: `run_batch` samples inverse-frequency against every earlier candidate's spec.
-- [ ] Novelty report: per-task similarity to the TB corpus (by set) and `examples/` (max/mean, nearest task), plus rejects per novelty layer across all batches.
+- [x] Novelty report: per-task similarity to the TB corpus (by set) and `examples/` (max/mean, nearest task), plus rejects per novelty layer across all batches. Done: `analysis.report` shows nearest TB task, per-set max cosine and nearest `examples/` task per shipped task, plus rejects per layer (so far 2 blueprint-judge rejects of 9 checked: variants of our own Phase 0 task).
 - [x] 💲 Near-duplicate check: Sonnet "same underlying task?" judge on the closest TF-IDF pairs. Done: the novelty gate indexes our own earlier candidates alongside the 425 published tasks (`novelty.gate_index`, excluding the candidate itself), at both the blueprint and final-package checks.
-- [ ] `analysis/diversity.py`: per-axis coverage, balance score exp(H)/N, difficulty spread, instruction uniqueness (TF-IDF cosine, Vendi).
+- [x] `analysis/diversity.py`: per-axis coverage, balance score exp(H)/N, difficulty spread, instruction uniqueness (TF-IDF cosine, Vendi). Done: difficulty spread added (blueprint labels, predicted pass-rate quartiles, observed pass rates).
 
 Batch 2
 - [ ] 💲 Batch 2: ~12-15 candidates with the red-team gate, tuner and coverage-steered sampler on.
@@ -389,7 +389,7 @@ Batch 2
 ### Phase 4: Part 3 + stretch A and D, write-up
 
 Part 3: pipeline metrics
-- [ ] `analysis/report.py`: funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, total cost and wall time. Writes `reports/summary.md` + JSON.
+- [x] `analysis/report.py`: funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, total cost and wall time. Writes `reports/summary.md` + JSON. Done: funnel, histogram, cost/time, per-batch table, diversity, novelty, curtailment, human-likeness; regenerated from evidence on every run.
 - [ ] Reconcile ledger spend against `make usage-json` (within 10%), and state the total in the report.
 
 Stretch A: cost-efficient evaluation
@@ -412,7 +412,7 @@ Verification (see "Verification" below)
 
 Deliverables
 - [ ] `CHANGELOG.md` complete: every phase, measured numbers, spend per phase, tradeoffs, honest failures.
-- [ ] `README.md` usage section: setup (`uv sync`, `.env`), `make` targets, running a batch, reading the report.
+- [x] `README.md` usage section: setup (`uv sync`, `.env`), `make` targets, running a batch, reading the report. Done: "Running this implementation" (setup, `make` targets, parallel/auto-calibrating batches, report).
 - [ ] Final cleanup: remove dead code, check secrets aren't anywhere in history, all commits pushed.
 - [ ] Final `make usage` recorded in `CHANGELOG.md` (total spend and remaining credit).
 

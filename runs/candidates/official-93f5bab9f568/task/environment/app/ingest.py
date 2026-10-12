@@ -1,137 +1,111 @@
-"""
-Ingestion module: reads CSV files from an input directory,
-validates columns and types, and returns a combined DataFrame.
-"""
+# CSV ingestion module
 
-from __future__ import annotations
-
-from pathlib import Path
+import os
 from typing import List, Optional
 
 import pandas as pd
 
-from config import (
-    get_logger,
-    CSV_REQUIRED_COLUMNS,
-    CSV_COLUMN_TYPES,
-    CHUNK_SIZE,
-)
-from utils import (
-    list_data_files,
-    coerce_numeric,
-    rename_columns_lower,
-    strip_string_columns,
-)
+from config import CSV_DTYPES, REQUIRED_COLUMNS, CHUNK_SIZE
+from utils import get_logger, discover_csv_files, coerce_revenue, summarize_dataframe
 
-logger = get_logger(__name__)
+logger = get_logger("ingest")
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _validate_columns(df: pd.DataFrame, path: Path) -> None:
-    """Raise ValueError if required columns are missing."""
-    missing = set(CSV_REQUIRED_COLUMNS) - set(df.columns)
-    if missing:
-        raise ValueError(
-            f"{path}: missing required columns: {sorted(missing)}"
-        )
-
-
-def _cast_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Cast columns to their declared types where possible."""
-    df = df.copy()
-    for col, typ in CSV_COLUMN_TYPES.items():
-        if col not in df.columns:
-            continue
-        if typ is float:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        elif typ is str:
-            df[col] = df[col].astype(str)
-    return df
-
-
-def _drop_bad_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows with null values in required columns."""
-    before = len(df)
-    df = df.dropna(subset=CSV_REQUIRED_COLUMNS)
-    dropped = before - len(df)
-    if dropped:
-        logger.warning("Dropped %d row(s) with null required fields", dropped)
-    return df
-
-
-def _read_single_file(path: Path) -> Optional[pd.DataFrame]:
-    """Read one CSV file and return a validated DataFrame, or None on error."""
-    logger.info("Reading %s", path)
+def _read_single_csv(path: str) -> Optional[pd.DataFrame]:
+    """Read a single CSV file and return a DataFrame, or None on error."""
     try:
-        chunks = []
-        for chunk in pd.read_csv(
+        df = pd.read_csv(
             path,
-            dtype=str,  # read everything as str first
-            chunksize=CHUNK_SIZE,
-            skip_blank_lines=True,
-        ):
-            chunk = rename_columns_lower(chunk)
-            chunk = strip_string_columns(chunk)
-            _validate_columns(chunk, path)
-            chunk = _cast_columns(chunk)
-            chunk = _drop_bad_rows(chunk)
-            chunks.append(chunk)
+            dtype=str,
+            keep_default_na=False,
+            skipinitialspace=True,
+        )
+    except Exception as exc:
+        logger.error(f"Failed to read {path}: {exc}")
+        return None
 
-        if not chunks:
-            logger.warning("%s produced no valid rows", path)
-            return None
+    # Normalize column names
+    df.columns = [c.strip().lower() for c in df.columns]
 
-        df = pd.concat(chunks, ignore_index=True)
-        logger.info("%s: loaded %d rows", path, len(df))
-        return df
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        logger.error(f"File {path} missing columns: {missing}")
+        return None
 
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Failed to read %s: %s", path, exc)
-        raise
+    # Keep only required columns
+    df = df[list(REQUIRED_COLUMNS)].copy()
+
+    # Coerce revenue to numeric
+    df["revenue"] = coerce_revenue(df["revenue"])
+
+    logger.debug(f"Read {path}: {summarize_dataframe(df)}")
+    return df
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def ingest_directory(directory: str | Path) -> pd.DataFrame:
-    """
-    Read all supported data files in *directory* and return a single
-    concatenated DataFrame with validated, type-cast columns.
-
-    Raises ValueError if no data files are found or none yield rows.
-    """
-    files = list_data_files(directory)
+def ingest_directory(input_dir: str) -> pd.DataFrame:
+    """Read all CSV files in input_dir and return a combined DataFrame."""
+    files = discover_csv_files(input_dir)
     if not files:
-        raise ValueError(f"No supported data files found in {directory}")
+        logger.warning(f"No CSV files found in {input_dir}")
+        return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
 
-    frames: List[pd.DataFrame] = []
+    logger.info(f"Ingesting {len(files)} CSV file(s) from {input_dir}")
+
+    frames = []
     for path in files:
-        df = _read_single_file(path)
+        df = _read_single_csv(path)
+        if df is not None and len(df) > 0:
+            frames.append(df)
+            logger.info(f"  {os.path.basename(path)}: {len(df)} rows")
+        else:
+            logger.warning(f"  {os.path.basename(path)}: skipped (empty or error)")
+
+    if not frames:
+        logger.warning("No data loaded from any CSV file")
+        return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+    combined = pd.concat(frames, ignore_index=True)
+    logger.info(f"Ingestion complete: {len(combined)} total rows")
+    return combined
+
+
+def ingest_files(file_paths: List[str]) -> pd.DataFrame:
+    """Read a specific list of CSV file paths and return a combined DataFrame."""
+    if not file_paths:
+        return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
+
+    frames = []
+    for path in file_paths:
+        df = _read_single_csv(path)
         if df is not None and len(df) > 0:
             frames.append(df)
 
     if not frames:
-        raise ValueError(f"All files in {directory} produced empty DataFrames")
+        return pd.DataFrame(columns=list(REQUIRED_COLUMNS))
 
-    combined = pd.concat(frames, ignore_index=True)
-    logger.info(
-        "Ingestion complete: %d file(s), %d total row(s)",
-        len(frames),
-        len(combined),
-    )
-    return combined
+    return pd.concat(frames, ignore_index=True)
 
 
-def ingest_file(path: str | Path) -> pd.DataFrame:
-    """
-    Read a single CSV file and return a validated DataFrame.
-    Convenience wrapper around the internal helper.
-    """
-    df = _read_single_file(Path(path))
-    if df is None or len(df) == 0:
-        raise ValueError(f"{path} produced no valid rows")
+def validate_ingested(df: pd.DataFrame) -> pd.DataFrame:
+    """Log a summary of what was ingested; return df unchanged."""
+    if df.empty:
+        logger.warning("Ingested DataFrame is empty")
+        return df
+
+    logger.info(f"Validated ingested data: {len(df)} rows")
+    for col in ["region", "product_category", "date"]:
+        n_unique = df[col].nunique()
+        logger.debug(f"  {col}: {n_unique} unique values")
+
+    rev_null = df["revenue"].isna().sum()
+    if rev_null:
+        logger.warning(f"  revenue: {rev_null} null values will be dropped")
+
     return df
+
+
+def ingest_pipeline(input_dir: str) -> pd.DataFrame:
+    """Full ingestion pipeline: read + validate."""
+    raw = ingest_directory(input_dir)
+    validated = validate_ingested(raw)
+    return validated

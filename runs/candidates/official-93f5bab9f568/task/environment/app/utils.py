@@ -1,214 +1,151 @@
-"""
-Utility helpers used across the ETL pipeline.
-General-purpose functions: path handling, data validation,
-type coercion, DataFrame utilities, and misc helpers.
-"""
+# Utility helpers for the ETL pipeline
 
-from __future__ import annotations
-
+import logging
 import os
 import re
-import hashlib
-import datetime
-from pathlib import Path
-from typing import Iterable, List, Optional
+from datetime import datetime
+from typing import List, Optional
 
 import pandas as pd
 
-from config import get_logger, SUPPORTED_EXTENSIONS, DATE_FORMAT
-
-logger = get_logger(__name__)
+from config import LOG_LEVEL, MIN_DATE, MAX_DATE, MIN_REVENUE, MAX_REVENUE
 
 
-# ---------------------------------------------------------------------------
-# Path utilities
-# ---------------------------------------------------------------------------
+def get_logger(name: str) -> logging.Logger:
+    """Return a configured logger for the given module name."""
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        handler.setFormatter(fmt)
+        logger.addHandler(handler)
+    level = getattr(logging, LOG_LEVEL.upper(), logging.INFO)
+    logger.setLevel(level)
+    return logger
 
-def list_data_files(directory: str | Path) -> List[Path]:
-    """Return sorted list of supported data files in *directory*."""
-    directory = Path(directory)
-    if not directory.is_dir():
-        raise ValueError(f"Not a directory: {directory}")
-    files = sorted(
-        p for p in directory.iterdir()
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS
-    )
-    logger.debug("Found %d data file(s) in %s", len(files), directory)
+
+def discover_csv_files(input_dir: str) -> List[str]:
+    """Return sorted list of CSV file paths in input_dir."""
+    if not os.path.isdir(input_dir):
+        raise ValueError(f"Input directory does not exist: {input_dir}")
+    files = [
+        os.path.join(input_dir, f)
+        for f in sorted(os.listdir(input_dir))
+        if f.lower().endswith(".csv")
+    ]
     return files
 
 
-def ensure_parent_dir(path: str | Path) -> Path:
-    """Create parent directories for *path* if they don't exist."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def file_checksum(path: str | Path, algorithm: str = "sha256") -> str:
-    """Compute hex-digest checksum of a file."""
-    h = hashlib.new(algorithm)
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-# ---------------------------------------------------------------------------
-# Date utilities
-# ---------------------------------------------------------------------------
-
-def parse_date(value: str) -> datetime.date:
-    """Parse an ISO-8601 date string to a date object."""
+def validate_date_string(date_str: str) -> bool:
+    """Return True if date_str is a valid YYYY-MM-DD string."""
+    if not isinstance(date_str, str):
+        return False
+    pattern = r"^\d{4}-\d{2}-\d{2}$"
+    if not re.match(pattern, date_str):
+        return False
     try:
-        return datetime.datetime.strptime(value, DATE_FORMAT).date()
-    except ValueError as exc:
-        raise ValueError(f"Cannot parse date {value!r}: {exc}") from exc
-
-
-def date_range(start: str, end: str) -> Iterable[str]:
-    """Yield ISO date strings from *start* to *end* inclusive."""
-    current = parse_date(start)
-    stop = parse_date(end)
-    while current <= stop:
-        yield current.strftime(DATE_FORMAT)
-        current += datetime.timedelta(days=1)
-
-
-def is_valid_date_string(value: str) -> bool:
-    """Return True if *value* matches the expected date format."""
-    try:
-        parse_date(value)
-        return True
+        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        return MIN_DATE <= date_str <= MAX_DATE
     except ValueError:
         return False
 
 
-# ---------------------------------------------------------------------------
-# DataFrame utilities
-# ---------------------------------------------------------------------------
-
-def drop_duplicates_stable(df: pd.DataFrame, subset: Optional[List[str]] = None) -> pd.DataFrame:
-    """Drop duplicate rows, keeping the first occurrence."""
-    before = len(df)
-    df = df.drop_duplicates(subset=subset, keep="first")
-    dropped = before - len(df)
-    if dropped:
-        logger.debug("Dropped %d duplicate row(s)", dropped)
-    return df
-
-
-def coerce_numeric(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
-    """Coerce specified columns to numeric, turning errors into NaN."""
-    df = df.copy()
-    for col in columns:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def filter_positive(df: pd.DataFrame, column: str) -> pd.DataFrame:
-    """Keep only rows where *column* > 0 (after dropping NaN)."""
-    before = len(df)
-    df = df[df[column].notna() & (df[column] > 0)]
-    logger.debug("filter_positive('%s'): %d -> %d rows", column, before, len(df))
-    return df
-
-
-def strip_string_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Strip leading/trailing whitespace from all string columns."""
-    df = df.copy()
-    for col in df.select_dtypes(include="object").columns:
-        df[col] = df[col].str.strip()
-    return df
-
-
-def rename_columns_lower(df: pd.DataFrame) -> pd.DataFrame:
-    """Lowercase all column names."""
-    df.columns = [c.lower() for c in df.columns]
-    return df
-
-
-# ---------------------------------------------------------------------------
-# String utilities
-# ---------------------------------------------------------------------------
-
-def slugify(text: str) -> str:
-    """Convert text to a lowercase slug (letters, digits, hyphens only)."""
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9]+", "-", text)
-    return text.strip("-")
-
-
-def truncate(text: str, max_len: int = 80, suffix: str = "...") -> str:
-    """Truncate *text* to *max_len* characters."""
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - len(suffix)] + suffix
-
-
-def safe_str(value) -> str:
-    """Convert *value* to string, returning empty string for None/NaN."""
-    if value is None:
-        return ""
+def validate_revenue(value) -> bool:
+    """Return True if value is a finite float within allowed range."""
     try:
-        if pd.isna(value):
-            return ""
+        v = float(value)
+        return MIN_REVENUE <= v <= MAX_REVENUE and not (v != v)  # NaN check
     except (TypeError, ValueError):
-        pass
-    return str(value)
+        return False
 
 
-# ---------------------------------------------------------------------------
-# Numeric utilities
-# ---------------------------------------------------------------------------
-
-def clamp(value: float, lo: float, hi: float) -> float:
-    """Clamp *value* to the range [*lo*, *hi*]."""
-    return max(lo, min(hi, value))
+def safe_strip(value) -> str:
+    """Strip whitespace from a value, returning empty string for non-strings."""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip() if value is not None else ""
 
 
-def round_half_up(value: float, decimals: int = 2) -> float:
-    """Round *value* to *decimals* places using round-half-up rule."""
-    from decimal import Decimal, ROUND_HALF_UP
-    d = Decimal(str(value))
-    quantizer = Decimal(10) ** -decimals
-    return float(d.quantize(quantizer, rounding=ROUND_HALF_UP))
+def normalize_region(region: str) -> str:
+    """Normalize region string: strip and upper-case."""
+    return safe_strip(region).upper()
 
 
-def safe_divide(numerator: float, denominator: float, default: float = 0.0) -> float:
-    """Divide, returning *default* if denominator is zero."""
-    if denominator == 0:
+def normalize_category(category: str) -> str:
+    """Normalize product_category string: strip and title-case."""
+    return safe_strip(category).title()
+
+
+def summarize_dataframe(df: pd.DataFrame, label: str = "") -> str:
+    """Return a short summary string for logging."""
+    tag = f"[{label}] " if label else ""
+    return (
+        f"{tag}rows={len(df)}, cols={list(df.columns)}, "
+        f"memory={df.memory_usage(deep=True).sum() // 1024}KB"
+    )
+
+
+def coerce_revenue(series: pd.Series) -> pd.Series:
+    """Coerce a Series to float, replacing unparseable values with NaN."""
+    return pd.to_numeric(series, errors="coerce")
+
+
+def drop_invalid_rows(df: pd.DataFrame, logger: logging.Logger) -> pd.DataFrame:
+    """Drop rows with NaN revenue or invalid dates, logging counts."""
+    initial = len(df)
+    df = df.dropna(subset=["revenue"])
+    after_rev = len(df)
+    if initial - after_rev:
+        logger.warning(f"Dropped {initial - after_rev} rows with invalid revenue")
+
+    valid_date_mask = df["date"].apply(validate_date_string)
+    df = df[valid_date_mask]
+    after_date = len(df)
+    if after_rev - after_date:
+        logger.warning(f"Dropped {after_rev - after_date} rows with invalid dates")
+
+    return df
+
+
+def chunk_dataframe(df: pd.DataFrame, chunk_size: int):
+    """Yield successive chunk_size-row chunks from df."""
+    for start in range(0, len(df), chunk_size):
+        yield df.iloc[start : start + chunk_size]
+
+
+def format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as a human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes = int(seconds // 60)
+    secs = seconds % 60
+    return f"{minutes}m {secs:.1f}s"
+
+
+def ensure_dir(path: str) -> None:
+    """Create directory at path if it does not exist."""
+    os.makedirs(path, exist_ok=True)
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    """Convert value to float, returning default on failure."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return default
-    return numerator / denominator
 
 
-# ---------------------------------------------------------------------------
-# Misc
-# ---------------------------------------------------------------------------
-
-def flatten(nested: Iterable) -> List:
-    """Flatten one level of nesting."""
-    result = []
-    for item in nested:
-        if isinstance(item, (list, tuple)):
-            result.extend(item)
-        else:
-            result.append(item)
-    return result
+def build_group_key(region: str, category: str, date: str) -> str:
+    """Build a canonical string key for a (region, category, date) triple."""
+    return f"{region}|{category}|{date}"
 
 
-def chunk_list(lst: list, size: int) -> Iterable[list]:
-    """Yield successive chunks of *lst* of length *size*."""
-    for i in range(0, len(lst), size):
-        yield lst[i: i + size]
-
-
-def deep_merge(base: dict, override: dict) -> dict:
-    """Recursively merge *override* into *base*, returning a new dict."""
-    result = dict(base)
-    for key, val in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
-            result[key] = deep_merge(result[key], val)
-        else:
-            result[key] = val
-    return result
+def parse_group_key(key: str):
+    """Parse a group key back into (region, category, date)."""
+    parts = key.split("|")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid group key: {key}")
+    return parts[0], parts[1], parts[2]

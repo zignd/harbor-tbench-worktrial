@@ -1,5 +1,5 @@
-The `packet-codec` service in `/app/repo` is busted after the pipeline migration. It panics on some inputs and throughput dropped hard compared to the old branch.
+The `packet-codec` service in `/app/repo` is broken after a pipeline migration. It panics on certain inputs and throughput has dropped significantly compared to the old branch. We need it passing all correctness tests and running at or below 200 ns average per packet on the fuzz corpus.
 
-Fix it so the codec roundtrips correctly for all inputs and the release build is properly optimized. The release profile must have `opt-level = 3` and `lto = true` set in `Cargo.toml`. Run `cargo test --release` in `/app/repo` to confirm all tests pass, and `cargo build --release` to produce the optimized binary.
+The test suite lives in `/app/repo/tests/` and the benchmark in `/app/repo/benches/`. Verification runs `cargo test --release` in `/app/repo` and measures median ns/packet from the criterion benchmark built with `cargo build --release`. Both must pass: every packet must roundtrip byte-for-byte correctly (encode then decode returns the original value), and the median encode+decode latency per packet must be at or below 200 ns.
 
-The test suite in `/app/repo/tests/` is what we will run to verify your work.
+The git history in `/app/repo` has both the old working branch (`old-pipeline`) and the current broken `master` branch. Your fix must be applied to the working tree (or committed) so that `cargo test --release` in `/app/repo` passes all tests with the corrected release profile.

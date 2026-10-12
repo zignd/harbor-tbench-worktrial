@@ -195,3 +195,30 @@ def test_clean_package_runs_quality_alongside_novelty_and_redteam(env, monkeypat
     shutil.copytree(TASK, cand.task_dir)
     assert pipeline.stage_gates(cand, ledger, 1) == ["typos: x", "fix the typo"]
     assert sorted(calls) == ["functional", "quality", "redteam", "static"]
+
+
+def test_attempt_interrupted_after_authoring_goes_back_to_its_gates(env, monkeypatch):
+    from analysis.ledger import Event, hash_dir
+
+    calls, ledger = env
+    spec = sample_specs(1, seed=13)[0]
+    first = pipeline.Candidate(spec)
+    first.save("blueprint.json", BLUEPRINT.model_dump())
+    first.save("blueprint_gate.json", {"accepted": True})
+    shutil.copytree(TASK, first.task_dir)  # authored, then the gates were cut off
+    h = hash_dir(first.task_dir)
+    ledger.append(Event("author", first.cand_id, {"attempt": 1, "outcome": "pass"}))
+    ledger.append(Event("gate_static", first.cand_id, {"problems": []}, inputs_hash=h))
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: [])
+    cand = pipeline.build_candidate(pipeline.Candidate(spec), ledger)
+    assert cand.status == "gated" and calls["author"] == []  # no re-authoring
+
+
+def test_changed_package_is_not_mistaken_for_the_authored_one(env):
+    from analysis.ledger import Event
+
+    _, ledger = env
+    cand = pipeline.Candidate(sample_specs(1, seed=14)[0])
+    shutil.copytree(TASK, cand.task_dir)
+    ledger.append(Event("author", cand.cand_id, {"attempt": 1, "outcome": "pass"}, inputs_hash="x"))
+    assert not pipeline.authored_unchanged(cand, ledger, 1)

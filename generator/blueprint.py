@@ -13,6 +13,9 @@ from analysis.llm import chat, extract_json
 from generator.spec import LEVERS, VERIFIERS, TaskSpec
 from validator import novelty
 
+# Calibration showed "genuine_difficulty" scored 4-5 on tasks Opus solved 4/4: a 3 is not enough.
+MIN_DIFFICULTY = 4
+
 SYSTEM = (
     "You design tasks for Terminal-Bench, a benchmark of hard, realistic command-line work. "
     "Your tasks are judged by whether a frontier coding agent fails them for genuine reasons."
@@ -31,11 +34,30 @@ it often fails, possible enough that it sometimes succeeds. Anything an average 
 in a few days is too easy. Difficulty must come from the problem itself, never from format fussiness,
 hidden resource limits, ambiguity or tricks.
 
-What makes strong agents fail for valid reasons:
+What does NOT make a task hard (measured on our own calibrations): "a few bugs in readable source".
+Three such tasks (a payments ledger with 2-3 interacting bugs, a C service with a buffer and a SQL
+bind bug) passed 4/4, 4/4 and 4/5 times: Opus reads the code, spots each bug by inspection and patches
+it in 9-25 commands. Bugs that are visible when reading the relevant file are not difficulty, however
+many there are. Their blueprints predicted a 25% pass rate; the observed rate was 80-100%.
+
+The task MUST get its difficulty from at least one of these, and the internal_hint must say which:
+- Not visible by reading: the cause only shows when the system runs on real data (state built up over
+  history, data-dependent paths, config + data interactions, a compiled component without source), so
+  the solver has to experiment, instrument and observe rather than read.
+- Substantial construction: the solver must build a non-trivial missing component (a parser for a
+  documented but unusual format, an algorithm with subtle correctness conditions), checked on many
+  hidden verify-time inputs.
+- A stated quantitative bar (accuracy, throughput, size) that needs real insight, not a compiler flag.
+- A long ordered procedure (recovery, migration, reconciliation) where an early wrong assumption
+  silently corrupts later results and the solver has to notice.
+- Domain reasoning (numerics, protocols, scheduling, formats) where plausible solutions are subtly
+  wrong on cases the samples don't show.
+
+And what makes strong agents fail for valid reasons once it is hard:
 - They verify shallowly: they check the provided sample and stop. Make correctness hinge on cases the
   sample doesn't show, and have the tests check behaviour on fresh inputs generated at verify time.
-- They implement partially: they fix the obvious issue and miss the second one. Make the levers
-  interact so a partial fix looks done.
+- They implement partially: they fix or build the obvious part and miss the rest. Make the levers
+  interact so a partial solution looks done.
 - They don't explore: put the key facts in the environment (code, data, logs), not the instruction.
 Every requirement the tests check must still be stated in the instruction. The solver must be able to
 succeed from the instruction plus what it can discover in the container.
@@ -77,7 +99,8 @@ Return only JSON with exactly these keys:
   "category": "one word or kebab-case",
   "tags": ["3-6 tags"]
 }}
-predicted_pass_rate is your honest estimate (0-1) of how often a frontier agent solves it."""
+predicted_pass_rate is your honest estimate (0-1) of how often a frontier agent solves it. Calibrate
+it against the evidence above: estimates have been far too low."""
 
 
 class Blueprint(BaseModel):
@@ -145,14 +168,23 @@ Score each criterion 1-5 and explain briefly:
   or hollow solution cannot pass.
 - genuine_difficulty: a frontier agent would fail it often for real reasons (shallow verification,
   partial fixes, missed exploration), not because of format fussiness, hidden limits or ambiguity.
+  First do the speedrun below; then score. Measured: tasks whose bugs are visible by reading the
+  source were solved 4/4 and 4/5 times by Opus in 9-25 commands, so that shape scores at most 2.
+
+Speedrun: you are a strong agent who has just read the instruction and listed the environment. Write
+the shortest plausible command-by-command path to a solution (read which files, change what, check
+how). Count the commands. If ~20 commands or fewer would likely succeed, genuine_difficulty is at
+most 2.
 - realism: it reads like a real engineering problem someone would actually have.
 
 Also list any way a failure could be *invalid* (ambiguity, test overreach, flaky environment).
 
-Return only JSON: {{"scores": {{"clarity": n, "solvability": n, "verifiability": n,
+Return only JSON: {{"speedrun": ["command or step", "..."], "speedrun_commands": n,
+"scores": {{"clarity": n, "solvability": n, "verifiability": n,
 "genuine_difficulty": n, "realism": n}}, "invalid_failure_risks": ["..."],
 "verdict": "accept|reject", "reasons": "2-3 sentences", "fixes": ["concrete improvements"]}}
-Accept only if every score is at least 3 and the average is at least 3.6."""
+Accept only if every score is at least 3, genuine_difficulty is at least 4, and the average is at
+least 3.6."""
 
 
 RETRY_SECTION = """
@@ -183,14 +215,18 @@ def review_blueprint(bp: Blueprint, spec: TaskSpec) -> tuple[dict, float]:
     reply = chat(
         REVIEW_PROMPT.format(blueprint=bp.to_markdown(spec)),
         system="You are a strict Terminal-Bench task reviewer.",
-        max_tokens=2000,
+        max_tokens=4000,
         temperature=0.0,
     )
     review = extract_json(reply.text)
     scores = review.get("scores", {})
     values = [float(v) for v in scores.values()] or [0.0]
     # Enforce the rule ourselves rather than trusting the model's verdict.
-    review["accepted"] = min(values) >= 3 and sum(values) / len(values) >= 3.6
+    review["accepted"] = (
+        min(values) >= 3
+        and float(scores.get("genuine_difficulty", 0)) >= MIN_DIFFICULTY
+        and sum(values) / len(values) >= 3.6
+    )
     return review, reply.cost_usd
 
 

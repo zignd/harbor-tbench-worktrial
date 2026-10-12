@@ -81,18 +81,10 @@ def deploy() -> bool:
 
     ensure_state_db(STATE_DB)
 
-    # BUG 3: The hash is computed from the compiled/ directory BEFORE the files
-    # are copied to deployed/. If compilation changed any files, the hash stored
-    # in state.db will reflect the compiled/ snapshot at this moment, not the
-    # actual deployed/ content after the copy.
-    # Additionally, the DB update and file copy are not wrapped in a single
-    # atomic operation, so a crash between them leaves an inconsistent state.
-    new_hash = compute_dir_hash(COMPILED_DIR)  # Should be computed AFTER copy
+    new_hash = compute_dir_hash(COMPILED_DIR)
     logger.info(f"Computed rule hash: {new_hash}")
 
-    # Copy compiled rules to deployed directory
     DEPLOYED_DIR.mkdir(parents=True, exist_ok=True)
-    # Remove old deployed files
     for old in DEPLOYED_DIR.glob("*.json"):
         old.unlink()
 
@@ -101,7 +93,6 @@ def deploy() -> bool:
         shutil.copy2(src, dst)
         logger.info(f"Deployed {src.name}")
 
-    # Update state DB with new hash (not in a transaction with the file copy)
     conn = sqlite3.connect(STATE_DB)
     conn.execute(
         "INSERT OR REPLACE INTO rule_state (key, value) VALUES (?, ?)",
@@ -159,8 +150,8 @@ if __name__ == "__main__":
     parser.add_argument("--compiled-dir", default=str(COMPILED_DIR))
     parser.add_argument("--deployed-dir", default=str(DEPLOYED_DIR))
     parser.add_argument("--state-db", default=STATE_DB)
-    parser.add_argument("--verify", action="store_true", help="Verify deployment")
-    parser.add_argument("--info", action="store_true", help="Show deployment info")
+    parser.add_argument("--verify", action="store_true")
+    parser.add_argument("--info", action="store_true")
     args = parser.parse_args()
 
     COMPILED_DIR = Path(args.compiled_dir)

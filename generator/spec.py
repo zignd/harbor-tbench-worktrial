@@ -124,6 +124,11 @@ LEVERS = {
     "edge_case_inputs": "correctness hinges on edge cases the samples don't show",
     "performance_threshold": "a working but slow solution fails a stated performance bar",
     "no_repro_given": "no reproduction is provided; the solver must find a failing case",
+    # Added after calibration: sources of difficulty that reading the code can't shortcut.
+    "observe_not_read": "the cause only shows when the system runs on real data or history",
+    "build_component": "a non-trivial missing component must be built and passes hidden inputs",
+    "opaque_component": "a compiled or black-box component must be characterised by experiment",
+    "ordered_procedure": "a multi-step recovery/migration where an early wrong step corrupts later ones",
 }
 STYLES = {
     "minimal": "one to three plain sentences stating the goal",

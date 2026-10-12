@@ -27,6 +27,9 @@
 /* Length of a SHA-256 HMAC digest in bytes */
 #define HMAC_SHA256_LEN  32
 
+/* Maximum canonical binary size: 19-byte header + 65535 payload */
+#define WAL_MAX_BINARY  (19 + 65535)
+
 /*
  * hex_decode - decode a hex string into binary.
  * Returns number of bytes written, or -1 on error.
@@ -124,14 +127,36 @@ void protocol_handle_line(AuditContext *ctx,
         }
     }
 
-    /* Compute HMAC over (possibly patched) binary record */
-    uint8_t digest[HMAC_SHA256_LEN];
-    if (compute_hmac_sha256(ctx, bin_buf, (size_t)decoded, digest) < 0) {
+    /* Serialise the (possibly patched) record into canonical binary form
+     * before computing the HMAC.  The payload pointer in rec still points
+     * into bin_buf, so pass bin_buf + 19 as the payload source. */
+    size_t serial_cap = WAL_MAX_BINARY;
+    uint8_t *serial_buf = malloc(serial_cap);
+    if (!serial_buf) {
+        free(bin_buf);
+        fprintf(out, "ERR\n");
+        return;
+    }
+    const uint8_t *payload_src = (rec.payload_len > 0) ? (bin_buf + 19) : NULL;
+    int serial_len = wal_record_serialize(&rec, payload_src,
+                                          serial_buf, serial_cap);
+    if (serial_len < 0) {
+        free(serial_buf);
         free(bin_buf);
         fprintf(out, "ERR\n");
         return;
     }
 
+    /* Compute HMAC over canonical binary record */
+    uint8_t digest[HMAC_SHA256_LEN];
+    if (compute_hmac_sha256(ctx, serial_buf, (size_t)serial_len, digest) < 0) {
+        free(serial_buf);
+        free(bin_buf);
+        fprintf(out, "ERR\n");
+        return;
+    }
+
+    free(serial_buf);
     free(bin_buf);
 
     /* Emit lowercase hex digest */

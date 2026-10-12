@@ -1,172 +1,186 @@
 """
 WAF Prometheus Metrics Exporter
-Exposes rule match counts, classification latency, and deployment status
-via a simple HTTP endpoint for Prometheus scraping.
+Exposes rule match counts and filter latency for monitoring.
 """
 
-import os
-import sys
-import json
 import time
-import threading
+import json
 import sqlite3
-import logging
+import threading
 from pathlib import Path
-from http.server import HTTPServer, BaseHTTPRequestHandler
 from collections import defaultdict
+from datetime import datetime, timedelta
 
-METRICS_PORT = int(os.environ.get("WAF_METRICS_PORT", "9090"))
+METRICS_PORT = 9101
 STATE_DB = "/opt/waf/state.db"
 DEPLOYED_DIR = Path("/opt/waf/deployed")
+METRICS_FILE = "/opt/waf/monitor/metrics.prom"
 
-logger = logging.getLogger("waf.metrics")
-
-# In-memory counters
 _counters = defaultdict(int)
 _latencies = []
 _lock = threading.Lock()
 
 
-def record_classification(action: str, rule_id: str, latency_ms: float) -> None:
-    """Record a classification event for metrics."""
-    with _lock:
-        _counters[f"waf_classifications_total{{action='{action}'}}" ] += 1
-        _counters[f"waf_rule_matches_total{{rule='{rule_id}'}}" ] += 1
-        _latencies.append(latency_ms)
-        if len(_latencies) > 10000:
-            _latencies.pop(0)
+class Counter:
+    def __init__(self, name: str, help_text: str, labels: list = None):
+        self.name = name
+        self.help_text = help_text
+        self.labels = labels or []
+        self._values = defaultdict(int)
+
+    def inc(self, label_values: dict = None, amount: int = 1):
+        key = tuple(sorted((label_values or {}).items()))
+        with _lock:
+            self._values[key] += amount
+
+    def collect(self) -> list:
+        lines = []
+        lines.append(f"# HELP {self.name} {self.help_text}")
+        lines.append(f"# TYPE {self.name} counter")
+        with _lock:
+            for key, val in self._values.items():
+                if key:
+                    label_str = ",".join(f'{k}="{v}"' for k, v in key)
+                    lines.append(f"{self.name}{{{label_str}}} {val}")
+                else:
+                    lines.append(f"{self.name} {val}")
+        return lines
 
 
-def get_deployment_info() -> dict:
-    """Read deployment metadata from state DB."""
-    info = {}
+class Histogram:
+    def __init__(self, name: str, help_text: str, buckets: list = None):
+        self.name = name
+        self.help_text = help_text
+        self.buckets = buckets or [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]
+        self._observations = []
+
+    def observe(self, value: float):
+        with _lock:
+            self._observations.append(value)
+
+    def collect(self) -> list:
+        lines = []
+        lines.append(f"# HELP {self.name} {self.help_text}")
+        lines.append(f"# TYPE {self.name} histogram")
+        with _lock:
+            obs = list(self._observations)
+        total = sum(obs)
+        count = len(obs)
+        for b in self.buckets:
+            bucket_count = sum(1 for o in obs if o <= b)
+            lines.append(f"{self.name}_bucket{{le=\"{b}\"}} {bucket_count}")
+        lines.append(f"{self.name}_bucket{{le=\"+Inf\"}} {count}")
+        lines.append(f"{self.name}_sum {total}")
+        lines.append(f"{self.name}_count {count}")
+        return lines
+
+
+class Gauge:
+    def __init__(self, name: str, help_text: str):
+        self.name = name
+        self.help_text = help_text
+        self._value = 0.0
+
+    def set(self, value: float):
+        with _lock:
+            self._value = value
+
+    def collect(self) -> list:
+        lines = []
+        lines.append(f"# HELP {self.name} {self.help_text}")
+        lines.append(f"# TYPE {self.name} gauge")
+        with _lock:
+            lines.append(f"{self.name} {self._value}")
+        return lines
+
+
+requests_total = Counter(
+    "waf_requests_total",
+    "Total WAF classified requests",
+    ["action"],
+)
+classify_duration = Histogram(
+    "waf_classify_duration_seconds",
+    "Time spent classifying a request",
+)
+rules_loaded = Gauge(
+    "waf_rules_loaded",
+    "Number of rules currently loaded",
+)
+deployment_age_seconds = Gauge(
+    "waf_deployment_age_seconds",
+    "Seconds since last rule deployment",
+)
+
+
+def record_classification(action: str, duration_seconds: float):
+    requests_total.inc({"action": action})
+    classify_duration.observe(duration_seconds)
+
+
+def update_rule_metrics():
+    count = len(list(DEPLOYED_DIR.glob("*.json"))) if DEPLOYED_DIR.exists() else 0
+    rules_loaded.set(float(count))
+
     try:
         conn = sqlite3.connect(STATE_DB)
-        rows = conn.execute("SELECT key, value FROM rule_state").fetchall()
+        row = conn.execute(
+            "SELECT value FROM rule_state WHERE key = 'deployed_at'"
+        ).fetchone()
         conn.close()
-        info = dict(rows)
-    except Exception as e:
-        logger.error(f"Failed to read state DB: {e}")
-    return info
+        if row:
+            deployed_at = datetime.fromisoformat(row[0])
+            age = (datetime.utcnow() - deployed_at).total_seconds()
+            deployment_age_seconds.set(age)
+    except Exception:
+        pass
 
 
-def count_deployed_rules() -> int:
-    """Count JSON files in deployed directory."""
-    if not DEPLOYED_DIR.exists():
-        return 0
-    return len(list(DEPLOYED_DIR.glob("*.json")))
-
-
-def compute_percentile(values: list, pct: float) -> float:
-    """Compute a percentile from a list of values."""
-    if not values:
-        return 0.0
-    sorted_vals = sorted(values)
-    idx = int(len(sorted_vals) * pct / 100)
-    idx = min(idx, len(sorted_vals) - 1)
-    return sorted_vals[idx]
-
-
-def render_prometheus_metrics() -> str:
-    """Render current metrics in Prometheus text format."""
+def render_metrics() -> str:
+    update_rule_metrics()
+    collectors = [requests_total, classify_duration, rules_loaded, deployment_age_seconds]
     lines = []
+    for collector in collectors:
+        lines.extend(collector.collect())
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_metrics_file():
+    content = render_metrics()
+    tmp = METRICS_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(content)
+    import os
+    os.replace(tmp, METRICS_FILE)
+
+
+def get_summary() -> dict:
     with _lock:
-        counters_snap = dict(_counters)
-        latencies_snap = list(_latencies)
-
-    lines.append("# HELP waf_classifications_total Total WAF classifications")
-    lines.append("# TYPE waf_classifications_total counter")
-    for metric, value in sorted(counters_snap.items()):
-        if "classifications" in metric:
-            lines.append(f"{metric} {value}")
-
-    lines.append("# HELP waf_rule_matches_total Rule match counts")
-    lines.append("# TYPE waf_rule_matches_total counter")
-    for metric, value in sorted(counters_snap.items()):
-        if "rule_matches" in metric:
-            lines.append(f"{metric} {value}")
-
-    lines.append("# HELP waf_deployed_rules_count Number of deployed rules")
-    lines.append("# TYPE waf_deployed_rules_count gauge")
-    lines.append(f"waf_deployed_rules_count {count_deployed_rules()}")
-
-    if latencies_snap:
-        p50 = compute_percentile(latencies_snap, 50)
-        p95 = compute_percentile(latencies_snap, 95)
-        p99 = compute_percentile(latencies_snap, 99)
-        lines.append("# HELP waf_classify_latency_ms Classification latency in ms")
-        lines.append("# TYPE waf_classify_latency_ms summary")
-        lines.append(f'waf_classify_latency_ms{{quantile="0.5"}} {p50}')
-        lines.append(f'waf_classify_latency_ms{{quantile="0.95"}} {p95}')
-        lines.append(f'waf_classify_latency_ms{{quantile="0.99"}} {p99}')
-        lines.append(f"waf_classify_latency_ms_count {len(latencies_snap)}")
-        lines.append(f"waf_classify_latency_ms_sum {sum(latencies_snap):.3f}")
-
-    deploy_info = get_deployment_info()
-    if deploy_info.get("rule_count"):
-        lines.append("# HELP waf_deployed_rule_count_db Rule count from state DB")
-        lines.append("# TYPE waf_deployed_rule_count_db gauge")
-        lines.append(f"waf_deployed_rule_count_db {deploy_info['rule_count']}")
-
-    return "\n".join(lines) + "\n"
-
-
-class MetricsHandler(BaseHTTPRequestHandler):
-    """Simple HTTP handler for Prometheus metrics scraping."""
-
-    def do_GET(self):
-        if self.path == "/metrics":
-            body = render_prometheus_metrics().encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; version=0.0.4")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/health":
-            body = b'{"status": "ok"}'
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, fmt, *args):
-        pass  # Suppress default access log
-
-
-def start_metrics_server(port: int = METRICS_PORT, daemon: bool = True) -> threading.Thread:
-    """Start the metrics HTTP server in a background thread."""
-    server = HTTPServer(("", port), MetricsHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=daemon)
-    thread.start()
-    logger.info(f"Metrics server listening on port {port}")
-    return thread
-
-
-def get_metrics_summary() -> dict:
-    """Return a dict summary of current metrics."""
-    with _lock:
-        total = sum(v for k, v in _counters.items() if "classifications" in k)
-        blocked = _counters.get("waf_classifications_total{action='block'}", 0)
-        allowed = _counters.get("waf_classifications_total{action='allow'}", 0)
-        latencies_snap = list(_latencies)
-
+        actions = dict(requests_total._values)
+        obs = list(classify_duration._observations)
     return {
-        "total_classifications": total,
-        "blocked": blocked,
-        "allowed": allowed,
-        "block_rate": blocked / total if total > 0 else 0.0,
-        "p50_latency_ms": compute_percentile(latencies_snap, 50),
-        "p95_latency_ms": compute_percentile(latencies_snap, 95),
-        "deployed_rules": count_deployed_rules(),
+        "total_requests": sum(actions.values()),
+        "by_action": {str(k): v for k, v in actions.items()},
+        "avg_latency_ms": (sum(obs) / len(obs) * 1000) if obs else 0,
+        "p99_latency_ms": (sorted(obs)[int(len(obs) * 0.99)] * 1000) if obs else 0,
     }
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    print(f"Starting WAF metrics exporter on port {METRICS_PORT}")
-    t = start_metrics_server(daemon=False)
-    t.join()
+    import argparse
+    parser = argparse.ArgumentParser(description="WAF Metrics Exporter")
+    parser.add_argument("--once", action="store_true", help="Write metrics once and exit")
+    parser.add_argument("--output", default=METRICS_FILE)
+    args = parser.parse_args()
+
+    METRICS_FILE = args.output
+
+    if args.once:
+        write_metrics_file()
+        print(f"Metrics written to {METRICS_FILE}")
+    else:
+        print(f"Metrics exporter running, writing to {METRICS_FILE} every 15s")
+        while True:
+            write_metrics_file()
+            time.sleep(15)

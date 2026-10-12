@@ -1,206 +1,196 @@
 """
-WAF Shared Logger Utility
+WAF Shared Logging Utilities
 Provides structured logging helpers used across all WAF components.
 """
 
-import os
-import sys
-import json
 import logging
-import logging.handlers
+import json
+import sys
+import os
 import time
-import threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
+from typing import Optional
 
 LOG_DIR = Path("/opt/waf/logs")
-DEFAULT_LEVEL = os.environ.get("WAF_LOG_LEVEL", "INFO")
-MAX_BYTES = 10 * 1024 * 1024  # 10 MB
-BACKUP_COUNT = 5
-
-_loggers = {}
-_lock = threading.Lock()
+DEFAULT_LEVEL = logging.INFO
 
 
 class StructuredFormatter(logging.Formatter):
-    """JSON-structured log formatter for machine-readable output."""
+    """JSON-structured log formatter for machine parsing."""
 
-    def __init__(self, component: str):
+    def __init__(self, component: str = "waf"):
         super().__init__()
         self.component = component
 
     def format(self, record: logging.LogRecord) -> str:
-        entry = {
-            "ts": datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat(),
+        log_entry = {
+            "ts": datetime.utcnow().isoformat(),
             "level": record.levelname,
             "component": self.component,
             "msg": record.getMessage(),
+            "logger": record.name,
         }
         if record.exc_info:
-            entry["exc"] = self.formatException(record.exc_info)
+            log_entry["exc"] = self.formatException(record.exc_info)
         if hasattr(record, "request_id"):
-            entry["request_id"] = record.request_id
+            log_entry["request_id"] = record.request_id
         if hasattr(record, "rule_id"):
-            entry["rule_id"] = record.rule_id
-        return json.dumps(entry)
+            log_entry["rule_id"] = record.rule_id
+        if hasattr(record, "action"):
+            log_entry["action"] = record.action
+        return json.dumps(log_entry)
+
+
+class TextFormatter(logging.Formatter):
+    """Human-readable log formatter."""
+
+    FMT = "%(asctime)s [%(levelname)-8s] %(name)s: %(message)s"
+    DATE_FMT = "%Y-%m-%d %H:%M:%S"
+
+    def __init__(self):
+        super().__init__(fmt=self.FMT, datefmt=self.DATE_FMT)
 
 
 class RateLimitedHandler(logging.Handler):
-    """
-    A handler that rate-limits log output to avoid flooding.
-    Drops records beyond max_per_second in any given second.
-    """
+    """Handler that rate-limits log output to avoid flooding."""
 
-    def __init__(self, inner: logging.Handler, max_per_second: int = 100):
+    def __init__(self, inner_handler: logging.Handler, max_per_second: int = 100):
         super().__init__()
-        self.inner = inner
+        self.inner = inner_handler
         self.max_per_second = max_per_second
-        self._bucket_time = 0
-        self._bucket_count = 0
+        self._count = 0
+        self._window_start = time.monotonic()
         self._dropped = 0
-        self._lock = threading.Lock()
 
-    def emit(self, record: logging.LogRecord) -> None:
-        now = int(time.time())
-        with self._lock:
-            if now != self._bucket_time:
-                if self._dropped > 0:
-                    drop_record = logging.LogRecord(
-                        name=record.name,
-                        level=logging.WARNING,
-                        pathname="",
-                        lineno=0,
-                        msg=f"Rate limiter dropped {self._dropped} log records in second {self._bucket_time}",
-                        args=(),
-                        exc_info=None,
-                    )
-                    self.inner.emit(drop_record)
-                self._bucket_time = now
-                self._bucket_count = 0
-                self._dropped = 0
+    def emit(self, record: logging.LogRecord):
+        now = time.monotonic()
+        if now - self._window_start >= 1.0:
+            if self._dropped > 0:
+                drop_record = logging.LogRecord(
+                    name=record.name,
+                    level=logging.WARNING,
+                    pathname="",
+                    lineno=0,
+                    msg=f"[rate-limited: dropped {self._dropped} messages]",
+                    args=(),
+                    exc_info=None,
+                )
+                self.inner.emit(drop_record)
+            self._count = 0
+            self._dropped = 0
+            self._window_start = now
 
-            if self._bucket_count < self.max_per_second:
-                self._bucket_count += 1
-                self.inner.emit(record)
-            else:
-                self._dropped += 1
+        if self._count < self.max_per_second:
+            self.inner.emit(record)
+            self._count += 1
+        else:
+            self._dropped += 1
 
 
-def get_logger(
-    component: str,
-    log_file: str | None = None,
-    level: str | None = None,
-    structured: bool = True,
+def setup_logger(
+    name: str,
+    log_file: Optional[str] = None,
+    level: int = DEFAULT_LEVEL,
+    structured: bool = False,
+    rate_limit: Optional[int] = None,
 ) -> logging.Logger:
-    """
-    Get (or create) a logger for the given component.
-    Uses rotating file handler + stderr handler.
-    """
-    with _lock:
-        if component in _loggers:
-            return _loggers[component]
+    """Configure and return a logger for a WAF component."""
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.handlers.clear()
 
-        log_level = getattr(logging, (level or DEFAULT_LEVEL).upper(), logging.INFO)
-        logger = logging.getLogger(f"waf.{component}")
-        logger.setLevel(log_level)
-        logger.propagate = False
+    if structured:
+        formatter = StructuredFormatter(component=name)
+    else:
+        formatter = TextFormatter()
 
-        formatter: logging.Formatter
-        if structured:
-            formatter = StructuredFormatter(component)
-        else:
-            formatter = logging.Formatter(
-                "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-            )
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setFormatter(formatter)
 
-        # Stderr handler
-        stderr_handler = logging.StreamHandler(sys.stderr)
-        stderr_handler.setFormatter(formatter)
-        stderr_handler.setLevel(log_level)
-        logger.addHandler(RateLimitedHandler(stderr_handler))
+    if rate_limit is not None:
+        console_handler = RateLimitedHandler(console_handler, max_per_second=rate_limit)
 
-        # File handler (rotating)
-        if log_file:
-            LOG_DIR.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.handlers.RotatingFileHandler(
-                log_file,
-                maxBytes=MAX_BYTES,
-                backupCount=BACKUP_COUNT,
-            )
-            file_handler.setFormatter(formatter)
-            file_handler.setLevel(log_level)
-            logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
 
-        _loggers[component] = logger
-        return logger
+    if log_file:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
 
-
-class RequestContext:
-    """Thread-local context for associating log records with a request."""
-
-    _local = threading.local()
-
-    @classmethod
-    def set(cls, request_id: str, client_ip: str = "") -> None:
-        cls._local.request_id = request_id
-        cls._local.client_ip = client_ip
-
-    @classmethod
-    def get_request_id(cls) -> str:
-        return getattr(cls._local, "request_id", "")
-
-    @classmethod
-    def get_client_ip(cls) -> str:
-        return getattr(cls._local, "client_ip", "")
-
-    @classmethod
-    def clear(cls) -> None:
-        cls._local.request_id = ""
-        cls._local.client_ip = ""
-
-
-class TimedOperation:
-    """Context manager that logs the duration of a code block."""
-
-    def __init__(self, logger: logging.Logger, operation: str, level: int = logging.DEBUG):
-        self.logger = logger
-        self.operation = operation
-        self.level = level
-        self.start_time = 0.0
-        self.elapsed_ms = 0.0
-
-    def __enter__(self):
-        self.start_time = time.perf_counter()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.elapsed_ms = (time.perf_counter() - self.start_time) * 1000
-        if exc_type is None:
-            self.logger.log(
-                self.level,
-                f"{self.operation} completed in {self.elapsed_ms:.2f}ms",
-            )
-        else:
-            self.logger.error(
-                f"{self.operation} failed after {self.elapsed_ms:.2f}ms: {exc_val}"
-            )
-        return False
+    return logger
 
 
 def log_classification_event(
     logger: logging.Logger,
-    request_path: str,
+    request_id: str,
+    path: str,
+    method: str,
     action: str,
     rule_id: str,
-    latency_ms: float,
-) -> None:
+    duration_ms: float,
+):
     """Log a structured classification event."""
-    extra = {
-        "request_id": RequestContext.get_request_id(),
-        "rule_id": rule_id,
-    }
+    extra = {"request_id": request_id, "rule_id": rule_id, "action": action}
     logger.info(
-        f"classify path={request_path!r} action={action} rule={rule_id} "
-        f"latency={latency_ms:.2f}ms",
+        f"{method} {path} -> {action} (rule={rule_id}, {duration_ms:.2f}ms)",
         extra=extra,
     )
+
+
+def log_deployment_event(
+    logger: logging.Logger,
+    rule_count: int,
+    hash_value: str,
+    deployed_at: str,
+):
+    """Log a structured deployment event."""
+    logger.info(
+        f"Rules deployed: count={rule_count}, hash={hash_value[:12]}..., at={deployed_at}"
+    )
+
+
+def get_log_stats(log_file: str) -> dict:
+    """Parse a log file and return basic statistics."""
+    stats = {"total_lines": 0, "errors": 0, "warnings": 0, "by_level": {}}
+    if not os.path.exists(log_file):
+        return stats
+    try:
+        with open(log_file) as f:
+            for line in f:
+                stats["total_lines"] += 1
+                try:
+                    entry = json.loads(line)
+                    level = entry.get("level", "UNKNOWN")
+                except json.JSONDecodeError:
+                    if "ERROR" in line:
+                        level = "ERROR"
+                    elif "WARNING" in line:
+                        level = "WARNING"
+                    else:
+                        level = "INFO"
+                stats["by_level"][level] = stats["by_level"].get(level, 0) + 1
+                if level == "ERROR":
+                    stats["errors"] += 1
+                elif level == "WARNING":
+                    stats["warnings"] += 1
+    except Exception as e:
+        stats["error"] = str(e)
+    return stats
+
+
+if __name__ == "__main__":
+    test_logger = setup_logger("waf.test", structured=True)
+    test_logger.info("Logger utility self-test")
+    log_classification_event(
+        test_logger,
+        request_id="req-001",
+        path="/api/v1/users",
+        method="GET",
+        action="allow",
+        rule_id="allow-001",
+        duration_ms=0.42,
+    )
+    print("Logger utility OK")

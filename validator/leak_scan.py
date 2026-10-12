@@ -31,6 +31,16 @@ _FIND_FILES = (
 )
 
 
+# A Rust image's file-name search ran 19 min unpruned and its container outlived the CLI
+# timeout. Searches are pruned and time-boxed inside the container, so it always exits.
+SCAN_TIMEOUT_S = 300
+_FIND_NAMED = (
+    f"timeout {SCAN_TIMEOUT_S} find / -xdev \\( "
+    + " -o ".join(f"-path {d}" for d in SYSTEM_DIRS.split())
+    + " \\) -prune -o \\( -name solve.sh -o -name test_outputs.py \\) -print 2>/dev/null"
+)
+
+
 def distinctive_tokens(task_dir: Path) -> dict[str, str]:
     """Answer-like literals from tests/ and solution/ -> kind ("answer" or "string").
 
@@ -98,7 +108,7 @@ def scan(task_dir: Path, tag: str) -> dict:
             "sh",
             "-c",
             "ls -d /solution /tests /app/solution /app/tests 2>/dev/null; "
-            "find / -xdev \\( -name solve.sh -o -name test_outputs.py \\) 2>/dev/null",
+            + _FIND_NAMED,
         ).stdout.split()
         leaks += [f"image contains {p}" for p in listing]
         if tokens:
@@ -115,6 +125,7 @@ def scan(task_dir: Path, tag: str) -> dict:
                     "-c",
                     (
                         "cat > /.leak-tokens && "
+                        + f"timeout {SCAN_TIMEOUT_S} "
                         + _FIND_FILES
                         + " | grep -v '^/.leak-tokens$' | xargs -r grep -lF -f /.leak-tokens"
                         + " 2>/dev/null | head -20"

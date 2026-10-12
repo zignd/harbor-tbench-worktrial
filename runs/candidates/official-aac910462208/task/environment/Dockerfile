@@ -17,11 +17,8 @@ COPY app/framecodec /app/framecodec
 COPY app/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
-# Vendor dependencies into project dir, configure offline mode, remove registry
+# Pre-fetch dependencies (uses Cargo.lock for pinned versions)
 WORKDIR /app/framecodec
-RUN cargo vendor vendor 2>&1 | tail -20 \
-    && mkdir -p .cargo \
-    && printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n' > .cargo/config.toml \
-    && rm -rf /root/.cargo/registry /root/.cargo/git
+RUN cargo fetch
 
 WORKDIR /app

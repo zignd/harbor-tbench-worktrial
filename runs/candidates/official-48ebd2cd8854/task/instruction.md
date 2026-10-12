@@ -1,7 +1,12 @@
-The regional sales aggregation service at /app/service/ is producing wrong summary numbers. The service compiles and runs without errors, and individual sale records look fine, but the per-region weighted totals in the region_summaries table of /app/data/sales.db do not match hand calculations.
+Hey, the regional sales aggregation numbers coming out of `/app/service/` don't match what I calculate by hand anymore. The service compiles and runs without errors, and individual records look fine — it's only the region-level summaries that are wrong.
 
-Find and fix whatever is broken in the source code so that every row in region_summaries has a weighted_total equal to the exact sum of (sale_amount * region_weight) for all records with that region_id, where region_weight is the value declared in /app/config/weights.ini for that region. The weights in /app/config/weights.ini are authoritative.
+The final numbers end up in the `region_summaries` table in `/app/data/sales.db`. After the service runs, each row in `region_summaries` must satisfy:
 
-After fixing the source, rebuild the service from /app/service/ and rerun it against /app/data/sales.db so the database reflects the corrected results. The binary must be produced by compiling the fixed source; do not patch the database directly.
+    weighted_total = sum(sale_amount * region_weight)
+                     for every record in sales_records with that region_id
 
-The weight stored in the weight_cache table must also match the corresponding value in /app/config/weights.ini (within floating-point precision) for every region. All regions present in sales_records must appear in region_summaries.
+where `region_weight` is the value declared for that region in `/app/config/weights.ini`. The weights in that file are the authoritative values.
+
+The weight stored in the `weight_cache` table for each region must also equal the value from `/app/config/weights.ini`, within floating-point precision. All regions present in `sales_records` must appear in `region_summaries` with a correct `weighted_total`.
+
+Fix whatever is broken in `/app/service/`, rebuild from source (the binary is at `/app/service/aggregator`), and rerun the service so the database reflects the corrected results. The fix must be in the source code; do not correct the database directly.

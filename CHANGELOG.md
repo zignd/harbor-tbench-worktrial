@@ -4,6 +4,34 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 20:48 -03:00 · Go/no-go: fix generation (difficulty) before scaling
+**The numbers:** $113.92 spent (`spent*`), 0 learnable tasks. Every calibrated task was too easy:
+- `ledger-reconcile`: 4/4, 4/4, 4/4 (original + 2 tuning rounds).
+- `2f50` C audit service: 4/5 (tuning round 1 failed the quality gate twice).
+
+Under the plan's rule (more than $40 per learnable task → fix generation before scaling) that's a no-go for scaling. The user approved: finish what's nearly done, start nothing new, retune generation for difficulty, then run a small validation batch.
+
+**Diagnosis:** all three too-easy tasks share one shape, "a few bugs in readable source". Opus reads the code, spots each bug and patches it in 9-25 commands. The blueprints predicted a 25% pass rate; the observed rate was 80-100%. The blueprint review scored their `genuine_difficulty` 4-5, so it wasn't predictive.
+
+**Changes:**
+- **Blueprint prompt:** cites the measured results, says that bugs visible by reading are not difficulty however many there are, and requires at least one source of difficulty that reading can't shortcut:
+  - causes that only show when the system runs on data or history;
+  - substantial construction checked on hidden inputs;
+  - a stated quantitative bar;
+  - a long ordered procedure where an early mistake silently corrupts later steps;
+  - domain reasoning that is subtly wrong on unseen cases.
+
+  It also asks for predicted pass rates calibrated against that evidence.
+- **Four new levers** for those sources: `observe_not_read`, `build_component`, `opaque_component`, `ordered_procedure`. They have zero history, so the inverse-frequency sampler favours them.
+- **Review "speedrun":** the reviewer writes the shortest plausible command path to a solution and counts the commands. A path of ~20 or fewer caps `genuine_difficulty` at 2, and acceptance now needs `genuine_difficulty ≥ 4` (`MIN_DIFFICULTY`), enforced in code. The review's token budget went 2000 → 4000, because the speedrun list truncated the JSON on the first try.
+- **Validation of the review before spending** (`review_validation` events, ~$0.22 total): it rejects both known too-easy blueprints (speedruns of 13 and 7 commands), and it rejects **all 8 in-flight candidates** it could check (difficulty 2, speedruns of 9-18 commands).
+- **In-flight builds stopped:** the plan was to let in-flight candidates finish, but with every one predicted too easy, more repairs and calibrations (~$20-30) would mostly confirm "too easy". They're marked `stopped` with the reason, and their evidence stays on disk. **Exception:** `1091` (WAF rule sync, which had passed its quality check) finishes its gates and is calibrated, to test the review's negative prediction (~$3). Batch 2's 4 unstarted specs are `held`.
+- **Resume gap fixed:** an attempt interrupted after authoring (package hash on the author event, or on its first gate event) now goes straight back to its gates. Before, `3bbd` re-authored a package that had already passed oracle/nop (~$1.5 wasted).
+- **Leak scan:**
+  - the file-name search was unpruned and ran 19 min on a Rust image, and its container outlived the CLI timeout. It now reuses the pruned directory list, and both searches run under an in-container `timeout 300`, so the container always exits. A real scan of `2f50` takes 2.3 s.
+  - `0cd6` had errored on exactly this timeout.
+- 120 tests pass.
+
 ### 20:08 -03:00 · Repo hygiene: no vendored deps in git or tasks; leak-scan cache false positive; dev calibration loop done
 - **Vendored third-party code was getting into the repo.** One Batch 2 Rust package vendored **68 MB** of crates (`framecodec/vendor/`, not yet committed), and a Node package's 553 `node_modules` files were already committed. The generator didn't write that code, it's reproducible from the lockfiles, and it bloats the repo AfterQuery clones.
   - `.gitignore` now excludes `node_modules/`, `vendor/`, `target/` and `__pycache__/` inside `runs/candidates/`, and the committed `node_modules` files were untracked. They stay in history, since rewriting it would need a force-push.

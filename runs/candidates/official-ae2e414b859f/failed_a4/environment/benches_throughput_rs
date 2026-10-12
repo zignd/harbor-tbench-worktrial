@@ -1,0 +1,63 @@
+//! Criterion benchmark: measures encode+decode throughput in ns/packet.
+
+use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
+use packet_codec::codec::Packet;
+use packet_codec::frame::{write_frame, read_frame};
+
+struct Xorshift64 { state: u64 }
+impl Xorshift64 {
+    fn new(seed: u64) -> Self { Xorshift64 { state: if seed == 0 { 0xdeadbeefcafe } else { seed } } }
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        self.state = x; x
+    }
+    fn fill(&mut self, buf: &mut Vec<u8>, n: usize) {
+        buf.clear();
+        for _ in 0..n { buf.push((self.next() & 0xFF) as u8); }
+    }
+}
+
+fn bench_encode_decode(c: &mut Criterion) {
+    let mut group = c.benchmark_group("codec_throughput");
+    group.sample_size(200);
+
+    // Build a corpus of 2000 packets with mixed sizes including power-of-two lengths
+    let mut rng = Xorshift64::new(0xbea1234567890abc);
+    let mut corpus: Vec<Packet> = Vec::with_capacity(2000);
+    let mut buf = Vec::new();
+
+    // 50 packets of each power-of-two length
+    for exp in 0..=10u32 {
+        let len = 1usize << exp;
+        for _ in 0..50 {
+            rng.fill(&mut buf, len);
+            corpus.push(Packet::new((rng.next() & 0xFF) as u8, buf.clone()));
+        }
+    }
+    // Fill remainder with random sizes up to 2000
+    while corpus.len() < 2000 {
+        let len = 1 + (rng.next() as usize % 1024);
+        rng.fill(&mut buf, len);
+        corpus.push(Packet::new((rng.next() & 0xFF) as u8, buf.clone()));
+    }
+
+    group.bench_function(BenchmarkId::new("frame_roundtrip", "mixed_2000"), |b| {
+        let mut encode_buf = Vec::with_capacity(2048);
+        b.iter(|| {
+            let mut total = 0usize;
+            for pkt in &corpus {
+                encode_buf.clear();
+                write_frame(pkt, &mut encode_buf);
+                let (decoded, _) = read_frame(&encode_buf).unwrap();
+                total += decoded.payload.len();
+            }
+            total
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_encode_decode);
+criterion_main!(benches);

@@ -203,9 +203,36 @@ def stage_author(
             ok = True
         except FileNotFoundError as e:
             result["error"] = str(e)
-    _record(ledger, cand, "author", result, cost, t0)
+    # The package's hash lets a resumed run recognise an attempt that was authored
+    # but interrupted before its gates finished.
+    _record(ledger, cand, "author", result, cost, t0, hash_dir(cand.task_dir) if ok else "")
     cand.status = "authored" if ok else "failed"
     return ok
+
+
+def authored_unchanged(cand: Candidate, ledger: Ledger, attempt: int) -> bool:
+    """True if `attempt` was already authored and task/ still holds exactly that package.
+
+    The package's hash is on the author event (or, for events written before that, on
+    the first gate event after it), so an interrupted attempt goes back to its gates
+    instead of paying for authoring again.
+    """
+    if not cand.task_dir.exists():
+        return False
+    events = ledger.events(task=cand.cand_id)
+    authors = [i for i, e in enumerate(events) if e.stage == "author"]
+    if not authors:
+        return False
+    last = events[authors[-1]]
+    if last.result.get("attempt") != attempt or "error" in last.result:
+        return False
+    if last.result.get("outcome") == "infra":
+        return False
+    h = hash_dir(cand.task_dir)
+    after = events[authors[-1] + 1 :]
+    return last.inputs_hash == h or any(
+        e.stage.startswith("gate_") and e.inputs_hash == h for e in after[:1]
+    )
 
 
 def gate_static(task_dir: Path, tag: str) -> tuple[list[str], bool, bool]:
@@ -386,8 +413,9 @@ def resume_point(cand: Candidate, ledger: Ledger) -> tuple[int, list[str] | None
 def build_candidate(cand: Candidate, ledger: Ledger) -> Candidate:
     """Blueprint (if needed) -> author -> gates, with repair rounds and one regeneration.
 
-    Resumable: a saved, accepted blueprint is reused and an interrupted repair
-    sequence continues after its last finished attempt.
+    Resumable: a saved, accepted blueprint is reused, an interrupted repair sequence
+    continues after its last finished attempt, and an attempt interrupted after
+    authoring goes straight back to its gates.
     """
     gate_file = cand.dir / "blueprint_gate.json"
     if (
@@ -405,7 +433,8 @@ def build_candidate(cand: Candidate, ledger: Ledger) -> Candidate:
         attempt += 1
         if attempt % per_build == 1:  # fresh build from the blueprint
             feedback, previous = None, None
-        if not stage_author(cand, ledger, attempt, feedback, previous):
+        resumed = authored_unchanged(cand, ledger, attempt)
+        if not resumed and not stage_author(cand, ledger, attempt, feedback, previous):
             attempt = -(-attempt // per_build) * per_build  # skip to the next fresh build
             continue
         problems = stage_gates(cand, ledger, attempt)

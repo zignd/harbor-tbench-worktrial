@@ -150,3 +150,35 @@ int wal_record_build(uint8_t *buf, size_t buf_capacity,
     }
     return (int)needed;
 }
+
+/*
+ * wal_record_serialize - produce the canonical binary representation of
+ * a WAL record for use in HMAC computation.
+ *
+ * The output buffer (out) must be at least WAL_HEADER_SIZE + rec->payload_len
+ * bytes.  Writes the fixed 19-byte header followed by the payload bytes.
+ * Returns the total number of bytes written, or -1 on error.
+ *
+ * The payload bytes are taken from payload_src (which may differ from
+ * rec->payload if the record has been patched in-place).
+ */
+int wal_record_serialize(const WalRecord *rec, const uint8_t *payload_src,
+                         uint8_t *out, size_t out_capacity) {
+    if (!rec || !out) return -1;
+    size_t needed = WAL_HEADER_SIZE + rec->payload_len;
+    if (out_capacity < needed) return -1;
+
+    out[OFF_RECORD_TYPE] = rec->record_type;
+    write_u64_be(out + OFF_TXID,        rec->txid);
+    write_u64_be(out + OFF_CHARGE_TXID, rec->charge_txid);
+
+    /* Encode the payload length into the canonical header. */
+    uint16_t len_field = (uint16_t)(rec->payload_len - 1);
+    out[OFF_PAYLOAD_LEN]   = (uint8_t)(len_field >> 8);
+    out[OFF_PAYLOAD_LEN+1] = (uint8_t)(len_field     );
+
+    if (rec->payload_len > 0 && payload_src) {
+        memcpy(out + OFF_PAYLOAD, payload_src, rec->payload_len);
+    }
+    return (int)needed;
+}

@@ -36,7 +36,7 @@ Guidance for AI agents (and humans) working in this repo. This is an AfterQuery 
 
 ## Plan checklist
 
-`docs/plan.md` → "Work checklist" tracks progress. When an item is finished, tick it (`- [x]`, with the commit hash if useful) and update the **Progress** counter **in the same commit**. If the work reveals a missing item, add it. Don't silently skip or drop items; mark them `~~struck~~` with the reason instead.
+`docs/plan.md` → "Work checklist" tracks progress. When an item is finished, tick it (`- [x]`, with the commit hash if useful) and update the **Progress** counter **in the same commit** (get the numbers from `make plan`). If the work reveals a missing item, add it. Don't silently skip or drop items; mark them `~~struck~~` with the reason instead.
 
 ## Changelog (required)
 

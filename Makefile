@@ -37,6 +37,9 @@ N ?= 3
 SEED ?= 1
 BUDGET ?= 20
 
+plan: ## Show docs/plan.md checklist progress per phase (ARGS=--remaining lists open items)
+	@bash scripts/track-plan.sh $(ARGS)
+
 test: ## Run unit tests
 	@uv run --quiet pytest -q
 

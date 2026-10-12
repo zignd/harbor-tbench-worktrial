@@ -4,6 +4,10 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:28 -03:00 · Plan progress tracker
+- Added `scripts/track-plan.sh` (+ `make plan`): overall and per-phase checklist counts for `docs/plan.md`; `--remaining` / `--all` list items with `file:line` references, and `--fail-if-incomplete` exits non-zero while work remains.
+- Replaces the `grep -c` hint next to the **Progress** line, which gave only a single total and no view of what is left per phase. Pure awk over the markdown, no dependencies.
+
 ### 17:25 -03:00 · Calibration: exact curtailment, per-trial judges, shipping
 - **`evaluator/calibrate.py`:**
   - `decide()` implements exact curtailment of the 5-run band test: accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails, stop immediately on a hacked pass or invalid failure. Tested on all 32 pass/fail sequences: the early verdict always equals the full 5-run verdict. Expected trials are 3.85-4.3 instead of 5 (14-23% saved) for true pass rates 0.2-0.8, before the extra savings from stopping on invalid failures.

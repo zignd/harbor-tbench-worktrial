@@ -48,7 +48,8 @@ from validator.lint import lint_task
 from validator.validate import validate_task
 
 MAX_REPAIRS = 2
-BLUEPRINT_TRIES = 2
+# Blueprints are cheap (~$0.13) next to a build (~$4-6); the difficulty review rejects most.
+BLUEPRINT_TRIES = 4
 ORACLE_RUNS = 3
 EXPECTED_AUTHOR_USD = 3.0
 EXPECTED_CHECK_USD = 0.2
@@ -113,7 +114,8 @@ def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
     # unrelated domains drifted back to the same ledger-reconciliation idea.
     concepts = novelty.concept_list(index)
     feedback = None
-    for attempt in range(1, BLUEPRINT_TRIES + 1):
+    earlier = len(list(cand.dir.glob("blueprint_rejected_*.json")))  # keep earlier evidence
+    for attempt in range(earlier + 1, earlier + BLUEPRINT_TRIES + 1):
         budget.check(0.3)
         t0 = time.monotonic()
         bp, cost = make_blueprint(cand.spec, concepts, feedback=feedback)

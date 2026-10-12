@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "sketch-index-throughput-repair",
+  "title": "Fix the Sketch-Based Index Throughput Regression",
+  "scenario": "A backend developer is chasing a production throughput regression in an in-house approximate-membership service written in Go. The service uses a Count-Min Sketch layered over a sharded in-memory index to answer high-frequency point queries. Recent profiling shows p99 latency tripled and aggregate throughput dropped from ~4M ops/sec to under 600K ops/sec after a 'precision improvement' commit. The codebase is ~1,200 lines across six files: a sketch implementation, a shard manager, a query router, an estimator that derives optimal sketch parameters at startup, a small HTTP API, and a benchmark harness.",
+  "instruction_draft": "The service in /app must process point queries at \u2265 3,500,000 ops/sec as measured by /app/bench/run_bench.go on the hidden verification inputs. The current implementation is functionally correct but does not meet this throughput bar. Fix it without replacing the Count-Min Sketch algorithm or the sharded index architecture.",
+  "requirements": [
+   "The service processes point queries at \u2265 3,500,000 ops/sec as measured by the benchmark harness on hidden verification inputs.",
+   "The Count-Min Sketch algorithm must remain as the membership/frequency estimation mechanism \u2014 it must not be replaced with a Bloom filter, hash set, cuckoo filter, or direct map.",
+   "The sharded index architecture must remain \u2014 the shard manager and per-shard locking structure must not be collapsed into a single global structure.",
+   "Query results must remain correct: false-positive rate must stay below 1% on the hidden verification inputs."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with Go 1.22 installed via apt/official tarball.",
+   "/app/sketch/cms.go: Count-Min Sketch implementation, ~200 lines. The 'precision improvement' commit changed the sketch dimensions by deriving w (width) and d (depth) from a target epsilon and delta using the standard formulas w=ceil(e/epsilon), d=ceil(ln(1/delta)). The values epsilon=0.0001 and delta=1e-9 were hardcoded, producing w=27183 and d=21 \u2014 a 570x larger sketch than needed for the actual query distribution. The sketch array is allocated as [][]int64 with d rows of w columns.",
+   "/app/sketch/cms.go also has the hash family implemented using a cryptographic hash (crypto/sha256) per cell update instead of a fast polynomial hash. This is the second performance killer and is not visible as a 'bug' \u2014 it looks like a quality improvement.",
+   "/app/index/shard.go: sharded index with 256 shards, each protected by a sync.RWMutex. The query path acquires a write lock even for read-only existence checks (a subtle lock-mode bug introduced in the same commit \u2014 the method is called QueryAndRecord and always takes Lock() instead of RLock() when the key already exists).",
+   "/app/index/manager.go: routes queries to shards via FNV hash, ~120 lines, correct.",
+   "/app/estimator/params.go: reads epsilon and delta from /app/config/sketch.toml at startup and passes them to the sketch constructor. The config file has epsilon=0.0001 and delta=1e-9.",
+   "/app/config/sketch.toml: contains the over-precise parameters. Correct values for the actual workload are epsilon=0.01 and delta=0.001, giving w=272 and d=7 \u2014 a 570x reduction in sketch memory and proportional speedup in cache behavior.",
+   "/app/api/server.go: HTTP wrapper, uninvolved in the performance path.",
+   "/app/bench/run_bench.go: benchmark harness that spawns N goroutines issuing point queries against the in-process index, measures wall-clock ops/sec over a 5-second window, prints a single line 'ops_per_sec: <N>' and exits with code 0 if N >= threshold else code 1. Threshold is passed as -threshold flag. The hidden verifier runs it with -threshold 3500000.",
+   "/app/bench/run_bench.go also exercises a distinct query key distribution (Zipfian s=1.2 over 1M keys) generated from a fixed seed \u2014 different from the small uniform sample in /app/bench/sample_data.go that the developer sees.",
+   "A /app/README.md explains the architecture and mentions the 'precision improvement' commit vaguely as 'tightened sketch accuracy bounds'.",
+   "All Go module files and dependencies are pre-downloaded offline."
+  ],
+  "internal_hint": "There are three interacting performance problems, none of which are visible as obvious bugs by reading \u2014 they look like reasonable engineering choices: (1) sketch dimensions are over-engineered by ~570x due to epsilon/delta values in sketch.toml that are 100x tighter than the actual workload requires; (2) the hash family in cms.go uses crypto/sha256 which is ~50x slower than a polynomial/FNV hash for this use case; (3) shard.go takes a write lock (Lock) instead of a read lock (RLock) for read-only queries in the hot path. A solver must benchmark first to see it is slow, then profile (go tool pprof or manual timing) to identify where time goes \u2014 they cannot see the cause by reading. The ordered-procedure trap: if the solver only fixes (3) they get maybe 2M ops/sec (still fails); if they fix (3) and (2) they get ~3M (still fails); all three must be fixed to clear 3.5M. If they fix sketch dimensions first without profiling they may pick wrong new values and still fail the false-positive constraint. The correct repair sequence is: (a) profile to find the sketch allocation and hash cost, (b) derive correct epsilon/delta for the actual error tolerance (epsilon=0.01, delta=0.001 from the error-rate requirement \u22641% false positives), (c) replace sha256 with a polynomial/FNV hash in the hash family, (d) fix the RLock bug. The math: for \u22641% FP rate with d=ceil(ln(1/0.001))=7 depth rows, e/epsilon width gives w=ceil(2.718/0.01)=272. A solver who guesses epsilon without deriving it may choose values that fail the FP correctness check.",
+  "trap": "A shallow solver runs the visible sample benchmark (/app/bench/sample_data.go, uniform 1K keys), sees it pass after fixing only the lock bug (uniform tiny-key workload fits in cache even with huge sketch), declares victory, and submits. The hidden verifier uses Zipfian 1M-key distribution where the 570x oversized sketch causes catastrophic cache pressure and the crypto hash dominates \u2014 throughput stays under 1M ops/sec. A solver who fixes only two of the three issues will land between 1.5M and 3M ops/sec depending on which two, always below the 3.5M threshold.",
+  "tests": [
+   "Run /app/bench/run_bench.go -threshold 3500000 -seed 42 -keys 1000000 -zipf_s 1.2 -duration 5s \u2014 exit code must be 0 (ops/sec >= 3,500,000).",
+   "Run a correctness probe: insert 100,000 distinct keys, query 10,000 known-absent keys generated from a different seed, verify false-positive count < 100 (i.e., FP rate < 1%).",
+   "Verify the sketch algorithm is still Count-Min: inspect that /app/sketch/cms.go contains a 2D frequency table (d rows \u00d7 w cols) and min-over-rows estimation; the verifier checks that the Update and Query methods exist and return values consistent with CMS semantics on a fixed test vector.",
+   "Verify sharding is preserved: /app/index/manager.go must still route to multiple shards; verifier checks that at least 2 distinct shards are accessed during a 1000-query run by instrumenting the shard counter.",
+   "Verify the benchmark harness itself was not modified to fake results: the verifier re-runs with a different seed (-seed 137) and still expects >= 3,500,000 ops/sec."
+  ],
+  "verifier_knob": {
+   "name": "throughput_threshold",
+   "value": "3500000 ops/sec",
+   "effect": "Raising to 4,500,000 requires also optimizing the hot-path allocations (pre-allocated hash buffers) making it nearly impossible without deeper systems knowledge; lowering to 2,000,000 allows fixing only the lock bug and passes without touching sketch dimensions or hash family."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the RLock bug (visible by reading), hits ~2M ops/sec, verifies against the small sample benchmark which passes due to cache effects, submits.",
+   "Agent fixes RLock and sha256\u2192FNV but does not touch sketch dimensions; hits ~2.8M ops/sec on hidden Zipfian inputs due to cache pressure from the 570x oversized sketch.",
+   "Agent reduces sketch dimensions but picks epsilon by guessing (e.g., epsilon=0.001) rather than deriving from the 1% FP requirement; gets w=2718 which is still 10x too large and stays under 3.5M ops/sec.",
+   "Agent replaces CMS with a Bloom filter or sync.Map to easily exceed the throughput bar; correctness test passes but the algorithm-preservation check fails.",
+   "Agent identifies all three issues but fixes them in the wrong order, miscalculates the epsilon/delta math, and produces a sketch with FP rate > 1% that fails the correctness probe."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "go",
+   "performance",
+   "mathematical-derivation",
+   "reverse-engineering",
+   "systems-programming",
+   "probabilistic-data-structures"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/config/sketch.toml  # see epsilon=0.0001, delta=1e-9",
+   "cat /app/sketch/cms.go  # see crypto/sha256 in hash family, see w=27183 d=21",
+   "cat /app/index/shard.go  # see Lock() used in read-only query path",
+   "cat /app/estimator/params.go",
+   "go run /app/bench/run_bench.go -threshold 3500000 -seed 42 -keys 1000000 -zipf_s 1.2 -duration 5s  # confirm failure",
+   "# Derive: FP<1% => delta=0.001, epsilon=0.01 => w=ceil(e/0.01)=272, d=ceil(ln(1000))=7",
+   "sed -i 's/epsilon=0.0001/epsilon=0.01/' /app/config/sketch.toml && sed -i 's/delta=1e-9/delta=0.001/' /app/config/sketch.toml",
+   "# Edit cms.go: replace crypto/sha256 with fnv.New64a() or polynomial hash per row",
+   "vi /app/sketch/cms.go  # replace sha256 hash family with FNV-based polynomial hash",
+   "# Edit shard.go: change Lock()/Unlock() to RLock()/RUnlock() in read-only query branch",
+   "vi /app/index/shard.go  # fix lock mode",
+   "go build ./...",
+   "go run /app/bench/run_bench.go -threshold 3500000 -seed 42 -keys 1000000 -zipf_s 1.2 -duration 5s",
+   "go run /app/bench/run_bench.go -threshold 3500000 -seed 137 -keys 1000000 -zipf_s 1.2 -duration 5s"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The throughput threshold (3,500,000 ops/sec) is hardware-dependent; on a slow or single-core container (1 CPU / 2 GB as specified) even a correct fix might not reach 3.5M ops/sec, making the test flaky.",
+   "The benchmark uses wall-clock time and goroutine scheduling which can vary significantly under container resource constraints, making the threshold non-deterministic.",
+   "The correctness probe parameters (100k inserts, 10k absent queries, FP < 100) are not stated in the instruction to the solver \u2014 only in the blueprint \u2014 so a solver cannot verify this constraint directly.",
+   "The epsilon/delta math derivation has ambiguity: the instruction says FP rate < 1% but CMS epsilon controls overcount error, not false-positive rate in the traditional sense; a solver might correctly implement CMS but with different parameter interpretations and still fail.",
+   "If the Go runtime or CPU frequency varies between runs, the 5-second window benchmark could produce inconsistent results near the threshold boundary."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are directly visible by reading the source files \u2014 crypto/sha256 in a hot path, suspiciously tight epsilon/delta in a config file, and Lock() in a read path are all immediately recognizable red flags to a skilled engineer, contradicting the blueprint's claim that 'they cannot see the cause by reading.' A strong agent would solve this in ~15 commands without needing profiling. Additionally, the throughput threshold is hardware-dependent and potentially flaky on a 1-CPU container, creating invalid failure risk.",
+  "fixes": [
+   "To increase genuine difficulty, make the bugs non-obvious by reading: e.g., use a custom fast-looking hash that has a subtle collision pattern causing cache thrashing, or hide the lock bug inside an interface dispatch, or make the epsilon/delta values appear in generated code rather than a config file.",
+   "Replace the absolute ops/sec threshold with a relative one (e.g., 'must be within 20% of a reference implementation') to eliminate hardware-dependency flakiness, or calibrate the threshold against the actual container hardware during environment build.",
+   "Add a fourth non-obvious issue (e.g., a GOMAXPROCS=1 setting in an init() function, or a sync.Pool misuse causing GC pressure) that requires actual profiling to discover, ensuring the task cannot be solved by reading alone.",
+   "State the correctness probe parameters explicitly in the solver-visible instruction so solvers can verify their FP rate before submitting."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted aggregation results in a sales database service, not about throughput optimization of a sketch-based index."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a throughput regression (ops/sec below a required bar) in a Go/pipeline service with a benchmark harness, though the domain differs (EMA metrics pipeline vs. Count-Min Sketch index); the core challenge of diagnosing and fixing a performance regression to meet a throughput target is essentially the same."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing panics and latency in a Rust packet codec, not about throughput optimization of a Go sketch-based index."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing correctness of a NetFlow v9 aggregation service in Rust, not about throughput optimization of a Go sketch-based index."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log ingestion pipeline for correctness and speed on NDJSON records, not about optimizing a Go Count-Min Sketch index."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.087
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.087
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.076
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.071
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.065
+    ]
+   ],
+   "cost_usd": 0.012003
+  },
+  "novel": false
+ },
+ "cost_usd": 0.048585
+}

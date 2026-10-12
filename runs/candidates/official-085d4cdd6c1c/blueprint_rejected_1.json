@@ -1,0 +1,159 @@
+{
+ "blueprint": {
+  "slug": "fast-quantile-sketch-go",
+  "title": "Fix the Slow Quantile Sketch",
+  "scenario": "A backend team runs a Go microservice that computes streaming quantile estimates over latency samples from production traffic. The service was deployed six months ago and works correctly, but a recent load test showed p99 latency of the sketch itself exceeds 40 ms per batch of 10,000 samples \u2014 the SLA requires under 5 ms. The codebase (~1,200 lines) has a sketch package, an ingestion pipeline, a merge layer, and a small HTTP API. The team suspects the sketch implementation has an algorithmic problem that makes it degrade badly as the buffer fills.",
+  "instruction_draft": "The quantile sketch in `/app` produces correct results but is too slow: `go test ./... -bench=. -benchtime=5s` must show BenchmarkSketchIngest at or above 2,000,000 ns/op is unacceptable; every benchmark in the suite must complete under 5,000,000 ns/op for a batch of 10,000 samples, AND the sketch must report p50, p90, p99 estimates within 1% relative error of the true quantiles on the hidden test inputs. Do not replace the sketch algorithm; fix the implementation so it meets both the accuracy and throughput requirements.",
+  "requirements": [
+   "BenchmarkSketchIngest for a batch of 10,000 samples must complete in under 5,000,000 ns/op (i.e., < 5 ms per batch).",
+   "p50, p90, and p99 estimates returned by the sketch must be within 1% relative error of true quantiles on hidden test inputs.",
+   "The sketch algorithm (GK summary / t-digest variant as present in the codebase) must not be wholesale replaced with a different algorithm \u2014 the same structural approach must remain.",
+   "All existing unit tests must continue to pass."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm with Go 1.22 installed via apt/manual install pinned.",
+   "/app/sketch/sketch.go: ~350 lines implementing a GK-style quantile summary. The compress() method is called on every single Insert() rather than amortized \u2014 this is the planted performance bug. The compress scan is O(n) per insert, making batch ingestion O(n^2). The correctness logic is sound.",
+   "/app/sketch/sketch_test.go: unit tests checking accuracy on fixed inputs (uniform, normal, heavy-tail distributions seeded deterministically). These pass.",
+   "/app/sketch/bench_test.go: BenchmarkSketchIngest benchmarks a batch of 10,000 inserts. Currently runs at ~120,000,000 ns/op (120ms) due to the O(n^2) compress loop.",
+   "/app/pipeline/pipeline.go: ~250 lines of ingestion/merge logic that calls sketch.Insert in a loop. Contains a secondary performance issue: it acquires a mutex around each individual Insert() call rather than batching under a single lock, adding ~30% overhead.",
+   "/app/pipeline/pipeline_test.go: integration tests for the pipeline.",
+   "/app/api/api.go: ~150 lines HTTP handler that calls pipeline, unrelated to the bug.",
+   "/app/api/api_test.go: HTTP handler tests.",
+   "/app/go.mod, /app/go.sum: module definition, no external dependencies beyond stdlib.",
+   "/app/internal/stats/stats.go: ~100 lines of helper math (sorting, rank calculation) used by tests.",
+   "The compress() method bug: after every Insert(), the code calls s.compress() which iterates the entire summary list checking merge conditions. The fix is to only call compress() when len(s.samples) exceeds a threshold (e.g., 2*maxSize), making amortized cost O(1) per insert.",
+   "The pipeline mutex bug: InsertBatch() locks per-element; should lock once for the batch.",
+   "Hidden test inputs at verify time: 5 deterministic seeds (seeded PRNG in verifier), each generating 50,000 samples from mixed distributions (uniform, exponential, bimodal). Verifier runs BenchmarkSketchIngest and checks quantile accuracy."
+  ],
+  "internal_hint": "Difficulty comes from two sources that interact: (1) the cause is NOT visible by reading \u2014 the compress() call looks reasonable until you measure that it is called 10,000 times per batch, each time scanning the whole summary; you must benchmark and profile (pprof) to see that compress is 98% of CPU. (2) A stated quantitative bar: fixing only the compress amortization gets to ~8ms (still fails); you also need to fix the per-element mutex in pipeline.go to get under 5ms. A solver who only finds one of the two issues will pass the accuracy tests but fail the throughput threshold. The ordered procedure: profile first to find compress hotspot, fix compress threshold, re-benchmark to see it's still marginal, profile again to find mutex contention, fix batch locking, verify accuracy still holds. Skipping the profile step or fixing only one issue produces a solution that looks done on the sample benchmark but fails the hidden 50k-sample threshold test.",
+  "trap": "A solver who reads sketch.go, spots the compress() call location, moves it to every N inserts (say N=100 instead of the correct threshold based on maxSize), and re-runs the provided bench may see ~6ms and think it passes \u2014 but the hidden verifier uses 50,000-sample batches where the mutex contention in pipeline.go dominates. Alternatively, a solver who fixes the mutex but not compress will pass the pipeline bench but fail the raw sketch bench. Both partial fixes pass the provided unit tests (accuracy is unaffected) but fail the throughput threshold on hidden inputs.",
+  "tests": [
+   "BenchmarkSketchIngest: verifier runs `go test ./sketch/... -bench=BenchmarkSketchIngest -benchtime=5s` and asserts reported ns/op < 5,000,000.",
+   "BenchmarkPipelineIngestBatch: verifier runs the pipeline batch benchmark and asserts ns/op < 5,000,000 for 10,000 samples.",
+   "Accuracy test (hidden, 5 seeds): verifier generates 50,000 samples per seed from uniform/exponential/bimodal distributions using a fixed PRNG, inserts them into the sketch, queries p50/p90/p99, computes true quantiles by sorting, and asserts all relative errors < 0.01.",
+   "Unit test pass: `go test ./...` exits 0.",
+   "Stress throughput test: verifier times a Go program that inserts 100,000 samples in a single batch call through the pipeline and asserts wall time < 50ms (catching any remaining O(n^2) behavior at larger scale)."
+  ],
+  "verifier_knob": {
+   "name": "performance_threshold_ns_per_op",
+   "value": "5000000",
+   "effect": "Lowering to 2,000,000 ns/op requires a third optimization (e.g., avoiding allocations in the summary merge); raising to 10,000,000 ns/op makes fixing only one of the two bugs sufficient."
+  },
+  "expected_failure_modes": [
+   "Agent reads sketch.go, moves compress() call to every 100 inserts without profiling, sees bench improve to ~7ms, assumes it passes, misses the mutex bottleneck in pipeline.go.",
+   "Agent fixes only the pipeline mutex (visible by reading pipeline.go), re-runs pipeline bench, sees improvement, misses that the raw sketch bench still fails because compress is still O(n^2) on large inputs.",
+   "Agent replaces the GK sketch with a simple sorted-slice or histogram approach \u2014 violates the 'same structural approach' requirement, fails the algorithm-preservation check.",
+   "Agent sets compress threshold too high (e.g., only compress every 10,000 inserts), causing accuracy to degrade below 1% on the heavy-tail hidden distribution.",
+   "Agent fixes both bugs but introduces a data race in the batched mutex path \u2014 race detector in verifier catches it.",
+   "Agent benchmarks only the provided sample size (10,000) and tunes to just pass it; hidden 50,000-sample test reveals residual O(n log n) behavior still too slow."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "go",
+   "profiling",
+   "quantile-sketch",
+   "concurrency",
+   "algorithmic-complexity",
+   "systems-programming"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/sketch/sketch.go",
+   "cat /app/pipeline/pipeline.go",
+   "go test ./... -bench=. -benchtime=5s  # baseline ~120ms",
+   "# Observe: compress() called on every Insert() in sketch.go",
+   "# Observe: mutex locked per-element in pipeline.go InsertBatch()",
+   "sed/edit sketch.go: wrap compress() call with 'if len(s.samples) > 2*s.maxSize'",
+   "sed/edit pipeline.go: move mutex.Lock() before loop, mutex.Unlock() after loop",
+   "go test ./... -bench=. -benchtime=5s  # verify <5ms",
+   "go test ./...  # verify unit tests pass"
+  ],
+  "speedrun_commands": 9,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 1,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'algorithm preservation' requirement has no automated test described \u2014 a verifier cannot reliably distinguish a refactored GK sketch from a replacement algorithm without semantic analysis.",
+   "Benchmark timing thresholds (ns/op) are environment-dependent; on a slow CI machine or under load, a correct fix might still exceed 5,000,000 ns/op, causing false failures.",
+   "The instruction's threshold wording is contradictory: 'at or above 2,000,000 ns/op is unacceptable' conflicts with 'must complete under 5,000,000 ns/op' \u2014 these are different bars and could confuse automated parsing.",
+   "The 'stress throughput test' (100,000 samples < 50ms wall time) is a wall-clock test sensitive to container CPU allocation, making it potentially flaky.",
+   "The compress threshold fix correctness depends on maxSize value which isn't specified in the blueprint \u2014 an agent choosing the wrong threshold constant could fail accuracy tests on heavy-tail distributions."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 1 because both bugs are directly readable from the source files in a single pass, making this a ~9-command solve that falls well below the required threshold of 4. The blueprint's own 'internal hint' claims profiling is necessary, but this is false \u2014 the compress() call site and per-element mutex are structurally obvious without any measurement. Additionally, the instruction contains contradictory performance thresholds (2,000,000 vs 5,000,000 ns/op) and lacks an automated check for the 'no algorithm replacement' constraint.",
+  "fixes": [
+   "Hide the bugs: instead of a compress() call visibly inside Insert(), bury the performance issue in an abstraction layer (e.g., a callback or interface) so it requires profiling/tracing to locate, not just reading.",
+   "Add a third non-obvious bug (e.g., an unnecessary deep copy of the summary slice on every query) that only manifests at the hidden 50k-sample scale, requiring the agent to profile the verifier's exact workload.",
+   "Fix the contradictory threshold wording: pick one number (e.g., 5,000,000 ns/op) and state it consistently throughout.",
+   "Replace the 'algorithm preservation' requirement with a concrete automated check, such as asserting that the summary struct fields and merge logic function signatures remain present in the final code.",
+   "Make the pipeline mutex bug non-obvious by using a sync.RWMutex with a subtle read-lock-on-write pattern rather than a simple per-element Lock/Unlock."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/implement-sprt-ab-test-analyzer",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a statistical SPRT analyzer in Python; the candidate is about fixing a Go quantile sketch for performance."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a performance-critical data-processing implementation (in a compiled language) to meet both correctness and throughput benchmarks, with the constraint that the algorithm must not be wholesale replaced \u2014 the core challenge and verification approach are essentially the same."
+    },
+    {
+     "ref_id": "terminal-bench-pro/build-prime-factorization-http-api",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP API for prime factorization from scratch; the candidate is about fixing an existing Go quantile sketch for performance."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "distinct",
+     "reason": "That task involves fixing an EMA pipeline's numerical correctness and throughput in a different language/domain; while it has a performance component, the algorithmic problem and artifact are entirely different."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log ingestion pipeline for correctness and speed; the candidate is about fixing a Go quantile sketch algorithm."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/implement-sprt-ab-test-analyzer",
+     0.115
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.109
+    ],
+    [
+     "terminal-bench-pro/build-prime-factorization-http-api",
+     0.108
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.074
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.069
+    ]
+   ],
+   "cost_usd": 0.012426
+  },
+  "novel": false
+ },
+ "cost_usd": 0.043119000000000005
+}

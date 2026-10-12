@@ -1,0 +1,61 @@
+{
+ "slug": "log-aggregator-rollup-drift",
+ "title": "Log Aggregator Rollup Drift",
+ "scenario": "You maintain a backend service that ingests structured JSON access logs from a running web app, aggregates them into per-minute rollup records stored in SQLite, and exposes a summary endpoint. The aggregation daemon is a compiled C binary (/usr/local/bin/logroll) with no source available. Since a recent deploy, downstream dashboards show rollup counts drifting from raw log counts, but only under real traffic patterns \u2014 the synthetic smoke-test the team wrote always passes. There are about 1,400 lines of Python glue code, config files, and a live Nginx instance generating traffic inside the container.",
+ "instruction_draft": "Hey, the log rollup service is messed up again. The `/app/rollup/db/rollups.db` SQLite database should have one row per (minute_bucket, status_class) pair where `count` equals the exact number of raw log lines in `/app/logs/access.log` that fall in that bucket and class. Same for `bytes_sum` \u2014 it should equal the sum of `response_bytes` for those lines. Right now the numbers are wrong under real traffic. Also, we recently added a new feature: the rollup service needs to write a companion file `/app/rollup/db/anomalies.json` that lists every minute_bucket where any status_class had a count spike \u2014 meaning its count is more than 2 standard deviations above that status_class's mean count across all buckets. Each entry should be `{\"bucket\": \"...\", \"status_class\": \"...\", \"count\": N}`. That file doesn't exist yet, you'll need to build it. Make sure both the db rows and the anomalies file are correct after you run whatever pipeline you put together.",
+ "requirements": [
+  "For every (minute_bucket, status_class) pair present in /app/logs/access.log, the rollups.db table `rollups` must have a row where `count` equals the exact number of matching log lines.",
+  "For every such pair, `bytes_sum` must equal the exact sum of `response_bytes` for matching log lines.",
+  "The file /app/rollup/db/anomalies.json must exist and be valid JSON.",
+  "anomalies.json must contain exactly the set of (bucket, status_class) entries where count > mean + 2*stddev for that status_class across all buckets.",
+  "Each anomaly entry must have keys: bucket (string, format YYYY-MM-DD HH:MM), status_class (string e.g. '2xx'), count (integer).",
+  "No spurious entries may appear in anomalies.json \u2014 only genuine spikes qualify."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm base.",
+  "Install: sqlite3, nginx, gcc, python3 packages (flask, schedule, watchdog), all pinned.",
+  "Compile and install /usr/local/bin/logroll from a C source that is NOT left on disk. The binary reads a JSON log file path as argv[1] and a SQLite db path as argv[2], upserts rollup rows into table `rollups(minute_bucket TEXT, status_class TEXT, count INTEGER, bytes_sum INTEGER, PRIMARY KEY(minute_bucket, status_class))`. The binary has a deliberate bug: it truncates response_bytes values to uint16 (max 65535) before summing, so bytes_sum is wrong for large responses. It also silently drops log lines whose `ts` field is not in ISO-8601 format (a format the real log generator sometimes emits for high-load bursts \u2014 a unix-epoch integer string). Neither bug is visible without running it on realistic data.",
+  "A Python log generator script /app/loggen/generator.py runs as a background service (systemd-style via a supervisor or simple loop). It writes JSON lines to /app/logs/access.log. ~80% of lines have ISO-8601 ts, ~20% have unix-epoch integer ts. response_bytes are drawn from a distribution where ~5% exceed 65535. This creates both the ts-drop bug and the bytes truncation bug.",
+  "A Python orchestrator /app/rollup/orchestrator.py calls logroll periodically (every 30s) and is the glue code the solver will read. It does NOT implement anomaly detection \u2014 that's the new feature.",
+  "About 800 lines of additional Python across /app/rollup/ covering config parsing, health endpoints (Flask), a metrics exporter, a log rotation helper, and unit tests for the smoke-test suite. None of this code contains the bug.",
+  "Nginx runs and generates synthetic traffic to a stub endpoint, with access logged to /app/logs/access.log via a Python middleware that formats lines. The middleware is in /app/loggen/ (~200 lines).",
+  "The smoke-test at /app/tests/smoke_test.py generates only ISO-8601 timestamps and response_bytes < 65535, so it always passes against the buggy binary.",
+  "Provide /app/README.md describing the rollup schema and the anomaly file format.",
+  "Pre-populate /app/logs/access.log with ~5000 realistic lines (seeded) so the bugs are already manifested in the db before the solver starts.",
+  "The rollups.db is pre-populated by running logroll on the existing log, so it already contains wrong data.",
+  "A seed-based script /app/scripts/gen_verify_log.py is used at verify time to generate a fresh deterministic log and check the solver's pipeline against it."
+ ],
+ "internal_hint": "Difficulty comes from two opaque_component bugs in the compiled logroll binary that are invisible by source inspection: (1) unix-epoch ts lines are silently dropped (observe_not_read: only ~20% of lines, only visible when running on real data), and (2) response_bytes are truncated to uint16 before summing (only affects ~5% of lines). The solver must characterize the binary by experiment \u2014 feed it controlled inputs and diff against ground truth \u2014 to discover both bugs. The fix is to bypass logroll entirely and reimplement the aggregation in Python (or any language), reading the raw log correctly. The new feature (anomalies.json) requires correctly aggregating first, then computing per-status_class mean and stddev, which is straightforward once the aggregation is correct. A solver who patches only the ts bug will still fail bytes_sum checks. A solver who fixes aggregation but computes anomalies from the still-wrong db will produce wrong anomaly entries.",
+ "trap": "A naive solver runs logroll on the existing log, sees that most counts look plausible (80% of lines land correctly), and writes the anomaly detector on top of the still-wrong db. The hidden verifier uses a fresh log with different seeds where the spike pattern is different, and also checks bytes_sum precisely \u2014 which logroll always gets wrong for large-response lines. The solver also fails if they only fix the ts format issue but keep using logroll (bytes_sum still truncated). Shallow verification against the provided sample passes because the smoke test was designed to avoid both bugs.",
+ "tests": [
+  "At verify time, /app/scripts/gen_verify_log.py generates a fresh deterministic access.log (different seed) with ~3000 lines including ~20% unix-epoch ts and ~6% large-response lines, writes it to a temp path, then runs the solver's pipeline against it.",
+  "Test 1: Query rollups.db for all rows; compare count per (bucket, status_class) against ground truth computed directly from the raw log lines in Python. All must match exactly.",
+  "Test 2: Query rollups.db for bytes_sum per (bucket, status_class); compare against Python ground truth sum of response_bytes (full integer, no truncation). All must match exactly.",
+  "Test 3: Parse /app/rollup/db/anomalies.json; verify it is valid JSON and contains exactly the entries where count > mean(status_class) + 2*std(status_class) across all buckets (computed from ground truth counts). No missing, no spurious entries.",
+  "Test 4: Verify each anomaly entry has exactly the keys bucket, status_class, count with correct types and values.",
+  "Test 5: Re-run the solver's pipeline on a second fresh log (seed+1) to verify the pipeline is general, not hardcoded to the original data."
+ ],
+ "verifier_knob": {
+  "name": "number_of_independent_state_properties_checked",
+  "value": "5 (count correctness, bytes_sum correctness, anomalies.json existence+validity, anomaly set correctness, anomaly entry schema)",
+  "effect": "Dropping bytes_sum check makes it easier (solver only needs to fix ts bug); adding a third fresh-log replay or checking rollup completeness for zero-count buckets makes it harder."
+ },
+ "expected_failure_modes": [
+  "Solver fixes the ts format bug by preprocessing the log before passing to logroll, but keeps logroll for bytes_sum \u2014 bytes_sum tests still fail because of uint16 truncation.",
+  "Solver replaces logroll correctly but builds anomaly detection on the old (wrong) rollups.db rows rather than recomputing from scratch, producing wrong anomaly counts.",
+  "Solver writes anomaly detection that computes stddev incorrectly (e.g., population vs sample, or wrong mean scope \u2014 per bucket vs per status_class), passes on the provided sample but fails on the verify-time log where spike distribution differs.",
+  "Solver characterizes only one of the two binary bugs (ts drop OR bytes truncation) via limited experiments and considers the binary fixed after patching one issue.",
+  "Solver hardcodes anomaly thresholds from the existing data rather than computing dynamically, fails on fresh verify-time log."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "opaque-binary",
+  "observe-not-read",
+  "new-feature",
+  "sqlite",
+  "data-pipeline",
+  "sysadmin"
+ ]
+}

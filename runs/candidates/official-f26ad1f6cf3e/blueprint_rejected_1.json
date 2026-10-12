@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "stream-cipher-audit-go",
+  "title": "Streaming Audit Log Cipher Characterization",
+  "scenario": "A security engineer is auditing an internal log-shipping service written in Go. The service encrypts audit records with a custom streaming cipher before writing them to rotating data files. The cipher implementation is only available as a compiled binary (`/app/bin/encryptor`); the Go source for the decryption side is present but has a subtle parameter derivation bug that causes silent output corruption on certain record lengths. The environment contains ~1,400 lines across several Go source files, a corpus of encrypted data files produced by the reference binary, and a handful of known-plaintext samples the engineer recovered from a staging system.",
+  "instruction_draft": "The encrypted audit log files in `/app/data/` were produced by `/app/bin/encryptor`. The Go service at `/app/service/` is supposed to decrypt them and emit newline-delimited JSON records to `/app/output/records.ndjson`. Currently the output is either missing records or contains corrupted fields. Fix the service so that `/app/output/records.ndjson` contains every record from every log file in `/app/data/`, each record exactly matching the plaintext the encryptor originally encrypted, with no extra or missing records.",
+  "requirements": [
+   "Every plaintext record originally encrypted into `/app/data/*.log` appears exactly once in `/app/output/records.ndjson`.",
+   "No record in `/app/output/records.ndjson` has any corrupted field (field values match the original plaintext byte-for-byte).",
+   "Records appear in the order they were encrypted (file order, then intra-file order).",
+   "The service must handle records of any length from 1 byte to 65535 bytes without corruption.",
+   "The decryption logic must be implemented in the Go service (not by shelling out to the encryptor binary)."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; additionally installs Go 1.22 via apt/tar, no internet at solve time.",
+   "`/app/bin/encryptor`: a compiled Go binary (no source) that reads a newline-delimited plaintext file and writes an encrypted binary log file. It accepts flags: `-key <hex32>` and `-input <file>` and `-output <file>`.",
+   "The encryptor uses a custom stream cipher: ChaCha20 keyed by the provided key, but the nonce for each record is derived as BLAKE2b-256(record_index_as_uint64_big_endian || record_length_as_uint16_big_endian)[0:12]. The record_length used in the nonce is the PADDED length (rounded up to next multiple of 16), not the original length.",
+   "`/app/data/`: 8 encrypted `.log` files produced by the encryptor with a fixed key embedded in `/app/service/config.go`.",
+   "`/app/known/`: 3 plaintext `.txt` files and their corresponding pre-encrypted `.log` files (smaller, staging samples) that the engineer can use for experimentation.",
+   "`/app/service/`: ~1,400 lines of Go across: `main.go`, `decrypt.go`, `record.go`, `config.go`, `pipeline.go`, `writer.go`, `util.go`. The bug is in `decrypt.go`: the nonce derivation uses `record_length` (the raw length from the frame header) instead of `padded_length` (rounded up to the next multiple of 16). The framing is correct; only the nonce derivation is wrong.",
+   "The encrypted file format (discoverable by experiment): 4-byte magic `0xAB 0xCD 0xEF 0x01`, then records each framed as: 2-byte big-endian original length, 2-byte big-endian padded length, padded ciphertext bytes.",
+   "`/app/service/go.mod` and `go.sum` with `golang.org/x/crypto` pinned (for ChaCha20 and BLAKE2b) \u2014 all dependencies vendored under `/app/vendor/`.",
+   "A helper script `/app/tools/encrypt_test.sh` that runs the encryptor on a user-supplied plaintext file, so the engineer can generate known-plaintext/ciphertext pairs.",
+   "The known-plaintext samples in `/app/known/` intentionally contain only records whose lengths happen to be multiples of 16, so the bug is invisible on those samples.",
+   "The production data files in `/app/data/` contain records of mixed lengths, exposing the bug.",
+   "`/app/output/` directory exists and is empty at start."
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources. (1) Opaque component: the encryptor binary must be characterized by experiment \u2014 the engineer must run it on controlled inputs to reverse-engineer the cipher (ChaCha20), the nonce construction (BLAKE2b of index||padded_length), and the framing format. The known-plaintext samples are carefully chosen so the bug is invisible without experimenting on records with non-multiple-of-16 lengths. (2) Build component + subtle math: once the cipher is understood, the engineer must find and fix the nonce derivation bug in `decrypt.go` \u2014 the bug uses `original_length` where it must use `padded_length = (original_length + 15) &^ 15`. The interaction is: the known samples pass with the buggy code, so shallow verification misses the fix. The engineer must generate test vectors with odd-length records (using the encryptor tool), confirm the service fails on them, identify the nonce mismatch, derive the correct formula by inspecting the framing (the padded length is right there in the frame header), and patch `decrypt.go`.",
+  "trap": "The known-plaintext samples in `/app/known/` all have record lengths that are multiples of 16. The buggy `decrypt.go` correctly decrypts those samples because `padded_length == original_length` for those records, so the nonce is identical under both the correct and buggy formulas. An agent that validates only against the known samples will believe the service is working and produce a corrupt `records.ndjson` that the verifier rejects. The verifier generates fresh test data files at verify time using the encryptor binary with records of lengths 1\u201315, 17\u201331, etc.",
+  "tests": [
+   "Verify `/app/output/records.ndjson` exists and is non-empty.",
+   "Run the encryptor at verify time to produce 3 fresh encrypted files with records of lengths 1, 7, 13, 17, 31, 33, 100, 255, 256, 1000, 1024, 1025 bytes (randomly generated plaintext seeded deterministically). Append these to `/app/data/` and re-run the service. Check that all records appear in `records.ndjson` byte-for-byte.",
+   "Verify the total record count in `records.ndjson` equals the total number of records across all original data files (count embedded in a manifest file `/app/data/manifest.json` written at environment build time).",
+   "Verify each line of `records.ndjson` is valid JSON with the correct fields and values (SHA-256 of each line's content matches a pre-computed reference for the original 8 data files).",
+   "Verify record order: the sequence of record hashes matches the order in the manifest.",
+   "Verify the fix is in the Go source, not a shell-out: check that the `decrypt.go` file calls a Go function for decryption (the verifier compiles the service from source and runs it; it does NOT use any cached binary).",
+   "Verify the service handles a single-record file with a 1-byte plaintext without crashing or producing empty output."
+  ],
+  "verifier_knob": {
+   "name": "number_of_independent_state_properties_checked",
+   "value": "7",
+   "effect": "Lowering to 3 checks only existence, count, and one hash batch \u2014 a partially correct solution (e.g., correctly decrypts most records but not edge-length ones) might pass. Raising to 9 adds checks on individual field-level JSON correctness and a stress file with 500 records of all lengths 1\u2013500, making any residual nonce error detectable."
+  },
+  "expected_failure_modes": [
+   "Agent reverses the cipher correctly but misidentifies the nonce input: derives it from original_length instead of padded_length, exactly replicating the bug.",
+   "Agent validates the fix only against the provided known samples (which all have lengths divisible by 16), concludes the service works, and submits without testing odd-length records.",
+   "Agent identifies that the nonce uses 'length' but reads the wrong field from the frame header (there are two length fields: original and padded), picking original rather than padded.",
+   "Agent correctly fixes the nonce formula but introduces an off-by-one in the padding calculation (e.g., `(length + 16) &^ 15` instead of `(length + 15) &^ 15`), which is invisible on lengths that are already multiples of 16.",
+   "Agent reverse-engineers the cipher but misses the BLAKE2b step, assuming the nonce is derived with SHA-256, producing wrong keystreams for all records."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "reverse-engineering",
+   "cryptography",
+   "go",
+   "data-processing",
+   "systems-programming",
+   "opaque-binary"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/service/decrypt.go",
+   "cat /app/service/config.go",
+   "cat /app/service/record.go",
+   "xxd /app/data/some.log | head -20",
+   "grep -n 'nonce\\|blake\\|length\\|padded' /app/service/decrypt.go",
+   "Observe: nonce uses original_length field, frame header has both original_length and padded_length",
+   "cat /app/service/util.go",
+   "Identify bug: nonce derivation passes original_length instead of padded_length",
+   "sed -i 's/originalLength/paddedLength/g' /app/service/decrypt.go  (or targeted edit)",
+   "Verify padding formula: (length+15)&^15 already in record.go or add it",
+   "cd /app && go build -o /app/service/svc ./service/",
+   "/app/service/svc",
+   "wc -l /app/output/records.ndjson",
+   "cat /app/data/manifest.json",
+   "python3 -c \"import json,hashlib; [print(hashlib.sha256(l).hexdigest()) for l in open('/app/output/records.ndjson','rb')]\" | head -5"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'opaque binary characterization' difficulty lever is largely nullified because the Go source files import golang.org/x/crypto/chacha20 and blake2b \u2014 an agent reading decrypt.go sees the algorithm directly without needing to reverse-engineer the binary.",
+   "The bug is a single variable name substitution (originalLength \u2192 paddedLength) visible by reading decrypt.go; no experimentation with the encryptor binary is required to find it.",
+   "The verifier re-runs the service after appending new files to /app/data/ \u2014 if the service reads all files at startup this works, but if it caches state or the output file isn't cleared between runs, the record count check could double-count or miss records (flaky).",
+   "The verifier's 'compile from source' check could fail if the agent edits go.mod or vendor directory in unexpected ways, causing a build failure unrelated to correctness.",
+   "SHA-256 reference hashes for original 8 data files are pre-computed at build time \u2014 if the build process is non-deterministic (e.g., random plaintext without fixed seed), hashes could be wrong; blueprint says 'deterministically seeded' for verify-time data but not clearly for build-time data."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty is at most 2: the bug is a single variable substitution visible by reading decrypt.go (the source is present and imports reveal the algorithm), so the 'opaque binary' lever provides no real obstacle and the speedrun completes in ~15 commands without any binary experimentation. The task fails the genuine_difficulty threshold of 4 required for acceptance. The interaction between the trap and the fix is clever in design but collapses in practice because the source code makes the cipher and the bug immediately legible.",
+  "fixes": [
+   "Remove the cipher algorithm from the Go source entirely: make decrypt.go contain only a stub that calls an undefined function, forcing the agent to characterize the binary to learn both the algorithm (ChaCha20 vs AES-CTR vs RC4) and the nonce construction \u2014 the source should not import or name the cipher.",
+   "Split the bug into two independent issues (e.g., wrong hash function AND wrong length field) so that fixing one still produces wrong output, requiring multiple rounds of experimentation against the encryptor.",
+   "Make the known-plaintext samples use a different key than the production data, so the agent cannot validate their fix against /app/known/ at all and must generate their own test vectors using the encryptor binary \u2014 this forces genuine binary interaction.",
+   "Add a second subtle bug in pipeline.go (e.g., off-by-one in file ordering) that is only visible on the full dataset, raising the number of required fix-and-verify cycles."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about schema validation and performance of a log ingestion pipeline, not cryptographic cipher debugging or decryption."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves HMAC-SHA256 computation over a binary WAL record format via TCP, not fixing a streaming cipher decryption bug in Go."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "variant",
+     "reason": "Both tasks involve reverse-engineering or fixing a Go streaming cipher, but the candidate asks to debug a parameter derivation bug in existing decryption code while the reference asks to implement encryption by reversing a decryption binary."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted aggregation in a sales service, unrelated to cryptography or streaming ciphers."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves repairing a NetFlow v9 UDP/TCP aggregation service in Rust, with no cryptographic or cipher component."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-94391df591b0",
+     0.401
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.277
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.231
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.188
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.169
+    ]
+   ],
+   "cost_usd": 0.011865
+  },
+  "novel": false
+ },
+ "cost_usd": 0.045447
+}

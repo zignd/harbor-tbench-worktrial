@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "fixed-point-sqrt-overflow",
+  "title": "Fixed-Point Square Root Overflow",
+  "scenario": "A backend developer maintains a small in-house Go service that computes integer square roots using a fixed-point Newton-Raphson iteration for an embedded telemetry pipeline. The service has been silently producing wrong results on certain inputs since a 'performance refactor' three weeks ago. The codebase is ~1200 lines across several packages: a core math library, an HTTP handler layer, a batch processor, and a calibration module. The bug only manifests on specific input magnitudes and is invisible by reading the code path alone\u2014it requires running the code and observing numerical divergence.",
+  "instruction_draft": "The integer square root service at /app produces incorrect results for some inputs. Fix it so that isqrt(n) returns floor(sqrt(n)) for every n in [0, 2^62] and the batch endpoint processes 500,000 calls in under 2 seconds on this machine.",
+  "requirements": [
+   "isqrt(n) == floor(sqrt(n)) for all n in [0, 2^62]",
+   "The batch HTTP endpoint completes 500,000 calls in under 2 seconds"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22 via apt/manual install",
+   "/app/mathlib/isqrt.go: fixed-point Newton-Raphson isqrt using uint64 arithmetic; the 'performance refactor' replaced the initial seed with `x >> 32` (a bitshift) instead of `1 << ((bits.Len64(x)+1)/2)`, which causes the iteration to converge to the wrong fixed point for inputs where x has an odd number of significant bits and x > 2^32",
+   "/app/mathlib/isqrt_test.go: tests only small values (0..1000) and two hardcoded large values that happen to work with the broken seed",
+   "/app/handler/batch.go: HTTP handler that accepts a JSON array of uint64 and returns isqrt for each; currently calls isqrt in a simple loop with no concurrency",
+   "/app/processor/calibrate.go: ~300 lines of plausible calibration logic that calls isqrt internally but is not the source of the bug",
+   "/app/cmd/server/main.go: wires everything together, starts on :8080",
+   "/app/bench/bench_test.go: a Go benchmark that measures batch throughput; the current implementation is too slow to pass 500k/2s",
+   "A sample client script /app/scripts/check_sample.py that tests a handful of values including some that pass with the broken seed, giving false confidence",
+   "The broken seed formula `x >> 32` is correct for x in [2^32, 2^33) but diverges or converges slowly for many ranges outside that band, requiring multiple extra iterations or producing off-by-one results",
+   "The batch handler processes requests serially; to hit 500k/2s the solver must add concurrency (goroutines + sync) or inline the math to avoid function call overhead, or use a lookup-table accelerated approach"
+  ],
+  "internal_hint": "Difficulty source 1 (not visible by reading): The broken seed `x >> 32` produces the wrong initial Newton-Raphson estimate for inputs where bits.Len64(x) is odd and x is outside [2^32, 2^33). The iteration still terminates (it converges to a nearby fixed point), so the function returns a plausible-looking but wrong value\u2014off by 1 in floor direction for certain ranges. This is invisible by code inspection because the logic looks 'almost right' and the existing tests don't cover the failing ranges. The solver must run the code against a range of large inputs to observe the divergence. Difficulty source 2 (quantitative bar): The serial batch loop cannot hit 500k/2s; the solver must parallelize (worker pool or goroutine fan-out) AND fix the math. A solver who only fixes the math correctness fails the throughput test. A solver who only adds concurrency fails correctness. The fix: restore the seed to `uint64(1) << ((bits.Len64(x)+1)/2)` (or equivalent) and add a goroutine pool in the batch handler.",
+  "trap": "A naive solver reads the Newton-Raphson loop, sees it looks reasonable, runs the provided sample script (which tests values that accidentally pass), concludes the math is fine, and only adds concurrency to hit the throughput bar. The hidden verifier tests isqrt on inputs like 2^40+1, 2^50-1, 2^61, and a sweep of all odd-bit-length ranges, where the wrong seed produces results that are off by 1. Conversely, a solver who fixes only the math but leaves the serial loop fails the 2-second threshold on 500k calls.",
+  "tests": [
+   "Correctness: verifier generates ~10,000 random uint64 values uniformly sampled from [0, 2^62], calls the HTTP endpoint for each, and checks isqrt(n) == floor(sqrt(n)) using Python's math.isqrt as reference; any mismatch fails",
+   "Correctness: verifier tests the specific ranges where the broken seed diverges: all integers in spot-check bands around 2^34, 2^40, 2^50, 2^60 (100 values each)",
+   "Throughput: verifier posts a single batch request of 500,000 random uint64 values and asserts the response arrives in under 2.0 seconds (wall clock, measured by the verifier process)",
+   "Correctness edge cases: isqrt(0)==0, isqrt(1)==1, isqrt(4)==2, isqrt(2^62)==2^31, isqrt(2^62-1)==2^31-1"
+  ],
+  "verifier_knob": {
+   "name": "performance_threshold",
+   "value": "500000 calls in 2 seconds",
+   "effect": "Lowering to 100k/2s makes the serial loop nearly fast enough (easy); raising to 1M/2s requires more aggressive optimization like SIMD or batch math (very hard). At 500k/2s, a simple goroutine pool suffices but must be correctly implemented."
+  },
+  "expected_failure_modes": [
+   "Agent runs provided sample tests, all pass, concludes math is correct, only adds concurrency\u2014fails hidden correctness sweep on odd-bit-length inputs",
+   "Agent identifies the seed formula as suspicious, replaces it with a correct version, but leaves the serial loop\u2014passes correctness, fails throughput threshold",
+   "Agent adds concurrency with a data race (unsynchronized result slice writes), causing intermittent wrong answers or panics under the verifier's concurrent load",
+   "Agent uses math.Sqrt (float64) as the isqrt implementation\u2014correct for small n but wrong for n near 2^62 due to float64 precision loss (off by 1 for values where float64 cannot represent consecutive integers)",
+   "Agent fixes the seed formula but introduces an off-by-one in the convergence termination condition, passing most tests but failing a few boundary values in the hidden sweep"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "golang",
+   "numerical-methods",
+   "fixed-point-arithmetic",
+   "concurrency",
+   "reverse-engineering",
+   "throughput"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/mathlib/isqrt.go",
+   "cat /app/handler/batch.go",
+   "cat /app/mathlib/isqrt_test.go",
+   "cat /app/scripts/check_sample.py",
+   "# Immediately spot x>>32 seed as suspicious vs correct 1<<((bits.Len64(x)+1)/2)",
+   "# Edit isqrt.go: replace `x >> 32` seed with `uint64(1) << ((bits.Len64(x)+1)/2)`",
+   "sed -i 's/x >> 32/uint64(1) << ((bits.Len64(x)+1)\\/2)/' /app/mathlib/isqrt.go",
+   "cd /app && go test ./mathlib/... -run TestIsqrt",
+   "# Edit batch.go: add goroutine fan-out with sync.WaitGroup over input slice",
+   "# Write parallel batch handler using worker pool or goroutine-per-item with mutex/channel",
+   "cat /app/handler/batch.go  # confirm structure before editing",
+   "# Implement parallel version: split slice into GOMAXPROCS chunks, goroutine per chunk, WaitGroup",
+   "vi /app/handler/batch.go  # or use sed/heredoc to rewrite handler",
+   "cd /app && go build ./...",
+   "cd /app && go test ./... -v",
+   "# Start server and run quick manual check",
+   "go run /app/cmd/server/main.go &",
+   "curl -s -X POST http://localhost:8080/batch -d '[4611686018427387904]'  # 2^62",
+   "# Run bench to verify throughput",
+   "cd /app && go test ./bench/... -bench=. -benchtime=5s",
+   "# Confirm 500k in <2s from bench output"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The broken seed `x >> 32` is visible by reading the code\u2014a skilled agent will immediately recognize it as wrong compared to the standard Newton-Raphson seed formula, making the bug discoverable by inspection rather than requiring runtime observation as the scenario claims.",
+   "The throughput threshold (500k in 2s) is machine-dependent; on a slow container or under CPU contention the threshold may be unreachable even with correct parallelism, causing valid solutions to fail.",
+   "GOMAXPROCS in the container is unspecified; if the container is single-CPU, goroutine parallelism provides no speedup and the throughput bar may be impossible to hit with goroutines alone, forcing a lookup-table approach that significantly raises implementation complexity.",
+   "The instruction says 'under 2 seconds on this machine' but the machine spec is not pinned in the Dockerfile\u2014different CI runners could make this flaky.",
+   "Using `math.isqrt` in Python as reference is correct, but the verifier using float64 intermediate math could itself have precision issues near 2^62 if not carefully implemented.",
+   "The scenario says the bug is 'invisible by reading the code path alone' but `x >> 32` vs `1 << ((bits.Len64(x)+1)/2)` is a well-known Newton-Raphson seed pattern that any engineer familiar with fixed-point math will spot immediately on first read."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 3 (borderline) because the bug is directly visible by reading the source\u2014`x >> 32` is an obviously wrong Newton-Raphson seed to any engineer familiar with the algorithm, contradicting the scenario's claim that it requires runtime observation. The speedrun reaches a plausible solution in ~20 commands by pure code inspection, which per the rubric caps genuine_difficulty at 2-3. Additionally, the throughput threshold is machine-dependent and unspecified CPU count in the container creates a real risk of invalid failures where correct parallel solutions still miss the 2-second bar on constrained hardware.",
+  "fixes": [
+   "Make the bug truly invisible by inspection: instead of a wrong seed formula, introduce a subtle integer overflow in the convergence termination condition (e.g., `prev - curr < 2` using unsigned subtraction that wraps for certain values) that looks correct but silently terminates early for specific input ranges\u2014this cannot be spotted without running the code.",
+   "Pin GOMAXPROCS and CPU count explicitly in the Dockerfile (e.g., `ENV GOMAXPROCS=4`) and calibrate the 500k/2s threshold against that specific configuration, or express the threshold as 'median of 3 runs' to reduce flakiness.",
+   "Replace the sample check script with one that tests values in the failing ranges (2^40, 2^50, etc.) so the trap is that the agent trusts the script rather than the script accidentally revealing the bug\u2014currently the script gives false confidence which is good, but make it more systematically misleading.",
+   "Add a red-herring performance issue in calibrate.go (e.g., an unnecessary mutex) so the agent must profile to find the real bottleneck in batch.go rather than immediately seeing the serial loop."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/build-prime-factorization-http-api",
+     "verdict": "distinct",
+     "reason": "That task builds a prime factorization HTTP API from scratch; the candidate task involves debugging a fixed-point Newton-Raphson integer square root overflow bug in an existing Go service."
+    },
+    {
+     "ref_id": "terminal-bench-pro/python-prime-http-server",
+     "verdict": "distinct",
+     "reason": "That task builds a prime/factorization HTTP server in Python; the candidate task is about finding and fixing a numerical overflow bug in an existing Go fixed-point square root implementation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/python-jacobi-eigen-solver-conversion",
+     "verdict": "distinct",
+     "reason": "That task converts a Fortran eigenvalue solver to Python; the candidate task debugs a fixed-point integer square root overflow in a Go service."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task fixes a weighted aggregation bug in a sales service; the candidate task fixes a numerical overflow in a fixed-point square root algorithm."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task fixes a binary frame codec protocol bug; the candidate task fixes a fixed-point arithmetic overflow in an integer square root Newton-Raphson iteration."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/build-prime-factorization-http-api",
+     0.256
+    ],
+    [
+     "terminal-bench-pro/python-prime-http-server",
+     0.215
+    ],
+    [
+     "terminal-bench-pro/python-jacobi-eigen-solver-conversion",
+     0.131
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.101
+    ],
+    [
+     "ours/official-aac910462208",
+     0.093
+    ]
+   ],
+   "cost_usd": 0.012320999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.038706
+}

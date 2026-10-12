@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "log-ingestion-anomaly-pipeline",
+  "title": "Structured Log Anomaly Aggregation Service",
+  "scenario": "A backend developer has a running log ingestion service inside a container. The service reads structured JSON logs from a Unix domain socket, classifies events by severity and source, and writes per-minute anomaly summaries to a PostgreSQL table. The developer noticed that the anomaly counts in production dashboards look wrong \u2014 sometimes way too low, sometimes doubled \u2014 but only after the system has been running a while with real traffic. The container has the running service, a log replay tool, and a compiled classifier binary with no source.",
+  "instruction_draft": "Hey, something's wrong with the anomaly aggregation service at /app. It reads logs off the socket, classifies them with the classifier binary, and should write one row per (minute_bucket, source, severity) to the anomaly_summary table in PostgreSQL with an accurate event_count. When I replay the sample traffic I see wrong counts \u2014 some buckets are missing, some are doubled. There's also a `replayer` tool at /app/tools/replayer that can feed traffic at different rates. Please fix it so that: (1) after replaying /app/data/sample.ndjson, the anomaly_summary table has exactly one row per (minute_bucket, source, severity) tuple, (2) event_count in each row matches the true count of events with that (minute_bucket, source, severity) in the input, (3) the pipeline is idempotent \u2014 replaying the same file a second time does not change any row, and (4) the classifier binary must still be used for all severity assignments (do not hardcode or bypass it).",
+  "requirements": [
+   "After replaying sample.ndjson, anomaly_summary has exactly one row per (minute_bucket, source, severity) tuple \u2014 no duplicate composite keys.",
+   "The event_count in each row equals the true count of events with that (minute_bucket, source, severity) in the input data.",
+   "Replaying the same file a second time leaves all rows unchanged (idempotency).",
+   "The compiled classifier binary at /app/bin/classifier must be invoked for severity classification \u2014 not bypassed or reimplemented by hardcoding."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm; install postgresql-15, python3-psycopg2, socat; pin versions.",
+   "PostgreSQL running locally (port 5432, db=logdb, user=loguser, password=logpass); table anomaly_summary(minute_bucket TIMESTAMPTZ, source TEXT, severity TEXT, event_count INT) created at startup.",
+   "Running ingestion service: /app/ingestor.py \u2014 reads newline-delimited JSON from Unix socket /tmp/logsock, calls /app/bin/classifier for each event, inserts into anomaly_summary. Service started via supervisord or a simple loop in a startup script.",
+   "Planted bug 1 (observe_not_read): ingestor.py uses a worker thread pool to call the classifier subprocess in parallel; it accumulates counts in a shared dict without a lock, causing race-condition undercounting that only manifests at higher event rates.",
+   "Planted bug 2 (observe_not_read): the INSERT statement does plain INSERT (no ON CONFLICT), so replaying creates duplicate rows; the aggregation also groups by source+severity but truncates the timestamp to the wrong granularity (seconds instead of minutes) for some code path, causing split buckets under bursty traffic.",
+   "Compiled classifier binary /app/bin/classifier (Python compiled with Cython or a small C binary, no readable source): reads a JSON line from stdin, prints a severity string to stdout. It has a subtle behavior: for events with 'level' field already set to 'WARN', it maps them to 'warning' (lowercase), but for all others it uses the 'level' field verbatim lowercased EXCEPT for 'ERROR' which it maps to 'critical'. This mapping must be discovered by experiment.",
+   "Replayer tool /app/tools/replayer: a Python script that takes a file path and optional --rate flag (events/sec) and feeds events to /tmp/logsock. Default rate is 1 ev/sec; --rate 50 triggers the race condition reliably.",
+   "Sample data /app/data/sample.ndjson: ~500 events spanning 5 minutes, sources=['auth','api','db'], levels=['INFO','WARN','ERROR','DEBUG']. Ground truth counts computable from the file.",
+   "Verification-time: verifier generates a fresh ndjson file with different counts/sources/timestamps, replays it twice, then checks the four requirements against anomaly_summary."
+  ],
+  "internal_hint": "Difficulty comes from two interacting issues that are invisible by code inspection alone: (1) The race condition in the thread-pool accumulation only appears at high event rates \u2014 the solver must run the replayer at --rate 50 to observe undercounting, then instrument the code to find the missing lock. (2) The INSERT without ON CONFLICT causes duplicates on replay, and the timestamp truncation bug (floor to seconds vs minutes) only shows up with bursty traffic where two events in the same second but logically the same minute get separate rows. The classifier binary maps 'WARN'\u2192'warning' and 'ERROR'\u2192'critical' \u2014 this must be discovered by feeding test inputs to the binary, not by reading source. The fix requires: adding a threading.Lock around the shared accumulation dict, changing INSERT to INSERT ... ON CONFLICT (minute_bucket, source, severity) DO UPDATE SET event_count = event_count + EXCLUDED.event_count (with a UNIQUE constraint added), fixing the timestamp truncation to date_trunc('minute', ...), and adding a UNIQUE constraint. The idempotency fix means the pipeline must upsert, not insert. A partial fix (only fixing the lock but not the upsert, or fixing the upsert but not the timestamp granularity) fails the hidden tests because the verifier uses bursty traffic.",
+  "trap": "A shallow fix only adds ON CONFLICT for idempotency but misses the timestamp truncation bug \u2014 the hidden test uses a burst of events within the same minute, which the broken truncation splits into multiple second-level buckets, so event_count is wrong even though there are no strict duplicates. Agents that test only with the default slow replay rate never trigger the race condition and think the counts are fine. Agents that hardcode the classifier mapping (after probing it on sample data) fail because the verifier generates events with level values not in the sample.",
+  "tests": [
+   "After one replay of sample.ndjson at rate 50, COUNT(*) from anomaly_summary equals the number of distinct (minute_bucket, source, severity) tuples computed independently from the file.",
+   "For each row in anomaly_summary, event_count equals the ground-truth count of matching events in sample.ndjson (verifier computes this independently in Python).",
+   "After a second replay of the same file, all rows are unchanged: no new rows, no changed event_count values.",
+   "Verifier generates a fresh ndjson (different sources 'cache','queue', different minute spans, includes 'WARN' and 'ERROR' events) and replays it; checks that severity values in anomaly_summary are 'warning' (not 'WARN') and 'critical' (not 'ERROR'), confirming the classifier binary is still being used.",
+   "Verifier replays the fresh file a second time and checks idempotency on the new data.",
+   "A row with minute_bucket for a burst of events all within the same 60-second window must show a single row, not multiple per-second rows."
+  ],
+  "verifier_knob": {
+   "name": "burst_rate",
+   "value": "50 events/sec for hidden tests vs 1 for sample",
+   "effect": "Lowering to 1 ev/sec makes the race condition and timestamp bug unlikely to manifest; raising to 50+ reliably exposes both. At the hardest setting, also inject events with novel level strings to stress-test classifier passthrough."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the ON CONFLICT upsert but misses the timestamp truncation bug \u2014 counts are wrong for bursty hidden data.",
+   "Agent runs replayer at default rate, sees correct counts by luck (no race condition triggered), declares success without testing at high rate.",
+   "Agent probes classifier on a few sample inputs and hardcodes the mapping instead of calling the binary \u2014 fails on novel level strings in hidden test data.",
+   "Agent adds the lock but uses the wrong granularity for minute_bucket (e.g., truncates to hour), causing all events to collapse into one row.",
+   "Agent adds ON CONFLICT but uses DO NOTHING instead of DO UPDATE, so the second replay leaves stale counts from partial first run."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "postgresql",
+   "race-condition",
+   "opaque-binary",
+   "idempotency",
+   "log-processing",
+   "concurrency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/ingestor.py",
+   "cat /app/tools/replayer",
+   "echo '{\"level\":\"WARN\",\"source\":\"auth\",\"message\":\"t\"}' | /app/bin/classifier",
+   "echo '{\"level\":\"ERROR\",\"source\":\"auth\",\"message\":\"t\"}' | /app/bin/classifier",
+   "echo '{\"level\":\"INFO\",\"source\":\"auth\",\"message\":\"t\"}' | /app/bin/classifier",
+   "psql -U loguser -d logdb -c '\\d anomaly_summary'",
+   "# All three bugs now visible from source: missing lock, wrong truncation, no ON CONFLICT",
+   "nano /app/ingestor.py  # add threading.Lock, fix date_trunc('minute',...), add ON CONFLICT upsert",
+   "psql -U loguser -d logdb -c 'ALTER TABLE anomaly_summary ADD CONSTRAINT uq_summary UNIQUE (minute_bucket, source, severity)'",
+   "pkill -f ingestor.py && python3 /app/ingestor.py &",
+   "sleep 1",
+   "python3 /app/tools/replayer /app/data/sample.ndjson --rate 50",
+   "sleep 2",
+   "psql -U loguser -d logdb -c 'SELECT COUNT(*) FROM anomaly_summary'",
+   "python3 -c \"import json; from collections import Counter; data=[json.loads(l) for l in open('/app/data/sample.ndjson')]; print(len(set((l['ts'][:16],l['source'],l['level']) for l in data)))\"",
+   "python3 /app/tools/replayer /app/data/sample.ndjson --rate 50",
+   "psql -U loguser -d logdb -c 'SELECT * FROM anomaly_summary ORDER BY 1,2,3'"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'observe_not_read' tag is misleading: all bugs are in readable Python source (ingestor.py), so an agent can fix everything by code inspection without ever running the replayer at high rate \u2014 the race condition is visible in the code, not just at runtime.",
+   "Timing sensitivity: at --rate 50 with 1 CPU / 2 GB, the race condition may or may not manifest depending on GIL scheduling; Python's GIL may actually prevent the race from appearing reliably, making the bug invisible at runtime even at high rates (dict operations in CPython are often GIL-protected).",
+   "The verifier's fresh ndjson generation is not fully specified \u2014 if the burst events happen to fall in different seconds AND different minutes, the truncation bug test is vacuous.",
+   "Supervisord/startup script restart behavior after ingestor.py is edited is not specified \u2014 agent may not know how to restart the service correctly, causing a valid fix to appear broken.",
+   "The UNIQUE constraint must be added by the agent (not pre-existing) \u2014 if the verifier's test runs before the agent adds it, ON CONFLICT will fail with an error rather than silently doing wrong things, which could cause confusing failures.",
+   "Python's threading and GIL interaction with subprocess calls means the race condition in a shared dict may be extremely hard to trigger reliably \u2014 the task's core 'observe_not_read' premise may be undermined."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: all three bugs (missing lock, wrong timestamp truncation, missing ON CONFLICT) are directly visible by reading the Python source ingestor.py, so a skilled agent needs no runtime observation to identify and fix them. The 'observe_not_read' framing is false \u2014 this is a code-reading task. Additionally, Python's GIL may prevent the dict race condition from manifesting reliably at runtime even at high rates, making the core runtime-observation premise unreliable and creating invalid failure risks.",
+  "fixes": [
+   "Make ingestor.py a compiled/opaque binary (like the classifier) so bugs cannot be read from source \u2014 the agent must infer behavior from runtime observation only, genuinely requiring the 'observe_not_read' approach.",
+   "Replace the Python threading race with a multiprocessing or async pattern where the GIL does not protect the shared state, ensuring the race condition reliably manifests at high rates on 1 CPU.",
+   "Pre-add the UNIQUE constraint to the table schema so the agent doesn't need to discover that it's missing \u2014 or make the constraint requirement explicit in the instructions to avoid ambiguity about whether the agent must add it.",
+   "If keeping readable source, increase genuine difficulty by adding a third non-obvious bug (e.g., the classifier binary silently drops events with unknown fields, causing systematic undercounting that only appears with the verifier's fresh data containing new field names).",
+   "Specify exactly how to restart the ingestion service (e.g., 'use supervisorctl restart ingestor') to avoid invalid failures from service restart confusion."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/bash-ddos-traffic-analyzer",
+     "verdict": "distinct",
+     "reason": "That task is about detecting DDoS patterns in network traffic logs via shell script; the candidate is about fixing a log aggregation pipeline with race conditions, deduplication, and idempotency in a PostgreSQL-backed service."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/log-summary-date-ranges",
+     "verdict": "distinct",
+     "reason": "That task is a straightforward log parsing and CSV summarization exercise; the candidate involves debugging a running service with concurrency/deduplication bugs, a Unix socket, a classifier binary, and database idempotency requirements."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation and performance in a Node.js NDJSON ingestion service; the candidate focuses on fixing duplicate/missing counts in a PostgreSQL aggregation pipeline with idempotency and an external classifier binary."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted aggregation due to wrong config values in a compiled service; the candidate is about fixing race conditions or logic bugs causing duplicate/missing rows in a streaming log aggregation pipeline with idempotency requirements."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-splitting and deduplication bugs in a CSV batch pipeline; the candidate involves a real-time log ingestion service reading from a Unix socket, classifying with a binary, and writing idempotent aggregates to PostgreSQL."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/bash-ddos-traffic-analyzer",
+     0.238
+    ],
+    [
+     "terminal-bench-2-1/log-summary-date-ranges",
+     0.168
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.162
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.151
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.109
+    ]
+   ],
+   "cost_usd": 0.013422
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056313
+}

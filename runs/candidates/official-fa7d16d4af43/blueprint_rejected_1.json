@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "sql-etl-normalizer-threshold",
+  "title": "Release ETL Normalizer Accuracy Fix",
+  "scenario": "You are a release engineer on a data platform team. The nightly build ships a compiled C binary `/app/bin/etl_normalize` that ingests raw transaction CSV files, applies a multi-step normalization pipeline, and writes results to a SQLite database. The pipeline then runs a SQL analytics layer on top that computes per-account settlement figures. The last release broke something: QA reports that settlement totals are wrong on roughly 15\u201330% of accounts, but only on inputs with certain amount distributions. The environment contains the binary (no source), the SQL layer (~600 lines across several files), sample data, and a test harness.",
+  "instruction_draft": "The nightly ETL pipeline at `/app` is producing incorrect per-account settlement totals that fail the \u2265 95% row-accuracy threshold on QA's hidden test suite. The pipeline has two stages: (1) the compiled binary `/app/bin/etl_normalize` reads `input.csv`, applies normalization, and writes `normalized.db`; (2) the SQL scripts in `/app/sql/` run against `normalized.db` and populate `settlements.db` with final per-account totals.\n\nYour job: make the end-to-end pipeline produce settlement totals that match the reference figures to within \u00b10.01 on at least 95% of accounts across all hidden test inputs. The reference figures are computed by a separate verifier using the same binary but with correct SQL. Every requirement the verifier checks is stated here: (a) `settlements.db` must exist and contain a table `account_settlements` with columns `account_id TEXT` and `total_amount REAL`; (b) each row's `total_amount` must match the reference within \u00b10.01; (c) at least 95% of accounts must satisfy (b); (d) no account present in the input may be absent from `account_settlements`.",
+  "requirements": [
+   "`settlements.db` must exist after running `/app/run_pipeline.sh`",
+   "`account_settlements` table must have columns `account_id TEXT` and `total_amount REAL`",
+   "Each account in the input must appear exactly once in `account_settlements`",
+   "At least 95% of accounts must have `total_amount` within \u00b10.01 of the reference value",
+   "No account present in the input may be missing from `account_settlements`"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3, python3-pip; compiles a C binary etl_normalize from source (source NOT included in final image, only binary) and places it at /app/bin/etl_normalize",
+   "The binary reads /app/data/input.csv, performs: (1) amount parsing that treats values >= 10000 as being in cents and divides by 100, (2) deduplication that keeps the LAST occurrence of each (account_id, txn_id) pair, (3) writes to /app/data/normalized.db table `transactions(account_id TEXT, txn_id TEXT, amount REAL, ts INTEGER)`",
+   "The binary's deduplication behavior is opaque: it must be discovered by experiment \u2014 the binary silently keeps the LAST row per (account_id, txn_id) rather than the first, which is undocumented",
+   "The binary's amount normalization threshold is exactly 10000 (>= 10000 \u2192 divide by 100), discoverable only by feeding probe inputs",
+   "/app/sql/ contains: 01_stage.sql (creates staging view), 02_settlements.sql (computes settlements \u2014 contains TWO bugs: a GROUP BY that incorrectly uses MIN(ts) to pick which duplicate to keep rather than trusting the binary's dedup, and a SUM that double-counts transactions with ts=0), 03_finalize.sql (writes to settlements.db)",
+   "/app/run_pipeline.sh: runs the binary then executes all SQL files in order against normalized.db, writing final output to /app/data/settlements.db",
+   "/app/data/input.csv: ~500 rows of sample data including duplicated (account_id, txn_id) pairs and amounts both above and below 10000, and some ts=0 rows",
+   "/app/data/reference_sample.csv: a small reference output for 20 accounts showing correct totals, so the solver can validate their fix locally",
+   "SQL files are ~200 lines total; ~400 lines of plausible but uninvolved helper scripts in /app/sql/lib/ for schema validation and logging",
+   "Python packages: none required beyond stdlib; sqlite3 available system-wide"
+  ],
+  "internal_hint": "Difficulty comes from two interacting opaque components. First, the binary's behavior must be characterized by experiment (feeding probe CSVs and inspecting normalized.db): it keeps the LAST occurrence of duplicate (account_id, txn_id) pairs and divides amounts >= 10000 by 100. Second, the SQL layer has two bugs that interact: (a) 02_settlements.sql re-implements deduplication using MIN(ts) which contradicts the binary's LAST-wins rule, causing wrong amounts on any account with duplicate txn_ids; (b) a WHERE clause in the SUM incorrectly filters out ts=0 rows (written as `WHERE ts > 0`), undercounting accounts that have legitimate zero-timestamp transactions. A solver who only fixes one bug will pass ~70% of accounts but fail the 95% threshold. The ordered procedure: first characterize binary behavior, then fix the SQL dedup logic to trust the binary's output (remove the re-dedup), then fix the ts=0 filter. Getting the dedup direction wrong (using MAX instead of trusting the binary, or using FIRST instead of LAST) silently corrupts results on hidden inputs with carefully constructed duplicate pairs.",
+  "trap": "A solver who only fixes the ts=0 filter bug (the more visible one) will pass about 75-80% of accounts on hidden inputs but fail the 95% threshold. A solver who characterizes the binary's dedup as FIRST-wins (a natural assumption) rather than LAST-wins will produce wrong totals on any hidden input where the last duplicate has a different amount than the first. The hidden test inputs are generated at verify time with controlled duplicate distributions that expose both bugs simultaneously; the sample data has few enough duplicates that fixing only one bug appears to pass locally.",
+  "tests": [
+   "Run /app/run_pipeline.sh on a fresh generated input.csv with 2000 accounts, 30% having duplicate txn_ids where last and first amounts differ by >1.00, 20% having ts=0 rows, and 15% having amounts >= 10000; verify settlements.db exists",
+   "Check account_settlements has exactly one row per account_id in the input",
+   "For each account, compute reference total using: take last occurrence of each txn_id, apply >=10000 /100 normalization, sum all amounts including ts=0; compare to account_settlements.total_amount within \u00b10.01",
+   "Assert at least 95% of accounts pass the \u00b10.01 check",
+   "Verify no account from input is absent from account_settlements",
+   "Run a second generated input with extreme cases: accounts with 5+ duplicate txn_ids, all ts=0, all amounts exactly 9999 or 10000; assert 95% accuracy threshold still holds"
+  ],
+  "verifier_knob": {
+   "name": "accuracy_threshold",
+   "value": "0.95",
+   "effect": "Lowering to 0.85 makes it passable by fixing only one bug; raising to 0.98 requires perfect handling of all edge cases including exact boundary amounts at 10000 and all-zero-ts accounts"
+  },
+  "expected_failure_modes": [
+   "Agent fixes the ts=0 SQL bug but mischaracterizes the binary's dedup as FIRST-wins; passes local sample but fails hidden inputs with last-wins duplicates",
+   "Agent correctly identifies both SQL bugs but reimplements dedup in SQL using MAX(ts) rather than trusting binary output, which fails when ts values are tied or non-monotonic",
+   "Agent only probes the binary with non-duplicate inputs, never discovers the LAST-wins dedup behavior, and leaves the SQL dedup logic in place",
+   "Agent fixes the SQL but does not account for the >=10000 threshold exactly (uses >10000 or >9999), causing off-by-one failures on amounts of exactly 10000",
+   "Agent verifies only against reference_sample.csv (20 accounts, all passing) and declares victory without testing the full pipeline on generated inputs"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-engineering",
+  "tags": [
+   "sql",
+   "etl",
+   "black-box-binary",
+   "data-processing",
+   "feature-iteration",
+   "specification-adherence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/run_pipeline.sh",
+   "cat /app/sql/02_settlements.sql",
+   "cat /app/sql/01_stage.sql",
+   "cat /app/sql/03_finalize.sql",
+   "head -50 /app/data/input.csv",
+   "cat /app/data/reference_sample.csv",
+   "Create probe CSV: acc1,txn1,5.00,1 and acc1,txn1,9.00,2 plus amount=10000 row",
+   "cp probe.csv /app/data/input.csv && /app/bin/etl_normalize",
+   "sqlite3 /app/data/normalized.db 'SELECT * FROM transactions;' -- confirm LAST-wins, 10000->100",
+   "Probe 9999 vs 10000 threshold to confirm exactly >=10000",
+   "Identify MIN(ts) re-dedup bug in 02_settlements.sql by reading it",
+   "Identify WHERE ts > 0 filter bug in 02_settlements.sql by reading it",
+   "Edit 02_settlements.sql: remove MIN(ts) dedup logic, trust binary output directly",
+   "Edit 02_settlements.sql: remove WHERE ts > 0 filter",
+   "Restore original input.csv",
+   "bash /app/run_pipeline.sh",
+   "sqlite3 /app/data/settlements.db 'SELECT count(*) FROM account_settlements;'",
+   "python3 quick_check.py -- cross-check against reference_sample.csv",
+   "Verify >=95% match on sample data",
+   "Done"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Binary compilation from hidden C source may behave differently across architectures or libc versions in python:3.13-slim-bookworm; if the binary segfaults or produces different normalization on the verify-time host, the task becomes unsolvable through no fault of the agent",
+   "The blueprint does not specify whether /app/data/input.csv is replaced at verify time or whether the agent's probe writes persist; if the agent's probe CSV overwrites input.csv and the pipeline runs on that probe data, the test could fail spuriously",
+   "The \u00b10.01 tolerance combined with REAL floating-point storage in SQLite could cause borderline failures on amounts near the 10000 threshold due to floating-point representation, making some failures ambiguous",
+   "reference_sample.csv covering only 20 accounts means local validation is weak; an agent could appear to pass locally but the hidden test distribution could expose edge cases not present in sample, which is intended but could feel like a hidden gotcha",
+   "The 'no source in final image' requirement means if the binary has a bug or unexpected behavior on verify-time inputs, the agent cannot fix it and the task becomes impossible"
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because both SQL bugs are directly readable from source files in a single pass through 02_settlements.sql, making the speedrun achievable in ~20 commands without deep binary characterization; the 'opaque binary' difficulty lever is undermined since the SQL fixes can be identified and applied before or independently of binary probing. The average score is (4+4+5+2+4)/5 = 3.8 but genuine_difficulty fails the minimum threshold of 4. The task also has a meaningful invalid-failure risk from binary portability across the build and verify environments.",
+  "fixes": [
+   "Make the SQL bugs non-obvious by obfuscating them: instead of a clear MIN(ts) re-dedup, bury the dedup logic inside a CTE chain or window function that looks plausible but silently contradicts the binary; remove any comments that hint at the bug",
+   "Add a third interacting bug that requires binary characterization to fix (e.g., the SQL assumes a specific amount column name or scale factor that only matches the binary's output if the agent correctly identifies the normalization threshold), so binary probing is load-bearing not optional",
+   "Increase the SQL layer to the stated ~600 lines with multiple plausible-looking but uninvolved files, forcing the agent to identify which file contains the real bugs rather than reading a short obvious file; currently the blueprint says ~200 lines total which is too short to hide bugs",
+   "Remove or obfuscate the reference_sample.csv so agents cannot easily validate locally and must rely on structural reasoning about the binary's behavior",
+   "Add a constraint that the agent must not modify the binary invocation or input format, and introduce a fourth subtle bug (e.g., account_id trimming mismatch between binary output and SQL join) that only manifests on hidden inputs with whitespace in account IDs"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a settlement aggregation pipeline producing wrong per-entity totals, with a binary/data layer plus a SQL/script layer, and a numeric accuracy threshold\u2014the core debugging pattern is essentially the same even though the domain (NetFlow vs. transaction CSV) and specific bugs differ."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is purely about SQL query optimization for performance, not fixing incorrect settlement totals in a multi-stage ETL pipeline."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task focuses on fixing row-count correctness, deduplication, and chunking logic in a CSV pipeline, not on numeric accuracy of aggregated financial totals."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both tasks require fixing an ETL pipeline that writes incorrect aggregate totals to a SQLite database, with similar numeric tolerance requirements and a SQL layer to debug\u2014the core problem and approach are nearly identical despite different column schemas."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves implementing a TCP audit service with HMAC computation and binary record serialization, which is a completely different problem domain and approach."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e5238fcac164",
+     0.174
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.14
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.137
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.132
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.094
+    ]
+   ],
+   "cost_usd": 0.01185
+  },
+  "novel": false
+ },
+ "cost_usd": 0.052554000000000003
+}

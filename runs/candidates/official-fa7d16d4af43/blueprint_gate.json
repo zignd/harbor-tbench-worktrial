@@ -1,0 +1,114 @@
+{
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/run_pipeline.sh",
+   "cat /app/sql/rollups.sql",
+   "cat /app/normalize_and_load.py",
+   "head /app/data/raw_samples.csv",
+   "echo '1,0\\n2,256\\n3,511\\n4,512\\n5,513\\n6,768\\n7,1023\\n8,895\\n9,900\\n10,901' | /app/bin/normalize",
+   "python3 -c \"import subprocess; lines=['%d,%d'%(i,i*4) for i in range(256)]; out=subprocess.run(['/app/bin/normalize'],input='\\n'.join(lines),capture_output=True,text=True).stdout; print(out[:500])\"",
+   "python3 -c \"import subprocess; inputs='\\n'.join(f'{i},{v}' for i,v in enumerate(range(0,1024,1))); out=subprocess.run(['/app/bin/normalize'],input=inputs,capture_output=True,text=True).stdout; lines=out.strip().split('\\n'); pairs=[(int(l.split(',')[0]),float(l.split(',')[1])) for l in lines]; import json; print(json.dumps(pairs[500:530]))\"",
+   "python3 /app/characterize_binary.py  # write script to probe 0-1023, find T and ceiling C by analyzing slope changes",
+   "# Identify: T~512, two slopes, DC offset above T, ceiling C~900",
+   "# Fix normalize_and_load.py: change string comparison join to cast reading_id to int on both sides",
+   "sed -i 's/df_orig\\[.reading_id.\\] == row\\[.reading_id.\\]/int(df_orig[\"reading_id\"]) == int(row[\"reading_id\"])/g' /app/normalize_and_load.py  # or edit properly",
+   "# More carefully: open normalize_and_load.py, find the join/merge, fix dtype mismatch",
+   "python3 -c \"open('/app/normalize_and_load.py').read()\" && nano /app/normalize_and_load.py  # fix merge to use astype(str) or astype(int) consistently",
+   "# Fix rollups.sql: replace AVG(normalized_value) with percentile window function for P90",
+   "# SQLite 3.25+ window: use NTILE or row_number approach",
+   "cat > /app/sql/rollups.sql << 'EOF'\n-- P90 via window function\nINSERT OR REPLACE INTO hourly_stats(zone, hour, p90_normalized)\nSELECT zone, timestamp_hour,\n  AVG(normalized_value) FILTER (WHERE pct_rank BETWEEN 0.85 AND 0.95)  -- approximate\nFROM (...) -- actually use proper row_number/count approach\nEOF",
+   "# Proper P90: use row_number() OVER (PARTITION BY zone,hour ORDER BY normalized_value) / COUNT(*)",
+   "# Fix zone_energy JOIN bug: inspect the wrong alias, correct column reference",
+   "grep -n 'JOIN\\|alias\\|zone_energy' /app/sql/rollups.sql",
+   "# Edit rollups.sql to fix both bugs: correct P90 implementation and correct JOIN column",
+   "bash /app/run_pipeline.sh",
+   "sqlite3 /app/db/sensors.db 'SELECT * FROM hourly_stats LIMIT 5; SELECT * FROM zone_energy LIMIT 5;'",
+   "sqlite3 /app/db/sensors.db 'SELECT COUNT(*) FROM readings;'",
+   "wc -l /app/data/raw_samples.csv",
+   "# Verify row counts match, spot-check P90 values against manual calculation"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The binary characterization step is underspecified for the agent: the instruction says 'exact transformation must be characterized by experiment' but does not state what precision is needed for T, slopes, or offset\u2014an agent could characterize the binary correctly enough to pass P90 within \u00b10.5 but the verifier might use a ground-truth formula that requires exact T, creating ambiguity about what 'correct characterization' means.",
+   "SQLite version dependency: the P90 fix requires window functions (SQLite 3.25+), but the Dockerfile uses python:3.13-slim-bookworm whose bundled sqlite3 version is not pinned in the blueprint\u2014if it ships an older SQLite, the window-function approach fails silently or errors, making the task unsolvable as described.",
+   "The leading-zero bug fix via type casting could interact with the boundary-value trap described in the blueprint (off-by-one for reading_ids near boundary values), meaning a correct-looking fix could still fail on hidden inputs in a way that's hard to distinguish from an incorrect fix.",
+   "The sample data is designed so AVG \u2248 P90, but the blueprint doesn't specify how close\u2014if the hidden test tolerance is \u00b10.5 and the sample AVG is within \u00b10.5 of true P90, the agent might not notice the bug even after running the pipeline, making the 'invisible on sample' claim depend on exact sample construction that isn't verified in the blueprint.",
+   "The 'determinism check' (run pipeline twice, verify identical results) could be flaky if normalize_and_load.py or the shell script has any timestamp-based behavior or if SQLite WAL mode causes ordering differences."
+  ],
+  "verdict": "reject",
+  "reasons": "The speedrun reaches ~20 commands and a skilled agent reading the source files directly sees all three bugs (AVG vs P90 in SQL, wrong JOIN alias in SQL, string-vs-int merge in Python) without needing to characterize the binary at all\u2014the binary characterization is only needed to validate that normalized values are correct, but since the pipeline already stores normalized_value in the DB, the SQL fixes alone may pass the thresholds. This means genuine_difficulty is borderline: the binary characterization subplot is the hardest part, but it can be bypassed if the agent trusts the stored normalized values. Additionally, the SQLite version for window functions is not pinned, creating a solvability risk, and the precision required for binary characterization is ambiguous relative to the \u00b10.5 tolerance.",
+  "fixes": [
+   "Pin the sqlite3 version explicitly in the Dockerfile (e.g., install sqlite3 3.39+ from backports or compile from source) and state the minimum required version in the instruction so agents know window functions are available.",
+   "Make binary characterization non-bypassable: instead of storing normalized_value directly, have the pipeline store only raw_value in the DB and require the SQL rollup itself to call the normalizer or use a precomputed lookup\u2014or add a fourth bug where the stored normalized values are wrong (e.g., normalize_and_load.py applies an incorrect inverse transform), forcing the agent to characterize the binary to detect the discrepancy.",
+   "Specify the required precision for binary characterization explicitly (e.g., 'your characterized transform must reproduce the binary's output to within \u00b10.1 normalized units across the full 0-1023 input range') so the verifier can check this independently of the P90 threshold.",
+   "Reduce the leading-zero drop rate from 8% to something that more reliably exceeds the \u00b11.0 zone_energy threshold on hidden inputs, and document the expected magnitude of the error so the verifier threshold is clearly calibrated."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is purely about SQL query optimization for performance, not about reverse-engineering a binary normalizer and fixing a multi-stage IoT pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/repair-broken-shell-data-pipeline",
+     "verdict": "distinct",
+     "reason": "That task fixes file permissions, line endings, and shebang issues in shell scripts, not reverse-engineering a compiled binary's transformation and repairing SQL rollup logic."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes chunk-splitting deduplication and row-count bugs in a Python CSV pipeline, not characterizing an opaque binary normalizer and repairing SQL aggregate queries."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task fixes incorrect aggregate totals in a Python ETL pipeline with visible source code, not reverse-engineering a compiled binary's calibration curve before fixing downstream SQL."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task fixes a Rust packet-codec service for correctness and performance, not characterizing an opaque normalizer binary and repairing SQL rollup queries."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.144
+    ],
+    [
+     "terminal-bench-pro/repair-broken-shell-data-pipeline",
+     0.144
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.142
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.112
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.096
+    ]
+   ],
+   "cost_usd": 0.011688
+  },
+  "novel": true
+ },
+ "cost_usd": 0.04864500000000001
+}

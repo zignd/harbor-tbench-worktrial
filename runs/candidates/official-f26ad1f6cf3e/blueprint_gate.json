@@ -1,0 +1,109 @@
+{
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/config/config.yaml  # get key_id and HMAC key",
+   "xxd /app/data/logs/$(ls /app/data/logs/ | head -1) | head -8  # confirm file format: 4B key_id + 16B nonce + 4B len + ciphertext",
+   "bash /app/selftest.sh  # get known plaintext->ciphertext hex pairs for multiple key_ids",
+   "python3 -c \"import binascii; ct=bytes.fromhex('<ciphertext>'); pt=b'<known_64_byte_plaintext>'; print(binascii.hexlify(bytes(a^b for a,b in zip(ct,pt))))\"  # recover 64 keystream bytes",
+   "nm /app/lib/encryptor.so  # check exported and internal symbol names for LFSR hints",
+   "objdump -d /app/lib/encryptor.so > /tmp/disasm.txt && grep -A5 -B5 'shr\\|xor\\|and' /tmp/disasm.txt | head -100  # find LFSR feedback logic",
+   "# Identify Galois LFSR: tap mask 0x80200003, seed = key_id XOR crc32_ieee(nonce), 1 LSB per step, 8 steps per byte",
+   "# Verify: reimplement LFSR in Python, check against recovered keystream bytes",
+   "python3 -c \"<LFSR verification script comparing computed vs recovered keystream>\"",
+   "mkdir -p /app/tools/decrypt",
+   "cat > /app/tools/decrypt/main.go << 'EOF'\npackage main\nimport (\n  \"encoding/binary\"\n  \"hash/crc32\"\n  \"os\"\n  \"fmt\"\n  \"path/filepath\"\n)\nfunc lfsr_keystream(seed uint32, n int) []byte {\n  state := seed\n  out := make([]byte, n)\n  for i := 0; i < n; i++ {\n    var b byte\n    for bit := 0; bit < 8; bit++ {\n      lsb := state & 1\n      b |= byte(lsb) << bit\n      state >>= 1\n      if lsb != 0 { state ^= 0x80200003 }\n    }\n    out[i] = b\n  }\n  return out\n}\nfunc main() {\n  data, _ := os.ReadFile(os.Args[1])\n  key_id := binary.LittleEndian.Uint32(data[0:4])\n  nonce := data[4:20]\n  plen := binary.LittleEndian.Uint32(data[20:24])\n  ct := data[24:24+plen]\n  seed := key_id ^ crc32.ChecksumIEEE(nonce)\n  ks := lfsr_keystream(seed, int(plen))\n  pt := make([]byte, plen)\n  for i := range pt { pt[i] = ct[i] ^ ks[i] }\n  // write to verify/outputs if input is from verify/inputs\n  if len(os.Args) > 1 {\n    base := filepath.Base(os.Args[1])\n    outpath := \"/app/verify/outputs/\" + base + \".txt\"\n    os.WriteFile(outpath, pt, 0644)\n  }\n  fmt.Printf(\"%s\", pt)\n}\nEOF",
+   "cd /app/tools/decrypt && go build ./...  # compile check",
+   "go run /app/tools/decrypt/main.go /app/data/logs/$(ls /app/data/logs/ | head -1)  # check LOG_ENTRY: prefix",
+   "go run /app/tools/decrypt/main.go /app/data/logs/$(ls /app/data/logs/ | sed -n '100p')  # spot check another file",
+   "# Manually verify HMAC on one file to confirm correctness",
+   "# Test on a long entry if available in corpus",
+   "strace -e trace=openat go run /app/tools/decrypt/main.go /app/data/logs/$(ls /app/data/logs/ | head -1) 2>&1 | grep encryptor  # confirm no .so open"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "CRC32 variant unspecified: Go has IEEE, Castagnoli, Koopman variants; blueprint says 'crc32(nonce)' without specifying which. Agent using wrong variant fails all verify-time inputs with no clear diagnostic.",
+   "Dual output behavior underspecified: instruction says tool writes to stdout AND to /app/verify/outputs/<filename>.txt, but doesn't clarify whether this is always done or only when input path contains 'verify/inputs'. Agent may write output files only when explicitly invoked differently, or always, causing path collisions.",
+   "golang-1.22 package name: on Debian bookworm the package is 'golang-1.22' but the go binary path may be /usr/lib/go-1.22/bin/go, not in PATH by default. Could cause 'go build' failures unrelated to the task.",
+   "strace check on 'go run' is noisy: go run opens many files during compilation; the check needs to filter carefully or use a pre-built binary. A false positive could invalidate a correct solution.",
+   "selftest binary path not specified in instruction: agent must discover whether to run '/app/service --selftest' or 'go run /app/main.go --selftest'; if the service binary isn't pre-compiled, this adds a step.",
+   "Tap mask endianness/form: the blueprint states 0x80200003 as the Galois feedback mask, but the disassembly may show it differently depending on compiler optimization. An agent reading the disassembly might reconstruct a different mask.",
+   "File format offset ambiguity: blueprint says '4 bytes key_id (LE) + 16 bytes nonce + 4 bytes plaintext_len (LE) + N bytes ciphertext' but the instruction draft says 'nonce (16 bytes) and key_id (4 bytes, little-endian) are prepended... followed by a 4-byte little-endian plaintext length'. The order (key_id first vs nonce first) is inconsistent between the two descriptions."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint has a critical internal inconsistency: the environment spec says the file format is 'key_id (4B) + nonce (16B) + len (4B) + ciphertext' but the cipher description says 'nonce and key_id are prepended' implying nonce-first order. This ambiguity would cause an agent to fail for reasons unrelated to skill. Additionally, the CRC32 variant is unspecified, which is a silent correctness trap that constitutes an invalid failure mode rather than a genuine difficulty. The dual-output behavior (stdout AND file write) is underspecified in the instruction draft.",
+  "fixes": [
+   "Resolve file format order inconsistency: explicitly state in both the instruction and environment spec that the format is key_id(4B LE) + nonce(16B) + plaintext_len(4B LE) + ciphertext(N bytes), with no contradicting description.",
+   "Specify CRC32 variant explicitly: state 'IEEE CRC32 (Go hash/crc32.ChecksumIEEE / polynomial 0xEDB88320)' in the environment spec so the agent has an unambiguous target.",
+   "Clarify dual output behavior: either (a) make the tool always write to /app/verify/outputs/ when the input path is under /app/verify/inputs/ (and document this), or (b) give the tool a --output flag, or (c) have the verifier run the tool with a redirect. The current instruction implies both stdout and file output simultaneously without explaining the mechanism.",
+   "Specify the selftest binary invocation path explicitly (e.g., '/app/bin/service --selftest' or 'go run /app/main.go --selftest') so the agent doesn't waste commands discovering it.",
+   "Fix the strace check to operate on a pre-built binary rather than 'go run' to avoid false positives from Go toolchain file opens."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "variant",
+     "reason": "Both tasks involve reverse-engineering a stream cipher from an opaque artifact and implementing a crypto tool, but the candidate reverses a binary plugin to build a decryptor while the reference reverses a decryptor to build an encryptor, making them mirror problems with the same core skill."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "The reference is a CTF credential-extraction task using XOR obfuscation in Go source, while the candidate is a cryptanalysis task against an opaque binary plugin requiring keystream weakness analysis."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-sentiment-cli-text-processing",
+     "verdict": "distinct",
+     "reason": "The reference is a text-processing bug fix in a sentiment classifier with no cryptographic component."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is a log pipeline correctness and performance debugging task with no cryptography involved."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference is a numerical aggregation bug fix in a sales service with no cryptographic or reverse-engineering component."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.366
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.301
+    ],
+    [
+     "terminal-bench-pro/fix-sentiment-cli-text-processing",
+     0.187
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.142
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.138
+    ]
+   ],
+   "cost_usd": 0.011766
+  },
+  "novel": false
+ },
+ "cost_usd": 0.078309
+}

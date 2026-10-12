@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 20:54 -03:00 · Validation batch: the review rejects 7 of 8 blueprints; generator self-checks
+- **First validation batch (4 specs, new levers):** the stricter review rejected 7 of 8 blueprints (two tries each, ~$0.30 per rejected candidate, no builds). The reasons repeat the old failure in new clothes: the generator claims an investigation-heavy lever but puts the defect in readable source. Examples: an "opaque" cipher shipped with its `decrypt.go`, "profiling needed" where the bad call site is visible, speedruns of 9-15 commands. One more was rejected as a variant of our own `93f5`. **1 accepted:** `sensor-rollup-calibration-fix` (genuine_difficulty 4), now being authored.
+- **The review gate is cheap, so the generator gets more tries:** `BLUEPRINT_TRIES` 2 → 4. A blueprint costs ~$0.13 and a build ~$4-6, so even 1 in 8 accepted is ~$1 per accepted blueprint.
+- **The generator runs the speedrun on itself** before answering, and redesigns if ≤ ~20 commands would work. A lever has to be real in the environment (an opaque component ships as a binary or black-box service, never next to its source).
+- Retries continue numbering after earlier rejections, so `blueprint_rejected_<n>.json` evidence is never overwritten. The 3 rejected candidates were re-queued under the new logic.
+
 ### 20:48 -03:00 · Go/no-go: fix generation (difficulty) before scaling
 **The numbers:** $113.92 spent (`spent*`), 0 learnable tasks. Every calibrated task was too easy:
 - `ledger-reconcile`: 4/4, 4/4, 4/4 (original + 2 tuning rounds).

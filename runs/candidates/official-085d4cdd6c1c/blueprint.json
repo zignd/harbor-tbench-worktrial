@@ -1,0 +1,59 @@
+{
+ "slug": "histogram-quantile-fastpath-bug",
+ "title": "HDR Histogram Quantile Fastpath Corruption",
+ "scenario": "A backend developer maintains an in-house metrics aggregation service written in Go. The service collects latency samples, builds HDR histograms, and exposes P50/P95/P99 quantiles over an HTTP endpoint. A compiled shared library `libhdrhist.so` provides the core bucket-index and inverse-CDF math; the Go layer calls it via cgo. After a recent 'performance optimization' patch to the shared library, P99 values started reporting suspiciously low on heavy-tailed distributions in production, but unit tests on synthetic uniform data pass. The source for the shared library is not present in the repository.",
+ "instruction_draft": "The metrics service at /app reports incorrect P99 latency quantiles for heavy-tailed workloads; P50 and P95 are accurate but P99 is consistently too low. Make the service return correct quantile values for all percentiles (P50, P95, P99) on any input distribution. The corrected service must compute each quantile within 2% relative error of the true value and respond to /metrics in under 150 ms at 10,000 samples/request on the provided hardware.",
+ "requirements": [
+  "P50 quantile is within 2% relative error of the true value for all test distributions",
+  "P95 quantile is within 2% relative error of the true value for all test distributions",
+  "P99 quantile is within 2% relative error of the true value for all test distributions",
+  "The /metrics HTTP endpoint responds in under 150 ms when processing 10,000 samples per request",
+  "Correctness holds for heavy-tailed (Pareto), bimodal, and uniform distributions generated at verify time"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, gcc, and build tools",
+  "~1400 lines of Go across: cmd/server/main.go (HTTP handler, sample ingestion), internal/histogram/histogram.go (HDR bucket logic calling cgo), internal/aggregator/aggregator.go (windowed aggregation), internal/reporter/reporter.go (quantile formatting), internal/config/config.go (tuning knobs)",
+  "A pre-built binary-only libhdrhist.so in /app/lib/ with header /app/lib/hdrhist.h; no C source present",
+  "The shared library exports: hdr_bucket_index(double value, int precision) -> int, hdr_inverse_cdf(double* counts, int num_buckets, int precision, double quantile) -> double",
+  "The planted bug: hdr_inverse_cdf interpolates linearly within the final bucket using (rank - cumulative) / bucket_count, but the final high-value bucket uses a bucket width computed with the wrong exponent\u2014it uses precision bits instead of (precision-1) bits in the sub-bucket width formula, causing the interpolated value inside the last occupied bucket to be ~half the correct value; this only matters when the target quantile falls in a high-value bucket, which uniform and low-percentile queries rarely trigger",
+  "histogram.go calls hdr_inverse_cdf directly for all quantiles; the Go wrapper passes precision=4",
+  "A working reference implementation hdr_inverse_cdf_ref() is also exported from libhdrhist.so but is not called by the Go code (discoverable by running 'nm -D /app/lib/libhdrhist.so')",
+  "A sample generator at /app/scripts/gen_samples.py that produces uniform, Pareto(alpha=1.5), and bimodal distributions as JSON",
+  "A test harness at /app/scripts/check_quantiles.py that calls the running service and computes relative error vs. scipy ground truth",
+  "The service runs correctly (builds, starts) but returns wrong P99 on heavy-tailed inputs",
+  "Logs show no errors; the bug is purely numerical and only manifests when the 99th-percentile rank lands in a high-value HDR bucket"
+ ],
+ "internal_hint": "Difficulty comes from two sources: (1) NOT VISIBLE BY READING\u2014the wrong exponent in the sub-bucket width formula only fires when the quantile target falls in a high-value bucket, so reading histogram.go reveals nothing wrong; the agent must run the service against a heavy-tailed distribution and observe that P99 is ~50% of the true value while P95 is correct, then reason about what mathematical property could cause exactly a 2x underestimate only at high percentiles; (2) SUBSTANTIAL CONSTRUCTION\u2014once the agent discovers via 'nm -D' that hdr_inverse_cdf_ref() exists in the .so, they must either (a) patch histogram.go to call hdr_inverse_cdf_ref() instead, or (b) re-implement a correct pure-Go inverse CDF that matches HDR histogram math. The ordered procedure trap: if the agent implements a naive linear-scan quantile in Go without understanding the HDR bucket structure, it will be correct but too slow (>150ms) at 10k samples because iterating all 2^(precision)*range buckets naively is O(buckets). A correct solution must understand the HDR two-level bucket structure to hit the performance bar.",
+ "trap": "A naive solution replaces hdr_inverse_cdf with a sort-and-scan over raw samples\u2014this gives correct quantiles but violates the 150ms latency constraint at 10,000 samples. A partially correct solution switches to hdr_inverse_cdf_ref() but only for P99 (hardcoded), failing on verify-time inputs that use non-standard percentiles like P99.5. The hidden tests use Pareto(alpha=1.2) which puts >40% of mass above the P95 bucket boundary, stressing the interpolation path that uniform distributions never reach.",
+ "tests": [
+  "Verify-time test 1: POST 10,000 samples from Pareto(alpha=1.2, seed=42) to /ingest, then GET /metrics?p=0.99; check relative error |reported - scipy_true| / scipy_true < 0.02",
+  "Verify-time test 2: POST 10,000 samples from bimodal (50% N(100,10) + 50% N(10000,500), seed=7) to /ingest, then GET /metrics?p=0.95 and p=0.99; both within 2% relative error",
+  "Verify-time test 3: POST 10,000 samples from uniform(1, 1e6, seed=99) to /ingest, then GET /metrics?p=0.50; within 2% relative error",
+  "Verify-time test 4: POST 10,000 samples from Pareto(alpha=1.5, seed=13) then time GET /metrics?p=0.99; wall time must be under 150ms (measured 5 times, median used)",
+  "Verify-time test 5: GET /metrics?p=0.995 on Pareto(alpha=1.2, seed=99) data; P99.5 within 2% relative error (catches hardcoded-percentile solutions)",
+  "Verify-time test 6: Correctness on fresh seed (seed=2025) Pareto(alpha=1.3) at P99 to confirm no seed-specific overfitting"
+ ],
+ "verifier_knob": {
+  "name": "performance_threshold_ms",
+  "value": "150",
+  "effect": "Lowering to 80ms forces the agent to understand HDR bucket math deeply enough to avoid any O(n_samples) path; raising to 500ms allows a sorted-array fallback and reduces difficulty to pure correctness"
+ },
+ "expected_failure_modes": [
+  "Agent reads histogram.go, finds no bug, concludes the issue is in aggregator.go and wastes time chasing windowing logic",
+  "Agent discovers hdr_inverse_cdf_ref but switches only the P99 call site, failing on P99.5 hidden test",
+  "Agent implements correct quantile math but uses sort+scan over raw samples, passing correctness tests but failing the 150ms latency bar",
+  "Agent patches the Go side with a correct-looking HDR interpolation but uses wrong sub-bucket width formula independently (same bug class), still failing on Pareto inputs",
+  "Agent verifies only on the provided uniform sample generator (which passes even with the bug) and submits without testing heavy-tailed distributions"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "go",
+  "cgo",
+  "numerical-methods",
+  "histogram",
+  "reverse-engineering",
+  "performance"
+ ]
+}

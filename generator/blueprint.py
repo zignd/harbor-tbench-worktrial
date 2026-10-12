@@ -68,6 +68,12 @@ succeed from the instruction plus what it can discover in the container.
   components (with plausible code that is not involved), so the problem has to be located by
   investigation, not by reading one small file.
 
+## Self-check before you answer (the reviewer will do the same)
+Play a strong agent that has read only the instruction and listed the environment, and write down the
+shortest command path to a solution. If ~20 commands or fewer would likely work, typically because the
+defect can be found by reading a file, redesign. Note that a lever has to be real in the environment:
+an "opaque component" ships as a binary or a black-box service, never next to its source.
+
 ## Hard constraints
 - The environment is built from a Dockerfile `FROM python:3.13-slim-bookworm`, with apt/pip packages
   pinned. It has 1 CPU and 2 GB RAM, no GPU, and the solver needs no internet.

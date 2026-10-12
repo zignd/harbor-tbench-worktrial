@@ -1,0 +1,54 @@
+{
+ "slug": "sensor-rollup-calibration-fix",
+ "title": "Sensor Rollup Calibration Pipeline Repair",
+ "scenario": "You are a release engineer at an industrial IoT company. The nightly sensor rollup job has been failing acceptance tests since a firmware team pushed a new build of the on-device pre-processor binary last sprint. The pipeline reads raw ADC counts from field sensors, runs them through a compiled normalizer binary (which applies the device's calibration curve), loads the results into SQLite, then executes SQL rollup queries that downstream dashboards consume. QA reports that hourly P90 latency bands and per-zone energy totals are both wrong on the hidden regression suite, but the sample output files look plausible at a glance.",
+ "instruction_draft": "The release build at /app is broken. The compiled binary /app/bin/normalize (built in the Dockerfile, no source available) transforms raw sensor readings before they reach the database; its exact transformation must be characterized by experiment before you can trust any downstream SQL. The pipeline is run by /app/run_pipeline.sh, which reads /app/data/raw_samples.csv, passes readings through the normalizer, loads results into /app/db/sensors.db, and then runs /app/sql/rollups.sql to populate the rollup tables hourly_stats and zone_energy. Two correctness requirements must hold on hidden inputs generated at verify time: (1) each row in hourly_stats must have p90_normalized within \u00b10.5 of the true 90th-percentile of normalized values for that (zone, hour) bucket, and (2) each row in zone_energy must have total_energy within \u00b11.0 of the true sum of energy values for that zone across the full input. Investigate the normalizer's actual behavior, then repair whatever in the pipeline\u2014SQL, shell glue, or both\u2014is needed so both thresholds are met.",
+ "requirements": [
+  "Each row in hourly_stats.(p90_normalized) must be within \u00b10.5 of the true 90th-percentile of normalized values for that (zone, hour) bucket on hidden verify-time inputs.",
+  "Each row in zone_energy.(total_energy) must be within \u00b11.0 of the true sum of energy values for that zone on hidden verify-time inputs.",
+  "The pipeline must complete successfully when /app/run_pipeline.sh is executed on new input data placed at /app/data/raw_samples.csv."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, gcc, python3 packages (pandas, numpy). Compiles /app/bin/normalize from a C source that is deleted after compilation\u2014only the binary remains.",
+  "The normalizer binary: reads lines of 'reading_id,raw_value' from stdin, writes 'reading_id,normalized_value' to stdout. Its transformation is NOT a simple linear scale: it applies a piecewise function\u2014linear below a hidden threshold T (approx 512 out of 0-1023 range), and a different slope plus a DC offset above T. The exact T, slopes, and offset are baked into the binary and must be discovered by probing.",
+  "A second subtle behavior: the binary silently clamps output values above a hidden ceiling C (approx 900 normalized units) to exactly C, introducing a nonlinearity that affects P90 calculations for high-load zones.",
+  "/app/data/raw_samples.csv: ~2000 rows with columns reading_id, zone, timestamp_hour, raw_value, raw_energy_wh. The raw_energy_wh column is NOT passed through the normalizer\u2014it is used directly in zone_energy totals.",
+  "/app/run_pipeline.sh: pipes raw_samples.csv through normalize, joins result back to original CSV by reading_id in Python (normalize_and_load.py), loads to sensors.db table 'readings' with columns (reading_id, zone, timestamp_hour, normalized_value, raw_energy_wh).",
+  "/app/sql/rollups.sql: FIRST BUG\u2014computes P90 using AVG(normalized_value) instead of the true 90th percentile (SQLite has no built-in PERCENTILE, so the original developer used AVG as a placeholder and never fixed it). SECOND BUG\u2014zone_energy query JOINs on a wrong column alias introduced in a recent refactor, causing all zone totals to be NULL or zero.",
+  "A third planted problem in normalize_and_load.py: the join between normalized output and the original CSV uses a string comparison on reading_id that silently drops rows whose reading_id has leading zeros (about 8% of rows), so totals are systematically low.",
+  "The sample /app/data/raw_samples.csv is constructed so that AVG \u2248 P90 for the sample data (because the sample is nearly uniform), meaning the SQL bug is invisible on the sample but fails on the hidden test inputs which have skewed distributions.",
+  "Hidden verify-time inputs: generated fresh with seeded random, covering high-skew distributions and zones with many readings above threshold T to stress the clamping behavior and expose both the AVG-vs-P90 bug and the energy join bug."
+ ],
+ "internal_hint": "Root causes and discovery path: (1) Probe the binary with carefully chosen inputs spanning 0-1023 to characterize the piecewise function and find T and the ceiling C\u2014this is essential because the correct P90 implementation must use normalized values that account for clamping. (2) The P90 SQL uses AVG\u2014invisible on uniform sample data but wrong on skewed distributions; must implement P90 via a window function or subquery (SQLite 3.25+ supports window functions). (3) The zone_energy JOIN bug produces NULLs; find by running the pipeline and inspecting the rollup table. (4) The leading-zero row-drop bug in normalize_and_load.py causes ~8% of rows to be missing; discover by comparing row counts before and after the join. Steps must be done in order: characterize binary first, then fix SQL so it correctly handles the clamped values, then fix the loader join, then verify totals. Getting binary characterization wrong (e.g., assuming linear everywhere) leads to wrong P90 even after SQL is fixed.",
+ "trap": "A naive agent fixes only the visible SQL bugs (AVG\u2192P90, JOIN alias) and passes the sample data check. It misses: (a) the leading-zero row-drop losing 8% of readings, causing zone_energy totals to be ~8% low on hidden inputs; (b) the clamping ceiling means P90 for high-load zones is exactly C even when the 90th percentile of unclamped values would be higher\u2014an agent that implements P90 correctly in SQL but doesn't account for the binary's clamping behavior will compute the right percentile of the wrong values. The sample data is designed so no zone has enough high readings to hit the ceiling, so shallow testing never reveals the clamping interaction.",
+ "tests": [
+  "Generate fresh raw_samples.csv with seeded RNG: 5 zones, 24 hours, ~3000 rows, skewed distribution (log-normal raw_values) with ~30% of readings above threshold T. Run /app/run_pipeline.sh. Query hourly_stats: for each (zone, hour) bucket, compute true P90 of normalized values using the known binary transform, compare to stored p90_normalized. All rows must be within \u00b10.5.",
+  "Same generated input: query zone_energy, compare total_energy per zone to ground-truth sum of raw_energy_wh for all rows in that zone. All rows must be within \u00b11.0.",
+  "Verify row count in readings table equals number of rows in raw_samples.csv (catches leading-zero drop bug).",
+  "Probe the binary directly during verification with a known input set covering values 400-600 to confirm the agent has correctly characterized T and the piecewise slopes (indirect: if P90 is correct on high-load zones, the binary was characterized correctly).",
+  "Run pipeline twice on the same input; verify results are identical (determinism check)."
+ ],
+ "verifier_knob": {
+  "name": "p90_tolerance",
+  "value": "\u00b10.5 normalized units",
+  "effect": "Tightening to \u00b10.1 requires the agent to also correctly handle the DC offset in the above-threshold linear segment with high precision; loosening to \u00b12.0 makes it possible to pass with a rough binary characterization."
+ },
+ "expected_failure_modes": [
+  "Agent fixes the SQL AVG\u2192P90 and JOIN bugs, verifies on sample data, declares done\u2014misses the leading-zero row-drop, fails zone_energy threshold on hidden inputs.",
+  "Agent correctly implements P90 in SQL but never characterizes the binary's clamping ceiling, so P90 for high-load zones is wrong on hidden inputs where many readings exceed the ceiling.",
+  "Agent discovers the piecewise threshold T but assumes a simple two-slope model without the DC offset, producing normalized values that are systematically off above T.",
+  "Agent fixes the loader join bug using a type cast that fixes leading-zeros but introduces a different off-by-one for reading_ids near boundary values.",
+  "Agent runs pipeline on sample, sees plausible numbers, stops without probing the binary's full input range."
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "data-pipeline",
+ "tags": [
+  "sql",
+  "binary-characterization",
+  "data-processing",
+  "sqlite",
+  "pipeline-repair",
+  "feature-iteration"
+ ]
+}

@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "go-audit-transform-fingerprint",
+  "title": "Audit Log Transform Fingerprint Recovery",
+  "scenario": "A security engineer is auditing a log-ingestion service written in Go. The service reads batches of raw audit events from binary data files, applies a compiled transformation pipeline (a prebuilt shared object loaded via cgo), and writes fingerprinted records to an output file. A downstream SIEM is rejecting records because the fingerprints do not match the reference values the security team computed independently. The environment contains the Go service source (~1200 lines across several files), a prebuilt opaque shared library `/app/lib/libtransform.so` with no source, sample input data files, and a reference fingerprint file for the sample batch.",
+  "instruction_draft": "The audit log service at `/app` produces fingerprinted records in `/app/output/records.bin`. Each output record must contain a 16-byte fingerprint that matches the reference SIEM fingerprint for that record. Make the service produce correct fingerprints for the provided sample batch and ensure a replacement transformer binary at `/app/cmd/transformer/main.go` produces correct fingerprints for any input batch in the same format.",
+  "requirements": [
+   "Each output record in `/app/output/records.bin` contains a 16-byte fingerprint field that exactly matches the reference values in `/app/reference/expected_fingerprints.bin` for the sample batch.",
+   "The Go binary built from `/app/cmd/transformer/main.go` produces correct fingerprints when run against fresh input batches generated at verify time.",
+   "The output file format (record count, fixed-width record layout, field offsets) matches the schema documented in `/app/docs/record_format.md`.",
+   "Processing throughput measured by the verifier on a 50 000-record batch completes without error (no panics, no partial writes).",
+   "The transformer does not call `libtransform.so` at all in the final solution (it must replace, not wrap, the opaque library)."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: golang 1.22 (from golang.org tarball, pinned), gcc, libc-dev.",
+   "`/app/lib/libtransform.so`: prebuilt x86-64 shared library (no source). Exports one C function: `void transform_record(const uint8_t *in, size_t in_len, uint8_t *out16)` that writes a 16-byte fingerprint. The function implements a non-standard keyed hash: it splits each input record into 8-byte blocks, XORs adjacent blocks with a secret 8-byte key derived from a position-dependent schedule, folds the result with a Fibonacci-weighted sum modulo 2^64, and packs the low and high 64-bit halves into 16 bytes. The key schedule is: key[i] = (base_key rotated-left by (i*7 % 64)) XOR fib(i % 16), where base_key = 0xA5C3E7F1B9D2046E and fib is the Fibonacci sequence mod 2^64 starting fib(0)=1, fib(1)=1. The schedule index i counts 8-byte blocks globally across the entire record (not per-record).",
+   "`/app/internal/pipeline/ingest.go`: reads binary input files, calls the cgo transform, writes output. About 300 lines.",
+   "`/app/internal/pipeline/batch.go`: batch management, ~200 lines.",
+   "`/app/internal/pipeline/writer.go`: output serialization, ~150 lines.",
+   "`/app/cmd/transformer/main.go`: entry point stub (~30 lines) that currently delegates to ingest.go which calls libtransform.so.",
+   "`/app/docs/record_format.md`: documents the binary input and output record layout precisely (field offsets, sizes, endianness).",
+   "`/app/data/sample_batch.bin`: 1 000 raw audit event records in the documented binary format, deterministically generated from a seeded Go PRNG.",
+   "`/app/reference/expected_fingerprints.bin`: 1 000 \u00d7 16 bytes = 16 000 bytes, the correct fingerprints for `sample_batch.bin` produced by the reference implementation.",
+   "`/app/output/` directory exists but `records.bin` is absent or wrong until the solver fixes the pipeline.",
+   "The cgo integration in ingest.go has a subtle off-by-one: the block counter `i` is reset to 0 for each record instead of being maintained globally across the batch, so all records get the same key schedule prefix and fingerprints are wrong for all records except possibly the first.",
+   "Additionally, the writer.go serializes the fingerprint bytes in big-endian order, but the reference expects little-endian (the fold step produces two uint64 values that must be written LE). This second error is data-dependent: it only manifests when the high bit of either 64-bit half differs between LE and BE, which is true for ~50% of records in the sample but varies unpredictably on fresh inputs.",
+   "The Fibonacci fold and rotation schedule are not documented anywhere in the Go source; the solver must discover them by probing libtransform.so experimentally (e.g., with crafted single-block inputs that isolate each step)."
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources: (1) the opaque compiled component \u2014 the solver must black-box probe libtransform.so with controlled inputs to reverse-engineer the key schedule (Fibonacci weighting, rotation stride, base key) and the endianness of the output packing; (2) substantial construction \u2014 once the algorithm is understood the solver must implement it correctly in pure Go without cgo, handling the global block counter correctly. The off-by-one in ingest.go is visible by reading the source but its effect only manifests on multi-record batches. The endianness bug is not visible by reading (writer.go uses `binary.Write` with `binary.BigEndian` which looks plausible) and only shows up by comparing actual vs reference bytes numerically. A shallow fix that only corrects the counter but not the endianness passes the first few reference records but fails on hidden batches. The solver must: (a) run libtransform.so with single-block inputs to isolate key[0], then two-block inputs to derive key[1] and infer the rotation stride and Fibonacci term, then verify the fold formula; (b) implement the full algorithm in Go; (c) fix the global counter; (d) fix the endianness.",
+  "trap": "An agent that corrects only the block-counter reset (the readable bug) and re-runs against the sample will see approximately half the fingerprints match (because the endianness error cancels for records where both 64-bit halves happen to have the same high-bit pattern under both orderings). The agent may conclude the fix is complete and write the output. The hidden-input verifier generates fresh batches where the endianness error is fully observable, causing all fingerprints to fail. Agents that wrap libtransform.so instead of replacing it also fail because the verifier checks that the final binary has no dynamic dependency on libtransform.so.",
+  "tests": [
+   "Verify `/app/output/records.bin` exists and contains exactly 1000 records; compare all 16 000 fingerprint bytes against `/app/reference/expected_fingerprints.bin` byte-for-byte.",
+   "Build `/app/cmd/transformer/main.go` with `go build`; run it against a freshly generated 2 000-record batch (seeded differently from the sample); compare all fingerprints against reference values computed by a known-correct Python implementation of the algorithm embedded in the verifier.",
+   "Run the built transformer against a 1-record batch (edge case: single block, single record); verify fingerprint.",
+   "Run the built transformer against a batch where every record is exactly 8 bytes (single block each); verify all fingerprints match reference.",
+   "Run the built transformer against a batch with records of varying lengths (8, 16, 24, 32, 40 bytes interleaved); verify fingerprints match reference, confirming the global block counter is maintained across records of different sizes.",
+   "Check that the built transformer binary has no dynamic dependency on `libtransform.so` (`ldd` output must not mention libtransform).",
+   "Confirm output file record count and field offsets match the schema in `record_format.md` (byte-level layout check on the 1000-record sample output)."
+  ],
+  "verifier_knob": {
+   "name": "number_of_independent_state_properties_checked",
+   "value": "7",
+   "effect": "Lowering to 3 checks only sample fingerprints and schema, making a partial fix (counter only) passable. Raising to 7 adds fresh-input batches of varied record sizes and the ldd check, requiring a fully correct reimplementation. The current value of 7 is calibrated to the hard target."
+  },
+  "expected_failure_modes": [
+   "Agent fixes the counter bug (readable in source) but misses the endianness bug (only visible by numerical comparison of bytes), causing hidden-batch failures.",
+   "Agent reverse-engineers the key schedule partially \u2014 gets the rotation stride right but uses the wrong Fibonacci variant (e.g., 0-indexed vs 1-indexed start, or mod 2^32 instead of 2^64) \u2014 so fingerprints are wrong on records beyond the first few blocks.",
+   "Agent wraps libtransform.so in a thin Go shim rather than reimplementing it, failing the ldd check.",
+   "Agent derives the algorithm from a small set of probe inputs that happen to not distinguish the rotation direction (left vs right), producing an implementation that matches ~50% of cases.",
+   "Agent implements the algorithm correctly but makes an off-by-one in the global block counter when records have non-multiple-of-8 lengths (padding behavior), failing only on variable-length batches.",
+   "Agent verifies only against the provided sample batch (all 1000 records pass) but does not test with fresh inputs, missing a subtle misimplementation that cancels on the specific sample seed."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "reverse-engineering",
+  "tags": [
+   "go",
+   "reverse-engineering",
+   "binary-format",
+   "systems-programming",
+   "security-audit",
+   "data-processing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/record_format.md",
+   "cat /app/internal/pipeline/ingest.go",
+   "cat /app/internal/pipeline/writer.go",
+   "cat /app/internal/pipeline/batch.go",
+   "cat /app/cmd/transformer/main.go",
+   "Write probe.go: call libtransform.so with 8-byte all-zero input, print out16 hex",
+   "Run probe: derive key[0] from XOR of input and output fold",
+   "Write probe with 16-byte input (block0=zeros, block1=zeros): derive key[1], infer rotation",
+   "Write probe with 16-byte input varying block1 to confirm Fibonacci term and fold formula",
+   "Write probe with known multi-block input, compare LE vs BE interpretation of out16",
+   "Confirm base_key, rotation stride 7, fib sequence, fold formula from probes",
+   "Implement pure-Go transform in /app/cmd/transformer/main.go with global block counter",
+   "Implement correct LE output packing for the two uint64 halves",
+   "go build -o /app/cmd/transformer/transformer /app/cmd/transformer/main.go",
+   "Run transformer on /app/data/sample_batch.bin, output to /app/output/records.bin",
+   "xxd /app/output/records.bin | head vs xxd /app/reference/expected_fingerprints.bin | head",
+   "Write byte-compare script to diff all 16000 fingerprint bytes",
+   "ldd /app/cmd/transformer/transformer | grep libtransform",
+   "Fix any mismatches, rebuild, rerun"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The libtransform.so must be actually prebuilt and correct \u2014 if the .so itself has a bug or the reference fingerprints were generated with a different implementation, the task is unsolvable; the blueprint must ensure perfect consistency between .so behavior, reference fingerprints, and the algorithm description.",
+   "The endianness bug description says it 'only manifests when the high bit of either 64-bit half differs between LE and BE' \u2014 this is always true for any nonzero value where byte order matters, so the claim that it affects ~50% of records needs careful validation; if the sample batch happens to have a different ratio, the trap may not work as described.",
+   "The instruction says the transformer must produce correct fingerprints 'for any input batch in the same format' but does not specify what 'same format' means precisely \u2014 agents could argue variable-length records are out of scope if record_format.md only documents fixed-length records.",
+   "Building libtransform.so correctly as a prebuilt binary that implements exactly the described algorithm (with no source) requires careful construction; any mismatch between the .so behavior and the written algorithm spec creates an unsolvable or ambiguous task.",
+   "The global block counter behavior for records whose length is not a multiple of 8 (padding behavior) is not specified in the instruction \u2014 the blueprint mentions this as a failure mode but the agent has no way to determine the correct padding behavior without additional documentation or probing edge cases.",
+   "The cgo probe approach requires gcc and cgo to work correctly in the container; if the FROM python:3.13-slim-bookworm base has library compatibility issues with the prebuilt x86-64 .so, probing may fail with linker errors unrelated to the task."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is undermined by two factors: first, both bugs (counter reset and BigEndian) are directly visible by reading the Go source files, reducing the reverse-engineering challenge to algorithm implementation rather than true discovery; second, the speedrun reaches ~19 commands which is at the boundary, but a strong agent who reads ingest.go and writer.go immediately sees both bugs without needing to probe, collapsing the difficulty. The padding/non-multiple-of-8 behavior for the global block counter is unspecified in the instruction and record_format.md scope, creating an invalid failure risk. The task also has a consistency risk: the prebuilt .so, reference fingerprints, and algorithm description must be perfectly synchronized during environment construction, which is fragile.",
+  "fixes": [
+   "Remove the endianness bug from writer.go entirely and instead make the endianness a property that must be discovered purely by probing libtransform.so \u2014 do not leave any source-readable clue; this forces genuine black-box reverse engineering rather than source reading.",
+   "Specify the padding behavior for records whose byte length is not a multiple of 8 explicitly in record_format.md (e.g., zero-pad to next 8-byte boundary, or truncate), so the variable-length batch test has a deterministic correct answer.",
+   "Add a construction note requiring the .so to be built from a reference Go or C implementation that is archived (but not shipped) so the task author can verify consistency between .so output, reference fingerprints, and algorithm spec before publishing.",
+   "To increase genuine difficulty, remove the off-by-one counter bug from ingest.go (make it a subtler semantic error, e.g., the counter increments by record index rather than block count) so the bug is not immediately obvious from reading the source and requires comparing actual vs expected outputs to locate."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log validation/filtering service for correctness and performance, not reverse-engineering an opaque shared library to reimplement a fingerprinting algorithm in Go."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a TCP service with HMAC-SHA256 over a specific binary serialization format, not reverse-engineering an opaque shared library to replace a fingerprinting transform pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task is about extracting XOR-obfuscated credentials from Go source code, not reverse-engineering a compiled shared library to reimplement a binary fingerprinting algorithm."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a weighted aggregation bug in a sales service, not reverse-engineering an opaque shared library to reimplement a fingerprinting transform."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-processing and deduplication bugs in a CSV pipeline, not reverse-engineering an opaque shared library to reimplement a binary fingerprinting algorithm."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-94391df591b0",
+     0.252
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.24
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.144
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.141
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.121
+    ]
+   ],
+   "cost_usd": 0.012069
+  },
+  "novel": true
+ },
+ "cost_usd": 0.052425
+}

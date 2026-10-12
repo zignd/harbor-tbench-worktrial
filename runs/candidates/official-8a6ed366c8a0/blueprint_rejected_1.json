@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "log-aggregator-fanout-repair",
+  "title": "Log Aggregation Fanout Pipeline Repair",
+  "scenario": "A backend service runs inside a single container: a compiled log-aggregator daemon (`/usr/local/bin/logfanout`) reads structured JSON log lines from a Unix socket, applies per-source bucketing and rate-windowed deduplication, then writes summarised records into a SQLite database. A Python web API serves the summaries. You've been seeing duplicate and missing counts in production dashboards ever since the team switched from hourly to 5-minute rollup windows three weeks ago. The repo has about 1 800 lines across the aggregator config, a schema-migration script, the API, and a replay harness that re-ingests historical log files.",
+  "instruction_draft": "Hey, something's wrong with the log fanout pipeline in `/app`. The aggregator is running and the API at `localhost:5000` is up, but when I replay the sample log files with `python /app/tools/replay.py /app/data/sample_logs/` the counts in the SQLite DB at `/app/db/metrics.db` don't match what I'd expect.\n\nSpecifically, three things should hold after a full replay:\n1. Every `(source, window_start)` pair in `metrics.db` must appear **exactly once** in the `rollup` table (no duplicate rows).\n2. The `event_count` for each row must equal the true number of distinct `event_id` values that fall inside that window from the raw log files \u2014 deduplication is by `event_id`, not by raw line count.\n3. A new table `source_totals` must exist with columns `(source TEXT, total_events INTEGER)` giving the sum of deduplicated events per source across all windows; the totals must match the rollup table.\n\nCan you dig in, figure out what's actually broken, and fix it so a fresh replay produces a correct DB? The aggregator config is in `/app/config/`, the DB schema is in `/app/schema/`, and there's a test harness at `/app/tools/verify.py` I wrote that checks a few things \u2014 but I haven't hooked it up to the hidden cases yet.",
+  "requirements": [
+   "After running `python /app/tools/replay.py /app/data/sample_logs/`, the `rollup` table in `/app/db/metrics.db` contains exactly one row per `(source, window_start)` pair.",
+   "Each row's `event_count` equals the number of distinct `event_id` values from raw log lines whose timestamps fall within that window for that source.",
+   "A table `source_totals` exists with schema `(source TEXT PRIMARY KEY, total_events INTEGER)` and each row equals the sum of `event_count` across all rollup rows for that source.",
+   "The three invariants hold not only for the supplied sample logs but for fresh log files generated at verify time with different sources, window boundaries, and deliberate duplicate event_ids."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install sqlite3; pip install flask requests",
+   "Compiled binary `/usr/local/bin/logfanout` (written in C, compiled at image build time from a source file that is NOT shipped) \u2014 it reads newline-delimited JSON from a Unix socket `/tmp/logfanout.sock`, applies a configurable deduplication window, and upserts rows into SQLite. The binary has a latent bug: when the window size in the config is set to values other than 3600 (the original hourly setting), the UPSERT uses INSERT OR REPLACE instead of INSERT OR IGNORE, causing duplicate rows when the same (source, window_start) key is seen twice across two socket reconnections.",
+   "Config at `/app/config/fanout.yaml` with `window_seconds: 300` (already changed to 5-min, which triggers the bug).",
+   "SQLite schema at `/app/schema/init.sql` \u2014 defines `rollup(source TEXT, window_start INTEGER, event_count INTEGER)` but with NO UNIQUE constraint on (source, window_start), so duplicates are silently accepted.",
+   "Replay harness `/app/tools/replay.py` \u2014 sends log lines through the socket in batches, reconnecting between batches (this is what exposes the duplicate-row bug).",
+   "Sample log files in `/app/data/sample_logs/` \u2014 6 gzipped JSONL files, each ~400 lines, with deliberate duplicate event_ids across files to test deduplication.",
+   "Flask API `/app/api/server.py` serving summaries from the DB \u2014 currently running as a background process.",
+   "Partial verify script `/app/tools/verify.py` that only checks row counts on the sample data, not deduplication correctness.",
+   "A schema migration stub `/app/schema/migrate.py` that is empty (solver must implement the `source_totals` table creation and population).",
+   "Startup script `/app/start.sh` that launches logfanout and the Flask API.",
+   "The binary's deduplication logic: it keeps a per-window in-memory bloom filter of seen event_ids, but only within a single process lifetime; on reconnect the filter is reset, so the same event_id arriving in a second batch is counted again \u2014 this is the second (data-dependent) bug.",
+   "Total source lines: ~900 lines of Python across replay, API, verify, migrate; ~400 lines of C source NOT present (binary only); ~200 lines config and SQL."
+  ],
+  "internal_hint": "Difficulty comes from two interacting opaque-component bugs that only manifest on real replayed data: (1) The compiled binary uses INSERT OR REPLACE (not INSERT OR IGNORE or ON CONFLICT DO UPDATE incrementally) when window_seconds != 3600, creating duplicate (source, window_start) rows whenever the replay script reconnects mid-stream. This is invisible from reading config or Python source \u2014 you have to run a replay, query the DB, and notice row counts exceed line counts. (2) The binary's in-process bloom filter for event_id deduplication resets on each socket reconnection, so duplicate event_ids split across batches are double-counted. You discover this by crafting a minimal two-batch replay with a known duplicate event_id and observing the count. Fixes: (a) add a UNIQUE constraint on rollup(source, window_start) and change the insert mode \u2014 but the binary's behavior must be characterised to know which constraint semantics to use (IGNORE vs REPLACE vs FAIL); the correct fix is UNIQUE + a wrapper script that merges rows post-insert or switches to a WAL-mode DB with an application-side dedup layer. The cleanest fix is to add a unique index and write a post-processing step in a new `/app/tools/dedup_rollup.py` that collapses duplicate rows by summing event_counts (which partially compensates for the bloom-filter reset bug), then build source_totals from the cleaned rollup. (c) Implement source_totals via migrate.py.",
+  "trap": "A solver that adds the UNIQUE constraint and reruns the replay will see clean rollup rows for the sample data but will still fail the hidden tests because: (1) the bloom-filter reset means event_count values are inflated for sources with duplicate event_ids split across batches \u2014 the dedup_rollup merge step sums inflated counts unless the solver also instruments the binary's behavior to realise deduplication must happen at the application layer post-insert; (2) source_totals will be wrong if populated before dedup_rollup runs. The hidden tests generate fresh log files with \u226530% duplicate event_ids deliberately split across reconnection boundaries.",
+  "tests": [
+   "After replay, SELECT COUNT(*) FROM (SELECT source, window_start FROM rollup GROUP BY source, window_start HAVING COUNT(*) > 1) returns 0.",
+   "For each (source, window_start) pair, the stored event_count matches a ground-truth count computed by the verifier by scanning raw log files and counting distinct event_ids in that window for that source.",
+   "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='source_totals') returns 1.",
+   "For each source, source_totals.total_events equals SUM(event_count) from the (already-deduplicated) rollup table for that source.",
+   "Verifier generates a fresh batch of 5 synthetic log files (different sources, different window boundaries, ~25% duplicate event_ids split across files) replays them, and repeats all four checks above.",
+   "The source_totals values for the fresh batch match the verifier's independent ground-truth totals computed from raw event_ids."
+  ],
+  "verifier_knob": {
+   "name": "duplicate_fraction_in_fresh_logs",
+   "value": "0.30",
+   "effect": "Raising the fraction of cross-batch duplicate event_ids makes the bloom-filter reset bug contribute more error to event_count, making a partial fix (only adding UNIQUE constraint without application-layer dedup) fail more loudly; lowering it to 0 lets a constraint-only fix pass."
+  },
+  "expected_failure_modes": [
+   "Agent adds UNIQUE constraint and reruns replay, sees sample data pass verify.py, declares done \u2014 fails hidden tests because event_count inflation from bloom-filter reset is not fixed.",
+   "Agent patches the schema and writes source_totals but populates it from the pre-dedup rollup, getting inflated totals.",
+   "Agent tries to modify the binary but has no source; gives up on the dedup fix and only handles the duplicate-row constraint, missing the count-inflation issue.",
+   "Agent correctly deduplicates rows (summing) but sums the wrong column, or uses MAX instead of SUM, getting wrong event_counts.",
+   "Agent implements source_totals correctly for sample data but forgets to re-run the population step after dedup, leaving stale values."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "sqlite",
+   "compiled-binary",
+   "opaque-component",
+   "deduplication",
+   "log-aggregation",
+   "pipeline-repair"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/config/fanout.yaml",
+   "cat /app/schema/init.sql \u2014 notice no UNIQUE constraint",
+   "python /app/tools/replay.py /app/data/sample_logs/",
+   "sqlite3 /app/db/metrics.db 'SELECT source, window_start, COUNT(*) FROM rollup GROUP BY source, window_start HAVING COUNT(*) > 1 LIMIT 5;'",
+   "cat /app/tools/replay.py \u2014 understand batch/reconnect structure",
+   "strings /usr/local/bin/logfanout | grep -iE 'INSERT|REPLACE|IGNORE|bloom'",
+   "Craft minimal 2-batch replay with known duplicate event_id, observe count=2 not 1 \u2014 confirms bloom filter reset",
+   "Realize: binary's event_count is unreliable; must recompute from raw log files at application layer",
+   "Write /app/tools/recount.py: scan all sample_logs/*.gz, compute distinct event_ids per (source, window_start) using window_seconds=300",
+   "sqlite3 /app/db/metrics.db 'DELETE FROM rollup;'",
+   "python /app/tools/recount.py \u2014 populates rollup with correct counts directly via sqlite3 Python",
+   "Verify no duplicates: sqlite3 'SELECT COUNT(*) FROM (SELECT source,window_start FROM rollup GROUP BY source,window_start HAVING COUNT(*)>1);'",
+   "Implement /app/schema/migrate.py: CREATE TABLE source_totals(source TEXT PRIMARY KEY, total_events INTEGER); INSERT OR REPLACE INTO source_totals SELECT source, SUM(event_count) FROM rollup GROUP BY source;",
+   "python /app/schema/migrate.py",
+   "sqlite3 /app/db/metrics.db 'SELECT * FROM source_totals;'",
+   "python /app/tools/verify.py",
+   "Add UNIQUE constraint to rollup for future safety: ALTER TABLE or recreate schema",
+   "Confirm hidden-test path: recount.py reads from /app/data/sample_logs/ glob \u2014 ensure it handles fresh log files placed there by verifier"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The hidden verifier generates fresh log files and replays them \u2014 but it's unclear whether the verifier re-runs replay.py (which goes through the buggy binary) or directly inserts ground-truth counts. If the verifier uses the binary, the bloom-filter bug will re-inflate counts in the fresh batch, making it impossible to pass test 2 without bypassing the binary entirely for counting.",
+   "The 'correct fix' per the internal hint is ambiguous: summing duplicate rows (dedup_rollup) is described as 'partially compensating' for bloom-filter reset, but the trap section says this still fails hidden tests. The instruction never tells the solver that the binary's event_count values are fundamentally untrustworthy \u2014 a solver who reads only the instruction (not the hint) may not realize they must bypass the binary's counting entirely.",
+   "The verifier's fresh log replay path is underspecified: does it clear the DB before replaying? Does it restart the logfanout daemon? If the daemon has stale in-memory state from the sample replay, fresh log counts could be contaminated.",
+   "The bloom filter reset behavior is only discoverable by experiment (crafting a 2-batch replay), which requires understanding the replay.py batching internals. If replay.py's reconnect behavior is not obvious from reading it, the solver may not think to test this specific scenario.",
+   "Difficulty lever 'observe_not_read' is real, but the task description in the instruction hints strongly at 'deduplication is by event_id' \u2014 a careful solver might immediately write an application-layer recount without ever needing to characterize the binary, making the opaque-component lever less effective.",
+   "The solvability concern: bypassing the binary entirely for counting (writing recount.py from scratch) is a significant implementation task under time pressure, and the correctness of window boundary arithmetic (floor division by window_seconds) must match exactly what the binary would produce for non-duplicate cases \u2014 a mismatch here would cause test 2 to fail even with a correct approach."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical underspecification: the hidden verifier replays fresh logs through the buggy binary, but the only correct fix requires bypassing the binary's event_count output entirely and recomputing from raw files. This creates an invalid failure mode where a solver who correctly characterizes both bugs and implements the right fix still fails if their window-boundary arithmetic doesn't exactly match the binary's (unknowable without source). Additionally, the verifiability is weakened because the verifier's own replay path goes through the opaque buggy component, making ground-truth comparison circular. The solvability score of 3 reflects that the full correct solution (application-layer recount + schema fix + migration) is achievable but requires ~18-22 focused commands with a non-obvious pivot insight, which is borderline for a hard task.",
+  "fixes": [
+   "Specify explicitly in the instruction that the binary's event_count values may be unreliable and that the solver is permitted (and expected) to implement application-layer counting that bypasses the binary's output \u2014 otherwise the correct fix path is not inferable from the instruction alone.",
+   "The hidden verifier should insert ground-truth counts directly (not via the buggy binary) for the fresh log batch, or alternatively provide a reference implementation of the window-boundary calculation so solvers can match it exactly. Currently the verifier's ground-truth computation and the binary's computation may diverge on edge cases (window boundary rounding), creating flaky failures.",
+   "Add a concrete hint in the instruction that the binary's deduplication state resets on reconnect (e.g., 'note that the aggregator process may not maintain deduplication state across reconnections') \u2014 this keeps the observe_not_read difficulty while making the failure mode discoverable without requiring the solver to reverse-engineer the binary.",
+   "Clarify the verifier's replay procedure: does it clear /app/db/metrics.db before the fresh batch replay? Does it restart logfanout? These details affect whether the solver's fix needs to handle incremental vs. fresh-start scenarios.",
+   "Consider making the binary's INSERT OR REPLACE bug fixable via a SQLite trigger or view rather than requiring full bypass of the binary's counting \u2014 this would make the opaque-component characterization sufficient without requiring a complete recount implementation."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task fixes weighted aggregation in a compiled service with a weight cache, while the candidate involves deduplication by event_id, rollup window bucketing, and creating a summary table in a Unix-socket-based log fanout pipeline."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task involves NetFlow v9 binary parsing and template state management for counterparty attribution, which is a fundamentally different problem from JSON log deduplication and rollup window repair."
+    },
+    {
+     "ref_id": "terminal-bench-pro/secure-postgres-schema-migration",
+     "verdict": "distinct",
+     "reason": "That task is about secure PostgreSQL schema migration with backup/encryption automation, unrelated to log aggregation deduplication or rollup window correctness."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing an ETL/aggregation pipeline writing to SQLite with requirements for deduplication (distinct user_id vs distinct event_id), no duplicate rows per composite key, and idempotent/correct aggregation \u2014 the core debugging challenge and invariants are essentially the same."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log ingestion service for schema validation correctness and performance, not about rollup window deduplication or SQLite aggregation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.19
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.163
+    ],
+    [
+     "terminal-bench-pro/secure-postgres-schema-migration",
+     0.159
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.154
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.138
+    ]
+   ],
+   "cost_usd": 0.012699
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056673
+}

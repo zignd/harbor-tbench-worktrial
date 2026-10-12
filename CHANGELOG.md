@@ -4,6 +4,17 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:43 -03:00 · Tuning round 2 still too easy; a $13 Opus trial explained; first pipeline tasks pass functional gates
+- **Tuning round 2 on `ledger-reconcile`:** a third interacting bug plus nastier verify-time cases. It re-gated cleanly (16/16 quality, novelty ok, red-team honest), then Opus went **4/4 again**. The task has used its 2 tuning rounds and is closed as too easy. Lesson for the presentation: on a ~300-line codebase, more bugs don't make it harder. Opus fixed three interacting bugs in 9-13 turns. Difficulty has to come from investigation depth, which the 800-2,000-line rule is for.
+- **One Opus trial cost $13.45 (48 turns, 48.5 min)**, vs $0.21-0.24 for the other three:
+  - It produced 300k output tokens. Every early response ran far past its JSON command, and terminus-2 warned "Extra text detected before/after JSON object" each turn. In that extra text Opus **imagined command outputs**, including whole alternate versions of the codebase, then reasoned about "the environment cycling between versions".
+  - The real terminal output stayed consistent, and Docker isolation was checked and is fine: images are content-hash tagged and each trial has its own compose project. After a context summarization the agent re-checked everything, solved it, and was judged legit.
+  - It's model behaviour that we may not change (no Opus/terminus-2 settings changes), so it stays a **tail cost risk** (~60× a normal trial), and the budget guard's per-trial pre-check doesn't bound it. It's covered by headroom: $62.72 spent of $380, $437.28 remaining. Spend rose ~$29 in 25 min, from this trial plus ~10 parallel authorings.
+- **Funnel progress:** three pipeline-generated candidates passed structure + lint + functional (oracle 3/3, nop 0): `ae2e` Rust codec (pilot, after 2 repairs), `3bbd` EMA engine (Batch 1, first build), `2f50` C audit service (Batch 1, after 2 repairs for leaked tokens). With `ledger-reconcile`, that's 4 tasks past the validator + functional gates.
+- **Lint false positive:** the suggestive-comment check scanned **vendored** third-party code (`node_modules/ajv-formats/...: // hint to the UI…`). Directories like `node_modules`, `vendor`, `site-packages`, `.git` and `target` are now skipped. Tradeoff: an author could in principle hide a hint there, but the leak scan still covers answer tokens anywhere in the image.
+- **Authoring guard:** one build spent 30+ turns stuck at a shell `>` continuation prompt (an unclosed quote). The meta-task instruction now says to send `C-c` and rewrite with a quoted heredoc.
+- 117 tests pass.
+
 ### 19:40 -03:00 · Six more speed-ups; scale Q&A for the presentation
 1. **Calibration starts as soon as a task passes its gates.** `run_batch --calibrate` calls the new `calibrate_one`, also used by `scripts.calibrate_candidates`: red-team if it never ran, calibrate, ship if learnable. A gated task no longer waits for a separate run. A resumed batch also calibrates tasks gated before a crash.
    - Several processes can now calibrate at once, so `opus_slots` (flock'd slot files under `jobs/.opus-slots/`) caps **machine-wide** Opus trials at `OPUS_CONCURRENCY`. A wave takes all its slots or none (no deadlock), and a crashed holder frees its slots. Tested with 4 concurrent waves: peak ≤ 3, all complete.

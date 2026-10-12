@@ -56,6 +56,13 @@ def test_suggestive_comment_and_answer_file_are_errors(task):
     assert any("answer-like file" in e for e in errs)
 
 
+def test_comments_in_vendored_third_party_code_are_not_hints(task):
+    lib = task / "environment" / "app" / "node_modules" / "ajv-formats" / "formats.js"
+    lib.parent.mkdir(parents=True)
+    lib.write_text("// hint to the UI to hide input strings\n")
+    assert not any("suggestive comment" in e for e in errors(lint_task(task, CANARY_LINE)))
+
+
 def test_package_check_in_tests_is_an_error(task):
     t = task / "tests" / "test_outputs.py"
     t.write_text(t.read_text() + "\n\ndef test_pkg():\n    import importlib.metadata\n")

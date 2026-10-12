@@ -66,7 +66,8 @@ int64_t refund_resolver_lookup(AuditContext *ctx, uint64_t refund_txid) {
     const char *sql =
         "SELECT rr.charge_txid "
         "FROM refund_refs rr "
-        "WHERE rr.charge_txid = ? "
+        "JOIN charges c ON c.txid = rr.charge_txid "
+        "WHERE rr.refund_txid = ? "
         "LIMIT 1";
 
     sqlite3_stmt *stmt = NULL;
@@ -77,10 +78,9 @@ int64_t refund_resolver_lookup(AuditContext *ctx, uint64_t refund_txid) {
         return 0;
     }
 
-    rc = sqlite3_bind_int64(stmt, 1, (sqlite3_int64)refund_txid);
+    /* Bind the refund transaction id to the query parameter. */
+    rc = sqlite3_bind_int64(stmt, 2, (sqlite3_int64)refund_txid);
     if (rc != SQLITE_OK) {
-        fprintf(stderr, "refund_resolver: bind failed: %s\n",
-                sqlite3_errmsg(ctx->db));
         sqlite3_finalize(stmt);
         return 0;
     }

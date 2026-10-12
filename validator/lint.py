@@ -14,6 +14,7 @@ from pathlib import Path
 Finding = tuple[str, str]
 
 INSTRUCTION_MAX_WORDS = 300
+VENDORED_DIRS = {"node_modules", "vendor", "site-packages", ".git", "target"}
 SUGGESTIVE = re.compile(
     r"#.*\b(BUG|FIXME|XXX|HACK|fix:|intentional(ly)?|the bug|bug here|hint)\b"
     r"|//.*\b(BUG|FIXME|fix:|intentional(ly)?|the bug|hint)\b",
@@ -88,6 +89,9 @@ def lint_task(task_dir: Path, canary_line: str) -> list[Finding]:
     # Environment leakage: answer-named files and comments that give away the fix.
     for path in sorted((task_dir / "environment").rglob("*")):
         if not path.is_file() or "__pycache__" in path.parts:
+            continue
+        # Third-party code the author vendored (not wrote): its comments aren't hints.
+        if VENDORED_DIRS & set(path.parts):
             continue
         rel = path.relative_to(task_dir)
         if ANSWER_FILENAME.search(path.name):

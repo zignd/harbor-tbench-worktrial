@@ -192,13 +192,62 @@ spec sampler (inverse-freq) ─► blueprint (Sonnet) ─► blueprint rubric re
 
 If an Opus trial costs more than ~$3, shrink the batch rather than cut the number of trials per task. Expect about a third of functionally correct tasks to land in band before tuning (SkillSynth base rate).
 
+### Spend discipline
+
+The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every rule below saves money **without** touching the work-trial constraints:
+- Opus 4.8 + terminus-2 is the only difficulty benchmark.
+- The band is defined on 5 runs.
+- `timeout_sec = 3600`.
+- No other models.
+- Only valid failures count.
+
+**Tracking**
+- `make usage` (OpenRouter `GET /api/v1/key`) is the source of truth for spend. Run it **before and after every phase and every batch**, and log the delta in `CHANGELOG.md` (the plan's budget table vs actual).
+- The ledger records each call's estimated cost. Per-model prices come from OpenRouter `/models` `pricing`, or Harbor's reported cost. After each batch, the ledger total is reconciled against `make usage-json`. A gap of more than 10% means our accounting is wrong, so stop and fix it.
+- The **budget guard** in `run_batch` reads `usage-json` before starting any Opus trial. It refuses to start new calibration once **remaining < $75**, the protected reserve.
+
+**Hard limits (configurable in `generator/config.py`, enforced in code)**
+
+| Limit | Value | Why |
+|---|---|---|
+| Protected reserve | $75 | Final re-verification, a 5× naive spot-check, and AfterQuery follow-ups |
+| Per-batch cap | `--budget` flag (e.g. $150) | Stop mid-batch instead of overspending |
+| Opus concurrency | ≤3 trials | Limits burn rate and local resource contention (Tmax saw local contention cause timeouts) |
+| Opus `max_turns` | 200 | Caps runaway trials (README allows it). Hitting it is an *invalid* failure, never a valid one |
+| Meta-task `max_turns` | e.g. 80 | Authoring isn't constrained by the README, so cap it tighter |
+| Repair rounds | ≤2, then regenerate | Bad first drafts rarely recover (SkillSynth) |
+| Phase caps | Budget table above | A phase that hits its cap stops and gets re-planned, not silently extended |
+
+**Spend Opus only on tasks that can ship**
+1. **All cheap gates first.** No Opus trial until the task has passed every one of these: structural, lints, leak scan, alignment check, oracle 3/3, nop, and the Sonnet red-team. Each costs cents or nothing; an Opus trial costs dollars.
+2. **Exact curtailment** (`decide()`): stop as soon as the 5-run verdict can't change. Accept at ≥1 legit pass and ≥2 fails (the maximum final passes is then 5 − fails ≤ 3). Reject at 4 passes or 5 fails. **The verdict is identical to running all 5.** For transparency, every report entry shows `k/n` and states that the verdict is guaranteed. If the budget allows at the end, shipped tasks are topped up to a full 5/5 record.
+3. **Judge as you go.** Run the failure judge and pass audit after *each* Opus trial, not at the end. An *invalid* failure (spec ambiguity, test overreach, env issue, turn cap) or a hacked pass means the task can't ship as-is. **Stop calibrating it immediately** and send it to repair. Don't spend the remaining trials on a broken task.
+4. **Order by promise.** Calibrate the candidates whose blueprint has the best alignment and rubric scores (and Sonnet-predicted pass rate near 0.5) first, so the budget goes to the likeliest learnable tasks.
+5. **Target-driven batches.** Stop generating once the target number of learnable tasks is reached (README: 10+). Don't run a fixed N if the target is already met.
+
+**Scale in steps, not all at once**
+- Batch sizes go 1 (Phase 0 spike) → 3 (pilot) → ~10 → ~12-15. After each step, compute **cost per learnable task** and the funnel yield, and decide the next batch size from those numbers.
+- If the pilot shows >$40 per learnable task, stop and fix the generator (difficulty levers, gates) before generating more.
+
+**Don't pay twice**
+- Each stage result is cached in the ledger under a **content hash of the task directory**. Re-running the pipeline skips stages whose inputs didn't change, so resuming after a crash or code change costs nothing.
+- Development and unit tests use **recorded job-dir fixtures** and a fake runner (`--dry-run`), with no API calls. Only real batches touch the key.
+- Check in Phase 0 whether OpenRouter reports **cached prompt tokens** for terminus-2 runs. If caching is active, long trajectories are much cheaper than the per-token estimate. Record this in the cost model either way.
+
+**What we must not do to save money**
+- Change Opus's sampling or thinking settings, the agent, or the 3600 s timeout. That would change what "learnable" means.
+- Use any other model as a cheap proxy for difficulty.
+- Ship a task on fewer than the trials its verdict needs.
+- Count a turn-cap or timeout failure as valid.
+
 ## Phases (each ends with small, meaningful commits)
 
 **Phase 0: setup and spike (day 1 morning)**
 - ~~Set up the uv project, Python and Harbor~~ (done, `e4c095c`).
 - ~~Put `OPENROUTER_API_KEY` and `OPENROUTER_API_BASE` in a git-ignored `.env`~~ (done; key validated against both models).
-- Run oracle/nop on all 6 examples.
-- Run 1-2 Opus terminus-2 trials on one example. Learn:
+- ~~`make usage` for spend tracking~~ (done). Run it before and after every step below.
+- Run oracle/nop on all 6 examples (no API cost).
+- Run 1-2 Opus terminus-2 trials on one example. Learn the **real cost per Opus trial** (and whether prompt caching applies) to re-plan the budget table, plus:
   - The job-dir layout and `result.json` fields (cost/tokens).
   - The trajectory format.
   - The behavior of `-k`, `-n`, `--ak max_turns`, image caching, and verify-time `uvx` flakiness.

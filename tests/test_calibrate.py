@@ -1,0 +1,63 @@
+from itertools import product
+
+import pytest
+
+from evaluator.calibrate import (
+    HACKED_PASS,
+    INVALID_FAIL,
+    LEGIT_PASS,
+    VALID_FAIL,
+    decide,
+    next_wave_size,
+)
+
+
+def full_verdict(seq: tuple[str, ...]) -> str:
+    passes = seq.count(LEGIT_PASS)
+    if passes == 0:
+        return "too_hard"
+    if passes >= 4:
+        return "too_easy"
+    return "learnable"
+
+
+@pytest.mark.parametrize("seq", list(product([LEGIT_PASS, VALID_FAIL], repeat=5)))
+def test_curtailment_matches_the_full_five_run_verdict(seq):
+    """Exhaustive over all 32 pass/fail sequences: stopping early never changes the verdict."""
+    for k in range(1, 6):
+        verdict = decide(list(seq[:k]))
+        if verdict is not None:
+            assert verdict == full_verdict(seq), (seq, k)
+            break
+    else:
+        pytest.fail(f"no verdict after 5 runs for {seq}")
+
+
+def test_curtailment_saves_trials_on_average():
+    stops = []
+    for seq in product([LEGIT_PASS, VALID_FAIL], repeat=5):
+        stops.append(next(k for k in range(1, 6) if decide(list(seq[:k]))))
+    assert sum(stops) / len(stops) < 4.5  # uniform p=0.5 over sequences
+
+
+def test_invalid_or_hacked_stops_immediately():
+    assert decide([LEGIT_PASS, INVALID_FAIL]) == "invalid"
+    assert decide([HACKED_PASS]) == "invalid"
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected"),
+    [
+        ([], 3),  # earliest verdict: learnable after 1 pass + 2 fails
+        ([LEGIT_PASS], 2),
+        ([LEGIT_PASS, VALID_FAIL], 1),
+        ([VALID_FAIL, VALID_FAIL], 1),  # one pass would make it learnable
+        ([LEGIT_PASS, LEGIT_PASS, LEGIT_PASS], 1),  # the next pass decides "too easy"
+    ],
+)
+def test_waves_never_overshoot_the_earliest_verdict(outcomes, expected):
+    assert next_wave_size(outcomes, concurrency=3) == expected
+
+
+def test_wave_respects_concurrency():
+    assert next_wave_size([], concurrency=1) == 1

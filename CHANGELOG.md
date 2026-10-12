@@ -4,6 +4,20 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:25 -03:00 · Calibration: exact curtailment, per-trial judges, shipping
+- **`evaluator/calibrate.py`:**
+  - `decide()` implements exact curtailment of the 5-run band test: accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails, stop immediately on a hacked pass or invalid failure. Tested on all 32 pass/fail sequences: the early verdict always equals the full 5-run verdict. Expected trials are 3.85-4.3 instead of 5 (14-23% saved) for true pass rates 0.2-0.8, before the extra savings from stopping on invalid failures.
+  - `next_wave_size()` runs trials in parallel waves no larger than the fewest trials that could still produce a verdict (3, then 2 or 1), so concurrency never pays for a trial whose result can't matter.
+  - `calibrate()` runs Opus waves (terminus-2, `max_turns=200`, budget check per wave), judges each trial as it lands, and writes ledger events.
+- **`analysis/judge.py`:**
+  - `condense()` keeps reasoning, commands and truncated output: ≤90k chars, head and tail kept, since action-only monitors are weaker (Terminal Wrench).
+  - `command_scan()` flags commands touching `/tests`, `/solution` or reward paths.
+  - `audit_pass()` labels passes legit / non-serious hack / serious exploit.
+  - `analyze_failure()` classifies failures with 10 valid modes (partial implementation, weak verification, …) and 6 invalid ones (spec ambiguity, test overreach, broken or nondeterministic env, tool quirk, resource limit). A "valid" verdict with an invalid mode is rejected in code.
+  - Harbor-level timeouts and turn-cap endings are always invalid.
+- **`scripts/calibrate_candidates.py`:** calibrates gated candidates and ships learnable ones to `output/<slug>/`, with a README modelled on the examples' (what it tests, calibration, why the model fails it, how it's verified). It refuses to run in dev mode.
+- 88 tests pass. Pilot batch (3 candidates) and a dev-mode batch are running. The first pilot blueprint was accepted (Rust packet codec with a throughput bar, predicted 0.25; $0.13).
+
 ### 17:22 -03:00 · Authoring cost levers; task.toml becomes pipeline-owned
 - **Where the Phase 0 money went:** the $2.75 Sonnet authoring run spent ~56% on cache reads of an ever-growing history (2k tokens at step 1, 104k at step 80, resent every turn) and ~32% on output tokens (file contents). Six turns reading the reference task added output that stayed in context for the remaining 74 turns.
 - **Levers (authoring agent only; Opus calibration keeps terminus-2's defaults):**

@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 36 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 40 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -354,13 +354,13 @@ Part 1 milestone
 
 ### Phase 2: Part 2, calibration
 
-- [ ] `evaluator/calibrate.py`: pure `decide(outcomes)` with exact curtailment (accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails). Exhaustively unit-tested against the full 5-run verdict.
-- [ ] Calibration runner: Opus trials in waves of ≤3, budget guard checked before every trial, outcomes written to the ledger.
+- [x] `evaluator/calibrate.py`: pure `decide(outcomes)` with exact curtailment (accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails). Exhaustively unit-tested against the full 5-run verdict. Done: tested on all 32 sequences. Expected 3.85-4.3 trials instead of 5 for p = 0.2-0.8.
+- [x] Calibration runner: Opus trials in waves of ≤3, budget guard checked before every trial, outcomes written to the ledger. Done: waves are capped at the fewest trials that can still reach a verdict, so they never overshoot.
 - [ ] 💲 Try `harbor analyze` (built-in `reward_hacking` + `task_specification` rubrics) on real calibration trajectories. Decide wrap vs build for both judges.
 - [ ] 💲 `analysis/judge.py` (a), pass audit: command scan plus a trajectory-level Sonnet judge (Meta-Task Fig. 8 + Terminal Wrench labels). Hacked passes don't count.
 - [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
-- [ ] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
-- [ ] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails).
+- [x] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
+- [x] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails). Done: `scripts/calibrate_candidates.py` writes `output/<slug>/README.md` (calibration plus judged failure reasons). Refuses to run in dev mode.
 - [ ] 💲 Dev-mode calibration loop (`DEV_MODE=1`): exercise waves, early stop, judges and ledger on 1-2 tasks before any Opus spend.
 - [ ] 💲 Calibrate the Phase 1 tasks (pilot). Record cost per learnable task. **Go/no-go:** above $40 per learnable task → fix generation before scaling.
 - [ ] 💲 Batch 1: ~10 new candidates end to end through calibration.

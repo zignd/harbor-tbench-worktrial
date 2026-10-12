@@ -6,7 +6,7 @@ UV_RUN := uv run --quiet --env-file .env
 
 TB_REFERENCE_DIR := data/tb-reference
 
-.PHONY: help usage usage-json tb-reference
+.PHONY: help usage usage-json tb-reference test lint dry-run batch
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -32,3 +32,19 @@ tb-reference: ## Download published Terminal-Bench tasks (latest, 2.1, Pro, Scie
 		-exec sh -c 'mkdir -p ../slim/$$(dirname "$$1") && cp "$$1" ../slim/"$$1"' _ {} \;
 	@rm -rf $(TB_REFERENCE_DIR) && mv $(TB_REFERENCE_DIR).tmp/slim $(TB_REFERENCE_DIR) && rm -rf $(TB_REFERENCE_DIR).tmp
 	@for d in $(TB_REFERENCE_DIR)/*/; do echo "  $$(ls $$d | wc -l | tr -d ' ') tasks  $$d"; done
+
+N ?= 3
+SEED ?= 1
+BUDGET ?= 20
+
+test: ## Run unit tests
+	@uv run --quiet pytest -q
+
+lint: ## Lint pipeline code (AfterQuery's validator/validate.py excluded)
+	@uv run --quiet ruff check . --exclude validator/validate.py
+
+dry-run: ## Run the batch pipeline with fixtures instead of model calls (free; real gates)
+	@uv run --quiet python -m scripts.run_batch --n 1 --dry-run
+
+batch: ## Generate and gate N candidates (N=3 SEED=1 BUDGET=20); DEV_MODE=1 for cheap plumbing runs
+	@$(UV_RUN) python -m scripts.run_batch --n $(N) --seed $(SEED) --budget $(BUDGET)

@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 30 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 36 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -331,9 +331,9 @@ Foundations
 Generation
 - [x] `generator/spec.py`: `TaskSpec` with the taxonomy axes, difficulty levers, verifier kind and knob, plus an inverse-frequency sampler. Unit-tested for coverage behavior.
 - [ ] 💲 `generator/blueprint.py`: spec → `Blueprint` (instruction draft, internal hint, env checklist, requirements, levers, verifier knob, predicted pass rate) via Sonnet structured output, plus a rubric review returning accept/reject with reasons.
-- [ ] `generator/metatask/`: meta-task package (instruction template adapted from Meta-Task Fig. 6, synthesis Dockerfile, in-container `tests/test.sh` completeness check, `task.toml` with `artifacts`).
-- [ ] 💲 `generator/author.py`: render a meta-task from a blueprint, run it, extract the package from `artifacts/`, stamp canary and metadata; repair mode with previous package + gate logs.
-- [ ] `generator/generate.py`: implement `generate_task(topic, output_dir)` end to end (spec → blueprint → author), keeping the template signature.
+- [x] `generator/metatask/`: meta-task package (instruction template adapted from Meta-Task Fig. 6, synthesis Dockerfile, in-container `tests/test.sh` completeness check, `task.toml` with `artifacts`).
+- [x] 💲 `generator/author.py`: render a meta-task from a blueprint, run it, extract the package from `artifacts/`, stamp canary and metadata; repair mode with previous package + gate logs. Done: repair rounds bake the failed package into `/app/previous` and append the gate findings. The canary is enforced by the in-container check plus lint rather than stamped afterwards.
+- [x] `generator/generate.py`: implement `generate_task(topic, output_dir)` end to end (spec → blueprint → author), keeping the template signature. Done: the topic becomes a hint on a sampled spec.
 
 Gates
 - [x] `validator/lint.py`: canary placement, no `docker_image`, timeout ≥ 3600, instruction style/length, no source-grep or package-installed tests, `solve.sh` investigates first, no COPY of `solution/`/`tests/`, COPY sources exist, no suggestive comments, test helpers only in `tests/`. Unit-tested on good/bad fixtures.
@@ -342,9 +342,9 @@ Gates
 - [x] `validator/novelty.py`: 13-gram + TF-IDF index over the 425-task TB corpus + `examples/`, `nearest(k=3)`, `concept_list()`. Thresholds calibrated on TB-vs-TB similarity. Unit-tested: a lightly reworded TB instruction is caught, and an unrelated one isn't. Done: 425 unique refs after de-duplication. Threshold set at cosine 0.70 (distinct-task p90 = 0.52; known variant pairs ≥ 0.75).
 - [ ] 💲 Novelty gate in blueprint review: TB concept list in the blueprint prompt, plus the Sonnet "same underlying task?" judge on the top-3 nearest TB tasks. A reject resamples the spec. Unit-tested with a planted near-copy blueprint.
 - [ ] 💲 Novelty re-check on the finished package before calibration (instruction can drift from the blueprint).
-- [ ] 💲 Alignment check: every test maps to an instruction requirement and every requirement has a test (via `harbor check` with a custom rubric, or direct Sonnet).
-- [ ] Functional gates: Docker build, oracle 3/3, nop 0, chained in order with early exit.
-- [ ] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`.
+- [x] 💲 Alignment check: every test maps to an instruction requirement and every requirement has a test (via `harbor check` with a custom rubric, or direct Sonnet). Done: `harbor check` with `generator/quality_rubric.toml` (11 Harbor + 5 work-trial criteria; 9 blocking). The spike task passes 16/16 for $0.13.
+- [x] Functional gates: Docker build, oracle 3/3, nop 0, chained in order with early exit.
+- [x] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`. Done: resumable via each candidate's `status.json`; `--dry-run` runs the real gates on fixtures for free (37 s).
 
 Part 1 milestone
 - [ ] 💲 Dev-mode dry run (`DEV_MODE=1`): 2-3 candidates end to end through generation and gates, to shake out plumbing bugs before official spend. Results stay in `output-dev/`.

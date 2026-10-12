@@ -144,6 +144,7 @@ class TaskSpec(BaseModel):
     verifier: str
     levers: list[str]
     style: str
+    topic: str = ""  # optional free-text hint (generate_task(topic)); not a sampled axis
 
     @property
     def spec_id(self) -> str:
@@ -160,15 +161,23 @@ class TaskSpec(BaseModel):
             f"- Main language: {self.language}",
             f"- Environment centerpiece: {self.fixture}",
             f"- Verifier kind: {self.verifier}: {verifier_desc} (difficulty knob: {knob})",
-            "- Difficulty levers: "
-            + "; ".join(f"{name} ({LEVERS[name]})" for name in self.levers),
+            "- Difficulty levers: " + "; ".join(f"{name} ({LEVERS[name]})" for name in self.levers),
             f"- Instruction style: {self.style}: {STYLES[self.style]}",
         ]
+        if self.topic:
+            lines.insert(
+                0, f"- Topic requested by the user (build the task around it): {self.topic}"
+            )
         return "\n".join(lines)
 
 
-def _pick(rng: random.Random, values: list[str], counts: Counter, k: int = 1,
-          base: list[int] | None = None) -> list[str]:
+def _pick(
+    rng: random.Random,
+    values: list[str],
+    counts: Counter,
+    k: int = 1,
+    base: list[int] | None = None,
+) -> list[str]:
     """Draw k distinct values with weight base / (count + 1)."""
     pool = list(values)
     weights = [(base[i] if base else 1) / (counts[v] + 1) for i, v in enumerate(values)]
@@ -187,7 +196,7 @@ def sample_specs(n: int, seed: int, history: Iterable[TaskSpec] = ()) -> list[Ta
     rng = random.Random(seed)
     counts: dict[str, Counter] = {axis: Counter() for axis in TaskSpec.model_fields}
     for spec in history:
-        for axis, value in spec.model_dump().items():
+        for axis, value in spec.model_dump(exclude={"topic"}).items():
             counts[axis].update(value if isinstance(value, list) else [value])
     specs = []
     for _ in range(n):
@@ -203,7 +212,7 @@ def sample_specs(n: int, seed: int, history: Iterable[TaskSpec] = ()) -> list[Ta
             levers=_pick(rng, list(LEVERS), counts["levers"], k=2),
             style=_pick(rng, list(STYLES), counts["style"])[0],
         )
-        for axis, value in spec.model_dump().items():
+        for axis, value in spec.model_dump(exclude={"topic"}).items():
             counts[axis].update(value if isinstance(value, list) else [value])
         specs.append(spec)
     return specs

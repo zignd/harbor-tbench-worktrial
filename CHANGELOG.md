@@ -4,6 +4,27 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:19 -03:00 · End-to-end candidate pipeline, quality gate, batch CLI
+- **Quality gate:** `evaluator/quality.py` + `generator/quality_rubric.toml`, wrapping `harbor check`.
+  - The rubric is Harbor's 11 default criteria plus 5 work-trial ones: deterministic_tests, valid_failure_modes, verify_time_inputs, oracle_investigates, instruction_style.
+  - **9 criteria block:** instruction↔test alignment both ways, anti-cheating, schema, tests/solution in the image, hardcoded solution, unmentioned files, determinism, valid failure modes. The other failures are fed back to repair as advice.
+  - On the Phase 0 spike task it passes 16/16 for $0.13 in 80 s.
+- **Pipeline:** `generator/pipeline.py`. Each candidate lives in `runs/candidates/<id>/`. Stages: blueprint + gate → authoring meta-task → gates, cheapest first:
+  1. structural + lint + leak scan (free);
+  2. oracle 3/3 + nop (free);
+  3. quality (~$0.13);
+  4. novelty re-check of the final instruction (~$0.02).
+
+  A failed gate feeds a **repair round**: the failed package is baked into the synthesis image at `/app/previous`, and the findings are appended to the meta-task instruction. At most 2 repairs, then **one regeneration** from the blueprint (SkillSynth: bad drafts rarely recover), then the candidate is dropped. Every stage writes a ledger event, and the budget guard runs before every paid stage.
+- **CLI:** `scripts/run_batch.py` (`make batch N=3 SEED=1 BUDGET=20`).
+  - Specs are sampled inverse-frequency against all earlier candidates.
+  - A per-batch budget cap applies on top of the global limits.
+  - Runs are resumable (finished candidates are skipped).
+  - **`--dry-run`** (`make dry-run`) swaps model calls for fixtures but runs the real gates. It passed end to end for free in 37 s.
+- **`generator/generate.py`:** the template's `generate_task(topic)` is now implemented. The topic becomes a hint on a sampled spec, so `scripts/generate.sh "<topic>"` produces a gated task.
+- `make test` / `make lint` targets added. 43 tests pass.
+- **Spend:** quality-gate check $0.13. Running total ≈ $3.3. Progress 36/83.
+
 ### 17:12 -03:00 · Lint and leak-scan gates; blueprint stage (dev-mode verified)
 - **`validator/lint.py`:** errors block a task, warnings are reported.
   - **Errors:** canary placement, `docker_image` set, a timeout under 3600, COPY of `tests/` or `solution/`, missing COPY sources, answer-like file names in `environment/`, suggestive comments ("BUG", "fix:", "intentionally", …), tests that check installed packages, no test functions.

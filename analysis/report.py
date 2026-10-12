@@ -1,0 +1,242 @@
+"""Pipeline report: reports/summary.md + reports/summary.json (README Part 3 + stretch goals).
+
+Built only from evidence on disk: runs/ledger.jsonl (official-mode events) and
+runs/candidates/*/ (spec, blueprint, gate decisions, calibration). Dev-mode
+events are excluded; the report refuses to run in dev mode.
+
+    uv run --env-file .env python -m analysis.report
+"""
+
+import json
+from collections import Counter, defaultdict
+from pathlib import Path
+
+from analysis.diversity import coverage, novelty_report, uniqueness
+from analysis.human_likeness import stylometrics
+from analysis.ledger import Ledger
+from evaluator.calibrate import LEGIT_PASS, N_RUNS
+from generator.config import EXAMPLES_DIR, OUTPUT_DIR, REPO_ROOT, assert_official_models
+from generator.pipeline import CANDIDATES_DIR
+from generator.spec import TaskSpec
+
+REPORTS_DIR = Path(REPO_ROOT) / "reports"
+
+
+def _load(path: Path):
+    return json.loads(path.read_text()) if path.exists() else None
+
+
+def candidates() -> list[dict]:
+    rows = []
+    for d in sorted(CANDIDATES_DIR.glob("official-*")):
+        rows.append(
+            {
+                "id": d.name,
+                "dir": d,
+                "spec": _load(d / "spec.json"),
+                "blueprint": _load(d / "blueprint.json"),
+                "gate": _load(d / "blueprint_gate.json"),
+                "status": (_load(d / "status.json") or {}).get("status", "in_progress"),
+                "calibration": _load(d / "calibration.json"),
+            }
+        )
+    return rows
+
+
+def funnel(rows: list[dict], events) -> dict:
+    by_task = defaultdict(list)
+    for e in events:
+        by_task[e.task].append(e)
+
+    def passed(stage: str, key: str, ok) -> int:
+        return sum(
+            any(e.stage == stage and ok(e.result.get(key)) for e in by_task[r["id"]]) for r in rows
+        )
+
+    return {
+        "candidates": len(rows),
+        "blueprint_accepted": sum(bool(r["gate"] and r["gate"]["accepted"]) for r in rows),
+        "authored": sum(any(e.stage == "author" for e in by_task[r["id"]]) for r in rows),
+        "structurally_valid": passed("gate_static", "problems", lambda p: p == []),
+        "functionally_correct": passed("gate_functional", "problems", lambda p: p == []),
+        "quality_ok": passed("gate_quality", "ok", lambda v: v is True),
+        "novel": passed("gate_novelty", "novel", lambda v: v is True),
+        "redteam_clean": passed("gate_redteam", "hackable", lambda v: v is False),
+        "gated": sum(r["status"] == "gated" for r in rows),
+        "calibrated": sum(r["calibration"] is not None for r in rows),
+        "learnable": sum(
+            bool(r["calibration"] and r["calibration"]["verdict"] == "learnable") for r in rows
+        ),
+    }
+
+
+def cost_and_time(events) -> dict:
+    by_stage = defaultdict(lambda: [0.0, 0.0, 0])
+    for e in events:
+        s = by_stage[e.stage]
+        s[0] += e.cost_usd
+        s[1] += e.seconds
+        s[2] += 1
+    return {
+        k: {"usd": round(v[0], 3), "minutes": round(v[1] / 60, 1), "events": v[2]}
+        for k, v in sorted(by_stage.items())
+    }
+
+
+def calibration_stats(rows: list[dict]) -> dict:
+    cal = [r for r in rows if r["calibration"]]
+    hist = Counter()
+    trials_run = 0
+    predicted_vs_observed = []
+    for r in cal:
+        outcomes = r["calibration"]["outcomes"]
+        trials_run += len(outcomes)
+        if r["calibration"]["verdict"] in ("learnable", "too_easy", "too_hard"):
+            hist[f"{outcomes.count(LEGIT_PASS)}/{len(outcomes)}"] += 1
+            observed = outcomes.count(LEGIT_PASS) / len(outcomes)
+            predicted_vs_observed.append((r["blueprint"]["predicted_pass_rate"], observed))
+        else:
+            hist[r["calibration"]["verdict"]] += 1
+    naive = N_RUNS * len(cal)
+    corr = None
+    if len(predicted_vs_observed) >= 3:
+        xs, ys = zip(*predicted_vs_observed, strict=True)
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        cov = sum((x - mx) * (y - my) for x, y in predicted_vs_observed)
+        sx = sum((x - mx) ** 2 for x in xs) ** 0.5
+        sy = sum((y - my) ** 2 for y in ys) ** 0.5
+        corr = round(cov / (sx * sy), 3) if sx and sy else None
+    return {
+        "calibrated": len(cal),
+        "histogram": dict(hist),
+        "trials_run": trials_run,
+        "trials_naive": naive,
+        "trials_saved_pct": round(100 * (1 - trials_run / naive), 1) if naive else 0.0,
+        "predicted_vs_observed": predicted_vs_observed,
+        "prediction_correlation": corr,
+    }
+
+
+def build() -> dict:
+    assert_official_models()
+    ledger = Ledger()
+    events = [e for e in ledger.events() if e.mode == "official"]
+    rows = candidates()
+    specs = [TaskSpec(**r["spec"]) for r in rows if r["spec"]]
+    shipped = sorted(p for p in Path(OUTPUT_DIR).iterdir() if (p / "task.toml").exists())
+    examples = sorted(p for p in Path(EXAMPLES_DIR).iterdir() if p.is_dir())
+    report = {
+        "funnel": funnel(rows, events),
+        "cost_and_time": cost_and_time(events),
+        "total_usd": round(sum(e.cost_usd for e in events), 2),
+        "total_minutes": round(sum(e.seconds for e in events) / 60, 1),
+        "calibration": calibration_stats(rows),
+        "coverage": coverage(specs),
+        "uniqueness_shipped": uniqueness([(p / "instruction.md").read_text() for p in shipped]),
+        "uniqueness_generated": uniqueness(
+            [
+                (r["dir"] / "task" / "instruction.md").read_text()
+                for r in rows
+                if (r["dir"] / "task" / "instruction.md").exists()
+            ]
+        ),
+        "novelty": novelty_report({p.name: (p / "instruction.md").read_text() for p in shipped}),
+        "stylometrics": {
+            "examples": {p.name: stylometrics(p) for p in examples},
+            "shipped": {p.name: stylometrics(p) for p in shipped},
+        },
+        "shipped": [p.name for p in shipped],
+        "candidates": [
+            {k: r[k] for k in ("id", "status")}
+            | {
+                "slug": (r["blueprint"] or {}).get("slug"),
+                "verdict": (r["calibration"] or {}).get("verdict"),
+                "outcomes": (r["calibration"] or {}).get("outcomes"),
+            }
+            for r in rows
+        ],
+    }
+    return report
+
+
+def to_markdown(rep: dict) -> str:
+    f = rep["funnel"]
+    lines = [
+        "# Pipeline report",
+        "",
+        (
+            "Generated by `python -m analysis.report` from "
+            "`runs/ledger.jsonl` and `runs/candidates/` (official-mode evidence only)."
+        ),
+        "",
+        "## Funnel (README Part 3)",
+        "",
+        "| Stage | Count |",
+        "|---|---|",
+    ]
+    lines += [f"| {k.replace('_', ' ')} | {v} |" for k, v in f.items()]
+    lines += [
+        "",
+        (
+            f"**Total cost:** ${rep['total_usd']:.2f} · **total stage time:** "
+            f"{rep['total_minutes']:.0f} min"
+        ),
+        "",
+        "| Stage | USD | Minutes | Events |",
+        "|---|---|---|---|",
+    ]
+    lines += [
+        f"| {k} | {v['usd']:.2f} | {v['minutes']} | {v['events']} |"
+        for k, v in rep["cost_and_time"].items()
+    ]
+    c = rep["calibration"]
+    lines += [
+        "",
+        "## Calibration (terminus-2 + claude-opus-4.8)",
+        "",
+        f"Pass-count distribution: {c['histogram']}",
+        (
+            f"Trials run {c['trials_run']} vs {c['trials_naive']} naive "
+            f"({c['trials_saved_pct']}% saved by exact curtailment and early stops)."
+        ),
+        (
+            f"Blueprint-time predicted vs observed pass rate: correlation "
+            f"{c['prediction_correlation']} over {len(c['predicted_vs_observed'])} tasks."
+        ),
+        "",
+        "| Candidate | Slug | Status | Verdict | Outcomes |",
+        "|---|---|---|---|---|",
+    ]
+    lines += [
+        f"| {r['id']} | {r['slug']} | {r['status']} | {r['verdict']} | {r['outcomes']} |"
+        for r in rep["candidates"]
+    ]
+    lines += ["", "## Diversity (stretch C)", "", "| Axis | Covered | Balance |", "|---|---|---|"]
+    lines += [
+        f"| {k} | {v['covered']}/{v['of']} | {v['balance']} |" for k, v in rep["coverage"].items()
+    ]
+    lines += [
+        "",
+        f"Shipped instructions: {rep['uniqueness_shipped']}",
+        f"All generated instructions: {rep['uniqueness_generated']}",
+        "",
+        "Nearest published Terminal-Bench task per shipped task:",
+        "",
+    ]
+    lines += [
+        f"- {r['task']}: {r['nearest_reference']} (cosine {r['cosine']})" for r in rep["novelty"]
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def main() -> int:
+    rep = build()
+    REPORTS_DIR.mkdir(exist_ok=True)
+    (REPORTS_DIR / "summary.json").write_text(json.dumps(rep, indent=1, default=str))
+    (REPORTS_DIR / "summary.md").write_text(to_markdown(rep))
+    print(f"wrote {REPORTS_DIR / 'summary.md'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

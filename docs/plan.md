@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 40 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 42 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -377,9 +377,9 @@ Stretch B: difficulty tuning
 - [ ] 💲 Run the tuner on every Batch 1 near-miss (0/5 with valid failures, 4-5/5). Record how many moved into the band.
 
 Stretch C: diversity
-- [ ] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells.
+- [x] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells. Done: `run_batch` samples inverse-frequency against every earlier candidate's spec.
 - [ ] Novelty report: per-task similarity to the TB corpus (by set) and `examples/` (max/mean, nearest task), plus rejects per novelty layer across all batches.
-- [ ] 💲 Near-duplicate check: Sonnet "same underlying task?" judge on the closest TF-IDF pairs.
+- [x] 💲 Near-duplicate check: Sonnet "same underlying task?" judge on the closest TF-IDF pairs. Done: the novelty gate indexes our own earlier candidates alongside the 425 published tasks (`novelty.gate_index`, excluding the candidate itself), at both the blueprint and final-package checks.
 - [ ] `analysis/diversity.py`: per-axis coverage, balance score exp(H)/N, difficulty spread, instruction uniqueness (TF-IDF cosine, Vendi).
 
 Batch 2

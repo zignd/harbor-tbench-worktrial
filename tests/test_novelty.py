@@ -70,3 +70,16 @@ def test_judge_all_distinct_is_novel():
         return Reply('{"verdicts": [' + verdicts + "]}", "m", 1, 0, 1, 0.0, 0.0)
 
     assert novelty.judge_same_task("backup job", _example_index(), chat=fake_chat)["novel"]
+
+
+def test_own_tasks_are_indexed_but_never_compared_with_themselves(tmp_path):
+    for cand, text in [("official-a", LOG_TASK), ("official-b", "Fix the nightly backup job.")]:
+        (tmp_path / cand / "task").mkdir(parents=True)
+        (tmp_path / cand / "task" / "instruction.md").write_text(text)
+    refs = novelty.own_tasks(tmp_path, exclude="official-a")
+    assert [r.ref_id for r in refs] == ["ours/official-b"]
+    index = Index(_example_index().refs + novelty.own_tasks(tmp_path, exclude="official-b"))
+    assert index.nearest(LOG_TASK, k=1)[0][0].ref_id in {
+        "examples/log-summary-date-ranges",
+        "ours/official-a",
+    }

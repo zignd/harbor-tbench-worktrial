@@ -153,6 +153,22 @@ def default_index() -> Index:
     return Index(load_reference())
 
 
+def own_tasks(candidates_dir: Path, exclude: str = "") -> tuple[RefTask, ...]:
+    """Our earlier generated tasks, so the gate also rejects near-duplicates of our own work."""
+    refs = []
+    for inst in sorted(Path(candidates_dir).glob("*/task/instruction.md")):
+        cand_id = inst.parent.parent.name
+        if cand_id != exclude:
+            text = inst.read_text()
+            refs.append(RefTask(f"ours/{cand_id}", text, _gist(text, inst.parent / "task.toml")))
+    return tuple(refs)
+
+
+def gate_index(candidates_dir: Path, exclude: str = "") -> Index:
+    """Published TB tasks + examples + our other candidates (rebuilt per call, ~0.2 s)."""
+    return Index(load_reference() + own_tasks(candidates_dir, exclude))
+
+
 def concept_list(index: Index | None = None) -> str:
     index = index or default_index()
     return "\n".join(f"- {r.ref_id}: {r.gist}" for r in index.refs)

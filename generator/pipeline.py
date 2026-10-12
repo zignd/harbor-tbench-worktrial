@@ -105,7 +105,7 @@ def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
         cand.spec.spec_id,
     )
     t0 = time.monotonic()
-    decision = gate_blueprint(bp, cand.spec)
+    decision = gate_blueprint(bp, cand.spec, novelty.gate_index(CANDIDATES_DIR, cand.cand_id))
     cand.save("blueprint_gate.json", decision)
     _record(
         ledger,
@@ -248,8 +248,9 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
         return problems + check["advice"]
     t0 = time.monotonic()
     instruction = (cand.task_dir / "instruction.md").read_text()
-    lexical = novelty.lexical_flags(instruction)
-    judged = None if lexical else novelty.judge_same_task(instruction)
+    index = novelty.gate_index(CANDIDATES_DIR, exclude=cand.cand_id)
+    lexical = novelty.lexical_flags(instruction, index)
+    judged = None if lexical else novelty.judge_same_task(instruction, index)
     novel = not lexical and bool(judged and judged["novel"])
     _record(
         ledger,

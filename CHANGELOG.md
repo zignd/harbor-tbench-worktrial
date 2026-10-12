@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:32 -03:00 · Novelty gate also covers our own earlier tasks
+- `validator/novelty.gate_index()` builds the gate's index from the 425 published TB tasks + `examples/` + **our own earlier candidates** (excluding the candidate being checked), at both the blueprint gate and the final-package re-check. A batch can't drift into near-duplicates of what it already generated, not just of published work.
+- **Coverage-steered sampling** was already in place (`run_batch` samples inverse-frequency against all earlier candidates' specs), so it's ticked.
+- `analysis/report.py` added: funnel, per-stage cost and time, calibration histogram and savings, coverage and balance, uniqueness, nearest published task, stylometrics. Official evidence only.
+- 93 tests. Progress 42/83.
+
 ### 17:30 -03:00 · Diversity and human-likeness analysis modules (stretch C, D)
 - **`analysis/diversity.py`:** per-axis coverage and **balance = exp(H)/N** (Tmax), instruction uniqueness (max/mean pairwise TF-IDF cosine, and a **Vendi score** with Jacobi eigenvalues, no numpy), and nearest published TB task per generated task.
   - **Baseline on the 6 examples:** Vendi 5.97 of 6, mean pairwise cosine 0.034, max 0.119. That's the bar for our batch.

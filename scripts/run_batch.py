@@ -64,7 +64,7 @@ def _install_dry_run(ledger_path: Path) -> Ledger:
     pipeline.run_check = lambda task_dir, name: {
         "ok": True, "outcomes": {}, "blocking_failures": [], "advice": [], "cost_usd": 0.0
     }  # fmt: skip
-    pipeline.novelty.judge_same_task = lambda text: {
+    pipeline.novelty.judge_same_task = lambda text, index=None: {
         "novel": True, "verdicts": [], "nearest": [], "cost_usd": 0.0
     }  # fmt: skip
     pipeline.budget.check = lambda expected: None

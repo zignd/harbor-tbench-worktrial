@@ -175,12 +175,18 @@ def review_blueprint(bp: Blueprint, spec: TaskSpec) -> tuple[dict, float]:
     return review, reply.cost_usd
 
 
-def gate_blueprint(bp: Blueprint, spec: TaskSpec) -> dict:
-    """Rubric review + novelty (lexical + Sonnet judge). Returns a decision record."""
+def gate_blueprint(bp: Blueprint, spec: TaskSpec, index=None) -> dict:
+    """Rubric review + novelty (lexical + Sonnet judge). Returns a decision record.
+
+    `index` defaults to the published corpus; the pipeline passes one that also
+    holds our earlier candidates.
+    """
     review, review_cost = review_blueprint(bp, spec)
     text = bp.novelty_text()
-    lexical = novelty.lexical_flags(text)
-    judged = novelty.judge_same_task(text) if not lexical else None
+    lexical = novelty.lexical_flags(text, index) if index else novelty.lexical_flags(text)
+    judged = None
+    if not lexical:
+        judged = novelty.judge_same_task(text, index) if index else novelty.judge_same_task(text)
     novel = not lexical and bool(judged and judged["novel"])
     return {
         "accepted": review["accepted"] and novel,

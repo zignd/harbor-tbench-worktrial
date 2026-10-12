@@ -14,4 +14,4 @@ if [ $# -lt 1 ]; then
 fi
 
 cd "$ROOT_DIR/generator"
-python generate.py "$1"
+uv run --project "$ROOT_DIR" python generate.py "$1"

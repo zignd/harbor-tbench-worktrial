@@ -19,6 +19,10 @@ TASK_DIR="$1"
 if [ ! -d "$TASK_DIR" ] && [ -d "$ROOT_DIR/$TASK_DIR" ]; then
     TASK_DIR="$ROOT_DIR/$TASK_DIR"
 fi
+# Make it absolute, since we cd into validator/ below.
+if [ -d "$TASK_DIR" ]; then
+    TASK_DIR="$(cd "$TASK_DIR" && pwd)"
+fi
 
 cd "$ROOT_DIR/validator"
-python validate.py "$TASK_DIR"
+uv run --project "$ROOT_DIR" python validate.py "$TASK_DIR"

@@ -84,6 +84,9 @@ int         wal_record_build(uint8_t *buf, size_t buf_capacity,
                              uint8_t record_type, uint64_t txid,
                              uint64_t charge_txid,
                              const uint8_t *payload, uint16_t payload_len);
+int         wal_record_serialize(const WalRecord *rec,
+                                 const uint8_t *payload_src,
+                                 uint8_t *out, size_t out_capacity);
 
 /* -----------------------------------------------------------------------
  * Function prototypes - protocol.c

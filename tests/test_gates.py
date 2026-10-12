@@ -56,11 +56,20 @@ def test_suggestive_comment_and_answer_file_are_errors(task):
     assert any("answer-like file" in e for e in errs)
 
 
-def test_comments_in_vendored_third_party_code_are_not_hints(task):
+def test_vendored_dependencies_are_an_error_but_not_hint_comments(task):
     lib = task / "environment" / "app" / "node_modules" / "ajv-formats" / "formats.js"
     lib.parent.mkdir(parents=True)
     lib.write_text("// hint to the UI to hide input strings\n")
-    assert not any("suggestive comment" in e for e in errors(lint_task(task, CANARY_LINE)))
+    errs = errors(lint_task(task, CANARY_LINE))
+    assert not any("suggestive comment" in e for e in errs)
+    assert sum("vendored dependencies" in e for e in errs) == 1
+
+
+def test_oversized_environment_is_an_error(task, monkeypatch):
+    from validator import lint
+
+    monkeypatch.setattr(lint, "MAX_ENV_BYTES", 10)
+    assert any("don't vendor" in e for e in errors(lint_task(task, CANARY_LINE)))
 
 
 def test_package_check_in_tests_is_an_error(task):

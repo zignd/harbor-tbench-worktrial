@@ -4,6 +4,18 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 20:08 -03:00 · Repo hygiene: no vendored deps in git or tasks; leak-scan cache false positive; dev calibration loop done
+- **Vendored third-party code was getting into the repo.** One Batch 2 Rust package vendored **68 MB** of crates (`framecodec/vendor/`, not yet committed), and a Node package's 553 `node_modules` files were already committed. The generator didn't write that code, it's reproducible from the lockfiles, and it bloats the repo AfterQuery clones.
+  - `.gitignore` now excludes `node_modules/`, `vendor/`, `target/` and `__pycache__/` inside `runs/candidates/`, and the committed `node_modules` files were untracked. They stay in history, since rewriting it would need a force-push.
+  - The authored packages, `failed_a*` repair snapshots and `before_tune_*` snapshots stay committed: they make the repair and tuning history auditable, and they total ~5 MB.
+- **Vendoring is also a cost and quality problem:** `harbor check` reads the whole environment, so that `node_modules` tree made one quality check cost **$2.24** instead of ~$0.13.
+  - Lint now rejects vendored dependency dirs (`node_modules`, `vendor`, `site-packages`) and environments over 20 MB.
+  - The meta-task instruction says to commit the lockfile and fetch pinned versions in the Dockerfile.
+- **Leak-scan false positive:** test tokens "matched" files in pip's HTTP cache (`/root/.cache/pip/http-v2/...`). Package-manager caches (`/root/.cache`, `.npm`, `.cargo/registry`, `go/pkg/mod`) are now pruned from the scan.
+- **Dev-mode calibration loop: done** on the dev package (DeepSeek, $0.31). One trial hit the 60-min agent timeout and was counted **invalid**, never a valid failure. The other passed and was audited, and calibration stopped early with verdict `invalid`. It also exercised crash-resume. Progress 57/83.
+- Seen in the gates: the novelty judge (now seeing our own nearest tasks) rejected Batch 1's `48eb` package as a variant of one of our tasks. Rust `aac9`'s oracle failed 0/3 because `solve.sh` doesn't leave the service running (repair feedback). Its vendored crates also triggered dozens of vendored-code findings.
+- 118 tests pass.
+
 ### 19:55 -03:00 · First task through every gate; checklist catch-up (56/83)
 - **`2f50` (C audit service, Batch 1) passed every gate** after 3 attempts: two repairs for answer tokens leaked into image files. It is the first pipeline-built task to get there and is now calibrating. It's a Phase 1 task, so its result goes into the pilot go/no-go number (cost per learnable task). Batch 2 calibration still waits for that decision.
 - **Migration to the new code:** 5 of 6 old processes moved at attempt boundaries (`ae2e`, `1091`/`3bbd`, `48eb`, `93f5`), and one finished on its own. Cost: `3bbd`'s in-progress quality/novelty/red-team gates restarted, with no authoring lost.

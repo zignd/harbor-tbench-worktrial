@@ -17,8 +17,12 @@ from pathlib import Path
 HEX = re.compile(r"\b[0-9a-f]{16,}\b")
 LONG_NUMBER = re.compile(r"(?<![\w.])-?\d{6,}(?:\.\d+)?(?![\w.])|(?<![\w.])-?\d+\.\d{4,}(?![\w.])")
 QUOTED = re.compile(r"""(["'])((?:(?!\1).){12,120})\1""")
-# Pruned from the search: OS and interpreter trees the task doesn't write answers into.
-SYSTEM_DIRS = "/proc /sys /dev /usr /lib /lib64 /bin /sbin /etc /var/lib /var/cache /boot /run /tmp"
+# Pruned from the search: OS and interpreter trees the task doesn't write answers into,
+# and package-manager download caches (pip's http cache matched test tokens by chance).
+SYSTEM_DIRS = (
+    "/proc /sys /dev /usr /lib /lib64 /bin /sbin /etc /var/lib /var/cache /boot /run /tmp"
+    " /root/.cache /root/.npm /root/.cargo/registry /root/go/pkg/mod"
+)
 # Shell snippet: candidate files (task-created areas, < 5 MB) for grep.
 _FIND_FILES = (
     "find / -xdev \\( "

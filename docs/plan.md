@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 56 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 57 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -361,7 +361,7 @@ Part 1 milestone
 - [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
 - [x] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
 - [x] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails). Done: `scripts/calibrate_candidates.py` writes `output/<slug>/README.md` (calibration plus judged failure reasons). Refuses to run in dev mode.
-- [ ] 💲 Dev-mode calibration loop (`DEV_MODE=1`): exercise waves, early stop, judges and ledger on 1-2 tasks before any Opus spend.
+- [x] 💲 Dev-mode calibration loop (`DEV_MODE=1`): exercise waves, early stop, judges and ledger on 1-2 tasks before any Opus spend. Done: on `dev-9992cd0670d5` (DeepSeek, $0.31): wave sizing, an `AgentTimeoutError` trial counted as invalid (never a valid failure), the pass audit on the other trial, early stop with verdict `invalid`, all in the ledger. Also exercised a crash-resume of calibration.
 - [ ] 💲 Calibrate the Phase 1 tasks (pilot). Record cost per learnable task. **Go/no-go:** above $40 per learnable task → fix generation before scaling.
 - [ ] 💲 Batch 1: ~10 new candidates end to end through calibration.
 - [ ] Read every failure-judge summary from Batch 1, and retune lever and knob defaults toward TB Medium/Hard. Record the before/after reasoning in `CHANGELOG.md`.

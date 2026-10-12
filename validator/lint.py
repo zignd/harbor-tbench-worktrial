@@ -14,6 +14,9 @@ from pathlib import Path
 Finding = tuple[str, str]
 
 INSTRUCTION_MAX_WORDS = 300
+MAX_ENV_BYTES = 20_000_000
+VENDOR_NAMES = {"node_modules", "vendor", "site-packages"}
+FETCH_PINNED = "commit the lockfile and fetch pinned versions in the Dockerfile instead"
 VENDORED_DIRS = {"node_modules", "vendor", "site-packages", ".git", "target"}
 SUGGESTIVE = re.compile(
     r"#.*\b(BUG|FIXME|XXX|HACK|fix:|intentional(ly)?|the bug|bug here|hint)\b"
@@ -85,6 +88,24 @@ def lint_task(task_dir: Path, canary_line: str) -> list[Finding]:
                 findings.append(("error", f"Dockerfile COPY source missing: environment/{src}"))
     if "FROM python:3.13-slim-bookworm" not in dockerfile:
         findings.append(("warn", "Dockerfile base is not python:3.13-slim-bookworm"))
+
+    # Vendored third-party code: `harbor check` reads the whole environment (one vendored
+    # node_modules made a $0.13 check cost $2.24), and it bloats the repo.
+    env = task_dir / "environment"
+    for vendored in sorted(p for p in env.rglob("*") if p.is_dir() and p.name in VENDOR_NAMES):
+        if not VENDOR_NAMES & set(vendored.relative_to(env).parts[:-1]):  # outermost only
+            findings.append(
+                (
+                    "error",
+                    f"vendored dependencies in {vendored.relative_to(task_dir)}: {FETCH_PINNED}",
+                )
+            )
+
+    # Vendored dependencies bloat the build context and the repo; fetch pinned ones at build time.
+    env_bytes = sum(f.stat().st_size for f in (task_dir / "environment").rglob("*") if f.is_file())
+    if env_bytes > MAX_ENV_BYTES:
+        size = f"environment/ is {env_bytes / 1e6:.0f} MB (limit {MAX_ENV_BYTES / 1e6:.0f} MB)"
+        findings.append(("error", f"{size}: don't vendor dependencies; {FETCH_PINNED}"))
 
     # Environment leakage: answer-named files and comments that give away the fix.
     for path in sorted((task_dir / "environment").rglob("*")):

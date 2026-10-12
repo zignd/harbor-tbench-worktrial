@@ -162,22 +162,14 @@ def test_cross_region_coverage():
 
 def test_adversarial_region_ordering():
     """Test 5: config_parser returns correct weights with reverse-alphabetical order."""
-    # Regions listed in reverse-alpha order: SW before SE, NW before NE, etc.
+    # Build adversarial config by reading canonical weights and writing in reverse-alpha order.
     # A buggy prefix-match loop would return wrong weights for several regions.
+    canonical_weights = load_weights(CONFIG_PATH)
     adv_config = "/tmp/weights_adversarial.ini"
-    adv_config_content = (
-        "[regions]\n"
-        "WEST=1.2167\n"
-        "SW=0.9901\n"
-        "SOUTH=0.9218\n"
-        "SE=1.1742\n"
-        "NW=0.8756\n"
-        "NORTH=1.1523\n"
-        "NE=1.0312\n"
-        "EAST=1.0834\n"
-    )
     with open(adv_config, "w") as f:
-        f.write(adv_config_content)
+        f.write("[regions]\n")
+        for region in sorted(canonical_weights.keys(), reverse=True):
+            f.write(f"{region}={canonical_weights[region]}\n")
     adv_db = "/tmp/test_adv.db"
     shutil.copy(SRC_DB, adv_db)
     conn = sqlite3.connect(adv_db)

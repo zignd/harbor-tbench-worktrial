@@ -2,10 +2,12 @@ import os
 
 # --- Inference gateway -----------------------------------------------------
 # Your inference API key, and the OpenAI-compatible gateway it talks to. The
-# generator's client and Harbor's LiteLLM both read these.
+# generator's client and Harbor's LiteLLM both read these (set them in .env,
+# see .env.example). The issued key is an OpenRouter key; it is rejected by
+# api.aqinference.com, so OpenRouter is the default.
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_API_BASE = os.environ.get(
-    "OPENROUTER_API_BASE", "https://api.aqinference.com/v1"
+    "OPENROUTER_API_BASE", "https://openrouter.ai/api/v1"
 )
 
 # --- Authoring model (the LLM that writes tasks) ---------------------------

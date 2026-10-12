@@ -40,7 +40,10 @@ Development environment (set up and committed in `e4c095c`):
     Both default to `claude-code` + `claude-sonnet-4-6`, so they must be pointed at our gateway and Sonnet 4.6.
 - **Machine:** Docker 29.8 (10 CPUs, 14.6 GB). Poppler is installed for reading PDFs.
 - **Shell note:** `VIRTUAL_ENV` points at a pyenv 3.11 env, so uv prints a harmless warning. `unset VIRTUAL_ENV` silences it.
-- **Not yet done:** inference key and env vars (`OPENROUTER_API_KEY`, `OPENROUTER_API_BASE`). Plan to keep them in a git-ignored `.env` (already ignored by `.gitignore`).
+- **Inference credentials:** these are in a git-ignored `.env` (mode 600); `.env.example` documents them. Load with `uv run --env-file .env ...`.
+  - The key is an **OpenRouter** key with a **$500 limit**. Its base is `https://openrouter.ai/api/v1`, *not* the README's `api.aqinference.com`, which returns 401 for it. `generator/config.py` now defaults to OpenRouter.
+  - Validated on 2026-10-12: `anthropic/claude-sonnet-4.6` answered through the OpenAI client, and `openrouter/anthropic/claude-opus-4.8` through LiteLLM (Harbor's path). Both models are listed on `/models`.
+  - Spend can be read from OpenRouter's `GET /api/v1/key` (`usage`, `limit_remaining`). That's a ground truth for the ledger's budget guard.
 
 ## Research that shapes the design
 
@@ -193,7 +196,7 @@ If an Opus trial costs more than ~$3, shrink the batch rather than cut the numbe
 
 **Phase 0: setup and spike (day 1 morning)**
 - ~~Set up the uv project, Python and Harbor~~ (done, `e4c095c`).
-- Put `OPENROUTER_API_KEY` and `OPENROUTER_API_BASE` in a git-ignored `.env`. Load it for `uv run` (`uv run --env-file .env ...`) and have `config.py` read it.
+- ~~Put `OPENROUTER_API_KEY` and `OPENROUTER_API_BASE` in a git-ignored `.env`~~ (done; key validated against both models).
 - Run oracle/nop on all 6 examples.
 - Run 1-2 Opus terminus-2 trials on one example. Learn:
   - The job-dir layout and `result.json` fields (cost/tokens).

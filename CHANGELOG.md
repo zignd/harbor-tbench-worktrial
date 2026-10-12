@@ -4,7 +4,7 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
-### 15:31 -03:00 · Plan as a work checklist
+### 15:19 -03:00 · Plan as a work checklist
 - Replaced the prose "Phases" section of `docs/plan.md` with a **work checklist**: 71 concrete items across Phases 0-4, each naming its output and how we know it's done, with a progress counter (9/71 done).
 - Items that call a model are marked 💲, so spend is visible before work starts. Go/no-go checkpoints are explicit: the meta-task spike, and cost per learnable task after the pilot.
 - Removed per-phase day estimates. Progress is tracked by ticked items, not by the calendar.

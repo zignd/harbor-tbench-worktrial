@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 28 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 30 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -336,8 +336,8 @@ Generation
 - [ ] `generator/generate.py`: implement `generate_task(topic, output_dir)` end to end (spec → blueprint → author), keeping the template signature.
 
 Gates
-- [ ] `validator/lint.py`: canary placement, no `docker_image`, timeout ≥ 3600, instruction style/length, no source-grep or package-installed tests, `solve.sh` investigates first, no COPY of `solution/`/`tests/`, COPY sources exist, no suggestive comments, test helpers only in `tests/`. Unit-tested on good/bad fixtures.
-- [ ] `validator/leak_scan.py`: build the image and search its filesystem plus `docker history` for distinctive tokens from `tests/` and `solution/`. Unit-tested on a planted-leak fixture.
+- [x] `validator/lint.py`: canary placement, no `docker_image`, timeout ≥ 3600, instruction style/length, no source-grep or package-installed tests, `solve.sh` investigates first, no COPY of `solution/`/`tests/`, COPY sources exist, no suggestive comments, test helpers only in `tests/`. Unit-tested on good/bad fixtures.
+- [x] `validator/leak_scan.py`: build the image and search its filesystem plus `docker history` for distinctive tokens from `tests/` and `solution/`. Unit-tested on a planted-leak fixture. Done: blocking leaks are answer-like tokens (hashes, long numbers); quoted strings found in the image are non-blocking notes. ~2 s per task.
 - [x] `make tb-reference`: download all published TB sets (latest/4.0, 2.1, Pro, Science = 425 tasks) into git-ignored `data/tb-reference/`, keeping instruction + task.toml only (verified).
 - [x] `validator/novelty.py`: 13-gram + TF-IDF index over the 425-task TB corpus + `examples/`, `nearest(k=3)`, `concept_list()`. Thresholds calibrated on TB-vs-TB similarity. Unit-tested: a lightly reworded TB instruction is caught, and an unrelated one isn't. Done: 425 unique refs after de-duplication. Threshold set at cosine 0.70 (distinct-task p90 = 0.52; known variant pairs ≥ 0.75).
 - [ ] 💲 Novelty gate in blueprint review: TB concept list in the blueprint prompt, plus the Sonnet "same underlying task?" judge on the top-3 nearest TB tasks. A reject resamples the spec. Unit-tested with a planted near-copy blueprint.

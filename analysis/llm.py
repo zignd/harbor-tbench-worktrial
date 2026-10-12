@@ -17,6 +17,7 @@ from evaluator.harbor_runner import load_prices
 from generator.config import MODEL, OPENROUTER_API_BASE, OPENROUTER_API_KEY
 
 RETRIES = 3
+MAX_TOKENS_CAP = 32000
 
 
 @dataclass(frozen=True)
@@ -42,17 +43,50 @@ def chat(
     temperature: float = 0.7,
     prices: dict[str, Price] | None = None,
 ) -> Reply:
-    """One chat completion, retried on transient API errors."""
+    """One chat completion, retried on transient API errors.
+
+    Reasoning models (e.g. the dev model) can spend the whole token budget on
+    hidden reasoning and return empty content with finish_reason "length"; in
+    that case the call is repeated with a larger budget (up to MAX_TOKENS_CAP),
+    and the cost of every attempt is counted.
+    """
     messages = ([{"role": "system", "content": system}] if system else []) + [
         {"role": "user", "content": prompt}
     ]
+    prices = prices if prices is not None else load_prices()
+    price = prices.get(model)
     started = time.monotonic()
+    totals = [0, 0, 0]  # input, cached, output
+    budget = max_tokens
+    while True:
+        response = _create(messages, model, budget, temperature)
+        usage = response.usage
+        details = getattr(usage, "prompt_tokens_details", None) if usage else None
+        totals[0] += usage.prompt_tokens if usage else 0
+        totals[1] += (getattr(details, "cached_tokens", 0) or 0) if details else 0
+        totals[2] += usage.completion_tokens if usage else 0
+        choice = response.choices[0]
+        text = choice.message.content or ""
+        if text or choice.finish_reason != "length" or budget >= MAX_TOKENS_CAP:
+            break
+        budget = min(budget * 2, MAX_TOKENS_CAP)
+    return Reply(
+        text=text,
+        model=model,
+        n_input_tokens=totals[0],
+        n_cache_tokens=totals[1],
+        n_output_tokens=totals[2],
+        cost_usd=price.cost(*totals) if price else 0.0,
+        seconds=time.monotonic() - started,
+    )
+
+
+def _create(messages: list[dict], model: str, max_tokens: int, temperature: float):
     for attempt in range(RETRIES):
         try:
-            response = _client().chat.completions.create(
+            return _client().chat.completions.create(
                 model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
             )
-            break
         except (APIConnectionError, RateLimitError) as e:
             last = e
         except APIStatusError as e:
@@ -60,25 +94,7 @@ def chat(
                 raise
             last = e
         time.sleep(2 * (attempt + 1))
-    else:
-        raise last  # type: ignore[possibly-undefined]
-    usage = response.usage
-    n_in = usage.prompt_tokens if usage else 0
-    n_out = usage.completion_tokens if usage else 0
-    details = getattr(usage, "prompt_tokens_details", None) if usage else None
-    n_cache = (getattr(details, "cached_tokens", 0) or 0) if details else 0
-    prices = prices if prices is not None else load_prices()
-    price = prices.get(model)
-    cost = price.cost(n_in, n_cache, n_out) if price else 0.0
-    return Reply(
-        text=response.choices[0].message.content or "",
-        model=model,
-        n_input_tokens=n_in,
-        n_cache_tokens=n_cache,
-        n_output_tokens=n_out,
-        cost_usd=cost,
-        seconds=time.monotonic() - started,
-    )
+    raise last  # type: ignore[possibly-undefined]
 
 
 def extract_json(text: str) -> dict:

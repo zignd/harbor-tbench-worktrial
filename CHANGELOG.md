@@ -4,6 +4,23 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:12 -03:00 · Lint and leak-scan gates; blueprint stage (dev-mode verified)
+- **`validator/lint.py`:** errors block a task, warnings are reported.
+  - **Errors:** canary placement, `docker_image` set, a timeout under 3600, COPY of `tests/` or `solution/`, missing COPY sources, answer-like file names in `environment/`, suggestive comments ("BUG", "fix:", "intentionally", …), tests that check installed packages, no test functions.
+  - **Warnings:** instruction over 300 words, headers or bold, tests that read solver source, a `solve.sh` that writes before it inspects.
+  - Both Phase 0 packages are clean. 6 tests use planted defects.
+- **`validator/leak_scan.py`:** builds the image and searches it (pruning OS directories, files under 5 MB) and `docker history` for literals from `tests/` and `solution/`. About 2 s per task.
+  - **First design flaw caught by its own test:** I'd skipped tokens the environment "already states", but the Dockerfile is part of the environment, so an answer planted with `RUN echo` was ignored.
+  - **Now:** only tokens the *instruction* states, and paths, are exempt. Answer-like tokens (hashes, long or high-precision numbers) found in the image are **blocking leaks**. Quoted strings are non-blocking notes, because they're usually input data the tests regenerate.
+  - **Second bug:** `grep --exclude-dir` matches directory names, not paths, so the first version crawled the whole filesystem for more than 10 minutes. It now uses `find -prune`.
+- **`generator/blueprint.py`:**
+  - **Generation:** spec → `Blueprint` (instruction draft, internal hint, requirements, environment, trap, tests, verifier knob, expected failure modes, predicted pass rate). The prompt gives the frontier-agent failure modes to design around, hard constraints, and the 425-task concept list (~18k prompt tokens).
+  - **Review:** a rubric review with acceptance **enforced from the scores** (every score ≥ 3, average ≥ 3.6), not from the model's verdict.
+  - **Gate:** `gate_blueprint()` combines the review with the novelty gate. Lexical flags reject without calling the judge; otherwise the Sonnet same-task judge runs.
+  - **Dev-mode run:** an accepted blueprint, novel against the 3 nearest TB tasks (max cosine 0.16), for ~$0.03.
+- **`analysis/llm.py`:** reasoning models can spend the whole `max_tokens` on hidden reasoning (DeepSeek: 6000/6000 reasoning tokens, empty content, `finish_reason=length`). `chat()` now retries with a doubled budget (up to 32k) and counts every attempt's cost.
+- **Tests:** 43 unit tests, all passing. **Spend:** ~$0.03 (dev). Progress 30/83.
+
 ### 16:45 -03:00 · Spec sampler, LLM client, novelty index
 - **`generator/spec.py`:** `TaskSpec` covers 12 domains, 8 skill types, 11 capabilities (2 per task), 6 pillars, 12 personas, weighted languages, 7 fixture kinds, 5 verifier kinds (each with a difficulty knob), 8 difficulty levers (2 per task) and 4 terse-compatible writing styles.
   - Sampling is **inverse-frequency** (SkillSynth): weight 1/(count+1) per value, optionally seeded with history. A batch therefore spreads across the taxonomy instead of piling onto common cells.

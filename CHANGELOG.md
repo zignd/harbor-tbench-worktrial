@@ -4,6 +4,14 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:34 -03:00 · Fix: stale Harbor job dirs could be silently resumed
+- **Found while the pilot ran:** the earlier dry run sampled the same spec (same seed, so the same candidate ID) and left gate job dirs (`jobs/gate-official-<id>-a1-*`) in the shared `jobs/`. Harbor **resumes** an existing job dir with the same config and keeps its finished trials, so the live pilot's oracle/nop gate would have reused the dry run's results, which came from the fixture task.
+- **Fixes:**
+  - The stale dirs were removed before the pilot reached its gates.
+  - `run_job()` now deletes an existing job dir before every run.
+  - Dry runs write their gate jobs under `jobs/dry-run/jobs/`, isolated from real runs. Verified.
+- **Lesson:** deterministic job names need either fresh dirs or unique names. Resume semantics are a footgun for an evaluation pipeline.
+
 ### 17:32 -03:00 · Novelty gate also covers our own earlier tasks
 - `validator/novelty.gate_index()` builds the gate's index from the 425 published TB tasks + `examples/` + **our own earlier candidates** (excluding the candidate being checked), at both the blueprint gate and the final-package re-check. A batch can't drift into near-duplicates of what it already generated, not just of published work.
 - **Coverage-steered sampling** was already in place (`run_batch` samples inverse-frequency against all earlier candidates' specs), so it's ticked.

@@ -125,9 +125,9 @@ def parse_trial(trial_dir: Path) -> TrialResult:
     rewards = (result.get("verifier_result") or {}).get("rewards") or {}
     kwargs = agent_cfg.get("kwargs") or {}
     if not kwargs and (trial_dir / "config.json").exists():
-        kwargs = json.loads((trial_dir / "config.json").read_text()).get("agent", {}).get(
-            "kwargs"
-        ) or {}
+        kwargs = (
+            json.loads((trial_dir / "config.json").read_text()).get("agent", {}).get("kwargs") or {}
+        )
     max_turns = kwargs.get("max_turns")
     return TrialResult(
         trial_name=result["trial_name"],
@@ -173,10 +173,33 @@ def run_job(
     jobs_dir: Path | str = JOBS_DIR,
     extra_args: list[str] | None = None,
 ) -> list[TrialResult]:
-    """Run one `harbor run` job and return its parsed trials (raises on fatal errors)."""
+    """Run one `harbor run` job and return its parsed trials (raises on fatal errors).
+
+    The job dir is always fresh: Harbor *resumes* an existing job dir with the
+    same config (keeping its finished trials), which would silently reuse stale
+    results from an earlier run with the same name.
+    """
     jobs_dir = Path(jobs_dir)
-    cmd = [_harbor_bin(), "run", "-p", str(task_dir), "-a", agent, "-k", str(attempts),
-           "-n", str(concurrent), "-o", str(jobs_dir), "--job-name", job_name, "-y", "-q"]
+    if (jobs_dir / job_name).exists():
+        shutil.rmtree(jobs_dir / job_name)
+    cmd = [
+        _harbor_bin(),
+        "run",
+        "-p",
+        str(task_dir),
+        "-a",
+        agent,
+        "-k",
+        str(attempts),
+        "-n",
+        str(concurrent),
+        "-o",
+        str(jobs_dir),
+        "--job-name",
+        job_name,
+        "-y",
+        "-q",
+    ]
     if model:
         cmd += ["-m", model]
     for key, value in (agent_kwargs or {}).items():

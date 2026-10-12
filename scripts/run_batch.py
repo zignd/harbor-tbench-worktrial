@@ -72,6 +72,10 @@ def _install_dry_run(ledger_path: Path) -> Ledger:
         "hackable": False, "reward": 0.0, "exploit": "", "cost_usd": 0.0, "trial": None
     }  # fmt: skip
     pipeline.CANDIDATES_DIR = ledger_path.parent / "candidates"
+    # Gate jobs go under the dry-run dir too, so they can never collide with real runs.
+    pipeline.JOBS_DIR = str(ledger_path.parent / "jobs")
+    real_run = pipeline.run_with_retries
+    pipeline.run_with_retries = lambda *a, **k: real_run(*a, **{"jobs_dir": pipeline.JOBS_DIR, **k})
     return Ledger(ledger_path)
 
 

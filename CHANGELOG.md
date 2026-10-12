@@ -4,6 +4,27 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:51 -03:00 · Tuner (stretch B) and curtailment analysis (stretch A); first calibration started
+- **`analysis/tuner.py` + `scripts/tune_candidates.py`:** an ACCEL-style mutation loop for near-misses.
+  - A Sonnet plan proposes ONE change, preferring the verifier knob (more or nastier verify-time cases, a stricter *stated* threshold), then a difficulty lever, then regeneration.
+  - The change is applied as a repair-style authoring round on the current package, re-gated (with up to one repair) and recalibrated. At most 2 rounds.
+  - Fairness rules are part of the directive: the instruction must state everything the tests check, and a too-hard task is never eased by weakening the check on its core requirement.
+  - Only tasks whose failures were all valid are tuned. 4 tests.
+- **`analysis/curtailment.py`:** exact expectation over all 2^5 sequences.
+
+  | true p | P(in band) | exact: trials (saved) | 0/3 early reject: trials (saved, recall of learnable) |
+  |---|---|---|---|
+  | 0.1 | 0.41 | 4.42 (11.7%) | 3.03 (39.4%, 0.66) |
+  | 0.2 | 0.67 | 4.05 (19.0%) | 3.13 (37.4%, 0.72) |
+  | 0.35 | 0.83 | 3.85 (23.1%) | 3.39 (32.1%, 0.81) |
+  | 0.5 | 0.78 | 3.94 (21.3%) | 3.75 (25.0%, 0.88) |
+  | 0.8 | 0.26 | 4.32 (13.7%) | 4.31 (13.9%, 0.97) |
+
+  Exact curtailment is lossless (recall 1.0). The aggressive rule saves up to 40% on hard tasks but **loses 19-37% of learnable tasks at low p**, so we don't use it: learnable tasks are the scarce output.
+  - **Correction:** my early study guide said P(in band) = 0.94 at p = 0.5. The correct value is 25/32 = 0.78.
+- **First calibration launched:** the Phase 0 Sonnet-authored `ledger-reconcile` task (oracle 3/3, nop 0, `harbor check` 16/16) is registered as candidate `official-p0-ledger-reconcile` and is being red-teamed, then calibrated on Opus (concurrency 2). It came from a **hand-written blueprint**, and the report will label it as such.
+- `harbor check` on all 6 examples is running for the stretch D comparison. ruff now skips generated task code (`runs/`, `output/`). 98 tests pass.
+
 ### 17:34 -03:00 · Fix: stale Harbor job dirs could be silently resumed
 - **Found while the pilot ran:** the earlier dry run sampled the same spec (same seed, so the same candidate ID) and left gate job dirs (`jobs/gate-official-<id>-a1-*`) in the shared `jobs/`. Harbor **resumes** an existing job dir with the same config and keeps its finished trials, so the live pilot's oracle/nop gate would have reused the dry run's results, which came from the fixture task.
 - **Fixes:**

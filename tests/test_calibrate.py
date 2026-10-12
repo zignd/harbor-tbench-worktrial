@@ -61,3 +61,13 @@ def test_waves_never_overshoot_the_earliest_verdict(outcomes, expected):
 
 def test_wave_respects_concurrency():
     assert next_wave_size([], concurrency=1) == 1
+
+
+def test_exact_curtailment_is_lossless_and_aggressive_rule_is_not():
+    from analysis.curtailment import simulate, table
+
+    for p in (0.1, 0.35, 0.65):
+        assert simulate(p)["recall"] == 1.0  # exact curtailment never misses a learnable task
+    rows = {r["p"]: r for r in table()}
+    assert rows[0.2]["aggressive_recall"] < 1.0  # 0/3 early reject loses some learnable tasks
+    assert rows[0.2]["aggressive_trials"] < rows[0.2]["expected_trials"]

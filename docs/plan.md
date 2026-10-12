@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 21 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 26 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -319,14 +319,14 @@ Spike follow-ups (found in Phase 0)
   - Asking for whole-file writes per command.
 
   Measure turns, cost and gate pass-rate on 2 blueprints.
-- [ ] Cost accounting for models LiteLLM can't price (DeepSeek reports `cost_usd: None`): compute from tokens with OpenRouter `/models` pricing in the ledger.
+- [x] Cost accounting for models LiteLLM can't price (DeepSeek reports `cost_usd: None`): compute from tokens with OpenRouter `/models` pricing in the ledger. Done: `TrialResult.priced_cost()` uses OpenRouter `/models` prices (cached in `runs/prices.json`).
 
 
 Foundations
-- [ ] `generator/config.py`: price table, budget caps ($75 reserve, per-batch cap), `MAX_TURNS`, concurrency; reads `.env` values.
-- [ ] `analysis/ledger.py`: append-only `runs/ledger.jsonl` (stage, task, inputs hash, cost, tokens, seconds, result) plus content-hash cache lookup. Unit-tested.
-- [ ] Budget guard: reads `make usage-json` data and refuses new model work below the reserve or per-batch cap. Unit-tested.
-- [ ] `evaluator/harbor_runner.py`: run oracle/nop/terminus-2 jobs and parse them into `TrialResult`; retry infra errors twice, then exclude. Supports `--dry-run` with fixtures. Unit-tested on fixtures.
+- [x] `generator/config.py`: price table, budget caps ($75 reserve, per-batch cap), `MAX_TURNS`, concurrency; reads `.env` values. Done: prices come from OpenRouter `/models` via `analysis/openrouter.py`.
+- [x] `analysis/ledger.py`: append-only `runs/ledger.jsonl` (stage, task, inputs hash, cost, tokens, seconds, result) plus content-hash cache lookup. Unit-tested.
+- [x] Budget guard: reads `make usage-json` data and refuses new model work below the reserve or per-batch cap. Unit-tested.
+- [x] `evaluator/harbor_runner.py`: run oracle/nop/terminus-2 jobs and parse them into `TrialResult`; retry infra errors twice, then exclude. Supports `--dry-run` with fixtures. Unit-tested on fixtures. Done: smoke-tested live (2 oracle trials). `--dry-run` lives at the batch level (fake runner over fixtures), wired in `run_batch`.
 
 Generation
 - [ ] `generator/spec.py`: `TaskSpec` with the taxonomy axes, difficulty levers, verifier kind and knob, plus an inverse-frequency sampler. Unit-tested for coverage behavior.

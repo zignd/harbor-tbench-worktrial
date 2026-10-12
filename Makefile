@@ -12,10 +12,10 @@ help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
 
 usage: ## Show OpenRouter spend, limit and remaining credit for the key in .env
-	@$(UV_RUN) python scripts/openrouter_usage.py
+	@$(UV_RUN) python -m scripts.openrouter_usage
 
 usage-json: ## Same as usage, as raw JSON (for scripts and the budget guard)
-	@$(UV_RUN) python scripts/openrouter_usage.py --json
+	@$(UV_RUN) python -m scripts.openrouter_usage --json
 
 # Published Terminal-Bench sets used as the novelty reference. terminal-bench@latest
 # is the current release (66 tasks; 4.0 as of 2026-10). Only instruction.md and

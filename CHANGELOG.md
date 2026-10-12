@@ -4,6 +4,20 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 16:41 -03:00 · Phase 1 foundations: runner, ledger, budget guard, pricing
+- **`evaluator/harbor_runner.py`:** runs `harbor run` and parses job dirs into `TrialResult` (reward, tokens, cost, turns, timing, paths). It classifies each trial as **pass / fail / invalid / infra / fatal**:
+  - Agent or verifier timeouts, context overflow and hitting the turn cap are *invalid*, never valid failures.
+  - API, network, build and missing-reward problems are *infra*. They're retried twice, then excluded.
+  - A bad key or unknown model is *fatal* and aborts the run.
+
+  Smoke-tested live on 2 parallel oracle trials.
+- **`analysis/ledger.py`:** an append-only `runs/ledger.jsonl` of `Event`s (stage, task, result, cost, seconds, inputs hash, dev/official mode). `hash_dir()` gives content hashes, so a stage is skipped when its inputs haven't changed.
+- **`analysis/budget.py`:** `check(expected_usd)` refuses work that would exceed the $380 authorization or drop remaining credit below the $75 reserve. It uses the larger of OpenRouter's two lagging counters.
+- **`analysis/openrouter.py`:** spend and per-model prices from OpenRouter (cache-read prices included). `TrialResult.priced_cost()` falls back to token pricing when Harbor's `cost_usd` is `None` (DeepSeek). The `make usage` script now reuses this module.
+- **Config:** `MAX_TURNS=200`, `METATASK_MAX_TURNS=80`, `OPUS_CONCURRENCY=3`, budget limits and repo paths in `generator/config.py`.
+- **Tests:** 20 unit tests on the recorded fixtures cover outcome classification (incl. the turn cap), retry and exclude, token pricing, the ledger cache, the budget limits and the counter-lag handling. `pytest` and `ruff` skip `tests/fixtures/` (which holds an authored task with its own tests).
+- **Spend:** $0 (the smoke test used the free oracle). Progress 26/83.
+
 ### 16:30 -03:00 · Phase 0 done: meta-task authoring works, and the gates caught a real bug
 - **Spike:** one hand-written blueprint (a payment-ledger CLI with two interacting bugs and a cross-day-refund trap), authored as a Harbor meta-task by both Sonnet 4.6 and DeepSeek (dev mode). Both meta-tasks scored 1.0 on the in-container package check, and `artifacts` delivered the package to the host.
 - **The host gates caught what self-validation missed.** Sonnet's package failed the oracle 3/3 in the real build: its `tests/test.sh` called `uvx` without installing uv. The author had verified by running pytest directly, never the verifier entry point.

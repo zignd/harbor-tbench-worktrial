@@ -6,25 +6,17 @@ per-key endpoint (GET /api/v1/key); the account-wide /credits endpoint needs a
 management key, which we don't have.
 
 Usage:
-    python scripts/openrouter_usage.py          # human-readable summary
-    python scripts/openrouter_usage.py --json   # raw key info, for scripts
+    python -m scripts.openrouter_usage          # human-readable summary
+    python -m scripts.openrouter_usage --json   # raw key info, for scripts
 """
 
 import json
 import os
 import sys
 import urllib.error
-import urllib.request
 from datetime import UTC, datetime
 
-
-def fetch_key_info(api_key: str, api_base: str) -> dict:
-    request = urllib.request.Request(
-        f"{api_base.rstrip('/')}/key",
-        headers={"Authorization": f"Bearer {api_key}"},
-    )
-    with urllib.request.urlopen(request, timeout=20) as response:
-        return json.load(response)["data"]
+from analysis.openrouter import fetch_key_info
 
 
 def _usd(value: float | None) -> str:
@@ -62,14 +54,12 @@ def summarize(info: dict) -> str:
 
 
 def main() -> int:
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    api_base = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
-    if not api_key:
+    if not os.environ.get("OPENROUTER_API_KEY"):
         print("OPENROUTER_API_KEY is not set (copy .env.example to .env).", file=sys.stderr)
         return 1
 
     try:
-        info = fetch_key_info(api_key, api_base)
+        info = fetch_key_info()
     except urllib.error.HTTPError as e:
         print(f"OpenRouter returned HTTP {e.code}: {e.read().decode()[:200]}", file=sys.stderr)
         return 1

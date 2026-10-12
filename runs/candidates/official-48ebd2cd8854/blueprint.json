@@ -1,0 +1,57 @@
+{
+ "slug": "aggregation-config-silent-drift",
+ "title": "Aggregation Engine Silent Misconfiguration",
+ "scenario": "An internal C-based data aggregation service reads sales records from a SQLite database, applies per-region weighting factors loaded from an INI-style config file, and writes rolled-up summaries back into the database. An analyst noticed that regional totals stopped matching manually computed checks about two weeks ago, but the service runs without errors and the per-row values look plausible. The codebase spans roughly 1,400 lines across a config parser, a record fetcher, an aggregation engine, a writer module, and a small CLI harness.",
+ "instruction_draft": "Hey, the regional sales aggregation numbers I'm getting out of `/app/service/` don't match what I calculate by hand anymore. The service compiles and runs fine, and individual records look okay \u2014 it's only the summaries that are wrong. The final numbers end up in the `region_summaries` table in `/app/data/sales.db`. Can you fix whatever's broken so the per-region weighted totals in that table are correct? Each region's summary value must equal the sum of (sale_amount \u00d7 region_weight) for every record in that region, where region_weight comes from the config. The weights in the config file are the authoritative values. After your fix, rebuild and rerun the service so the database reflects the corrected results.",
+ "requirements": [
+  "Each row in region_summaries.weighted_total equals the exact sum of (sale_amount * region_weight) for all records with that region_id, using the weight from the config file.",
+  "region_weight values used in the computation must match what is declared in /app/config/weights.ini for every region.",
+  "All regions present in the sales records must appear in region_summaries with a correct weighted_total.",
+  "The service must compile from source under /app/service/ and the database must be populated by running it, not by a manual SQL script.",
+  "Cross-component consistency: the weight loaded by the config parser, the weight stored in the intermediate weight cache table, and the weight actually multiplied in the aggregation engine must all be the same value for every region."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm with gcc, make, libsqlite3-dev, sqlite3 installed via apt.",
+  "/app/service/ contains: main.c (~120 lines CLI harness), config_parser.c + config_parser.h (~200 lines), db_fetch.c + db_fetch.h (~180 lines), aggregator.c + aggregator.h (~300 lines), db_writer.c + db_writer.h (~220 lines), and a Makefile.",
+  "/app/config/weights.ini contains correct region weights for 8 regions (e.g. NORTH=1.15, SOUTH=0.92, EAST=1.08, WEST=1.21, NE=1.03, NW=0.87, SE=1.17, SW=0.99).",
+  "/app/data/sales.db is pre-populated with a `sales_records` table (~2000 rows across 8 regions) and an empty `region_summaries` table and a `weight_cache` table.",
+  "Bug 1 (misleading symptom / wrong component): config_parser.c uses sscanf to parse 'KEY=VALUE' lines but has an off-by-one in the key-comparison loop \u2014 it silently matches the FIRST region in the file for ANY lookup when the requested key is not found, returning NORTH's weight for unknown regions. The symptom looks like a database read error because mismatched summaries only show up for regions that sort after NORTH alphabetically, making the analyst suspect the fetcher.",
+  "Bug 2 (cross-component consistency): db_writer.c caches the applied weight into the `weight_cache` table using a separate second config_parser call, but that call goes through a different code path that truncates float strings to 2 decimal places before parsing, so weight_cache stores rounded values. The aggregation engine reads from weight_cache (not directly from config) when it detects the cache is populated, meaning after the first run the engine uses the rounded weights. The first run (cold cache) uses correct weights; subsequent runs drift.",
+  "The service is shipped pre-built (binary present) but with the bugs in source. The pre-built binary reflects the buggy state. Solver must fix source and rebuild.",
+  "A reference Python script /app/tests/verify.py is included that the test harness calls: it generates fresh (region_id, sale_amount) pairs with a seeded PRNG, inserts them into a scratch copy of the DB, runs the built binary against it, and compares results to a Python reference computation using the weights from weights.ini."
+ ],
+ "internal_hint": "The analyst's instinct is that the fetcher is broken because the wrong regions are affected. But the fetcher is fine. Root cause 1: config_parser.c has a loop `for(i=0;i<num_keys;i++)` that compares with `strncmp(keys[i], target, strlen(keys[i]))` \u2014 when target is not found the loop exits without resetting the return buffer, which retains the last-compared (first-alphabetically) entry. Fix: add a not-found sentinel. Root cause 2: db_writer.c calls `snprintf(valbuf, 6, '%.2f', w)` before caching, truncating e.g. 1.15 to '1.15' but 0.87 to '0.87' \u2014 fine so far \u2014 but 1.21 becomes '1.21' and 1.17 becomes '1.17'. However the aggregator's cache-read path calls `atof` on a value that was stored as REAL in SQLite but written by a different INSERT that used the truncated string literal, losing precision on weights like 1.08\u21921.08 (ok) but 0.87\u21920.87 (ok) \u2014 the real damage is that 8 significant digits become 3 for weights that round differently. The engine then uses weight_cache on re-runs. Fix: remove the truncation, store full precision, or remove the cache-read shortcut in the aggregator. Both bugs must be fixed for all regions to pass all generated test inputs.",
+ "trap": "A solver who only fixes the config_parser lookup bug will see correct output on the first run against the provided database (cold cache). The verifier always runs the binary twice against fresh data \u2014 the second run populates then reads from weight_cache, exposing the precision truncation bug. A solver who only notices the cache truncation and fixes it but misses the config lookup bug will fail for regions whose weight is fetched with the wrong key. Shallow verification against the pre-existing sales.db (which has been run before, leaving a warm cache) will also miss the config bug because the cache masks it.",
+ "tests": [
+  "Test 1 \u2014 cold-cache correctness: wipe weight_cache, insert 500 fresh (region_id, sale_amount) rows with seeded RNG covering all 8 regions, run binary, compare region_summaries.weighted_total for every region against Python reference sum(amount * weight_from_ini). All 8 must match within 1e-6.",
+  "Test 2 \u2014 warm-cache consistency: after Test 1, insert 500 more rows (different seed), run binary again (cache is now populated), compare summaries against reference. Tests the cache path. All 8 regions must still match.",
+  "Test 3 \u2014 weight_cache table integrity: after any run, SELECT weight_cache.weight for each region and compare to float(weights.ini value). Difference must be < 1e-6 for all regions.",
+  "Test 4 \u2014 cross-region coverage: generated inputs ensure every region appears at least 30 times; no region may be absent from region_summaries.",
+  "Test 5 \u2014 adversarial region ordering: run with a modified weights.ini where regions are listed in reverse alphabetical order; verify the config_parser still returns correct weights for all regions (catches the off-by-one regardless of file order).",
+  "Test 6 \u2014 rebuild check: verify the binary's mtime is newer than the source files, confirming the solver actually rebuilt from fixed source."
+ ],
+ "verifier_knob": {
+  "name": "num_generated_rows",
+  "value": "1000 per run, 2 runs",
+  "effect": "Increasing to 5000 rows per run and 4 runs with varied seeds makes precision drift from the cache bug accumulate to a larger absolute error, making marginal fixes (e.g. slightly better truncation) fail more reliably; decreasing to 100 rows makes the test faster but allows larger tolerance."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the config_parser lookup bug, passes the cold-cache run, but fails the warm-cache run because weight_cache still stores truncated weights.",
+  "Agent fixes only the weight_cache precision bug, passes warm-cache runs for most regions, but fails for regions where the config lookup returns NORTH's weight instead of the correct one.",
+  "Agent replaces the service with a Python script instead of fixing and rebuilding the C source, failing the rebuild-check test.",
+  "Agent manually corrects the database with SQL UPDATE statements rather than fixing the code, failing when the verifier wipes and repopulates the database with fresh inputs.",
+  "Agent finds the weight_cache truncation and works around it by deleting the cache before each run (via a shell wrapper), missing the config_parser bug that still corrupts some regions on the first run.",
+  "Agent fixes the off-by-one in config_parser but introduces a different comparison bug (e.g. using strcasecmp incorrectly) that fails on the adversarial reversed-order weights.ini test."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "c",
+  "sqlite",
+  "configuration",
+  "reverse-engineering",
+  "refactoring",
+  "fuzz-equivalence"
+ ]
+}

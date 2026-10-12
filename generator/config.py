@@ -45,8 +45,10 @@ BAND_HIGH = int(os.environ.get("BAND_HIGH", "3"))
 # --- Turn caps and concurrency ---------------------------------------------
 # README allows capping turns at 200 to stop spirals; hitting the cap is never a
 # valid failure. Authoring isn't constrained by the README, so it is capped tighter.
+# 80 authoring turns ran out mid-build (pilot: 80 turns, broken Dockerfile, $3.86); a repair
+# round costs ~$0.9 and 30 min, so finishing the first build is cheaper.
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
-METATASK_MAX_TURNS = int(os.environ.get("METATASK_MAX_TURNS", "80"))
+METATASK_MAX_TURNS = int(os.environ.get("METATASK_MAX_TURNS", "140"))
 # Authoring cost lever: terminus-2 summarizes when free context drops below this.
 # LiteLLM gives Sonnet a 200k limit, so 140k summarizes once history passes ~60k
 # (Phase 0: authoring history grew to 104k and cost $2.75). Authoring only; the

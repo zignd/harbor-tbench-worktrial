@@ -4,6 +4,19 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:17 -03:00 · First-pass yield: longer authoring, all cheap gates in one round, overgenerate
+No fresh official candidate had passed every gate on its first build. The measured causes and the three fixes:
+1. **Authoring turn cap 80 → 140** (`METATASK_MAX_TURNS`). The pilot's first build hit the 80-turn cap with a broken Dockerfile ($3.86, 42 min), then needed a repair (~$0.9, ~30 min each). Finishing the first build costs less than repairing it. 140 turns can run past an hour, so the **authoring meta-task's** agent timeout goes 3600 → 7200 s. Generated tasks keep `timeout_sec = 3600` (`make_task_toml`, enforced by lint). That rule is the README's, about the tasks Opus is calibrated on.
+2. **Every cheap gate runs in the same round.** `stage_gates` used to stop at the first failing group, so a package could fail, get repaired, then fail the next gate, one round at a time. Example: the C candidate's first build failed the leak scan (answer tokens baked into `/app/etc/audit.key` and `seed.sql`), and its oracle and quality results were never seen. Now:
+   - structure + lint + build/leak scan always run;
+   - oracle/nop run whenever the image builds;
+   - `harbor check` runs whenever the structure is valid (~$0.13, vs ~$0.9 per extra repair round).
+
+   All findings go into one repair. Novelty and the red-team (~$0.2-2) still run only on a package that passes everything else.
+3. **Overgenerate.** With parallel builds, more candidates cost the same wall-clock time, and spend isn't the limit ($33.71 spent, $466.29 left). Batch 2's generation starts now (8 candidates, 4 workers, under the new cap and gates). Its **calibration waits for the pilot go/no-go** (cost per learnable task vs $40), so the checkpoint still gates Opus spend.
+- The already-running builders keep the old code until they exit. Only new processes use the 140 cap and the aggregated gates.
+- 111 tests pass (new: one round reports leak + oracle + quality findings together; gates that can't run are skipped). Dry run: 1/1 gated through all five gates.
+
 ### 19:05 -03:00 · Self-duplication caught; blueprint retry; report gains per-batch, novelty-layer and difficulty sections
 - **Finding:** the novelty judge rejected 2 of 8 official blueprints as **variants of our own Phase 0 task** (`ledger-reconcile`). One was a data-processing/SQLite spec ("ledger-aggregation-pipeline-drift"), the other a networking/algorithmic spec ("settlement-aggregator-consistency-bug"). Sonnet drifts toward ledger reconciliation even when the spec points elsewhere. The self-dedup layer (our candidates indexed next to the 425 published tasks) is what caught it. Without it, two near-copies would have reached Opus.
 - **Why it cost two batch slots:** a rejected blueprint ended the candidate, while the plan said a reject should resample. Resampling the spec is the wrong fix, since the spec was fine and the *idea* drifted. Now:

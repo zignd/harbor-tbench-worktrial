@@ -138,3 +138,43 @@ def test_rejected_blueprint_is_retried_once_with_the_reason(tmp_path, monkeypatc
     assert prompts[0] == ("- ours/x: ledger", None)
     assert "variant of ours/x (same ledger bug)" in prompts[1][1]
     assert (cand.dir / "blueprint_rejected_1.json").exists()
+
+
+def _gate_env(monkeypatch, static, functional, quality):
+    calls = []
+    monkeypatch.setattr(pipeline, "gate_static", lambda d, tag: (calls.append("static"), static)[1])
+    monkeypatch.setattr(
+        pipeline, "gate_functional", lambda d, n: (calls.append("functional"), functional)[1]
+    )
+    monkeypatch.setattr(pipeline, "run_check", lambda d, n: (calls.append("quality"), quality)[1])
+    monkeypatch.setattr(pipeline.budget, "check", lambda expected: None)
+    monkeypatch.setattr(pipeline, "stage_redteam", lambda *a: (calls.append("redteam"), [])[1])
+    return calls
+
+
+QUALITY_FAIL = {"ok": False, "outcomes": {}, "blocking_failures": ["typos: x"],
+                "advice": ["fix the typo"], "cost_usd": 0.1}  # fmt: skip
+
+
+def test_gates_report_every_cheap_finding_in_one_round(env, monkeypatch):
+    _, ledger = env
+    calls = _gate_env(
+        monkeypatch,
+        (["leak: answer in /app/x"], True, True),
+        (["oracle passed 2/3"], {"oracle": [], "nop": [], "excluded": 0}),
+        QUALITY_FAIL,
+    )
+    cand = pipeline.Candidate(sample_specs(1, seed=10)[0])
+    shutil.copytree(TASK, cand.task_dir)
+    problems = pipeline.stage_gates(cand, ledger, 1)
+    assert problems == ["leak: answer in /app/x", "oracle passed 2/3", "typos: x", "fix the typo"]
+    assert calls == ["static", "functional", "quality"]  # no novelty/red-team on a broken package
+
+
+def test_gates_skip_what_cannot_run(env, monkeypatch):
+    _, ledger = env
+    calls = _gate_env(monkeypatch, (["structure: no tests/"], False, False), None, None)
+    cand = pipeline.Candidate(sample_specs(1, seed=11)[0])
+    shutil.copytree(TASK, cand.task_dir)
+    assert pipeline.stage_gates(cand, ledger, 1) == ["structure: no tests/"]
+    assert calls == ["static"]  # no image to run, no valid structure to review

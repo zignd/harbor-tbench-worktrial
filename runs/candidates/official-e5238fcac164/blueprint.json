@@ -1,0 +1,57 @@
+{
+ "slug": "netflow-settlement-codec-repair",
+ "title": "NetFlow Settlement Codec Repair",
+ "scenario": "A finance-ops team uses an internal Python service (~1,200 lines across 5 modules) that ingests raw NetFlow v9 records exported by routers, aggregates them into per-counterparty byte-transfer totals, and emits daily settlement files that feed a chargeback billing system. Since a recent refactor the nightly reconciliation job has started producing totals that drift from the router's own SNMP counters on certain traffic classes. No reproduction script was left; only the data files and service code are in the container. The environment contains a realistic set of NetFlow template records, data flowsets in binary files, and a reference totals CSV that the billing system trusts.",
+ "instruction_draft": "Hey, our NetFlow settlement aggregator at /app is producing wrong per-counterparty byte totals for some traffic classes \u2014 the numbers don't match what the routers report via SNMP. Nobody left a repro. The rules are: (1) each data flowset record's byte count must be attributed to the counterparty identified by the source-IP-to-ASN mapping table, (2) when a flow template is re-exported mid-file the aggregator must use the most-recently-seen field layout for all subsequent records in that file, and (3) multi-file runs must carry template state forward across files in the order the files are processed (sorted by filename). Fix /app so that running `python /app/settle.py /app/data/` produces a `settlement.csv` whose per-counterparty totals match the reference computation for any valid set of NetFlow v9 binary input files.",
+ "requirements": [
+  "Each data flowset record's byte count is attributed to the counterparty identified by the source-IP-to-ASN mapping table in /app/data/asn_map.csv.",
+  "When a flow template is re-exported mid-file, the aggregator uses the most-recently-seen field layout for all subsequent records in that file.",
+  "Multi-file runs carry template state forward across files processed in sorted filename order.",
+  "Running `python /app/settle.py /app/data/` produces a `settlement.csv` with correct per-counterparty byte totals."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm; pip install scapy==2.5.0 (for struct reference only, not used in app), no other unusual deps.",
+  "/app/settle.py \u2014 CLI entry point (~80 lines): discovers .bin files in the given directory, calls parser and aggregator, writes settlement.csv.",
+  "/app/netflow/parser.py (~300 lines): parses NetFlow v9 binary; BUG 1 \u2014 when a template flowset is re-encountered, the code skips updating the template cache ('if template_id in self.templates: continue') so it always uses the first-seen layout even after the router re-exports a revised template with a different field order.",
+  "/app/netflow/aggregator.py (~250 lines): accumulates per-ASN byte counts; BUG 2 \u2014 the aggregator creates a fresh parser (and therefore empty template cache) for each file rather than passing the persistent parser instance, so cross-file template state is lost.",
+  "/app/netflow/asn_lookup.py (~150 lines): CIDR-prefix trie for source-IP-to-ASN lookups; correct but plausibly suspicious.",
+  "/app/netflow/schema.py (~100 lines): NetFlow v9 field type constants; correct.",
+  "/app/netflow/utils.py (~80 lines): checksum helpers, logging; correct.",
+  "/app/data/asn_map.csv: 40 CIDR prefixes mapped to 8 ASN counterparty IDs.",
+  "/app/data/flows_001.bin through flows_006.bin: synthetically generated binary NetFlow v9 files; flows_003.bin re-exports a revised template mid-file; flows_004.bin through 006 depend on that revised template being carried forward.",
+  "/app/data/reference_totals.csv: ground-truth per-ASN byte totals computed by a reference implementation (used only inside the test suite, not shipped as a hint).",
+  "Test suite at /app/tests/test_settlement.py: generates fresh random NetFlow v9 binary inputs at verify time using a seeded reference encoder, runs settle.py, and compares output to reference totals computed inline."
+ ],
+ "internal_hint": "There are exactly two bugs. BUG 1 is in parser.py: the guard `if template_id in self.templates: continue` must be removed (or changed to always overwrite) so that re-exported templates replace the cached layout. BUG 2 is in aggregator.py: a single Parser instance must be created once and reused across all files in sorted order rather than instantiated per file. Finding both requires reading parser.py carefully (the skip-on-duplicate logic is subtle), then noticing in aggregator.py that a new Parser() is constructed inside the per-file loop. The agent must trace a failing case through the binary files \u2014 flows_003.bin triggers BUG 1, and flows_004\u2013006 trigger BUG 2 because they reference the template updated in 003. The reference totals CSV is not readable by the agent (it lives only inside the test); the agent must deduce correctness by reasoning about the spec and the code.",
+ "trap": "An agent that only fixes BUG 1 (the template overwrite guard) will pass flows_003.bin in isolation but fail the cross-file tests because the aggregator still resets the parser per file. Conversely fixing only BUG 2 (sharing the parser) still fails because the first-seen template is never updated. The fuzz tests generate files where (a) a template is revised after initial export within a single file and (b) that revision is needed by a subsequent file; both conditions must hold simultaneously for the totals to match. Shallow testing against only the provided sample files (which happen to have flows_001\u2013002 that need neither fix) will appear green.",
+ "tests": [
+  "Smoke test: run settle.py on the provided /app/data/ directory and check that settlement.csv exists and has the expected ASN rows.",
+  "Fuzz test (N=40 input sets, seeded): generate random NetFlow v9 binary scenarios where each scenario includes: at least one mid-file template revision, at least two files where the second file references a template last seen in the first; compute reference totals with the reference encoder; run settle.py; assert per-ASN byte totals match within 0 bytes.",
+  "Cross-file ordering test: generate two files where file_b.bin's data records are only decodable with the template last exported in file_a.bin; verify settle.py produces correct totals only when files are processed in sorted (a before b) order.",
+  "Template overwrite test: generate a single file with the same template ID exported twice with different field orders; verify byte totals match the second (revised) layout.",
+  "Attribution test: generate flows with source IPs spanning multiple CIDR prefixes; verify bytes are attributed to the correct ASN counterparty, not aggregated under a catch-all."
+ ],
+ "verifier_knob": {
+  "name": "number_of_fuzz_scenarios",
+  "value": "40",
+  "effect": "Raising to 80\u2013120 increases the probability of hitting unusual template-revision patterns and multi-file orderings that expose partial fixes; lowering to 5\u201310 makes it easier for a partial fix to pass by luck."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the template-overwrite guard (BUG 1) and misses the per-file parser re-instantiation (BUG 2), passes the provided sample but fails cross-file fuzz tests.",
+  "Agent fixes only the per-file parser sharing (BUG 2) and misses the template-overwrite guard (BUG 1), fails fuzz scenarios with mid-file template revisions.",
+  "Agent reads asn_lookup.py or schema.py suspecting bugs there, spends time on the correct components, and runs out of time before tracing the real issues in parser.py and aggregator.py.",
+  "Agent rewrites the parser from scratch with correct logic but reintroduces the per-file instantiation pattern from the original aggregator.py structure.",
+  "Agent verifies only against the provided /app/data/ files (flows_001\u2013002 don't exercise either bug) and concludes the code is already correct."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "networking",
+ "tags": [
+  "netflow",
+  "binary-protocol",
+  "debugging",
+  "state-management",
+  "finance-ops",
+  "codec"
+ ]
+}

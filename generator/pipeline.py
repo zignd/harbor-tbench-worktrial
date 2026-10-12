@@ -206,15 +206,18 @@ def stage_author(
     return ok
 
 
-def gate_static(task_dir: Path, tag: str) -> list[str]:
-    problems = [f"structure: {e}" for e in validate_task(str(task_dir))["errors"]]
-    problems += [f"lint: {e}" for e in lint_errors(lint_task(task_dir, CANARY_LINE))]
-    if not problems:
+def gate_static(task_dir: Path, tag: str) -> tuple[list[str], bool, bool]:
+    """Structure + lint + build/leak scan. Returns (problems, structure_ok, built)."""
+    structural = [f"structure: {e}" for e in validate_task(str(task_dir))["errors"]]
+    problems = structural + [f"lint: {e}" for e in lint_errors(lint_task(task_dir, CANARY_LINE))]
+    built = False
+    if (task_dir / "environment" / "Dockerfile").exists():
         scan = leak_scan.scan(task_dir, tag)
-        if not scan["built"]:
+        built = scan["built"]
+        if not built:
             problems.append(f"docker build failed:\n{scan.get('error', '')[-3500:]}")
         problems += [f"leak: {leak}" for leak in scan["leaks"]]
-    return problems
+    return problems, not structural, built
 
 
 def gate_functional(task_dir: Path, name: str) -> tuple[list[str], dict]:
@@ -244,35 +247,41 @@ def gate_functional(task_dir: Path, name: str) -> tuple[list[str], dict]:
 
 
 def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
-    """Run gates cheapest-first; stop at the first failing group. Returns problems."""
+    """Run every cheap gate, then novelty and red-team on a clean package. Returns problems.
+
+    Static, functional and quality gates all run even when an earlier one fails
+    (functional needs a built image, quality a valid structure), so one repair
+    round sees every finding instead of discovering them one round at a time.
+    Novelty and the red-team only run once those pass.
+    """
     h = hash_dir(cand.task_dir)
     tag = f"claude-gate-{cand.cand_id}-a{attempt}".lower()
     t0 = time.monotonic()
-    problems = gate_static(cand.task_dir, tag)
+    problems, structure_ok, built = gate_static(cand.task_dir, tag)
     _record(ledger, cand, "gate_static", {"problems": problems}, 0.0, t0, h)
+    if built:
+        t0 = time.monotonic()
+        found, result = gate_functional(cand.task_dir, f"gate-{cand.cand_id}-a{attempt}")
+        _record(ledger, cand, "gate_functional", {**result, "problems": found}, 0.0, t0, h)
+        problems += found
+    if structure_ok:
+        budget.check(EXPECTED_CHECK_USD)
+        t0 = time.monotonic()
+        check = run_check(cand.task_dir, f"check-{cand.cand_id}-a{attempt}")
+        cand.save(f"quality_a{attempt}.json", check)
+        found = check["blocking_failures"] or ([check["error"]] if "error" in check else [])
+        _record(
+            ledger,
+            cand,
+            "gate_quality",
+            {"ok": check["ok"], "outcomes": check["outcomes"], "problems": found},
+            check["cost_usd"],
+            t0,
+            h,
+        )
+        problems += found + (check["advice"] if found else [])
     if problems:
         return problems
-    t0 = time.monotonic()
-    problems, result = gate_functional(cand.task_dir, f"gate-{cand.cand_id}-a{attempt}")
-    _record(ledger, cand, "gate_functional", {**result, "problems": problems}, 0.0, t0, h)
-    if problems:
-        return problems
-    budget.check(EXPECTED_CHECK_USD)
-    t0 = time.monotonic()
-    check = run_check(cand.task_dir, f"check-{cand.cand_id}-a{attempt}")
-    cand.save(f"quality_a{attempt}.json", check)
-    problems = check["blocking_failures"] or ([check["error"]] if "error" in check else [])
-    _record(
-        ledger,
-        cand,
-        "gate_quality",
-        {"ok": check["ok"], "outcomes": check["outcomes"], "problems": problems},
-        check["cost_usd"],
-        t0,
-        h,
-    )
-    if problems:
-        return problems + check["advice"]
     t0 = time.monotonic()
     instruction = (cand.task_dir / "instruction.md").read_text()
     index = novelty.gate_index(CANDIDATES_DIR, exclude=cand.cand_id)

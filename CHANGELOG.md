@@ -4,6 +4,13 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 18:04 -03:00 · Architecture guide with Mermaid diagrams
+- `docs/architecture.md` is a presentation-oriented guide:
+  - **9 Mermaid diagrams:** the band, the system overview, the candidate lifecycle state machine, an authoring meta-task sequence diagram, the calibration curtailment flow, the valid-vs-invalid failure taxonomy, the reward-hacking defence layers, the budget controls, and a repository map.
+  - **A decisions table** with the why and tradeoff for each choice, each tied to a paper or a measured result.
+  - **Q&A for reviewers**, answered with measured numbers.
+- All 9 diagrams render with `@mermaid-js/mermaid-cli` 11, so there are no syntax errors. Linked from the README.
+
 ### 17:58 -03:00 · Stretch D baseline: AfterQuery's examples on our 16-criterion rubric
 - `harbor check` with `generator/quality_rubric.toml` on all 6 hand-written examples ($0.66; `reports/quality_examples.json`):
 

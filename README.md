@@ -182,7 +182,7 @@ Include:
 
 ## Running this implementation
 
-Everything below was added for the work trial; the sections above are AfterQuery's spec. Design, decisions and measured results are in `docs/plan.md`, `docs/harbor-notes.md`, `CHANGELOG.md` and `reports/summary.md`.
+Everything below was added for the work trial; the sections above are AfterQuery's spec. **Start with `docs/architecture.md`** (diagrams, decisions, Q&A). Design, decisions and measured results are in `docs/plan.md`, `docs/harbor-notes.md`, `CHANGELOG.md` and `reports/summary.md`.
 
 ### Setup
 

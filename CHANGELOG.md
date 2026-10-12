@@ -4,6 +4,13 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 18:07 -03:00 · Authoring cost, measured: levers helped input, bigger tasks cost more
+- Pilot candidate 1 (`rust-codec-deploy-regression`, a Rust codebase as the new size rule asks for) was authored in **80 turns (cap), 42 min, $3.86**.
+  - Summarization fired twice and cut total input by 25% vs Phase 0 (3.82M vs 5.07M tokens).
+  - But every summary breaks the prompt cache (uncached input 0.35M vs 0.10M), and output doubled (100k vs 58k tokens) for the larger environment.
+- The tuner's repair-style round on `ledger-reconcile` took **24 turns, $0.91**: starting from an existing package is ~4× cheaper.
+- **Conclusion:** fresh builds of realistically sized tasks cost ~$3-4, and repairs/tunes ~$1. The ≤$1.5 target only held for repairs, and that is recorded rather than hidden. The $90 authoring bucket still covers ~25 builds. Summarization stays on, since it bounds context growth on long runs.
+
 ### 18:04 -03:00 · Architecture guide with Mermaid diagrams
 - `docs/architecture.md` is a presentation-oriented guide:
   - **9 Mermaid diagrams:** the band, the system overview, the candidate lifecycle state machine, an authoring meta-task sequence diagram, the calibration curtailment flow, the valid-vs-invalid failure taxonomy, the reward-hacking defence layers, the budget controls, and a repository map.

@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 46 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 47 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -313,7 +313,7 @@ Harbor spike (learn the real mechanics before writing pipeline code)
 
 Spike follow-ups (found in Phase 0)
 - [x] Pipeline-owned `tests/test.sh`: the authored one called `uvx` without installing it, so the oracle failed 3/3 in the real build even though in-container self-checks passed. Now the standard `generator/metatask/standard_test.sh` ships in the synthesis image, `collect_package()` always overwrites `tests/test.sh` with it, and the author self-checks with the exact verifier command. Re-gated: Sonnet's package passes oracle 3/3 and nop 0, and so does DeepSeek's.
-- [ ] 💲 Cut authoring cost from $2.75/task toward ≤$1.5. Sonnet hit the 80-turn cap with ~63k context per call. Levers (authoring only; Opus calibration settings untouched):
+- [x] 💲 Cut authoring cost from $2.75/task toward ≤$1.5. Sonnet hit the 80-turn cap with ~63k context per call. Levers (authoring only; Opus calibration settings untouched): **Outcome (measured):** summarization fired (2× on an 80-turn run) and cut total input 25% (5.07M→3.82M), but each summary breaks the prompt cache (uncached input 0.10M→0.35M), and the new ~800-2,000-line environments doubled output (58k→100k). A fresh build now costs **$3.86**, and a repair-style round **$0.91**. The target was missed for fresh builds because tasks are deliberately larger; the budget ($90 for ~25 builds) still fits. Summarization is kept, since it bounds context on long runs.
   - terminus-2 `proactive_summarization_threshold` so long contexts get summarized.
   - A compact format spec in the instruction instead of reading the whole reference task.
   - Asking for whole-file writes per command.

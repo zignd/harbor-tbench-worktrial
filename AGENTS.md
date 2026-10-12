@@ -33,6 +33,10 @@ Guidance for AI agents (and humans) working in this repo. This is an AfterQuery 
 - `harbor/` is vendored Harbor source, **read-only**. The real package is in `.venv`.
 - Docker runs locally (10 CPUs, 14.6 GB). Keep Opus concurrency ≤3.
 
+## Plan checklist
+
+`docs/plan.md` → "Work checklist" tracks progress. When an item is finished, tick it (`- [x]`, with the commit hash if useful) and update the **Progress** counter **in the same commit**. If the work reveals a missing item, add it. Don't silently skip or drop items; mark them `~~struck~~` with the reason instead.
+
 ## Changelog (required)
 
 `CHANGELOG.md` is a graded deliverable. AfterQuery reads it to understand what we did, **why**, and the **tradeoffs**.

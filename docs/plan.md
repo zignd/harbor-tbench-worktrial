@@ -240,45 +240,123 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 - Ship a task on fewer than the trials its verdict needs.
 - Count a turn-cap or timeout failure as valid.
 
-## Phases (each ends with small, meaningful commits)
+## Work checklist
 
-**Phase 0: setup and spike (day 1 morning)**
-- ~~Set up the uv project, Python and Harbor~~ (done, `e4c095c`).
-- ~~Put `OPENROUTER_API_KEY` and `OPENROUTER_API_BASE` in a git-ignored `.env`~~ (done; key validated against both models).
-- ~~`make usage` for spend tracking~~ (done). Run it before and after every step below.
-- Run oracle/nop on all 6 examples (no API cost).
-- Run 1-2 Opus terminus-2 trials on one example. Learn the **real cost per Opus trial** (and whether prompt caching applies) to re-plan the budget table, plus:
-  - The job-dir layout and `result.json` fields (cost/tokens).
-  - The trajectory format.
-  - The behavior of `-k`, `-n`, `--ak max_turns`, image caching, and verify-time `uvx` flakiness.
-- **Meta-task spike.** Run one hand-written meta-task with Sonnet 4.6 and confirm:
-  - `artifacts = ["/app/output"]` lands on the host.
-  - The cost per authoring run.
-  - Whether in-container self-validation works without Docker.
+Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-  If it fails, switch to the custom-loop fallback.
-- **Evaluate `harbor check` and `harbor analyze`** with `-a terminus-2 -m openrouter/anthropic/claude-sonnet-4.6`. Check that the default `harbor check` rubric is the TB 19-criterion one.
-- Record the findings in `CHANGELOG.md`, and write `harbor_runner.py` against real outputs, plus fixtures.
+**Progress: 9 / 71 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
-**Phase 1: Part 1, valid tasks (day 1-2)**
-- Build the spec sampler, blueprint + review, meta-task author, lints, leak scan, alignment check and host gates (oracle 3/3, nop).
-- Target: ≥5 tasks that pass the validator plus the functional gates.
-- Hand-review 2 tasks against the examples and the guideline rules, and tighten the meta-task template.
+### Phase 0: setup and spike
 
-**Phase 2: Part 2, calibration (day 2-3)**
-- Build the ledger, budget guard, sequential calibrator, pass audit and failure judge.
-- Batch 1: ~10 candidates.
-- Read every failing trajectory summary. Retune lever and knob defaults toward TB Medium/Hard effort.
+Environment and repo
+- [x] uv project with pinned `harbor==0.24.0`, Python 3.13, scripts via `uv run` (`086928a`)
+- [x] Fix `validate.sh` relative-path bug; all 6 examples pass the validator with the Harbor cross-check
+- [x] Credentials in git-ignored `.env` + `.env.example`; key validated on Sonnet 4.6 and Opus 4.8; `config.py` defaults to OpenRouter (`181ac72`)
+- [x] `make usage` / `make usage-json` for spend tracking (`38fe483`)
+- [x] Plan + full-text research notes in `docs/research/` (`92fa03d`)
+- [x] Spend-discipline rules in the plan (`8f92630`)
+- [x] `AGENTS.md` / `CLAUDE.md` with constraints and conventions; timestamped `CHANGELOG.md` (`554fc8c`, `26d6649`)
+- [x] Conventional-commit history
+- [x] Checklist-format plan (this section)
 
-**Phase 3: stretch B + C and red-team (day 3-4)**
-- Build the tuner, red-team gate, and coverage-steered sampler with dedup and decontamination.
-- Batch 2: ~12-15 candidates, using the tuner on near-misses.
+Harbor spike (learn the real mechanics before writing pipeline code)
+- [ ] Run `oracle` and `nop` on all 6 examples. Record the pass/fail table, run times, and whether verify-time `uvx` installs ever fail (no API cost).
+- [ ] Inspect a job dir. Document the layout, `result.json` fields (reward, cost/tokens, timing, exceptions), trajectory format and where `artifacts/` lands (in `docs/harbor-notes.md`).
+- [ ] 💲 Run 1 Opus 4.8 terminus-2 trial on one example. Record the **real cost per trial**, the turn count, and whether OpenRouter reports cached prompt tokens.
+- [ ] Confirm `-k`, `-n`, `--ak max_turns=200` behave as expected and Docker image caching works across trials.
+- [ ] 💲 Meta-task spike: one hand-written meta-task run with Sonnet 4.6. Confirm `artifacts = ["/app/output"]` arrives on the host, record the authoring cost, and check that in-container self-validation works without Docker. **Go/no-go:** if it fails, switch to the custom `docker exec` loop.
+- [ ] 💲 Try `harbor check` on 1 example and `harbor analyze` on the Opus trial, both with Sonnet 4.6 through our gateway. Record whether the default `check` rubric is the TB 19-criterion one, and decide wrap vs build for `analysis/judge.py`.
+- [ ] Re-plan the budget table from the measured costs (Opus trial, authoring run, judge call).
+- [ ] Save 1 oracle, 1 nop, 1 Opus and 1 meta-task job dir as test fixtures under `tests/fixtures/` (secrets stripped).
 
-**Phase 4: Part 3 + stretch A and D, write-up (day 4-5)**
-- Produce the report: funnel, histogram, cost and time totals, curtailment savings vs naive 5×, simulation over the observed p, predicted-vs-observed pass rate.
-- Run the human-likeness study (19-criterion rubric + discrimination test) and the diversity report.
-- Write `CHANGELOG.md` (what, why, tradeoffs, honest failures) and a README usage section.
-- Final cleanup.
+### Phase 1: Part 1, valid tasks
+
+Foundations
+- [ ] `generator/config.py`: price table, budget caps ($75 reserve, per-batch cap), `MAX_TURNS`, concurrency; reads `.env` values.
+- [ ] `analysis/ledger.py`: append-only `runs/ledger.jsonl` (stage, task, inputs hash, cost, tokens, seconds, result) plus content-hash cache lookup. Unit-tested.
+- [ ] Budget guard: reads `make usage-json` data and refuses new model work below the reserve or per-batch cap. Unit-tested.
+- [ ] `evaluator/harbor_runner.py`: run oracle/nop/terminus-2 jobs and parse them into `TrialResult`; retry infra errors twice, then exclude. Supports `--dry-run` with fixtures. Unit-tested on fixtures.
+
+Generation
+- [ ] `generator/spec.py`: `TaskSpec` with the taxonomy axes, difficulty levers, verifier kind and knob, plus an inverse-frequency sampler. Unit-tested for coverage behavior.
+- [ ] 💲 `generator/blueprint.py`: spec → `Blueprint` (instruction draft, internal hint, env checklist, requirements, levers, verifier knob, predicted pass rate) via Sonnet structured output, plus a rubric review returning accept/reject with reasons.
+- [ ] `generator/metatask/`: meta-task package (instruction template adapted from Meta-Task Fig. 6, synthesis Dockerfile, in-container `tests/test.sh` completeness check, `task.toml` with `artifacts`).
+- [ ] 💲 `generator/author.py`: render a meta-task from a blueprint, run it, extract the package from `artifacts/`, stamp canary and metadata; repair mode with previous package + gate logs.
+- [ ] `generator/generate.py`: implement `generate_task(topic, output_dir)` end to end (spec → blueprint → author), keeping the template signature.
+
+Gates
+- [ ] `validator/lint.py`: canary placement, no `docker_image`, timeout ≥ 3600, instruction style/length, no source-grep or package-installed tests, `solve.sh` investigates first, no COPY of `solution/`/`tests/`, COPY sources exist, no suggestive comments, test helpers only in `tests/`. Unit-tested on good/bad fixtures.
+- [ ] `validator/leak_scan.py`: build the image and search its filesystem plus `docker history` for distinctive tokens from `tests/` and `solution/`. Unit-tested on a planted-leak fixture.
+- [ ] 💲 Alignment check: every test maps to an instruction requirement and every requirement has a test (via `harbor check` with a custom rubric, or direct Sonnet).
+- [ ] Functional gates: Docker build, oracle 3/3, nop 0, chained in order with early exit.
+- [ ] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`.
+
+Part 1 milestone
+- [ ] 💲 Pilot batch of 3 candidates through generation and gates. Record funnel and cost per task.
+- [ ] 💲 Reach **≥5 tasks** that pass the structural validator and the functional gates (oracle 3/3, nop 0).
+- [ ] Hand-review 2 generated tasks side by side with `examples/` and the guideline rules. Tighten the meta-task template and lints from what's found.
+
+### Phase 2: Part 2, calibration
+
+- [ ] `evaluator/calibrate.py`: pure `decide(outcomes)` with exact curtailment (accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails). Exhaustively unit-tested against the full 5-run verdict.
+- [ ] Calibration runner: Opus trials in waves of ≤3, budget guard checked before every trial, outcomes written to the ledger.
+- [ ] 💲 `analysis/judge.py` (a), pass audit: command scan plus a trajectory-level Sonnet judge (Meta-Task Fig. 8 + Terminal Wrench labels). Hacked passes don't count.
+- [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
+- [ ] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
+- [ ] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails).
+- [ ] 💲 Calibrate the Phase 1 tasks (pilot). Record cost per learnable task. **Go/no-go:** above $40 per learnable task → fix generation before scaling.
+- [ ] 💲 Batch 1: ~10 new candidates end to end through calibration.
+- [ ] Read every failure-judge summary from Batch 1, and retune lever and knob defaults toward TB Medium/Hard. Record the before/after reasoning in `CHANGELOG.md`.
+
+### Phase 3: stretch B + C and red-team
+
+Red-team (part of "how we know tasks are good")
+- [ ] 💲 `evaluator/redteam.py`: hack-elicitation copy of the task + 1 Sonnet terminus-2 trial + judge. A serious exploit goes to repair, with the exploit trajectory as feedback.
+- [ ] Wire the red-team as a gate before Opus calibration, and record the hackable rate per batch.
+
+Stretch B: difficulty tuning
+- [ ] `analysis/tuner.py`: knob → lever → regenerate (≤2 rounds), with each mutation and its effect logged.
+- [ ] 💲 Run the tuner on every Batch 1 near-miss (0/5 with valid failures, 4-5/5). Record how many moved into the band.
+
+Stretch C: diversity
+- [ ] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells.
+- [ ] Decontamination: 13-gram + TF-IDF overlap against `examples/` and the TB 2.0 instructions (fetched with `harbor download` if available).
+- [ ] 💲 Near-duplicate check: Sonnet "same underlying task?" judge on the closest TF-IDF pairs.
+- [ ] `analysis/diversity.py`: per-axis coverage, balance score exp(H)/N, difficulty spread, instruction uniqueness (TF-IDF cosine, Vendi).
+
+Batch 2
+- [ ] 💲 Batch 2: ~12-15 candidates with the red-team gate, tuner and coverage-steered sampler on.
+- [ ] Reach the **README target of 10+ generated tasks** in the Part 3 batch, plus the learnable tasks shipped in `output/`.
+
+### Phase 4: Part 3 + stretch A and D, write-up
+
+Part 3: pipeline metrics
+- [ ] `analysis/report.py`: funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, total cost and wall time. Writes `reports/summary.md` + JSON.
+- [ ] Reconcile ledger spend against `make usage-json` (within 10%), and state the total in the report.
+
+Stretch A: cost-efficient evaluation
+- [ ] Curtailment savings: trials run vs naive 5× per task, in $ and %.
+- [ ] Simulation over the observed per-task p: expected savings and the effect of the optional aggressive 0/3 early reject (reported only, not used for shipping).
+- [ ] Predicted-vs-observed pass rate: correlation of Sonnet's blueprint-time prediction with the Opus outcome, and whether it would work as a pre-filter.
+
+Stretch D: human-likeness
+- [ ] 💲 Score generated tasks and `examples/` with the same TB 19-criterion rubric (`harbor check`), shown side by side.
+- [ ] 💲 Blinded "which is human-written?" discrimination test, with accuracy reported (≈50% means indistinguishable).
+- [ ] Stylometrics: instruction length, bullets, headers and emphasis words, ours vs examples.
+- [ ] `analysis/human_likeness.py` section in the report.
+
+Verification (see "Verification" below)
+- [ ] `uv run pytest` and `uv run ruff check .` pass.
+- [ ] Every task in `output/` passes `bash scripts/validate.sh`, and an independent oracle (3/3) and nop re-run.
+- [ ] Every shipped task has its calibration record and a valid-failure explanation in `reports/summary.md`.
+- [ ] 💲 Spot-check reproducibility: rerun one shipped task 5× naively (budget permitting).
+- [ ] 💲 If budget remains above the reserve, top up shipped tasks to full 5-run records.
+
+Deliverables
+- [ ] `CHANGELOG.md` complete: every phase, measured numbers, spend per phase, tradeoffs, honest failures.
+- [ ] `README.md` usage section: setup (`uv sync`, `.env`), `make` targets, running a batch, reading the report.
+- [ ] Final cleanup: remove dead code, check secrets aren't anywhere in history, all commits pushed.
+- [ ] Final `make usage` recorded in `CHANGELOG.md` (total spend and remaining credit).
 
 ## Key tradeoffs (to document in the CHANGELOG)
 

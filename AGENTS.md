@@ -37,7 +37,7 @@ Guidance for AI agents (and humans) working in this repo. This is an AfterQuery 
 
 `CHANGELOG.md` is a graded deliverable. AfterQuery reads it to understand what we did, **why**, and the **tradeoffs**.
 - **Update it in the same commit as the change.** Every commit that changes behavior, the pipeline design, results or spend adds an entry. Pure typo fixes are the only exception.
-- Entries go under a dated heading (`## YYYY-MM-DD`), newest first. Each entry says what changed, why, and any tradeoff or rejected alternative.
+- Entries go under a dated heading (`## YYYY-MM-DD`), newest first. Each entry has a **timestamped** heading, `### HH:MM ±HH:MM · Title` (local time with UTC offset, e.g. `### 15:12 -03:00 · Agent guidance`; get it with `date "+%H:%M %z"`). Each entry says what changed, why, and any tradeoff or rejected alternative.
 - Record **measured numbers honestly**: spend per phase (from `make usage`), funnel counts, pass distributions, failures, and things that didn't work.
 
 ## Git

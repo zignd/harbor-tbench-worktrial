@@ -196,16 +196,27 @@ spec sampler (inverse-freq) ─► blueprint (Sonnet, TB concept list) ─► ru
 - **`scripts/run_batch.py`** (+ `scripts/pipeline.sh`): `run_batch --n 12 --budget 150`, resumable from the ledger.
 - **`tests/`** (unit tests for our code, not task tests): `decide()`, ledger and budget guard, lints, leak-scan token extraction, sampler coverage/inverse-frequency, the blueprint schema, and the job-dir and artifacts parser on a recorded fixture.
 
-### Budget plan ($500, re-planned after Phase 0 measures real per-trial cost)
+### Budget plan ($500 key; $380 authorized for the goal run; re-planned after Phase 0)
 
-| Bucket | Cap |
-|---|---|
-| Phase 0 probing (examples, 2-3 Opus trials, 1-2 meta-task runs) | $20 |
-| Blueprints + reviews (Sonnet, ~45 candidates, ~1/3 rejected) | $15 |
-| Meta-task authoring + repairs (Sonnet, ~30 builds) | $60 |
-| Red-team + judges + alignment checks (Sonnet) | $40 |
-| Opus calibration (~25 tasks × ~3.5 avg trials with curtailment) | $310 |
-| Reserve | $55 |
+**Measured unit costs (Phase 0, 2026-10-12):**
+
+| Unit | Measured | Notes |
+|---|---|---|
+| Opus 4.8 trial, Easy example (`fix-git`) | $0.117 | 11 turns, 85% cached input. Generated Medium/Hard tasks will run more turns; **assume $0.5-1.5** until measured in Phase 2 |
+| Sonnet 4.6 authoring meta-task | **$2.75** | Hit the 80-turn cap; 5.07M input tokens (98% cached), 58k output; 25 min. The main cost lever to cut (see Phase 1) |
+| DeepSeek authoring meta-task (dev) | ~$0.15-0.2 | 37 turns, 1.03M input, 230k output; ~47 min. Harbor reports `cost_usd: None` (no LiteLLM price) |
+| `harbor check` (Sonnet reviewer) | $0.084 | ~1.5 min per task |
+
+**Buckets (sum ≤ $380 authorization; the $75 reserve stays untouched):**
+
+| Bucket | Cap | Basis |
+|---|---|---|
+| Phase 0 probing (done) | $3.2 | Actual |
+| Blueprints + novelty judge + reviews (~45 candidates) | $10 | Small structured Sonnet calls |
+| Meta-task authoring + repairs (~30 builds) | $90 | ~$2.5 per build now; target ≤$1.5 after the cost lever |
+| `harbor check` + red-team + judges | $45 | check $0.08/task; red-team ≈ one Sonnet terminus run/task; judges per Opus trial |
+| Opus calibration | $215 | ~25-40 tasks × ~3.5 trials (curtailment) at ~$1.5-2.5/trial worst case |
+| Contingency inside the authorization | $17 | |
 
 If an Opus trial costs more than ~$3, shrink the batch rather than cut the number of trials per task. Expect about a third of functionally correct tasks to land in band before tuning (SkillSynth base rate).
 
@@ -271,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 16 / 80 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
+**Progress: 21 / 83 items** (update this line when ticking items; count with `grep -c "^- \[x\]" docs/plan.md`)
 
 ### Phase 0: setup and spike
 
@@ -292,14 +303,24 @@ Harbor spike (learn the real mechanics before writing pipeline code)
 - [x] Inspect a job dir. Document the layout, `result.json` fields (reward, cost/tokens, timing, exceptions), trajectory format and where `artifacts/` lands (in `docs/harbor-notes.md`).
 - [x] 💲 Run 1 Opus 4.8 terminus-2 trial on one example. Record the **real cost per trial**, the turn count, and whether OpenRouter reports cached prompt tokens.
 - [x] Confirm `-k`, `-n`, `--ak max_turns=200` behave as expected and Docker image caching works across trials.
-- [ ] 💲 Dev-mode meta-task spike (`DEV_MODE=1`, DeepSeek): one hand-written meta-task run. Get the wiring right (prompt rendering, `artifacts` collection, in-container test) for cents.
-- [ ] 💲 Meta-task spike: one hand-written meta-task run with Sonnet 4.6. Confirm `artifacts = ["/app/output"]` arrives on the host, record the authoring cost, and check that in-container self-validation works without Docker. **Go/no-go:** if it fails, switch to the custom `docker exec` loop.
+- [x] 💲 Dev-mode meta-task spike (`DEV_MODE=1`, DeepSeek): one hand-written meta-task run. Get the wiring right (prompt rendering, `artifacts` collection, in-container test) for cents.
+- [x] 💲 Meta-task spike: one hand-written meta-task run with Sonnet 4.6. Confirm `artifacts = ["/app/output"]` arrives on the host, record the authoring cost, and check that in-container self-validation works without Docker. **Go/no-go:** if it fails, switch to the custom `docker exec` loop.
 - [x] 💲 Try `harbor check` on 1 example with Sonnet 4.6 through our gateway. Done: it works for $0.084 per task, the default rubric has 11 criteria (not 19), and the decision is to wrap it with a custom rubric.
-- [ ] 💲 Try `harbor analyze` on a real calibration trajectory (deferred to Phase 2, when there are failing Opus runs to analyze). Decide wrap vs build for the failure judge.
-- [ ] Re-plan the budget table from the measured costs (Opus trial, authoring run, judge call).
-- [ ] Save 1 oracle, 1 nop, 1 Opus and 1 meta-task job dir as test fixtures under `tests/fixtures/` (secrets stripped).
+- [x] Re-plan the budget table from the measured costs (Opus trial, authoring run, judge call).
+- [x] Save 1 oracle, 1 nop, 1 Opus and 1 meta-task job dir as test fixtures under `tests/fixtures/` (secrets stripped).
 
 ### Phase 1: Part 1, valid tasks
+
+Spike follow-ups (found in Phase 0)
+- [x] Pipeline-owned `tests/test.sh`: the authored one called `uvx` without installing it, so the oracle failed 3/3 in the real build even though in-container self-checks passed. Now the standard `generator/metatask/standard_test.sh` ships in the synthesis image, `collect_package()` always overwrites `tests/test.sh` with it, and the author self-checks with the exact verifier command. Re-gated: Sonnet's package passes oracle 3/3 and nop 0, and so does DeepSeek's.
+- [ ] 💲 Cut authoring cost from $2.75/task toward ≤$1.5. Sonnet hit the 80-turn cap with ~63k context per call. Levers (authoring only; Opus calibration settings untouched):
+  - terminus-2 `proactive_summarization_threshold` so long contexts get summarized.
+  - A compact format spec in the instruction instead of reading the whole reference task.
+  - Asking for whole-file writes per command.
+
+  Measure turns, cost and gate pass-rate on 2 blueprints.
+- [ ] Cost accounting for models LiteLLM can't price (DeepSeek reports `cost_usd: None`): compute from tokens with OpenRouter `/models` pricing in the ledger.
+
 
 Foundations
 - [ ] `generator/config.py`: price table, budget caps ($75 reserve, per-batch cap), `MAX_TURNS`, concurrency; reads `.env` values.
@@ -335,6 +356,7 @@ Part 1 milestone
 
 - [ ] `evaluator/calibrate.py`: pure `decide(outcomes)` with exact curtailment (accept at ≥1 legit pass + ≥2 valid fails, reject at 4 passes or 5 fails). Exhaustively unit-tested against the full 5-run verdict.
 - [ ] Calibration runner: Opus trials in waves of ≤3, budget guard checked before every trial, outcomes written to the ledger.
+- [ ] 💲 Try `harbor analyze` (built-in `reward_hacking` + `task_specification` rubrics) on real calibration trajectories. Decide wrap vs build for both judges.
 - [ ] 💲 `analysis/judge.py` (a), pass audit: command scan plus a trajectory-level Sonnet judge (Meta-Task Fig. 8 + Terminal Wrench labels). Hacked passes don't count.
 - [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
 - [ ] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.

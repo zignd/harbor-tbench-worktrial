@@ -23,7 +23,7 @@ The reward contract: tests/test.sh must write `1` (pass) or `0` (fail) to
 import os
 import sys
 
-from config import CANARY_LINE, OUTPUT_DIR
+from generator.config import CANARY_LINE, OUTPUT_DIR
 
 
 def generate_task(topic: str, output_dir: str | None = None) -> dict:

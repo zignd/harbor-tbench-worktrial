@@ -13,5 +13,5 @@ if [ $# -lt 1 ]; then
     exit 1
 fi
 
-cd "$ROOT_DIR/generator"
-uv run --project "$ROOT_DIR" python generate.py "$1"
+cd "$ROOT_DIR"
+uv run --env-file .env python -m generator.generate "$1"

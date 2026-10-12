@@ -4,6 +4,19 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 16:30 -03:00 · Phase 0 done: meta-task authoring works, and the gates caught a real bug
+- **Spike:** one hand-written blueprint (a payment-ledger CLI with two interacting bugs and a cross-day-refund trap), authored as a Harbor meta-task by both Sonnet 4.6 and DeepSeek (dev mode). Both meta-tasks scored 1.0 on the in-container package check, and `artifacts` delivered the package to the host.
+- **The host gates caught what self-validation missed.** Sonnet's package failed the oracle 3/3 in the real build: its `tests/test.sh` called `uvx` without installing uv. The author had verified by running pytest directly, never the verifier entry point.
+  - **Fix:** `tests/test.sh` is now pipeline-owned (`generator/metatask/standard_test.sh`, the examples' isolated-`uvx` approach). It's pre-placed in the synthesis image (now with uv), and `collect_package()` overwrites it.
+  - **Result:** both packages pass oracle 3/3 and nop 0. Sonnet's fails 5 of 7 tests unsolved, including the trap and idempotency tests.
+  - **Go/no-go: go.** In-container authoring with a host-side gate produces functionally correct tasks. The custom `docker exec` fallback isn't needed.
+- **Costs:**
+  - Sonnet authoring was **$2.75** (it hit the 80-turn cap, with ~63k context resent per turn), about twice the plan's estimate. Cutting it is now a Phase 1 item.
+  - DeepSeek authoring was ~$0.15-0.2. Harbor reports `cost_usd: None` because LiteLLM has no price for it, so the ledger will price tokens from OpenRouter `/models`.
+- **Budget re-planned** from measured unit costs (Opus $0.117 on an Easy task, authoring $2.75, `harbor check` $0.084) into buckets that fit the $380 authorization, with $215 for Opus calibration.
+- **Code:** `generator`, `validator`, `evaluator`, `analysis` and `tests` are now packages with absolute imports (`python -m generator.author`). pytest and ruff are configured in `pyproject.toml`. The meta-task fixture was added (without the 5 MB trajectory).
+- **Spend:** Phase 0 total **$3.0-3.1** (`make usage`: $2.95 used, $3.12 by `limit − remaining`; the counters lag). Progress 21/83.
+
 ### 16:12 -03:00 · Novelty gate against every published Terminal-Bench set; `harbor check` evaluated
 - **Novelty corpus:** `make tb-reference` downloads every Terminal-Bench set on the Harbor hub into git-ignored `data/tb-reference/` (~2 min), keeping only `instruction.md` + `task.toml` (3.6 MB). That's 425 tasks:
   - `terminal-bench@latest`, 66 tasks. This matches Terminal-Bench **4.0** (Aug 2026), and none of its tasks overlap with 2.x.

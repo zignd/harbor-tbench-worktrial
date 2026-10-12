@@ -8,6 +8,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir pytest==8.4.1
 
+# uv, so the author can run the standard verifier (tests/test.sh) exactly as Harbor will.
+RUN curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
 WORKDIR /app
 COPY reference /app/reference
-RUN mkdir -p /app/output
+# The verifier entry point is pipeline-owned; the author only writes test_outputs.py.
+COPY standard_test.sh /app/output/tests/test.sh

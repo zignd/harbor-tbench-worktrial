@@ -93,3 +93,25 @@ uv run --env-file .env harbor check <task-dir> -a terminus-2 -m openrouter/anthr
 - **Decision:** use `harbor check` (default criteria plus our own rubric additions) as the alignment/quality gate, instead of writing a judge from scratch.
 
 `harbor analyze` (trajectory review) ships a built-in rubric (`harbor/analyze/prompts/analyze-rubric.toml`) with `reward_hacking` and `task_specification`. We'll try it on calibration trajectories once there are some.
+
+## Meta-task authoring spike (same hand-written blueprint, two models)
+
+| | Sonnet 4.6 (official) | DeepSeek v4.1 Flash (dev) |
+|---|---|---|
+| Meta-task reward (in-container package check) | 1.0 | 1.0 |
+| Turns / wall time | **80 (hit the cap)** / 25 min | 37 / ~47 min |
+| Tokens in (cached) / out | 5.07M (4.97M) / 58k | 1.03M (0.97M) / 230k |
+| Cost | **$2.75** (Harbor `cost_usd`) | ~$0.15-0.2 (Harbor reports `None`) |
+| Host gates as authored | **oracle 0/3**: `test.sh` called `uvx` without installing it | n/a (gated after the fix) |
+| Host gates with the standard `test.sh` | oracle 3/3, nop 0 (5/7 tests fail unsolved) | oracle 3/3, nop 0 |
+
+- **`artifacts = ["/app/output"]` works.** The package lands in `<trial>/artifacts/app/output/` (mirrored by absolute path). `generator.author.collect_package()` copies it out.
+- **In-container self-validation is not enough on its own.** The author ran pytest directly, not the verifier entry point, so a broken `test.sh` passed. Fixes:
+  - `tests/test.sh` is now pipeline-owned (`generator/metatask/standard_test.sh`).
+  - It's pre-placed in the synthesis image, which now has `uv`.
+  - `collect_package()` always overwrites it.
+  - The author is told to self-check with the exact verifier command.
+
+  The host gates (oracle 3/3, nop) remain the real check.
+- **Authoring cost is the next lever.** Sonnet averaged ~63k context per call over 80 turns, and the history is resent every turn. Levers to measure in Phase 1: terminus-2 summarization threshold, a compact format spec instead of a full reference task, whole-file writes.
+- DeepSeek is slow per turn (~75 s; it writes whole files inside terminus-2's JSON reply), but it reaches the same gate result for ~1/15 of the cost. That makes it good enough for plumbing runs.

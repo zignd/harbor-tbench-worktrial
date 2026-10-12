@@ -50,3 +50,24 @@ def test_unknown_kind_falls_back_to_knob():
 def test_directive_keeps_fairness_rules():
     text = tuner.directive({"kind": "knob", "direction": "harder", "change": "more cases"})
     assert "too easy" in text and "every requirement the tests check" in text
+
+
+def test_plan_sees_earlier_rounds_so_it_does_not_repeat_them():
+    seen = {}
+    rounds = [{"round": 1, "plan": {"change": "add a third bug"}, "result": "too_easy",
+               "outcomes": ["pass"] * 4}]  # fmt: skip
+    tuner.plan_mutation("bp", CAL_EASY, rounds, chat_fn=_fake({"kind": "knob"}, seen))
+    assert "round 1: add a third bug -> too_easy" in seen["prompt"]
+
+
+def test_resume_rounds_restores_finished_rounds_from_the_ledger(tmp_path):
+    from analysis.ledger import Event, Ledger
+
+    ledger = Ledger(tmp_path / "l.jsonl")
+    ledger.append(Event("calibration_trial", "c-t1", {"outcome": "pass", "turns": 9}))
+    ledger.append(Event("tune", "c", {"round": 1, "plan": {}, "result": "too_easy",
+                                      "outcomes": ["pass"] * 4}))  # fmt: skip
+    rounds, cal = tuner._resume_rounds("c", ledger)
+    assert [r["round"] for r in rounds] == [1]
+    assert cal["verdict"] == "too_easy" and cal["trials"] == [{"outcome": "pass", "turns": 9}]
+    assert tuner._resume_rounds("other", ledger) == ([], None)

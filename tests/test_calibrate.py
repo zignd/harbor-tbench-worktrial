@@ -71,3 +71,18 @@ def test_exact_curtailment_is_lossless_and_aggressive_rule_is_not():
     rows = {r["p"]: r for r in table()}
     assert rows[0.2]["aggressive_recall"] < 1.0  # 0/3 early reject loses some learnable tasks
     assert rows[0.2]["aggressive_trials"] < rows[0.2]["expected_trials"]
+
+
+def test_unfinished_trials_resume_only_a_run_without_a_verdict(tmp_path):
+    from analysis.ledger import Event, Ledger
+    from evaluator.calibrate import unfinished_trials
+
+    ledger = Ledger(tmp_path / "l.jsonl")
+    ledger.append(Event("calibration_trial", "t", {"outcome": "fail"}, cost_usd=0.3))
+    ledger.append(Event("calibration", "t", {"verdict": "too_hard"}))
+    assert unfinished_trials(ledger, "t") == []  # finished runs are never reused
+    ledger.append(Event("calibration_trial", "t", {"outcome": "pass"}, cost_usd=0.25))
+    ledger.append(Event("calibration_trial", "t", {"outcome": "pass"}, cost_usd=0.2))
+    got = unfinished_trials(ledger, "t")
+    assert [t["outcome"] for t in got] == ["pass", "pass"]
+    assert sum(t["_ledger_cost"] for t in got) == 0.45

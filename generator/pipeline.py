@@ -297,31 +297,76 @@ def stage_redteam(cand: Candidate, ledger: Ledger, attempt: int, h: str = "") ->
     return []
 
 
+def already_gated(cand: Candidate, ledger: Ledger) -> bool:
+    """True if this exact package (by content hash) already passed every gate, e.g. before a crash."""
+    if not cand.task_dir.exists():
+        return False
+    h = hash_dir(cand.task_dir)
+    return any(
+        e.inputs_hash == h and not e.result.get("hackable", True)
+        for e in ledger.events(stage="gate_redteam", task=cand.cand_id)
+    )
+
+
+def resume_point(cand: Candidate, ledger: Ledger) -> tuple[int, list[str] | None, Path | None]:
+    """(attempts finished, their gate feedback, the failed package) for an interrupted build.
+
+    A finished attempt leaves failed_a<k>/; an attempt cut off mid-way leaves nothing
+    and is simply redone.
+    """
+    done = sorted(int(p.name.removeprefix("failed_a")) for p in cand.dir.glob("failed_a*"))
+    if not done:
+        return 0, None, None
+    k = done[-1]
+    saved = cand.dir / f"feedback_a{k}.json"
+    if saved.exists():
+        feedback = json.loads(saved.read_text())
+    else:  # written before feedback files existed: take the last failing gate's findings
+        gates = [e for e in ledger.events(task=cand.cand_id) if e.stage.startswith("gate_")]
+        feedback = next(
+            (e.result["problems"] for e in reversed(gates) if e.result.get("problems")), None
+        )
+    return k, feedback, cand.dir / f"failed_a{k}"
+
+
 def build_candidate(cand: Candidate, ledger: Ledger) -> Candidate:
-    """Blueprint (if needed) -> author -> gates, with repair rounds and one regeneration."""
+    """Blueprint (if needed) -> author -> gates, with repair rounds and one regeneration.
+
+    Resumable: a saved, accepted blueprint is reused and an interrupted repair
+    sequence continues after its last finished attempt.
+    """
+    gate_file = cand.dir / "blueprint_gate.json"
+    if (
+        cand.blueprint is None
+        and gate_file.exists()
+        and json.loads(gate_file.read_text())["accepted"]
+    ):
+        cand.blueprint = Blueprint(**json.loads((cand.dir / "blueprint.json").read_text()))
     if cand.blueprint is None and not stage_blueprint(cand, ledger):
         cand.save("status.json", {"status": cand.status, "history": cand.history})
         return cand
-    attempt = 0
-    for regeneration in range(2):
-        feedback, previous = None, None
-        for _ in range(MAX_REPAIRS + 1):
-            attempt += 1
-            if not stage_author(cand, ledger, attempt, feedback, previous):
-                break
-            problems = stage_gates(cand, ledger, attempt)
-            if not problems:
-                cand.status = "gated"
-                cand.save(
-                    "status.json",
-                    {"status": cand.status, "attempts": attempt, "history": cand.history},
-                )
-                return cand
-            feedback, previous = problems, cand.dir / f"failed_a{attempt}"
-            if previous.exists():
-                shutil.rmtree(previous)
-            shutil.copytree(cand.task_dir, previous)
-        _ = regeneration  # second pass = fresh authoring from the same blueprint
+    per_build = MAX_REPAIRS + 1  # one build plus its repairs; done twice (original + regeneration)
+    attempt, feedback, previous = resume_point(cand, ledger)
+    while attempt < 2 * per_build:
+        attempt += 1
+        if attempt % per_build == 1:  # fresh build from the blueprint
+            feedback, previous = None, None
+        if not stage_author(cand, ledger, attempt, feedback, previous):
+            attempt = -(-attempt // per_build) * per_build  # skip to the next fresh build
+            continue
+        problems = stage_gates(cand, ledger, attempt)
+        if not problems:
+            cand.status = "gated"
+            cand.save(
+                "status.json",
+                {"status": cand.status, "attempts": attempt, "history": cand.history},
+            )
+            return cand
+        feedback, previous = problems, cand.dir / f"failed_a{attempt}"
+        if previous.exists():
+            shutil.rmtree(previous)
+        shutil.copytree(cand.task_dir, previous)
+        cand.save(f"feedback_a{attempt}.json", feedback)
     cand.status = "failed"
     cand.save("status.json", {"status": cand.status, "attempts": attempt, "history": cand.history})
     return cand

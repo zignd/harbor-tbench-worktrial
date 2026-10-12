@@ -2,6 +2,7 @@
 """Verifier tests for the ledger reconciliation CLI."""
 import csv
 import os
+import sqlite3
 import subprocess
 import pytest
 
@@ -116,37 +117,33 @@ class TestRefundMatchByTxnId:
     Buggy code (ORDER BY txn_date ASC, no merchant filter) finds BETA first.
     """
 
-    def test_cross_merchant_refund_attribution(self, workspace):
+    def test_cross_merchant_refund_correct(self, workspace):
         exports_dir, db_path = workspace
-        # BETA has earlier txn_date so buggy ORDER BY txn_date ASC finds it first
+        # BETA_CORP has an earlier charge of the same amount
         rows_day1 = [
-            ["PA-B1", "BETA_CORP",  "USD", "47.00", "charge", "", "2024-03-01"],
-            ["PA-A1", "ALPHA_CORP", "USD", "47.00", "charge", "", "2024-03-02"],
-            ["PA-A2", "ALPHA_CORP", "USD", "100.00", "charge", "", "2024-03-01"],
-            ["PA-B2", "BETA_CORP",  "USD", "200.00", "charge", "", "2024-03-01"],
+            ["PA-A1", "BETA_CORP",  "USD", "47.00", "charge", "", "2024-02-01"],
+            ["PA-A2", "ALPHA_CORP", "USD", "47.00", "charge", "", "2024-02-05"],
         ]
-        _write_a(os.path.join(exports_dir, "provider_a_20240301.csv"), rows_day1)
+        _write_a(os.path.join(exports_dir, "provider_a_20240201.csv"), rows_day1)
 
-        # Refund references ALPHA_CORP's PA-A1 charge specifically
+        # Refund references ALPHA_CORP's charge explicitly
         rows_day2 = [
-            ["PA-R1", "ALPHA_CORP", "USD", "47.00", "refund", "PA-A1", "2024-03-10"],
+            ["PA-R1", "ALPHA_CORP", "USD", "47.00", "refund", "PA-A2", "2024-02-10"],
         ]
-        _write_a(os.path.join(exports_dir, "provider_a_20240302.csv"), rows_day2)
+        _write_a(os.path.join(exports_dir, "provider_a_20240210.csv"), rows_day2)
 
         out = _run_report(exports_dir, db_path)
         balances = _parse_report(out)
 
-        # ALPHA_CORP: 47.00 + 100.00 - 47.00 (own refund) = 100.00
-        alpha_expected = _minor("100.00")
-        alpha_actual = balances.get(("ALPHA_CORP", "USD"))
+        alpha_expected = 0  # 47.00 - 47.00
+        alpha_actual = balances.get(("ALPHA_CORP", "USD"), 0)
         assert alpha_actual == alpha_expected, (
-            f"ALPHA_CORP USD: expected {_fmt(alpha_expected)}, "
-            f"got {_fmt(alpha_actual) if alpha_actual is not None else 'missing'}. "
-            f"Refund must offset ALPHA's own charge (PA-A1), not BETA's."
+            f"ALPHA_CORP USD: expected 0.00, "
+            f"got {_fmt(alpha_actual)}. "
+            f"Refund must match by provider_txn_id, not earliest same-amount charge."
         )
 
-        # BETA_CORP: 47.00 + 200.00 = 247.00 (no refund touches BETA)
-        beta_expected = _minor("247.00")
+        beta_expected = _minor("47.00")
         beta_actual = balances.get(("BETA_CORP", "USD"))
         assert beta_actual == beta_expected, (
             f"BETA_CORP USD: expected {_fmt(beta_expected)}, "
@@ -232,6 +229,48 @@ class TestIdempotencyDedupKey:
             f"TRI_MERCH USD: expected {_fmt(expected)}, "
             f"got {_fmt(actual) if actual is not None else 'missing'}. "
             f"All three charges must be recorded."
+        )
+
+    def test_row_count_after_double_import(self, workspace):
+        """After two imports the DB must contain exactly one import's worth of rows."""
+        exports_dir, db_path = workspace
+        rows = [
+            ["PA-K1", "COUNT_MERCH", "USD", "10.00", "charge", "", "2024-09-01"],
+            ["PA-K2", "COUNT_MERCH", "USD", "10.00", "charge", "", "2024-09-02"],
+            ["PA-K3", "COUNT_MERCH", "USD", "20.00", "charge", "", "2024-09-03"],
+            ["PA-K4", "COUNT_MERCH", "USD", "20.00", "refund", "PA-K3", "2024-09-04"],
+        ]
+        _write_a(os.path.join(exports_dir, "provider_a_20240901.csv"), rows)
+
+        # First import
+        _run_report(exports_dir, db_path)
+        conn = sqlite3.connect(db_path)
+        charges_after_1 = conn.execute("SELECT COUNT(*) FROM charges").fetchone()[0]
+        refunds_after_1 = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+        conn.close()
+
+        # Second import
+        _run_report(exports_dir, db_path)
+        conn = sqlite3.connect(db_path)
+        charges_after_2 = conn.execute("SELECT COUNT(*) FROM charges").fetchone()[0]
+        refunds_after_2 = conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0]
+        conn.close()
+
+        assert charges_after_2 == charges_after_1, (
+            f"Charges row count changed after second import: "
+            f"{charges_after_1} -> {charges_after_2}. Import is not idempotent."
+        )
+        assert refunds_after_2 == refunds_after_1, (
+            f"Refunds row count changed after second import: "
+            f"{refunds_after_1} -> {refunds_after_2}. Import is not idempotent."
+        )
+        # With the buggy key, PA-K1 and PA-K2 (same amount 10.00) collapse to 1
+        assert charges_after_1 == 3, (
+            f"Expected 3 charge rows after first import, got {charges_after_1}. "
+            f"Same-amount charges from same merchant must each be stored."
+        )
+        assert refunds_after_1 == 1, (
+            f"Expected 1 refund row after first import, got {refunds_after_1}."
         )
 
 

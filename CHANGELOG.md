@@ -4,6 +4,23 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 18:52 -03:00 · Crash recovery: every stage resumes without repaying; tuner sees its own history
+- **What happened:** the machine rebooted at ~21:40 UTC with 4 jobs in flight: pilot repair a2 (Rust), Batch 1 authoring a1 (C), tuning round 2's Opus calibration (2 legit passes recorded, 2 trials in flight), and the dev calibration. Every Docker container died.
+- **Resume gaps found:**
+  1. `run_batch` re-sampled specs with a history that now included the batch's own candidates, so a rerun would have drawn **different** specs.
+  2. `build_candidate` re-ran the blueprint (paid, and possibly different) and restarted at attempt 1.
+  3. `calibrate` and the tuner started over.
+- **Fixes:**
+  - **Saved batch plans:** each batch's sampled specs go to `runs/batches/seed<S>-n<N>.json` and are reloaded on rerun. The plans for the two crashed batches were rebuilt by replaying the history each started with. The spec ids match the candidates on disk.
+  - **`build_candidate`** reuses an accepted saved blueprint and continues after the last finished attempt (`failed_a<k>/`). Gate feedback is now saved as `feedback_a<k>.json`; older attempts fall back to the last failing gate's findings in the ledger.
+  - **`calibrate`** keeps judged trials of a run that never reached its verdict. A finished run is never reused. New wave numbers don't overwrite the old job dirs.
+  - **`tune_candidate`** restores finished rounds from the ledger. A round whose new package already passed every gate (the content hash matches a clean red-team record and differs from the round's `before_tune_r<n>` snapshot) goes straight to calibration. Plans are saved as `tune_plan_r<n>.json`. Round 2's plan was recovered from its rendered meta-task instruction.
+  - **Net loss from the crash:** the C candidate's partial first build (no finished attempt to resume from) and 2 in-flight Opus trials (~$0.5).
+- **Tuner bug found during recovery:** round 2's plan was round 1's again ("add a third interacting bug"). The planner sees only the original blueprint, not what earlier rounds changed. `plan_mutation` now gets the round history (plan → verdict, outcomes) and a rule not to repeat a change that didn't move the pass rate. Pass summaries now include the audit's description of *how* Opus solved the task, not just turns and minutes. Round 2 keeps its plan, since it's already authored and gated.
+- **The dev quality gate did its job:** the dev package (`fix-inhouse-pinmux-planner`) passed oracle 3/3 and nop, then was blocked by `deterministic_tests` and `valid_failure_modes`. A test asserted wall-clock time under 90 s, and the instruction didn't state the time limit. No calibration money was spent on a flaky task.
+- 107 tests pass (new: resume point, blueprint reuse, exact-package gating, unfinished trials, tuner round restore, history in the plan prompt).
+- Spend at restart: $20.81 (`spent*`), $479.19 remaining.
+
 ### 18:26 -03:00 · Dev mode found a crash; per-candidate error isolation
 - **Bug, found by the dev-mode batch:** the leak scan's `grep` matched inside a **binary** file in the image (a SQLite db), and `docker run … cat <file>` output that wasn't UTF-8 made `subprocess.run(text=True)` raise `UnicodeDecodeError`. That took down the whole batch process after 47 minutes of authoring.
 - **Fixes:**

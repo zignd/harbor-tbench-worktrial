@@ -72,10 +72,7 @@ def fetch_prices(cache_path: Path | None = None) -> dict[str, Price]:
     if cache_path and cache_path.exists():
         raw = json.loads(cache_path.read_text())
     else:
-        raw = {
-            m["id"]: m.get("pricing", {})
-            for m in _get("models")["data"]
-        }
+        raw = {m["id"]: m.get("pricing", {}) for m in _get("models")["data"]}
         if cache_path:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
             cache_path.write_text(json.dumps(raw, indent=1, sort_keys=True))

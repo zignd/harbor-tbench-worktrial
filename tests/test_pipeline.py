@@ -78,3 +78,34 @@ def test_rejected_blueprint_stops_early(env, monkeypatch):
     monkeypatch.setattr(pipeline, "stage_blueprint", reject)
     cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=6)[0]), ledger)
     assert cand.status == "rejected" and calls["author"] == []
+
+
+def test_resume_reuses_blueprint_and_continues_after_last_finished_attempt(env, monkeypatch):
+    calls, ledger = env
+    spec = sample_specs(1, seed=7)[0]
+    first = pipeline.Candidate(spec)
+    first.save("blueprint.json", BLUEPRINT.model_dump())
+    first.save("blueprint_gate.json", {"accepted": True})
+    shutil.copytree(TASK, first.dir / "failed_a1")  # attempt 1 finished; attempt 2 was cut off
+    first.save("feedback_a1.json", ["docker build failed"])
+    monkeypatch.setattr(pipeline, "stage_blueprint", lambda c, l: pytest.fail("re-blueprinted"))
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: [])
+    cand = pipeline.build_candidate(pipeline.Candidate(spec), ledger)
+    assert cand.status == "gated" and cand.blueprint.slug == BLUEPRINT.slug
+    assert calls["author"] == [
+        {"attempt": 2, "feedback": ["docker build failed"], "previous": first.dir / "failed_a1"}
+    ]
+
+
+def test_already_gated_matches_the_exact_package(env):
+    from analysis.ledger import Event, hash_dir
+
+    _, ledger = env
+    cand = pipeline.Candidate(sample_specs(1, seed=8)[0])
+    shutil.copytree(TASK, cand.task_dir)
+    assert not pipeline.already_gated(cand, ledger)
+    h = hash_dir(cand.task_dir)
+    ledger.append(Event("gate_redteam", cand.cand_id, {"hackable": False}, inputs_hash=h))
+    assert pipeline.already_gated(cand, ledger)
+    (cand.task_dir / "instruction.md").write_text("changed")
+    assert not pipeline.already_gated(cand, ledger)

@@ -35,6 +35,9 @@ Why the agent failed in failed runs (from a judge), if any:
 How passing runs went, if any:
 {passes}
 
+Changes earlier tuning rounds already made (the blueprint above predates them), and their results:
+{history}
+
 Propose exactly ONE change, preferring (1) the verifier knob, then (2) a difficulty lever, then (3) regenerate.
 Available levers: {levers}
 
@@ -46,6 +49,8 @@ Rules:
 - To make it EASIER: fewer interacting causes, a clearer symptom in the environment (log line, error
   message), or a looser stated threshold. Never stop testing the core requirement.
 - Aim for a pass rate of about 2/5.
+- Don't repeat an earlier round's change. If it didn't move the pass rate, the difficulty must come from
+  somewhere else (e.g. a symptom that points away from the cause, or a cause found only by exploring).
 
 Return only JSON: {{"kind": "knob|lever|regenerate", "direction": "harder|easier",
 "change": "precise description of what to change in the environment, instruction and tests",
@@ -60,12 +65,29 @@ def _failures(calibration: dict) -> str:
 def _passes(calibration: dict) -> str:
     rows = [t for t in calibration.get("trials", []) if t.get("outcome") == "pass"]
     return (
-        "\n".join(f"- passed in {r.get('turns')} turns, {r.get('minutes')} min" for r in rows)
+        "\n".join(
+            f"- passed in {r.get('turns')} turns, {r.get('minutes')} min: "
+            f"{r.get('audit', {}).get('reason', '')}"
+            for r in rows
+        )
         or "(none)"
     )
 
 
-def plan_mutation(blueprint_md: str, calibration: dict, chat_fn=chat) -> tuple[dict, float]:
+def _history(rounds: list[dict]) -> str:
+    return (
+        "\n".join(
+            f"- round {r['round']}: {(r.get('plan') or {}).get('change', '?')} -> {r.get('result')} "
+            f"({r.get('outcomes')})"
+            for r in rounds
+        )
+        or "(none)"
+    )
+
+
+def plan_mutation(
+    blueprint_md: str, calibration: dict, rounds: list[dict] | None = None, chat_fn=chat
+) -> tuple[dict, float]:
     outcomes = calibration["outcomes"]
     summary = f"{outcomes.count('pass')}/{len(outcomes)} judged runs passed"
     reply = chat_fn(
@@ -75,6 +97,7 @@ def plan_mutation(blueprint_md: str, calibration: dict, chat_fn=chat) -> tuple[d
             blueprint=blueprint_md,
             failures=_failures(calibration),
             passes=_passes(calibration),
+            history=_history(rounds or []),
             levers="; ".join(f"{k} ({v})" for k, v in LEVERS.items()),
         ),
         system="You adjust benchmark task difficulty without making tasks unfair.",
@@ -96,9 +119,28 @@ def directive(plan: dict) -> str:
     )
 
 
+def _resume_rounds(cand_id: str, ledger) -> tuple[list[dict], dict | None]:
+    """Rounds a crashed tuning run already finished, and the calibration they left."""
+    rounds = [e.result for e in ledger.events(stage="tune", task=cand_id)]
+    if not rounds:
+        return [], None
+    last = rounds[-1]
+    name = f"{cand_id}-t{last['round']}"
+    trials = [e.result for e in ledger.events(stage="calibration_trial", task=name)]
+    return rounds, {
+        "verdict": last["result"],
+        "outcomes": last.get("outcomes", []),
+        "trials": trials,
+    }
+
+
 def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
-    """Mutate -> re-author -> gates -> recalibrate, up to max_rounds. Returns the tuning record."""
-    from analysis.ledger import Event
+    """Mutate -> re-author -> gates -> recalibrate, up to max_rounds. Returns the tuning record.
+
+    Resumable: finished rounds come back from the ledger, and a round whose new
+    package already passed every gate goes straight to calibration.
+    """
+    from analysis.ledger import Event, hash_dir
     from evaluator.calibrate import calibrate
     from generator import pipeline
     from generator.blueprint import Blueprint
@@ -110,27 +152,33 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
     cand.blueprint = Blueprint(**json.loads((cand_dir / "blueprint.json").read_text()))
     calibration = json.loads((cand_dir / "calibration.json").read_text())
     record = {"start": calibration["verdict"], "rounds": []}
+    record["rounds"], resumed = _resume_rounds(cand.cand_id, ledger)
+    calibration = resumed or calibration
 
-    for rnd in range(1, max_rounds + 1):
+    for rnd in range(len(record["rounds"]) + 1, max_rounds + 1):
         if calibration["verdict"] not in ("too_easy", "too_hard"):
             break
-        plan, plan_cost = plan_mutation(cand.blueprint.to_markdown(spec), calibration)
         previous = cand_dir / f"before_tune_r{rnd}"
-        if previous.exists():
-            shutil.rmtree(previous)
-        shutil.copytree(cand.task_dir, previous)
-        attempt = 100 + rnd  # keeps tuning job names apart from build attempts
-        feedback = [directive(plan)]
-        problems = ["authoring failed"]
-        for repair in range(2):
-            if not pipeline.stage_author(cand, ledger, attempt + 10 * repair, feedback, previous):
-                break
-            problems = pipeline.stage_gates(cand, ledger, attempt + 10 * repair)
-            if not problems:
-                break
-            feedback = [directive(plan), *problems]
-            shutil.rmtree(previous)
-            shutil.copytree(cand.task_dir, previous)
+        plan_file = cand_dir / f"tune_plan_r{rnd}.json"
+        resuming = previous.exists() and plan_file.exists()
+        if (
+            resuming
+            and hash_dir(cand.task_dir) != hash_dir(previous)
+            and pipeline.already_gated(cand, ledger)
+        ):
+            plan, plan_cost, problems = json.loads(plan_file.read_text()), 0.0, []
+        else:
+            if resuming:  # interrupted mid-authoring: redo it from the saved snapshot and plan
+                plan, plan_cost = json.loads(plan_file.read_text()), 0.0
+            else:
+                plan, plan_cost = plan_mutation(
+                    cand.blueprint.to_markdown(spec), calibration, record["rounds"]
+                )
+                if previous.exists():
+                    shutil.rmtree(previous)
+                shutil.copytree(cand.task_dir, previous)
+                plan_file.write_text(json.dumps(plan, indent=1))
+            problems = _retune(cand, ledger, rnd, plan, previous)
         round_rec = {"round": rnd, "plan": plan, "gate_problems": problems}
         if problems:
             round_rec["result"] = "gates_failed"
@@ -152,3 +200,22 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
     (cand_dir / "tuning.json").write_text(json.dumps(record, indent=1, default=str))
     (cand_dir / "calibration.json").write_text(json.dumps(calibration, indent=1, default=str))
     return record
+
+
+def _retune(cand, ledger, rnd: int, plan: dict, previous: Path) -> list[str]:
+    """Apply the plan as a repair-style authoring round (one gate repair allowed)."""
+    from generator import pipeline
+
+    attempt = 100 + rnd  # keeps tuning job names apart from build attempts
+    feedback = [directive(plan)]
+    problems = ["authoring failed"]
+    for repair in range(2):
+        if not pipeline.stage_author(cand, ledger, attempt + 10 * repair, feedback, previous):
+            break
+        problems = pipeline.stage_gates(cand, ledger, attempt + 10 * repair)
+        if not problems:
+            break
+        feedback = [directive(plan), *problems]
+        shutil.rmtree(previous)
+        shutil.copytree(cand.task_dir, previous)
+    return problems

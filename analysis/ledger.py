@@ -65,8 +65,10 @@ class Ledger:
             if not line.strip():
                 continue
             e = Event(**json.loads(line))
-            if (stage is None or e.stage == stage) and (task is None or e.task == task) and (
-                mode is None or e.mode == mode
+            if (
+                (stage is None or e.stage == stage)
+                and (task is None or e.task == task)
+                and (mode is None or e.mode == mode)
             ):
                 out.append(e)
         return out

@@ -37,6 +37,21 @@ def _history() -> list[TaskSpec]:
     return specs
 
 
+def _batch_specs(n: int, seed: int, plan_dir: Path) -> list[TaskSpec]:
+    """The batch's specs, sampled once and saved so a rerun resumes the same candidates.
+
+    Sampling depends on the history of earlier candidates, which grows as the
+    batch runs; without the saved plan a restart would draw different specs.
+    """
+    plan = plan_dir / f"seed{seed}-n{n}.json"
+    if plan.exists():
+        return [TaskSpec(**d) for d in json.loads(plan.read_text())]
+    specs = sample_specs(n, seed=seed, history=_history())
+    plan.parent.mkdir(parents=True, exist_ok=True)
+    plan.write_text(json.dumps([s.model_dump() for s in specs], indent=1))
+    return specs
+
+
 def _install_dry_run(ledger_path: Path) -> Ledger:
     """Swap model-calling stages for fixtures; gates stay real."""
     blueprint = Blueprint(**json.loads((FIXTURES / "blueprint_ledger.json").read_text()))
@@ -92,7 +107,10 @@ def main() -> int:
     else:
         ledger = Ledger()
     start_cost = ledger.total_cost()
-    specs = sample_specs(args.n, seed=args.seed, history=_history())
+    plan_dir = (
+        Path("jobs/dry-run/batches") if args.dry_run else pipeline.CANDIDATES_DIR.parent / "batches"
+    )
+    specs = _batch_specs(args.n, args.seed, plan_dir)
 
     summary = []
     for spec in specs:
@@ -113,7 +131,9 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 - one broken candidate must not stop the batch
             cand.status = "error"
             cand.save("status.json", {"status": "error", "error": f"{type(e).__name__}: {e}"})
-            ledger.append(Event("error", cand.cand_id, {"error": f"{type(e).__name__}: {e}"[:2000]}))
+            ledger.append(
+                Event("error", cand.cand_id, {"error": f"{type(e).__name__}: {e}"[:2000]})
+            )
         cost = sum(e.cost_usd for e in ledger.events(task=cand.cand_id))
         slug = cand.blueprint.slug if cand.blueprint else "-"
         summary.append((cand.cand_id, slug, cand.status, cost))

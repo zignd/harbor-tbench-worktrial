@@ -84,8 +84,23 @@ def judge_trial(task_dir, trial) -> tuple[str, dict, float]:
     return INVALID_FAIL, {"harbor": trial.outcome, "exception": trial.exception}, 0.0
 
 
+def unfinished_trials(ledger, name: str) -> list[dict]:
+    """Judged trials of a calibration run of `name` that never reached its verdict (a crash)."""
+    trials: list[dict] = []
+    for e in ledger.events(task=name):
+        if e.stage == "calibration":
+            trials = []
+        elif e.stage == "calibration_trial":
+            trials.append({**e.result, "_ledger_cost": e.cost_usd})
+    return trials
+
+
 def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Calibration:
-    """Run Opus trials in waves until decide() returns a verdict."""
+    """Run Opus trials in waves until decide() returns a verdict.
+
+    Resumable: trials already judged under `name` without a final verdict are
+    kept, so an interrupted run only pays for the trials it still needs.
+    """
     from analysis import budget
     from analysis.ledger import Event
     from evaluator.harbor_runner import run_with_retries
@@ -93,7 +108,11 @@ def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Ca
 
     concurrency = concurrency or OPUS_CONCURRENCY
     cal = Calibration(task=name)
-    wave = 0
+    for t in unfinished_trials(ledger, name):
+        cal.outcomes.append(t["outcome"])
+        cal.cost_usd += t.pop("_ledger_cost")
+        cal.trials.append(t)
+    wave = len(cal.outcomes)  # waves hold >= 1 trial, so new job names never collide
     while (verdict := decide(cal.outcomes)) is None:
         k = next_wave_size(cal.outcomes, concurrency)
         budget.check(EXPECTED_OPUS_TRIAL_USD * k)

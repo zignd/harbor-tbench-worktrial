@@ -19,7 +19,7 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
   - The synthesis image uses the same base (`python:3.13-slim-bookworm`) that generated tasks must use, so the author can reproduce the task env without Docker.
   - The in-container `check_package.py` gives the meta-task a "package complete" reward.
   - `artifacts = ["/app/output"]` collects the package.
-- **Fixtures:** sanitized oracle, nop and Opus job dirs in `tests/fixtures/jobs/` for unit tests (no secrets; absolute paths replaced by `<REPO>`).
+- **Fixtures:** sanitized oracle, nop and Opus job dirs in `tests/fixtures/harbor_jobs/` for unit tests (no secrets; absolute paths replaced by `<REPO>`).
 - **Spend:** Opus trial $0.0775. Running total $0.078.
 
 ### 15:30 -03:00 · Dev mode: cheap model for plumbing iterations

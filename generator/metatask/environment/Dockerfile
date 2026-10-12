@@ -12,6 +12,16 @@ RUN pip install --no-cache-dir pytest==8.4.1
 RUN curl -LsSf https://astral.sh/uv/0.9.5/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 
+# Toolchains, installed with the same lines as recipes/*.dockerfile so this container
+# matches a task image that pastes a recipe. Testing aid only: task images install
+# their own toolchain from the recipe (generated tasks stay self-contained).
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.82.0
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl -fsSL "https://go.dev/dl/go1.22.5.linux-$(dpkg --print-architecture).tar.gz" | tar -C /usr/local -xz
+ENV PATH="/usr/local/go/bin:${PATH}"
+RUN curl -fsSL "https://nodejs.org/dist/v20.17.0/node-v20.17.0-linux-$(dpkg --print-architecture | sed s/amd64/x64/).tar.gz" | tar -C /usr/local --strip-components=1 -xz
+COPY recipes /app/recipes
+
 WORKDIR /app
 # Pipeline-owned files, pre-placed: the author writes everything else.
 COPY standard_test.sh /app/output/tests/test.sh

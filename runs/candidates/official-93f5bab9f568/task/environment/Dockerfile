@@ -16,5 +16,5 @@ COPY app/transform.py     /app/transform.py
 COPY app/aggregate.py     /app/aggregate.py
 COPY app/storage.py       /app/storage.py
 COPY app/run_pipeline.py  /app/run_pipeline.py
-COPY app/tests/           /app/tests/
+COPY app/sample_test.py    /app/tests/sample_test.py
 COPY app/sample_data/     /app/sample_data/

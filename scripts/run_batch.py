@@ -26,6 +26,7 @@ from analysis.ledger import Event, Ledger
 from generator import pipeline
 from generator.blueprint import Blueprint
 from generator.spec import TaskSpec, sample_specs
+from scripts.calibrate_candidates import calibrate_one
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 FIXTURE_TASK = (
@@ -125,6 +126,11 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--budget", type=float, default=20.0, help="max spend for this batch")
     parser.add_argument("--workers", type=int, default=3, help="candidates built in parallel")
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="calibrate each candidate against Opus as soon as it passes every gate",
+    )
     parser.add_argument("--dry-run", action="store_true", help="no model calls (fixtures)")
     args = parser.parse_args()
 
@@ -148,6 +154,10 @@ def main() -> int:
         if status.get("status") == "building" and _alive(status.get("pid")):
             print(f"{cand.cand_id}  (being built by pid {status['pid']})", flush=True)
             return None
+        if status.get("status") == "gated" and args.calibrate and not args.dry_run:
+            if not (cand.dir / "calibration.json").exists():  # gated before a crash
+                calibrate_one(cand.dir, ledger)
+            return None
         if status and status.get("status") != "building":  # resume: already ran to a final status
             print(f"{cand.cand_id}  (already {status['status']})")
             return None
@@ -165,6 +175,9 @@ def main() -> int:
             ledger.append(
                 Event("error", cand.cand_id, {"error": f"{type(e).__name__}: {e}"[:2000]})
             )
+        if args.calibrate and cand.status == "gated" and not args.dry_run:
+            # Straight to calibration: a gated task no longer waits for a separate run.
+            calibrate_one(cand.dir, ledger)
         cost = sum(e.cost_usd for e in ledger.events(task=cand.cand_id))
         slug = cand.blueprint.slug if cand.blueprint else "-"
         print(f"{cand.cand_id}  {slug:40}  {cand.status:9}  ${cost:.2f}", flush=True)

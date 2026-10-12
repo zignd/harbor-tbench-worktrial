@@ -178,3 +178,20 @@ def test_gates_skip_what_cannot_run(env, monkeypatch):
     shutil.copytree(TASK, cand.task_dir)
     assert pipeline.stage_gates(cand, ledger, 1) == ["structure: no tests/"]
     assert calls == ["static"]  # no image to run, no valid structure to review
+
+
+def test_clean_package_runs_quality_alongside_novelty_and_redteam(env, monkeypatch):
+    _, ledger = env
+    calls = _gate_env(
+        monkeypatch, ([], True, True), ([], {"oracle": [], "nop": [], "excluded": 0}), QUALITY_FAIL
+    )
+    monkeypatch.setattr(pipeline.novelty, "gate_index", lambda d, exclude="": None)
+    monkeypatch.setattr(pipeline.novelty, "lexical_flags", lambda text, index: [])
+    monkeypatch.setattr(
+        pipeline.novelty, "judge_same_task",
+        lambda text, index: {"novel": True, "verdicts": [], "nearest": [], "cost_usd": 0.0},
+    )  # fmt: skip
+    cand = pipeline.Candidate(sample_specs(1, seed=12)[0])
+    shutil.copytree(TASK, cand.task_dir)
+    assert pipeline.stage_gates(cand, ledger, 1) == ["typos: x", "fix the typo"]
+    assert sorted(calls) == ["functional", "quality", "redteam", "static"]

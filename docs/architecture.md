@@ -220,14 +220,14 @@ Partly, yes. A task with true pass rate 0.5 lands in band 78% of the time. That'
 - Exact curtailment cuts 14-23% of trials.
 - Calibration stops on the first invalid failure or hacked pass.
 - Waves never run a trial that can't change the verdict.
-- Authoring summarizes its history past ~60k tokens.
+- Authoring summarizes its history past ~60k tokens, and Anthropic prompt caching is on (measured: 96.5% of authoring input tokens are cache reads; output tokens are now ~43% of an authoring run's cost).
 - Dry runs and dev mode exist for debugging.
 - A $75 reserve is enforced in code.
 - Measured costs so far: Opus trial ≈ $0.23, judge ≈ $0.012, `harbor check` ≈ $0.13, blueprint + gate ≈ $0.13. Sonnet authoring cost $2.75 before the cost levers.
 
 **How do you avoid generating the same task over and over?**
-- Inverse-frequency sampling over a 10-axis taxonomy (SkillSynth): each value's weight is 1/(count+1).
-- A novelty gate against published tasks and against our own earlier candidates.
+- Inverse-frequency sampling over a 10-axis taxonomy (SkillSynth): each value's weight is 1/(count+1)², squared after a 300-seed simulation showed plain 1/(count+1) repeated a domain 3+ times in 18% of 8-task batches (5% squared).
+- A novelty gate against published tasks and against our own earlier candidates (in-flight ones by their blueprint). The judge always sees our 2 nearest own tasks, because short outcome-only instructions on the same theme can score cosine ~0.1. It caught 2 of the first 8 blueprints as variants of our own first task: Sonnet drifts back to ledger reconciliation.
 - The report shows per-axis balance (exp(H)/N) and a Vendi score. The hand-written examples score Vendi 5.97 of 6, which is the bar.
 
 **Can it adjust difficulty?**
@@ -240,12 +240,65 @@ Yes, through the tuner (stretch B). It makes one change per round: first the ver
 
 Hand review still matters: it found that the first task's instruction named its own bug, which no automated check flagged. The prompts were tightened as a result.
 
-**What would you do at 10,000 tasks?**
-- Parallel sandboxes (Daytona or Modal) instead of local Docker.
-- A cheaper pre-filter for difficulty, only if it proves predictive. We log the blueprint's predicted pass rate against the observed one for exactly this.
-- A second-stage red-team on tasks that show any hack signal (Terminal Wrench's two-stage method).
-- Re-calibrating as models improve, since the band moves.
-- Seeding from real engineering incidents for realism.
+### Throughput and scale
+
+**What limited speed, and what did you do about it?**
+The bottleneck was the pipeline's shape, not compute or money. Authoring a task is a 25-45 min Sonnet session whose container idles at ~1% CPU, and batches built one candidate at a time (~2-3 candidates per hour). Changes, each measured or tested:
+
+| Change | Why |
+|---|---|
+| Candidates build in parallel (`--workers`), with crash-safe claims (`status.json` + pid) | Authoring is API-bound; 2 → 7+ concurrent builds |
+| All cheap gates run in one round (static, oracle/nop, quality) | A package used to fail, get repaired, then fail the next gate, one round at a time |
+| Novelty → red-team run in parallel with the quality check | ~5-10 min per candidate; the red-team may be paid for and then discarded |
+| Authoring cap 80 → 140 turns, repairs capped at 70 | The pilot's first build ran out of turns mid-build; a repair round costs ~$0.9 and ~30 min |
+| Toolchain recipes (Rust, Go, Node, C) | Same lines in the authoring image and the task Dockerfile: no turns spent installing toolchains, and builds share Docker's layer cache. Tasks stay self-contained |
+| Calibration starts as soon as a task passes its gates | A gated task used to wait for a separate run. A machine-wide slot lock keeps total Opus trials at ≤3 across processes |
+| Resume everything after a crash | A reboot mid-run would otherwise have re-sampled specs, re-paid blueprints and restarted calibrations |
+
+Remaining limits: stages within a candidate are sequential on purpose (no Opus spend on a task that might be hackable), and the shared machine caps Opus at 2-3 concurrent trials.
+
+**Could you have gone faster by relaxing the rules?**
+Only the rules we set ourselves, and only openly. The README's constraints (Sonnet authors, Opus calibrates, no public tasks, 3600 s timeout, no turn-cap failures counted) are non-negotiable, since a task built around them wouldn't be a valid deliverable. Our own gates are design choices, and every change to them is in `CHANGELOG.md` with the reason.
+
+**What would you change to generate 10,000 gate-approved tasks?**
+
+Rough numbers: at a 40-60% gate yield, ~20k candidates. At ~$4-6 per authored candidate that's ~$100k (less with caching and scaffolding), plus ~$15k of Opus calibration at ~$1-1.5 per task with curtailment. At ~40 min per build, ~200 concurrent sandboxes give ~300 builds/hour, or ~3 days.
+
+```mermaid
+flowchart LR
+    T[Topic graph<br/>scenario → skill paths] --> Q1[(blueprint queue)]
+    Q1 --> W1[Blueprint workers<br/>API-bound]
+    W1 --> Q2[(author queue)]
+    Q2 --> W2[Authoring workers<br/>~200 remote sandboxes]
+    W2 --> Q3[(gate queue)]
+    Q3 --> W3[Gate workers<br/>CPU-bound, shared image cache]
+    W3 -->|findings| Q2
+    W3 --> Q4[(calibration queue)]
+    Q4 --> P{Difficulty<br/>predictor}
+    P -->|clearly too easy/hard| X[Skip]
+    P --> W4[Opus workers<br/>rate-limited]
+    W4 --> S[(Shipped tasks)]
+    W1 & W2 & W3 & W4 -.events.-> DB[(Postgres ledger<br/>+ object store)]
+    DB -.yield, drift, cost.-> D[Dashboards & quotas]
+    D -.coverage quotas.-> T
+```
+
+| Area | Today | At 10k |
+|---|---|---|
+| Orchestration | Threads per batch, `status.json` claims | A durable queue per stage, with backpressure, retries and a dead-letter queue. Stages are already idempotent by content hash, so they port as-is |
+| Compute | Local Docker, 10 shared CPUs | Remote sandboxes (Harbor supports cloud environments such as Daytona and Modal), with separate pools for API-bound authoring, CPU-bound gates and Opus calibration |
+| Images | Every task builds from scratch | Shared base images per language in a registry, a remote BuildKit cache, and pinned package mirrors (which also removes verify-time `uvx` network flakiness) |
+| Evidence | JSONL ledger with `flock` | Postgres for events, object storage for packages and trajectories, and dashboards for yield per stage, taxonomy cell and failure mode |
+| Rate limits | Not a concern | Token-per-minute budgets per model, adaptive concurrency, and circuit breakers, so one systemic failure (e.g. a broken base image) doesn't burn a thousand builds |
+
+Novelty and diversity become the hard problems at 10k:
+- The taxonomy has ~10^5 cells, many of them incoherent, so it needs a richer topic generator. One option is a scenario→skill graph (SkillSynth), whose paths also produce harder tasks.
+- All-pairs TF-IDF/n-gram dedup grows quadratically. It would need approximate nearest-neighbour search (MinHash/LSH), with the Sonnet judge only on the nearest few.
+- Per-cell quotas stop the generator from piling into the cells it finds easy. We already saw it drift back to ledger tasks.
+
+Quality without hand-reviewing everything: hand-audit a random sample from every N tasks, alert on drift in gate pass rates, hack rates and the failure-mode mix, and re-red-team a sample after any prompt change.
+
+The biggest calibration saving at scale is a difficulty predictor trained on the accumulated calibration records, which skips clearly too-easy or too-hard candidates before any Opus trial. Within this trial it would have to be Sonnet or Opus. We already log the blueprint's predicted pass rate against the observed one to test the idea. Curtailment saves another ~20%, and the band has to be re-calibrated as models improve.
 
 **Why these papers?**
 They are the 2026 terminal-task synthesis and evaluation literature: task quality (Bercovich), reward hacking (Terminal Wrench, HVTB), synthesis pipelines (CLI-Universe, Meta-Task, Tmax, SkillSynth) and learnability (Foster & Foerster). Each design decision above cites the one it came from (`docs/research/`).

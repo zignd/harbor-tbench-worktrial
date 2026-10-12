@@ -49,6 +49,8 @@ BAND_HIGH = int(os.environ.get("BAND_HIGH", "3"))
 # round costs ~$0.9 and 30 min, so finishing the first build is cheaper.
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 METATASK_MAX_TURNS = int(os.environ.get("METATASK_MAX_TURNS", "140"))
+# A repair or tuning round patches /app/previous instead of building from scratch.
+METATASK_REPAIR_MAX_TURNS = int(os.environ.get("METATASK_REPAIR_MAX_TURNS", "70"))
 # Authoring cost lever: terminus-2 summarizes when free context drops below this.
 # LiteLLM gives Sonnet a 200k limit, so 140k summarizes once history passes ~60k
 # (Phase 0: authoring history grew to 104k and cost $2.75). Authoring only; the

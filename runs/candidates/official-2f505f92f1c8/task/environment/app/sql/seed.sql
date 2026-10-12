@@ -27,11 +27,7 @@ INSERT INTO wal_records (txid, record_type, payload) VALUES
     (3042, 'refund', X'f00d3042'),
     (8000042, 'refund', X'f00d8042');
 
--- Refund -> charge mappings
--- refund 2001 reverses charge 1001
--- refund 2002 reverses charge 1002
--- refund 3042 reverses charge 5001
--- refund 8000042 reverses charge 9999999
+-- Refund reference mappings
 INSERT INTO refund_refs (refund_txid, charge_txid) VALUES
     (2001, 1001),
     (2002, 1002),

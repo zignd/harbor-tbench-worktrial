@@ -18,6 +18,7 @@ its blueprint once, then dropped. Calibration against Opus is a separate stage
 import json
 import shutil
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from generator.config import (
     DEV_MODE,
     JOBS_DIR,
     METATASK_MAX_TURNS,
+    METATASK_REPAIR_MAX_TURNS,
     METATASK_SUMMARIZE_THRESHOLD,
     MODEL,
     OUTPUT_DIR,
@@ -181,7 +183,7 @@ def stage_author(
         name,
         model=f"openrouter/{MODEL}",
         agent_kwargs={
-            "max_turns": METATASK_MAX_TURNS,
+            "max_turns": METATASK_REPAIR_MAX_TURNS if previous else METATASK_MAX_TURNS,
             "proactive_summarization_threshold": METATASK_SUMMARIZE_THRESHOLD,
         },
     )
@@ -247,12 +249,13 @@ def gate_functional(task_dir: Path, name: str) -> tuple[list[str], dict]:
 
 
 def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
-    """Run every cheap gate, then novelty and red-team on a clean package. Returns problems.
+    """Run the gates and return every problem found. Returns [] for a package that passed.
 
     Static, functional and quality gates all run even when an earlier one fails
     (functional needs a built image, quality a valid structure), so one repair
     round sees every finding instead of discovering them one round at a time.
-    Novelty and the red-team only run once those pass.
+    Novelty and the red-team run only on a package that built, passed oracle/nop
+    and lint, in parallel with the quality check.
     """
     h = hash_dir(cand.task_dir)
     tag = f"claude-gate-{cand.cand_id}-a{attempt}".lower()
@@ -264,24 +267,39 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
         found, result = gate_functional(cand.task_dir, f"gate-{cand.cand_id}-a{attempt}")
         _record(ledger, cand, "gate_functional", {**result, "problems": found}, 0.0, t0, h)
         problems += found
-    if structure_ok:
-        budget.check(EXPECTED_CHECK_USD)
-        t0 = time.monotonic()
-        check = run_check(cand.task_dir, f"check-{cand.cand_id}-a{attempt}")
-        cand.save(f"quality_a{attempt}.json", check)
-        found = check["blocking_failures"] or ([check["error"]] if "error" in check else [])
-        _record(
-            ledger,
-            cand,
-            "gate_quality",
-            {"ok": check["ok"], "outcomes": check["outcomes"], "problems": found},
-            check["cost_usd"],
-            t0,
-            h,
-        )
-        problems += found + (check["advice"] if found else [])
-    if problems:
+    if not structure_ok:
         return problems
+    if problems:  # broken package: quality findings still go into the same repair round
+        return problems + stage_quality(cand, ledger, attempt, h)
+    # Clean so far: the quality check and the novelty -> red-team chain are independent,
+    # so they run side by side (~5-10 min saved). The red-team may be paid for and then
+    # discarded if quality fails; its findings still go into the repair.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        quality = pool.submit(stage_quality, cand, ledger, attempt, h)
+        adversarial = pool.submit(_novelty_then_redteam, cand, ledger, attempt, h)
+        return quality.result() + adversarial.result()
+
+
+def stage_quality(cand: Candidate, ledger: Ledger, attempt: int, h: str) -> list[str]:
+    """`harbor check` with our rubric. Returns blocking failures plus advice."""
+    budget.check(EXPECTED_CHECK_USD)
+    t0 = time.monotonic()
+    check = run_check(cand.task_dir, f"check-{cand.cand_id}-a{attempt}")
+    cand.save(f"quality_a{attempt}.json", check)
+    found = check["blocking_failures"] or ([check["error"]] if "error" in check else [])
+    _record(
+        ledger,
+        cand,
+        "gate_quality",
+        {"ok": check["ok"], "outcomes": check["outcomes"], "problems": found},
+        check["cost_usd"],
+        t0,
+        h,
+    )
+    return found + (check["advice"] if found else [])
+
+
+def _novelty_then_redteam(cand: Candidate, ledger: Ledger, attempt: int, h: str) -> list[str]:
     t0 = time.monotonic()
     instruction = (cand.task_dir / "instruction.md").read_text()
     index = novelty.gate_index(CANDIDATES_DIR, exclude=cand.cand_id)

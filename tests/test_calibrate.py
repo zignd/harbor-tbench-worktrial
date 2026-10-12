@@ -86,3 +86,29 @@ def test_unfinished_trials_resume_only_a_run_without_a_verdict(tmp_path):
     got = unfinished_trials(ledger, "t")
     assert [t["outcome"] for t in got] == ["pass", "pass"]
     assert sum(t["_ledger_cost"] for t in got) == 0.45
+
+
+def test_opus_slots_cap_concurrent_trials_across_holders(tmp_path):
+    import threading
+    import time
+
+    from evaluator.calibrate import opus_slots
+
+    running, peak, lock = [0], [0], threading.Lock()
+
+    def wave(k):
+        with opus_slots(k, total=3, lock_dir=tmp_path, poll_s=0.01):
+            with lock:
+                running[0] += k
+                peak[0] = max(peak[0], running[0])
+            time.sleep(0.05)
+            with lock:
+                running[0] -= k
+
+    threads = [threading.Thread(target=wave, args=(k,)) for k in (2, 2, 1, 3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    assert not any(t.is_alive() for t in threads)  # all-or-nothing: no deadlock
+    assert peak[0] <= 3

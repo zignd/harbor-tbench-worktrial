@@ -66,6 +66,36 @@ def ship(cand_dir: Path, cal: dict) -> Path:
     return dest
 
 
+def calibrate_one(cand_dir: Path, ledger) -> dict | None:
+    """Red-team (if never run), calibrate and ship one gated candidate. Returns the record."""
+    status_file = cand_dir / "status.json"
+    if not list(cand_dir.glob("redteam_a*.json")):
+        # Gated before the red-team gate existed: run it now, before any Opus spend.
+        cand = Candidate(
+            TaskSpec(**json.loads((cand_dir / "spec.json").read_text())), cand_id=cand_dir.name
+        )
+        problems = stage_redteam(cand, ledger, attempt=0)
+        if problems:
+            status_file.write_text(json.dumps({"status": "hackable", "problems": problems}))
+            print(f"{cand_dir.name}  red-team found an exploit; not calibrated", flush=True)
+            return None
+    cal = calibrate(cand_dir / "task", cand_dir.name, ledger)
+    record = {
+        "verdict": cal.verdict,
+        "outcomes": cal.outcomes,
+        "trials": cal.trials,
+        "cost_usd": round(cal.cost_usd, 4),
+    }
+    (cand_dir / "calibration.json").write_text(json.dumps(record, indent=1, default=str))
+    shipped = ship(cand_dir, record) if cal.verdict == "learnable" else None
+    print(
+        f"{cand_dir.name}  {cal.summary}  ${cal.cost_usd:.2f}"
+        + (f"  -> {shipped}" if shipped else ""),
+        flush=True,
+    )
+    return record
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--only", nargs="*", help="candidate ids to calibrate")
@@ -81,31 +111,8 @@ def main() -> int:
             continue
         if (cand_dir / "calibration.json").exists() or done >= args.max:
             continue
-        if not list(cand_dir.glob("redteam_a*.json")):
-            # Gated before the red-team gate existed: run it now, before any Opus spend.
-            cand = Candidate(
-                TaskSpec(**json.loads((cand_dir / "spec.json").read_text())), cand_id=cand_dir.name
-            )
-            problems = stage_redteam(cand, ledger, attempt=0)
-            if problems:
-                status_file.write_text(json.dumps({"status": "hackable", "problems": problems}))
-                print(f"{cand_dir.name}  red-team found an exploit; not calibrated", flush=True)
-                continue
-        cal = calibrate(cand_dir / "task", cand_dir.name, ledger)
-        record = {
-            "verdict": cal.verdict,
-            "outcomes": cal.outcomes,
-            "trials": cal.trials,
-            "cost_usd": round(cal.cost_usd, 4),
-        }
-        (cand_dir / "calibration.json").write_text(json.dumps(record, indent=1, default=str))
-        shipped = ship(cand_dir, record) if cal.verdict == "learnable" else None
-        print(
-            f"{cand_dir.name}  {cal.summary}  ${cal.cost_usd:.2f}"
-            + (f"  -> {shipped}" if shipped else ""),
-            flush=True,
-        )
-        done += 1
+        if calibrate_one(cand_dir, ledger) is not None:
+            done += 1
     return 0
 
 

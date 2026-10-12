@@ -16,7 +16,11 @@ Trials run in waves no larger than the fewest trials that could still reach a
 verdict, so curtailment never pays for a trial whose result can't matter.
 """
 
+import fcntl
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 N_RUNS = 5
 LEGIT_PASS, VALID_FAIL, HACKED_PASS, INVALID_FAIL = "pass", "fail", "hacked", "invalid"
@@ -95,6 +99,39 @@ def unfinished_trials(ledger, name: str) -> list[dict]:
     return trials
 
 
+@contextmanager
+def opus_slots(k: int, total: int, lock_dir: Path, poll_s: float = 5.0):
+    """Hold k of `total` machine-wide trial slots while a wave runs.
+
+    Several batch processes calibrate at once, but the machine runs at most `total`
+    Opus trials. Slots are flock'd files, so a crashed holder frees its slots. A wave
+    takes all k slots or none (then waits), so two waits can't deadlock.
+    """
+    k = min(k, total)
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    while True:
+        held = []
+        for i in range(total):
+            f = (lock_dir / f"slot{i}").open("w")
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                held.append(f)
+            except BlockingIOError:
+                f.close()
+            if len(held) == k:
+                break
+        if len(held) == k:
+            break
+        for f in held:
+            f.close()
+        time.sleep(poll_s)
+    try:
+        yield
+    finally:
+        for f in held:
+            f.close()
+
+
 def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Calibration:
     """Run Opus trials in waves until decide() returns a verdict.
 
@@ -104,7 +141,7 @@ def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Ca
     from analysis import budget
     from analysis.ledger import Event
     from evaluator.harbor_runner import run_with_retries
-    from generator.config import EVAL_AGENT, EVAL_MODEL, MAX_TURNS, OPUS_CONCURRENCY
+    from generator.config import EVAL_AGENT, EVAL_MODEL, JOBS_DIR, MAX_TURNS, OPUS_CONCURRENCY
 
     concurrency = concurrency or OPUS_CONCURRENCY
     cal = Calibration(task=name)
@@ -117,15 +154,16 @@ def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Ca
         k = next_wave_size(cal.outcomes, concurrency)
         budget.check(EXPECTED_OPUS_TRIAL_USD * k)
         wave += 1
-        counted, excluded = run_with_retries(
-            task_dir,
-            EVAL_AGENT,
-            f"cal-{name}-w{wave}",
-            model=EVAL_MODEL,
-            attempts=k,
-            concurrent=k,
-            agent_kwargs={"max_turns": MAX_TURNS},
-        )
+        with opus_slots(k, OPUS_CONCURRENCY, Path(JOBS_DIR) / ".opus-slots"):
+            counted, excluded = run_with_retries(
+                task_dir,
+                EVAL_AGENT,
+                f"cal-{name}-w{wave}",
+                model=EVAL_MODEL,
+                attempts=k,
+                concurrent=k,
+                agent_kwargs={"max_turns": MAX_TURNS},
+            )
         if not counted:
             verdict = "infra"
             break

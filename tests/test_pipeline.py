@@ -109,3 +109,32 @@ def test_already_gated_matches_the_exact_package(env):
     assert pipeline.already_gated(cand, ledger)
     (cand.task_dir / "instruction.md").write_text("changed")
     assert not pipeline.already_gated(cand, ledger)
+
+
+def test_rejected_blueprint_is_retried_once_with_the_reason(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "CANDIDATES_DIR", tmp_path / "candidates")
+    monkeypatch.setattr(pipeline.budget, "check", lambda expected: None)
+    monkeypatch.setattr(pipeline.novelty, "gate_index", lambda d, e="": None)
+    monkeypatch.setattr(pipeline.novelty, "concept_list", lambda index=None: "- ours/x: ledger")
+    prompts = []
+
+    def fake_make(spec, concepts, feedback=None):
+        prompts.append((concepts, feedback))
+        return BLUEPRINT, 0.1
+
+    variant = {"verdict": "variant", "ref_id": "ours/x", "reason": "same ledger bug"}
+    decisions = iter([
+        {"accepted": False, "review": {"accepted": True, "scores": {}},
+         "novelty": {"lexical_flags": [], "judge": {"verdicts": [variant]}, "novel": False},
+         "cost_usd": 0.01},
+        {"accepted": True, "review": {"accepted": True, "scores": {}},
+         "novelty": {"lexical_flags": [], "judge": {"verdicts": []}, "novel": True},
+         "cost_usd": 0.01},
+    ])  # fmt: skip
+    monkeypatch.setattr(pipeline, "make_blueprint", fake_make)
+    monkeypatch.setattr(pipeline, "gate_blueprint", lambda bp, spec, index: next(decisions))
+    cand = pipeline.Candidate(sample_specs(1, seed=9)[0])
+    assert pipeline.stage_blueprint(cand, Ledger(tmp_path / "l.jsonl"))
+    assert prompts[0] == ("- ours/x: ledger", None)
+    assert "variant of ours/x (same ledger bug)" in prompts[1][1]
+    assert (cand.dir / "blueprint_rejected_1.json").exists()

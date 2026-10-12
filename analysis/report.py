@@ -12,13 +12,14 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 from analysis.curtailment import table as curtailment_table
-from analysis.diversity import coverage, novelty_report, uniqueness
+from analysis.diversity import coverage, difficulty_spread, novelty_report, uniqueness
 from analysis.human_likeness import stylometrics
 from analysis.ledger import Ledger
 from evaluator.calibrate import LEGIT_PASS, N_RUNS
-from generator.config import EXAMPLES_DIR, OUTPUT_DIR, REPO_ROOT, assert_official_models
+from generator.config import EXAMPLES_DIR, OUTPUT_DIR, REPO_ROOT, RUNS_DIR, assert_official_models
 from generator.pipeline import CANDIDATES_DIR
 from generator.spec import TaskSpec
+from validator.novelty import Index, RefTask
 
 REPORTS_DIR = Path(REPO_ROOT) / "reports"
 
@@ -118,6 +119,55 @@ def calibration_stats(rows: list[dict]) -> dict:
     }
 
 
+def novelty_layers(rows: list[dict], events) -> dict:
+    """Rejects per novelty layer: lexical (n-gram/cosine) or the Sonnet judge, at blueprint
+    time and on the finished package."""
+    out = Counter()
+    for r in rows:
+        nov = (r["gate"] or {}).get("novelty") or {}
+        if nov.get("lexical_flags"):
+            out["blueprint_lexical"] += 1
+        elif nov and not nov.get("novel", True):
+            out["blueprint_judge"] += 1
+    for e in events:
+        if e.stage == "gate_novelty" and not e.result.get("novel"):
+            out["package_lexical" if e.result.get("lexical") else "package_judge"] += 1
+    checked = {
+        "blueprints_checked": sum(bool((r["gate"] or {}).get("novelty")) for r in rows),
+        "packages_checked": sum(e.stage == "gate_novelty" for e in events),
+    }
+    return checked | {k: out.get(k, 0) for k in (
+        "blueprint_lexical", "blueprint_judge", "package_lexical", "package_judge"
+    )}  # fmt: skip
+
+
+def batches(rows: list[dict], events) -> list[dict]:
+    """Per saved batch plan: funnel, red-team hackable rate and cost."""
+    from generator.pipeline import Candidate
+
+    out = []
+    for plan in sorted((Path(RUNS_DIR) / "batches").glob("*.json")):
+        ids = {Candidate(TaskSpec(**d)).cand_id for d in json.loads(plan.read_text())}
+        mine = [r for r in rows if r["id"] in ids]
+        evs = [e for e in events if e.task in ids or e.task.rsplit("-t", 1)[0] in ids]
+        red = [e for e in evs if e.stage == "gate_redteam"]
+        out.append(
+            {
+                "batch": plan.stem,
+                "candidates": len(ids),
+                "gated": sum(r["status"] == "gated" for r in mine),
+                "learnable": sum(
+                    bool(r["calibration"] and r["calibration"]["verdict"] == "learnable")
+                    for r in mine
+                ),
+                "redteam_runs": len(red),
+                "redteam_hackable": sum(bool(e.result.get("hackable")) for e in red),
+                "usd": round(sum(e.cost_usd for e in evs), 2),
+            }
+        )
+    return out
+
+
 def _cand_for(slug: str) -> str | None:
     for d in CANDIDATES_DIR.glob("official-*"):
         bp = _load(d / "blueprint.json")
@@ -156,7 +206,18 @@ def build() -> dict:
                 if (r["dir"] / "task" / "instruction.md").exists()
             ]
         ),
-        "novelty": novelty_report({p.name: (p / "instruction.md").read_text() for p in shipped}),
+        "novelty": novelty_report(
+            {p.name: (p / "instruction.md").read_text() for p in shipped},
+            examples=Index(
+                tuple(RefTask(p.name, (p / "instruction.md").read_text(), "") for p in examples)
+            ),
+        ),
+        "novelty_layers": novelty_layers(rows, events),
+        "batches": batches(rows, events),
+        "difficulty": difficulty_spread(
+            [r["blueprint"] for r in rows],
+            [o for _, o in calibration_stats(rows)["predicted_vs_observed"]],
+        ),
         "stylometrics": {
             "examples": {p.name: stylometrics(p) for p in examples},
             "shipped": {p.name: stylometrics(p) for p in shipped},
@@ -215,6 +276,18 @@ def to_markdown(rep: dict) -> str:
         f"| {k} | {v['usd']:.2f} | {v['minutes']} | {v['events']} |"
         for k, v in rep["cost_and_time"].items()
     ]
+    lines += [
+        "",
+        "Per batch:",
+        "",
+        "| Batch | Candidates | Gated | Learnable | Red-team hackable | USD |",
+        "|---|---|---|---|---|---|",
+    ]
+    lines += [
+        f"| {b['batch']} | {b['candidates']} | {b['gated']} | {b['learnable']} | "
+        f"{b['redteam_hackable']}/{b['redteam_runs']} | {b['usd']:.2f} |"
+        for b in rep["batches"]
+    ]
     c = rep["calibration"]
     lines += [
         "",
@@ -246,11 +319,20 @@ def to_markdown(rep: dict) -> str:
         f"Shipped instructions: {rep['uniqueness_shipped']}",
         f"All generated instructions: {rep['uniqueness_generated']}",
         "",
-        "Nearest published Terminal-Bench task per shipped task:",
+        f"Difficulty spread: {rep['difficulty']}",
         "",
+        f"Novelty rejects per layer: {rep['novelty_layers']}",
+        "",
+        "Shipped tasks vs published Terminal-Bench (max cosine per set) and `examples/`:",
+        "",
+        "| Task | Nearest TB task | Cosine | Per-set max | Nearest example |",
+        "|---|---|---|---|---|",
     ]
     lines += [
-        f"- {r['task']}: {r['nearest_reference']} (cosine {r['cosine']})" for r in rep["novelty"]
+        f"| {r['task']} | {r['nearest_reference']} | {r['cosine']} | "
+        f"{', '.join(f'{k} {v["max"]}' for k, v in r['by_set'].items())} | "
+        f"{r.get('nearest_example')} ({r.get('example_cosine')}) |"
+        for r in rep["novelty"]
     ]
     lines += [
         "",

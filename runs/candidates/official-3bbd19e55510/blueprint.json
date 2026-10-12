@@ -1,0 +1,59 @@
+{
+ "slug": "ema-throughput-log-fixer",
+ "title": "Fix the EMA Metrics Pipeline",
+ "scenario": "An embedded systems team runs a real-time sensor metrics aggregator that computes Exponential Moving Averages (EMA) for device telemetry and writes summary statistics to a metrics log. The pipeline has been producing subtly wrong EMA values for weeks and its throughput recently fell below the 50,000-samples/second threshold required for production. There are roughly 1,400 lines of Bash, Python, and C across several components \u2014 a C ingest daemon, a Python EMA engine, and Bash orchestration scripts \u2014 plus a growing log directory of historical metric files.",
+ "instruction_draft": "The metrics pipeline at /app has been flagged for two issues.\n\nPasted output from the nightly validation job:\n\n  WARN  channel=temp   ema_final=47.231  expected_range=[52.1, 53.9]  FAIL\n  WARN  channel=temp   ema_final=47.231  expected_range=[52.1, 53.9]  FAIL\n  INFO  channel=pressure  ema_final=1.013   expected_range=[0.98, 1.02]  PASS\n  PERF  throughput=31,204 sps  required=50000  FAIL\n\nYour goal:\n\n1. The EMA engine must produce numerically correct results. For every channel, the final EMA value written to /app/output/metrics_summary.json must agree with the correct closed-form EMA recurrence to within an absolute error of 1e-4. The recurrence is: EMA_n = alpha * x_n + (1 - alpha) * EMA_{n-1}, where alpha = 2 / (window + 1) and EMA_0 = x_0 (the first sample, not zero).\n\n2. The pipeline must sustain at least 50,000 samples per second as measured by the benchmark script at /app/bench/run_bench.sh, which writes its result to /app/bench/throughput.txt as a single integer (samples per second).\n\n3. The file /app/output/metrics_summary.json must exist after running /app/run_pipeline.sh and must contain a JSON object mapping each channel name to its final EMA value (a float) and the sample count (an integer), e.g.: {\"temp\": {\"ema\": 52.87, \"count\": 10000}, ...}.\n\nInvestigate the codebase and logs to find and fix the root causes. Do not change the public interface of run_pipeline.sh or the JSON output schema.",
+ "requirements": [
+  "Running /app/run_pipeline.sh must produce /app/output/metrics_summary.json",
+  "Each channel's final EMA in metrics_summary.json must satisfy: |computed - correct| < 1e-4, where correct uses the recurrence EMA_n = alpha*x_n + (1-alpha)*EMA_{n-1}, alpha = 2/(window+1), EMA_0 = x_0",
+  "The benchmark /app/bench/run_bench.sh must write a value >= 50000 to /app/bench/throughput.txt",
+  "metrics_summary.json must contain both 'ema' (float) and 'count' (integer) for every channel present in the input data"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm; install gcc, make, python3-dev, bc via apt; numpy via pip",
+  "/app/src/ingest.c: ~300-line C daemon that reads raw CSV sample files from /app/data/raw/ and writes binary-packed records to /app/data/packed/; contains no bugs",
+  "/app/src/ema_engine.py: ~350-line Python EMA computation engine; BUG 1: initialises EMA_0 = 0.0 instead of EMA_0 = x_0 (first sample); this causes systematic underestimation that grows with the magnitude of the signal",
+  "/app/src/ema_engine.py: BUG 2 (interacting): the alpha computation uses window_size - 1 instead of window + 1 in the denominator (alpha = 2.0 / (window_size - 1)), which partially compensates BUG 1 on the 'pressure' channel (small values, large window) so pressure appears to PASS in the sample output, masking that alpha is wrong",
+  "/app/scripts/orchestrate.sh: ~200-line Bash orchestration; calls ema_engine.py via subprocess with a Python for-loop over channels; this serial loop is the throughput bottleneck; the script also sleeps 0.01s between channels 'for safety'",
+  "/app/bench/run_bench.sh: ~80-line Bash benchmark that generates 200,000 synthetic samples across 4 channels, runs the full pipeline, and measures elapsed time; writes integer samples-per-second to /app/bench/throughput.txt",
+  "/app/data/raw/: pre-seeded with 3 channels (temp: window=20, ~10,000 samples; pressure: window=100, ~10,000 samples; humidity: window=50, ~10,000 samples); temp values are in range [50,55] (large signal exposes BUG 1 strongly); pressure values are in range [0.98,1.02] (small signal, large window, BUG 1 and BUG 2 cancel approximately)",
+  "/app/output/: empty directory, created by run_pipeline.sh",
+  "/app/run_pipeline.sh: top-level entry point that calls ingest (pre-run, data already packed) then orchestrate.sh then formats JSON output",
+  "/app/logs/: 5 historical .log files with prior run metadata (~50 lines each, realistic noise)",
+  "/app/config/channels.conf: declares channel names and window sizes, read by ema_engine.py",
+  "The Makefile compiles ingest.c; compiled binary is at /app/bin/ingest",
+  "Total codebase: ~1,400 lines across 8 files"
+ ],
+ "internal_hint": "There are two interacting bugs. BUG 1: ema_engine.py initialises EMA with 0.0 instead of the first sample value. For channels with large absolute values (like temp ~52), this drags the EMA far below the true value. BUG 2: alpha uses (window_size - 1) in the denominator instead of (window + 1). For the pressure channel, window=100 is large and values are near 1.0, so the combined error of BUG 1 and BUG 2 nearly cancel, making pressure appear correct \u2014 so fixing only BUG 1 will cause pressure to fail (the alpha is now wrong and no longer compensating), revealing BUG 2. The throughput problem is separate: orchestrate.sh calls ema_engine.py serially per channel with a sleep 0.01 between channels, and the Python script re-reads the entire packed binary file on each invocation. The fix is to (a) remove the sleep, (b) process all channels in a single Python invocation (or use numpy vectorised operations), so the benchmark reaches \u226550,000 sps. A solver who only fixes BUG 1 will see pressure break and may think they've overcorrected; they need to also fix the alpha formula. A solver who only speeds up the pipeline but leaves the EMA wrong will fail the numerical checks.",
+ "trap": "Fixing only BUG 1 (EMA initialisation) makes temp pass but breaks pressure, because BUG 2 (wrong alpha denominator) was accidentally compensating for BUG 1 on that channel. The verifier generates fresh channels at verify time with varying window sizes and signal magnitudes, so a solver cannot hand-tune constants to pass the sample channels \u2014 the alpha formula must be correct. Additionally, the throughput check uses a fresh 200,000-sample benchmark run, so a solution that just pre-caches results without actually fixing the pipeline speed will fail.",
+ "tests": [
+  "Run /app/run_pipeline.sh; assert /app/output/metrics_summary.json exists and is valid JSON",
+  "For each of the 3 pre-seeded channels (temp, pressure, humidity): recompute the ground-truth EMA using the correct recurrence in a reference Python snippet; assert |json_value - ground_truth| < 1e-4",
+  "At verify time: generate 2 fresh synthetic channels with random window sizes (10\u2013200) and random signal ranges (e.g., [-100, 100] and [0.001, 0.01]); inject them into /app/data/raw/ and /app/config/channels.conf; re-run /app/run_pipeline.sh; assert both new channels satisfy |computed - correct| < 1e-4 using the correct recurrence",
+  "Run /app/bench/run_bench.sh; read /app/bench/throughput.txt; assert the integer value >= 50000",
+  "Assert metrics_summary.json contains 'ema' (float) and 'count' (integer >= 1) for every channel listed in /app/config/channels.conf"
+ ],
+ "verifier_knob": {
+  "name": "number_of_fresh_channels_at_verify_time",
+  "value": "2",
+  "effect": "Increasing to 4-6 fresh channels with more extreme window/magnitude combinations makes it harder to accidentally pass with a partially correct alpha; decreasing to 0 makes it easier (only pre-seeded channels tested, where BUG 2 compensation is observable)"
+ },
+ "expected_failure_modes": [
+  "Fixes EMA initialisation (BUG 1) but misses the wrong alpha denominator (BUG 2); pressure now fails the numerical check with the corrected BUG 1 since compensation is gone",
+  "Fixes both EMA bugs but does not address the throughput bottleneck; the benchmark still reports ~31,000 sps and fails the >= 50,000 threshold",
+  "Speeds up the pipeline by parallelising channel processing but introduces a race condition on the output JSON; sporadic failures on the count field",
+  "Notices the sleep and removes it, gaining some speed, but the per-channel subprocess invocation overhead remains; throughput reaches ~40,000 but not 50,000",
+  "Fixes alpha and initialisation for the visible channels by inspecting the log output, but the fix is not general (e.g., hard-codes window values); fails on the fresh verify-time channels with different window sizes"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "ema",
+  "numerical-correctness",
+  "throughput",
+  "two-interacting-bugs",
+  "bash",
+  "python"
+ ]
+}

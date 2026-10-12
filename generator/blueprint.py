@@ -155,10 +155,23 @@ Return only JSON: {{"scores": {{"clarity": n, "solvability": n, "verifiability":
 Accept only if every score is at least 3 and the average is at least 3.6."""
 
 
-def make_blueprint(spec: TaskSpec, concepts: str | None = None) -> tuple[Blueprint, float]:
+RETRY_SECTION = """
+
+## A previous blueprint for this spec was rejected
+Reason: {feedback}
+Write a substantially different task: a different system, failure and investigation path, not a
+rewording of the rejected one."""
+
+
+def make_blueprint(
+    spec: TaskSpec, concepts: str | None = None, feedback: str | None = None
+) -> tuple[Blueprint, float]:
     concepts = concepts if concepts is not None else novelty.concept_list()
+    prompt = BLUEPRINT_PROMPT.format(spec=spec.to_prompt(), concepts=concepts)
+    if feedback:
+        prompt += RETRY_SECTION.format(feedback=feedback)
     reply = chat(
-        BLUEPRINT_PROMPT.format(spec=spec.to_prompt(), concepts=concepts),
+        prompt,
         system=SYSTEM,
         max_tokens=6000,
         temperature=0.9,

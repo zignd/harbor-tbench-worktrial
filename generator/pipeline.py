@@ -46,6 +46,7 @@ from validator.lint import lint_task
 from validator.validate import validate_task
 
 MAX_REPAIRS = 2
+BLUEPRINT_TRIES = 2
 ORACLE_RUNS = 3
 EXPECTED_AUTHOR_USD = 3.0
 EXPECTED_CHECK_USD = 0.2
@@ -88,41 +89,67 @@ def _record(
     cand.history.append({"stage": stage, **result})
 
 
+def _rejection_feedback(decision: dict) -> str:
+    """Why a blueprint was rejected, phrased for the next attempt."""
+    parts = []
+    nov = decision["novelty"]
+    if nov["lexical_flags"]:
+        parts.append("it overlaps textually with: " + "; ".join(nov["lexical_flags"][:3]))
+    for v in (nov.get("judge") or {}).get("verdicts", []):
+        if v["verdict"] != "distinct":
+            parts.append(f"it is a {v['verdict']} of {v['ref_id']} ({v['reason']})")
+    if not decision["review"]["accepted"]:
+        scores = decision["review"].get("scores", {})
+        parts.append(f"the reviewer scored it {scores}: {decision['review'].get('reasons', '')}")
+    return "; ".join(parts)
+
+
 def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
-    budget.check(0.3)
-    t0 = time.monotonic()
-    bp, cost = make_blueprint(cand.spec)
-    cand.blueprint = bp
-    cand.save("spec.json", cand.spec.model_dump())
-    cand.save("blueprint.json", bp.model_dump())
-    _record(
-        ledger,
-        cand,
-        "blueprint",
-        {"slug": bp.slug, "predicted": bp.predicted_pass_rate},
-        cost,
-        t0,
-        cand.spec.spec_id,
-    )
-    t0 = time.monotonic()
-    decision = gate_blueprint(bp, cand.spec, novelty.gate_index(CANDIDATES_DIR, cand.cand_id))
-    cand.save("blueprint_gate.json", decision)
-    _record(
-        ledger,
-        cand,
-        "blueprint_gate",
-        {
-            "accepted": decision["accepted"],
-            "scores": decision["review"].get("scores"),
-            "novel": decision["novelty"]["novel"],
-        },
-        decision["cost_usd"],
-        t0,
-        cand.spec.spec_id,
-    )
-    if not decision["accepted"]:
-        cand.status = "rejected"
-    return decision["accepted"]
+    """Blueprint + review + novelty gate; one retry told why the first was rejected."""
+    index = novelty.gate_index(CANDIDATES_DIR, cand.cand_id)
+    # Our own earlier tasks go in the "must not resemble" list too: without them, specs in
+    # unrelated domains drifted back to the same ledger-reconciliation idea.
+    concepts = novelty.concept_list(index)
+    feedback = None
+    for attempt in range(1, BLUEPRINT_TRIES + 1):
+        budget.check(0.3)
+        t0 = time.monotonic()
+        bp, cost = make_blueprint(cand.spec, concepts, feedback=feedback)
+        cand.blueprint = bp
+        cand.save("spec.json", cand.spec.model_dump())
+        cand.save("blueprint.json", bp.model_dump())
+        _record(
+            ledger,
+            cand,
+            "blueprint",
+            {"slug": bp.slug, "predicted": bp.predicted_pass_rate, "attempt": attempt},
+            cost,
+            t0,
+            cand.spec.spec_id,
+        )
+        t0 = time.monotonic()
+        decision = gate_blueprint(bp, cand.spec, index)
+        cand.save("blueprint_gate.json", decision)
+        _record(
+            ledger,
+            cand,
+            "blueprint_gate",
+            {
+                "accepted": decision["accepted"],
+                "scores": decision["review"].get("scores"),
+                "novel": decision["novelty"]["novel"],
+                "attempt": attempt,
+            },
+            decision["cost_usd"],
+            t0,
+            cand.spec.spec_id,
+        )
+        if decision["accepted"]:
+            return True
+        cand.save(f"blueprint_rejected_{attempt}.json", {"blueprint": bp.model_dump(), **decision})
+        feedback = _rejection_feedback(decision)
+    cand.status = "rejected"
+    return False
 
 
 def stage_author(

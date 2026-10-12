@@ -120,10 +120,48 @@ def uniqueness(texts: list[str]) -> dict:
     }
 
 
-def novelty_report(named_texts: dict[str, str], index: Index | None = None) -> list[dict]:
+def novelty_report(
+    named_texts: dict[str, str], index: Index | None = None, examples: Index | None = None
+) -> list[dict]:
+    """Per task: nearest published TB task, max/mean cosine per TB set, and vs `examples/`."""
     index = index or default_index()
     rows = []
     for name, text in named_texts.items():
         ref, score = index.nearest(text, k=1)[0]
-        rows.append({"task": name, "nearest_reference": ref.ref_id, "cosine": round(score, 3)})
+        by_set: dict[str, list[float]] = {}
+        for r, c in zip(index.refs, index.cosine_all(text), strict=True):
+            by_set.setdefault(r.ref_id.split("/")[0], []).append(c)
+        row = {
+            "task": name,
+            "nearest_reference": ref.ref_id,
+            "cosine": round(score, 3),
+            "by_set": {
+                k: {"max": round(max(v), 3), "mean": round(sum(v) / len(v), 3)}
+                for k, v in sorted(by_set.items())
+            },
+        }
+        if examples is not None:
+            ex, ex_score = examples.nearest(text, k=1)[0]
+            row["nearest_example"] = ex.ref_id
+            row["example_cosine"] = round(ex_score, 3)
+        rows.append(row)
     return rows
+
+
+def difficulty_spread(blueprints: list[dict], observed: list[float]) -> dict:
+    """Intended difficulty (blueprint label, predicted pass rate) vs what Opus showed."""
+    predicted = sorted(b["predicted_pass_rate"] for b in blueprints if b)
+
+    def quartiles(xs: list[float]) -> list[float]:
+        if not xs:
+            return []
+        return [round(xs[min(len(xs) - 1, int(q * len(xs)))], 2) for q in (0, 0.25, 0.5, 0.75)] + [
+            round(xs[-1], 2)
+        ]
+
+    bins = Counter(f"{x:.2f}" for x in observed)
+    return {
+        "labels": dict(Counter(b["difficulty"] for b in blueprints if b)),
+        "predicted_pass_rate_quartiles": quartiles(predicted),
+        "observed_pass_rate_bins": dict(sorted(bins.items())),
+    }

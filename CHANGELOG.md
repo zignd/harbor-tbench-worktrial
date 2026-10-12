@@ -4,6 +4,20 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:05 -03:00 · Self-duplication caught; blueprint retry; report gains per-batch, novelty-layer and difficulty sections
+- **Finding:** the novelty judge rejected 2 of 8 official blueprints as **variants of our own Phase 0 task** (`ledger-reconcile`). One was a data-processing/SQLite spec ("ledger-aggregation-pipeline-drift"), the other a networking/algorithmic spec ("settlement-aggregator-consistency-bug"). Sonnet drifts toward ledger reconciliation even when the spec points elsewhere. The self-dedup layer (our candidates indexed next to the 425 published tasks) is what caught it. Without it, two near-copies would have reached Opus.
+- **Why it cost two batch slots:** a rejected blueprint ended the candidate, while the plan said a reject should resample. Resampling the spec is the wrong fix, since the spec was fine and the *idea* drifted. Now:
+  1. Our own earlier tasks are listed in the blueprint prompt's "must not resemble" section (they were only in the gate).
+  2. A rejected blueprint gets **one retry** with the reason (judge verdicts, lexical overlaps, review scores), saved as `blueprint_rejected_<n>.json`. ~$0.13 per retry vs ~$4 for a full build that a later gate would throw away.
+
+  The two rejected candidates were relaunched under the new logic. Their first rejections are kept as `blueprint_rejected_0.json`.
+- **Report** (`analysis/report.py`, `analysis/diversity.py`):
+  - **per batch:** candidates, gated, learnable, red-team hackable rate, USD.
+  - **novelty rejects per layer:** blueprint lexical / blueprint judge / package lexical / package judge. So far 7 blueprints and 2 packages checked, 2 judge rejects.
+  - **per shipped task:** max cosine per TB set plus the nearest of `examples/`.
+  - **difficulty spread:** blueprint labels, predicted pass-rate quartiles, observed pass rates. Every blueprint so far is labelled "hard" with predicted p 0.25-0.4, while the only calibrated task was observed at 1.0. That's the gap calibration and the tuner exist to close.
+- 109 tests pass.
+
 ### 19:02 -03:00 · Candidates build in parallel (the throughput bottleneck)
 - **Bottleneck:** `run_batch` built one candidate at a time. A Sonnet authoring run takes 25-45 min (up to 80 turns) and is API-bound: its container idles at 0-1% CPU. Two batch processes gave ~2-3 candidates per hour, so the ~25 candidates still needed would have taken 10+ h. Spend was never the limit ($21 of $380).
 - **`run_batch --workers N`** (default 3) builds candidates on a thread pool. Each candidate still runs its stages in order. CPU-heavy work (oracle runs, Opus trials) stays bounded by the gates' and calibrator's own concurrency.

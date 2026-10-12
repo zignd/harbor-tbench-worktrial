@@ -11,6 +11,7 @@ import json
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from analysis.curtailment import table as curtailment_table
 from analysis.diversity import coverage, novelty_report, uniqueness
 from analysis.human_likeness import stylometrics
 from analysis.ledger import Ledger
@@ -117,6 +118,21 @@ def calibration_stats(rows: list[dict]) -> dict:
     }
 
 
+def _cand_for(slug: str) -> str | None:
+    for d in CANDIDATES_DIR.glob("official-*"):
+        bp = _load(d / "blueprint.json")
+        if bp and bp.get("slug") == slug:
+            return d.name
+    return None
+
+
+def _mean_style(rows: dict) -> dict:
+    if not rows:
+        return {}
+    keys = next(iter(rows.values())).keys()
+    return {k: round(sum(r[k] for r in rows.values()) / len(rows), 1) for k in keys}
+
+
 def build() -> dict:
     assert_official_models()
     ledger = Ledger()
@@ -146,6 +162,16 @@ def build() -> dict:
             "shipped": {p.name: stylometrics(p) for p in shipped},
         },
         "shipped": [p.name for p in shipped],
+        "curtailment": curtailment_table(),
+        "quality_examples": _load(REPORTS_DIR / "quality_examples.json"),
+        "quality_shipped": {
+            p.name: _load(CANDIDATES_DIR / c / f)
+            for p in shipped
+            for c in [_cand_for(p.name)]
+            if c
+            for f in sorted(x.name for x in (CANDIDATES_DIR / c).glob("quality_a*.json"))[-1:]
+        },
+        "discrimination": _load(REPORTS_DIR / "discrimination.json"),
         "candidates": [
             {k: r[k] for k in ("id", "status")}
             | {
@@ -226,6 +252,66 @@ def to_markdown(rep: dict) -> str:
     lines += [
         f"- {r['task']}: {r['nearest_reference']} (cosine {r['cosine']})" for r in rep["novelty"]
     ]
+    lines += [
+        "",
+        "## Cost-efficient evaluation (stretch A)",
+        "",
+        "Expected Opus trials per task (exact over all 2^5 sequences):",
+        "",
+        "| true p | P(in band) | exact curtailment | saved | 0/3 early reject | saved | recall |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    lines += [
+        f"| {r['p']} | {r['p_in_band']} | {r['expected_trials']} | {r['saved_pct']}% | "
+        f"{r['aggressive_trials']} | {r['aggressive_saved_pct']}% | {r['aggressive_recall']} |"
+        for r in rep["curtailment"]
+    ]
+    lines += [
+        "",
+        (
+            "Exact curtailment is lossless; the 0/3 early reject loses learnable tasks at low p, "
+            "so it is reported, not used."
+        ),
+        "",
+        "## Human-likeness (stretch D)",
+        "",
+    ]
+    qe = rep.get("quality_examples") or {}
+    if qe:
+        lines += [
+            "`harbor check` with the same 16-criterion rubric (passes / criteria):",
+            "",
+            "| Task | Set | Passed | Blocking failures |",
+            "|---|---|---|---|",
+        ]
+        for name, q in qe.items():
+            n_pass = sum(v == "pass" for v in q["outcomes"].values())
+            lines.append(
+                f"| {name} | example | {n_pass}/{len(q['outcomes'])} | "
+                f"{len(q['blocking_failures'])} |"
+            )
+        for name, q in (rep.get("quality_shipped") or {}).items():
+            if q:
+                n_pass = sum(v == "pass" for v in q["outcomes"].values())
+                lines.append(
+                    f"| {name} | generated | {n_pass}/{len(q['outcomes'])} | "
+                    f"{len(q['blocking_failures'])} |"
+                )
+    st = rep["stylometrics"]
+    lines += [
+        "",
+        f"Mean stylometrics, examples: {_mean_style(st['examples'])}",
+        f"Mean stylometrics, shipped: {_mean_style(st['shipped'])}",
+    ]
+    d = rep.get("discrimination")
+    if d:
+        lines += [
+            "",
+            (
+                f"Blinded 'which is human-written?' test: accuracy {d['accuracy']:.0%} over "
+                f"{len(d['pairs'])} pairs (50% = indistinguishable)."
+            ),
+        ]
     return "\n".join(lines) + "\n"
 
 

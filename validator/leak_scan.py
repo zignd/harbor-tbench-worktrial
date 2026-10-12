@@ -63,9 +63,12 @@ def scan(task_dir: Path, tag: str) -> dict:
     Returns {built, leaks (blocking), notes (non-blocking), tokens_checked}.
     """
     task_dir = Path(task_dir)
-    build = _docker("build", "-q", "-t", tag, str(task_dir / "environment"))
+    build = _docker("build", "--progress=plain", "-t", tag, str(task_dir / "environment"))
     if build.returncode != 0:
-        return {"built": False, "error": build.stderr[-2000:], "leaks": [], "tokens_checked": 0}
+        # Keep the failing step's own output (plain progress), not just BuildKit's summary.
+        lines = [ln for ln in build.stderr.splitlines() if ln.strip()]
+        error = "\n".join(lines[-60:])[-4000:]
+        return {"built": False, "error": error, "leaks": [], "tokens_checked": 0}
     try:
         kinds = distinctive_tokens(task_dir)
         tokens = sorted(kinds)

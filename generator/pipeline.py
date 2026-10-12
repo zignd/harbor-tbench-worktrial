@@ -185,7 +185,7 @@ def gate_static(task_dir: Path, tag: str) -> list[str]:
     if not problems:
         scan = leak_scan.scan(task_dir, tag)
         if not scan["built"]:
-            problems.append(f"docker build failed: {scan.get('error', '')[-600:]}")
+            problems.append(f"docker build failed:\n{scan.get('error', '')[-3500:]}")
         problems += [f"leak: {leak}" for leak in scan["leaks"]]
     return problems
 

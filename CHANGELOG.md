@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 18:07 -03:00 · Repair feedback now carries the real build error
+- Pilot candidate 1 failed the static gate: `docker build` died in the author's `setup_repo.sh`. The pipeline sent it to repair, but the feedback was only BuildKit's last 600 characters ("process … did not complete successfully: exit code 1"), which hid the actual cause.
+- **Fix:** the leak-scan build now uses `--progress=plain`, and the failure feedback keeps the last ~60 lines (≤3.5k chars) of the failing step's own output. For this task that reveals the real problem: `git commit` with **"nothing to commit"**, so the repo files were never written where the setup script expected.
+- The repair already in flight got the old, short message (its process loaded the earlier code). Future repairs get the full error.
+
 ### 18:07 -03:00 · Authoring cost, measured: levers helped input, bigger tasks cost more
 - Pilot candidate 1 (`rust-codec-deploy-regression`, a Rust codebase as the new size rule asks for) was authored in **80 turns (cap), 42 min, $3.86**.
   - Summarization fired twice and cut total input by 25% vs Phase 0 (3.82M vs 5.07M tokens).

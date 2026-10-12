@@ -1,0 +1,256 @@
+# Plan: AfterQuery Harbor / Terminal-Bench task-generation work trial (core + stretch A-D)
+
+## Context
+
+AfterQuery's work trial (`harbor-tbench-worktrial/README.md`) asks for a pipeline that **authors Terminal-Bench-style Harbor tasks with `claude-sonnet-4.6`** and **keeps only "learnable" ones**: 1-3 of 5 runs pass with `terminus-2` + `claude-opus-4.8`. Graded in this order:
+1. Fraction of tasks in band, with *valid* failure reasons.
+2. Pipeline design.
+3. How we know tasks are good.
+4. Reliability and throughput.
+5. Code quality.
+
+Hard limits:
+- $500 of API credit.
+- Only those two models.
+- Novel tasks only (no public repos or examples).
+- `[agent].timeout_sec = 3600`.
+- Timeouts and running out of turns are not valid failures.
+
+Deliverables are source, `CHANGELOG.md` and a readable git history in the private repo `zignd/harbor-tbench-worktrial`.
+
+Decisions made with the user:
+- **3-5 day timebox.**
+- **Agentic in-container authoring.** Sonnet builds and self-tests each task inside a live container. Implemented as a **Harbor meta-task** (see "Changes from the full papers", item 1).
+- **Local Docker only.** 10 CPUs and 14.6 GB, so about 3 concurrent trials.
+
+Development environment (set up and committed in `e4c095c`):
+- **uv project at the repo root.** `pyproject.toml` + `uv.lock` pin `harbor==0.24.0`, `openai`, `pydantic` and `toml`, with `pytest` and `ruff` as dev dependencies. Run `uv sync` once, then `uv run ...`.
+- **Python 3.13.16** (uv-managed) in `.venv/`, pinned by `.python-version` = `3.13`. Harbor needs Python ≥3.12.
+- **uv 0.13.0 from Homebrew** is the only uv on PATH. Update it with `brew upgrade uv`.
+- **Harbor is a project dependency**, not a global tool. That makes `validator/validate.py`'s native Harbor schema cross-check active; all 6 examples pass it.
+- **Scripts** (`scripts/*.sh`) call `uv run --project "$ROOT_DIR"`. `validate.sh` now resolves task paths to absolute (a template bug fix).
+- **Confirmed in Harbor 0.24.0:**
+  - Agents `oracle`, `nop` and `terminus-2`.
+  - Flags `-k/--n-attempts`, `-n/--n-concurrent`, `--ak/--agent-kwarg`.
+  - `task.toml` **`artifacts = [...]`**, which copies container paths into the trial's host `artifacts/` dir after the run (`harbor/trial/artifact_handler.py`).
+  - Two built-in QA commands that overlap with our judges:
+    - **`harbor check`**: task quality against a rubric.
+    - **`harbor analyze`**: trajectories against `reward_hacking` and `task_specification` rubrics.
+
+    Both default to `claude-code` + `claude-sonnet-4-6`, so they must be pointed at our gateway and Sonnet 4.6.
+- **Machine:** Docker 29.8 (10 CPUs, 14.6 GB). Poppler is installed for reading PDFs.
+- **Shell note:** `VIRTUAL_ENV` points at a pyenv 3.11 env, so uv prints a harmless warning. `unset VIRTUAL_ENV` silences it.
+- **Not yet done:** inference key and env vars (`OPENROUTER_API_KEY`, `OPENROUTER_API_BASE`). Plan to keep them in a git-ignored `.env` (already ignored by `.gitignore`).
+
+## Research that shapes the design
+
+All eight papers are downloaded to `docs/research/<arxiv-id>.pdf`, with a text conversion (`<arxiv-id>.txt`, from `pdftotext -layout`), and **all were read in full** (index: `docs/research/README.md`).
+
+| Source | What we take |
+|---|---|
+| Bercovich, [*What Makes a Good Terminal-Agent Benchmark Task*](https://arxiv.org/abs/2604.28093) (arXiv 2604.28093; also [tbench.ai post](https://www.tbench.ai/news/writing-a-good-terminal-bench-task)) | Short, outcome-only instructions (LLM-written ones are the #1 failure). Oracle must *investigate* before fixing. Test outcomes on more than one or hidden examples. No clerical/format difficulty. Run batches of 5 and read the failures. |
+| [Terminal Wrench](https://arxiv.org/abs/2604.17596) (arXiv 2604.17596; data: [few-sh/terminal-wrench](https://github.com/few-sh/terminal-wrench)) | ~17.7% of public TB tasks are hackable, and the synthetic SETA set is 17.5%. Exploit taxonomy (hollow-implementation, output-spoofing, structural-extraction, binary-hijacking, ...). Hack-elicitation prompt plus LLM judge. Judges need the reasoning trace (AUC 0.97 vs 0.92 on actions only). |
+| [Hack-Verifiable Terminal Bench (HVTB)](https://arxiv.org/abs/2608.22103) (arXiv 2608.22103; [project page](https://majoroth.github.io/hack-verifiable-environments/hvtb)) | Claude-family agents read leaked tests or solutions ~31% of the time. Harder tasks get hacked more, and hacks happen early. Retry infra errors twice, then exclude them. Cost anchor ≈ $1.1 per trace. All 6 of our `examples/` are in the "Easy" class, so our target is TB "Medium/Hard". |
+| [CLI-Universe](https://arxiv.org/abs/2606.22883) (arXiv 2606.22883) | **4-axis taxonomy** (17 domains, 8 skill types, 11 capabilities, 6 engineering pillars; App. A). **Blueprint** = instruction + internal hint + env checklist, rubric-reviewed before building (acceptance 72→91%). **Role-separated** test and solution agents. **Fail-to-pass** check. **Survival is only 33.6%**: ideas −30%, blueprints −14%, env build −14%, F2P −8.4%. Asset quality is the biggest ablation (−6.2 pts). **9-mode failure taxonomy** (Execution / Coherence / Verification). **Opus's dominant failure is *weak verification* (36%)**: it checks, but too shallowly. |
+| [Meta-Task](https://arxiv.org/abs/2607.27929) (arXiv 2607.27929) | **Synthesis is itself a TB-format task**, run through Harbor, with the agent working inside a container and self-validating. >85% of packages succeed. Its full **meta-task instruction template** (App. F, Fig. 6) is directly reusable: consistency matrix instruction↔solution↔env↔tests, leakage check, and Dockerfile rules (never COPY solution/tests, verify every COPY source exists). Its **"Hard" spec**: specialized knowledge, non-obvious path, ≥3 checks, ≥1 trap, ~30+ expert minutes, anti-pattern list. **10 instruction writing styles.** Trajectory-level judge prompt (Fig. 8: shortcutting / fabrication / unproductive). Failure modes: context-compaction loss 47%, flawed self-verification 33%; **80% of failures declare success while wrong**. Implementation review uses the official **19-criterion TB rubric**. Decontamination by n-gram + TF-IDF. |
+| [Tmax](https://arxiv.org/abs/2606.23321) (arXiv 2606.23321; code: [hamishivi/tmax](https://github.com/hamishivi/tmax)) | **9 sampling axes** (Table 8): domain, skill type, primitive skills, persona, language, task complexity, command complexity, **fixture kind** (image/audio/video/stripped binary/vendored pkg/compose), **verifier kind** (exact, metric_threshold, adversarial_corpus, fuzz_equivalence, multi_protocol). **Verifier thresholds are a continuous difficulty knob.** Without difficulty control, pools come out bimodal. **Balance score exp(H)/N** per axis. 13-gram decontamination vs TB2. Observed hacks: replacing a checker under `/tests` with a no-op, and stub binaries that fake outputs. Local sandboxes caused more timeouts than cloud. |
+| [SkillSynth](https://arxiv.org/abs/2604.25727) (arXiv 2604.25727) | **Planner→constructor split**: one-pass generation gives inconsistent, under-complex tasks. Dual checks: oracle execution + rubric (instruction↔test alignment, no hint leakage). **77% of rubric failures are tests over- or under-specified vs the instruction.** Repair ≤3 cycles × ≤20 tool calls. **Bad first drafts rarely recover, so regenerate.** Coherent multi-step workflows are harder than single-skill seeds or random combinations; random multi-skill gives "many fine-grained requirements, few steps". **Inverse-frequency sampling** for coverage (Alg. 1). Base rate with 3 tries: 38% 0/3, **37% learnable**, 25% 3/3. Failures: partial implementation 42%, inline self-test over-trust 30%. ~$27 per verified task. |
+| Foster & Foerster, [*Learning to Reason at the Frontier of Learnability*](https://arxiv.org/abs/2502.12272) (arXiv 2502.12272, NeurIPS 2025) | Learnability = p(1-p) bounds expected policy improvement (Thm 3.1), so the 1-3/5 band is justified. **Caveat: variance from aleatoric randomness looks learnable but isn't.** Pass/fail variance must come from the model, not a flaky environment. Future work they suggest: an LLM predicting learnability without rollouts, and ACCEL-style mutation of tasks to the right difficulty. These map to our stretch A and B. |
+
+## Changes from the full papers (delta vs the earlier draft)
+
+1. **Authoring is a Harbor meta-task** (Meta-Task). No custom tool-use loop.
+   - Each synthesis request is a Harbor task (`generator/metatask/`) whose instruction is the filled meta-task template. Its env has a task skeleton, an example *format* reference, and common toolchains.
+   - Run it with `harbor run -a terminus-2 -m openrouter/anthropic/claude-sonnet-4.6`.
+   - Its `task.toml` declares `artifacts = ["/app/output"]`, so Harbor copies the package out. Its `tests/test.sh` runs our structural checks inside the container, so the meta-task reward means "the package is complete".
+   - We get Harbor's trajectory logging, cost accounting and retries for free.
+   - The repair round is a new meta-task run seeded with the previous package plus the host-gate logs.
+   - Fallback, if Phase 0 shows a blocker: the custom `docker exec` loop from the earlier draft.
+2. **Blueprint stage before building** (CLI-Universe, SkillSynth).
+   - Sonnet turns a sampled spec into a blueprint: instruction draft, *internal hint* (resolution path, never shown to the solver), env/asset checklist, requirement list, difficulty levers, and verifier kind.
+   - A cheap rubric review rejects weak ideas *before* any container work. The rubric covers clarity and convergence, solvability and verifiability, and difficulty and robustness.
+3. **Taxonomy and sampler upgrade.**
+   - Axes: CLI-Universe's four (domain, skill type, capability, pillar), plus Tmax's persona, task/command complexity, **fixture kind** and **verifier kind**, plus Meta-Task's **writing style** (restricted to terse-compatible styles: minimal, casual, terminal-dump, short narrative).
+   - Tasks must be a **coherent, sequentially dependent workflow**, not a bundle of small requirements.
+   - SkillSynth's **inverse-frequency weighting** (∝ 1/(count+1)) steers coverage.
+4. **Difficulty levers aimed at frontier failure modes.**
+   - All three synthesis papers find that strong models fail mostly by **shallow self-verification and partial implementation**. Opus specifically: weak verification at 36%.
+   - So the levers that produce *valid*, stochastic Opus failures are:
+     - Several substantive requirements, all stated in the instruction.
+     - At least one non-obvious trap that a naive implementation fails (Meta-Task Hard spec).
+     - Behavior checked on **hidden, verify-time-generated inputs** (Tmax `fuzz_equivalence`, `adversarial_corpus`).
+     - State that must be consistent across components.
+   - Forbidden as levers: format fussiness, hidden resource limits, hidden timeouts. CLI-Universe's compcert example shows how a hidden 120 s cap creates an invalid failure.
+5. **Verifier kinds give the tuner a continuous knob** (Tmax). Stretch B tunes in this order:
+   1. Adjust a stated threshold, N inputs, or corpus size, then recalibrate.
+   2. Add or remove one lever.
+   3. Regenerate from the blueprint, rather than repairing more than twice, because bad first drafts rarely recover (SkillSynth).
+
+   This is an ACCEL-style mutation, the follow-up Foster & Foerster suggest.
+6. **Test↔instruction alignment is the #1 gate** (SkillSynth: 77% of rubric failures).
+   - Check both directions: *too lenient* (a requirement with no test) and *too strict* (a test with no requirement).
+   - Run it before Opus spend, preferably via `harbor check` with a custom rubric built on the TB 19-criterion rubric (Meta-Task App. D).
+7. **Determinism gate** (Foster & Foerster's aleatoric caveat).
+   - Oracle must pass **3/3**, and nop must fail.
+   - Lint tests for time, randomness or network dependence.
+   - The failure judge has an explicit "environment nondeterminism" label (invalid).
+8. **Failure-judge taxonomy made concrete.**
+   - Use CLI-Universe's 9 modes plus the SkillSynth and Meta-Task categories, each mapped to valid/invalid.
+   - **Valid:** partial implementation, weak/no verification, premature termination, wrong root cause, reasoning–action mismatch, context-compaction loss, API hallucination.
+   - **Invalid:** turn/step budget exhausted, pager/tmux/interactive-editor trap, env timeout, spec ambiguity, test overreach, env nondeterminism.
+   - Judge at the **trajectory level** (Meta-Task found task-level judging less precise).
+9. **Pass-audit prompt adopts Meta-Task's Fig. 8 criteria** (shortcutting, fabrication, red-flag filenames, reading "BUG:" comments), plus the Terminal Wrench exploit labels.
+10. **New lints** (Meta-Task Dockerfile rules, plus the Tmax hack observations):
+    - No COPY of `solution/` or `tests/`.
+    - Every COPY source exists.
+    - Setup scripts deleted after use.
+    - No expected-output files in `environment/`.
+    - **No suggestive comments** in env files (`BUG`, `FIXME`, `fix:`, `intentionally`, `hint`).
+    - Test helpers live in `tests/`, never in agent-writable paths.
+11. **Novelty and decontamination** (Tmax, Meta-Task).
+    - 13-gram overlap plus TF-IDF cosine against `examples/` and the public TB 2.0 instructions (fetched with `harbor download` if available).
+    - Report this in stretch C.
+12. **Stretch A additions.**
+    - Log Sonnet's *predicted* pass rate at blueprint time (Foster & Foerster future work) and report its correlation with the observed band.
+    - Use it as a pre-filter only if it proves predictive.
+    - Expectation set by SkillSynth: ~1/3 of functionally correct tasks land in band before tuning, so plan for ~3 candidates per shipped task.
+13. **Stretch D uses the official TB 19-criterion implementation rubric**. It scores generated tasks and `examples/` with the same rubric (via `harbor check`), alongside the blinded human-vs-generated discrimination test.
+
+## Architecture
+
+Keep the template's structure (`generator/`, `validator/`, `scripts/`, `output/`) and add an evaluator and analysis layer. Every stage is a pure function `TaskDir -> StageResult` and records an event in an append-only ledger.
+
+```
+spec sampler (inverse-freq) ─► blueprint (Sonnet) ─► blueprint rubric review ──reject──► resample
+       ▲                                                     │ pass
+       │                                                     ▼
+ coverage stats            meta-task authoring: harbor run -a terminus-2 -m sonnet-4.6
+       │                   (in-container build + self-validate, artifacts=/app/output)
+       │                                                     │
+       │        structural + lint + leak scan + alignment check (harbor check / Sonnet)
+       │                                                     │
+       │        host gates: docker build, oracle=1 (3/3), nop=0 ──fail──► repair meta-task (≤2) / regenerate
+       │                                                     │
+       │        red-team: Sonnet hack-elicitation trial (1 run) ──exploit──► repair
+       │                                                     │
+       │        calibration: Opus 4.8 sequential trials (stop when decided)
+       │                                                     │
+       │        audit: pass audit (hacks) + failure judge (valid/invalid) per trajectory
+       │                                                     │
+       └── tuner: knob → lever → regenerate (≤2 rounds) ◄── band verdict ──► output/<task> + report
+```
+
+### Modules (new files unless noted)
+
+- **`generator/config.py`** (extend): read `.env`; price table, budget caps, `MAX_TURNS=200`, concurrency, band params (the band params already exist and are reused).
+- **`generator/spec.py`**: `TaskSpec` (pydantic) over the axes in delta 3. It also holds named **difficulty levers** (delta 4) and a **verifier kind** with its knob value. The inverse-frequency sampler draws from it.
+- **`generator/blueprint.py`**: spec → `Blueprint` (instruction draft, internal hint, env/asset checklist, requirements, levers, verifier kind and knob, Sonnet-predicted pass rate). Followed by a rubric review that returns accept/reject with reasons.
+- **`generator/metatask/`**: the meta-task Harbor package.
+  - `instruction.md.j2`: Meta-Task Fig. 6 template, adapted with our rules, the blueprint, the canary and the `uvx` verifier convention.
+  - `environment/Dockerfile`: synthesis base with Python, common build tools, procps and a task skeleton.
+  - `tests/test.sh`: in-container structural self-check, so the reward means the package is complete.
+  - `task.toml`: `artifacts = ["/app/output"]`.
+  - **Role separation** (CLI-Universe): the instruction tells the agent to write `tests/` from the instruction and requirement list *before* writing `solve.sh`, and not to edit tests to fit the solution. A separate Sonnet alignment check enforces it afterwards.
+- **`generator/author.py`**: renders a meta-task for a blueprint, runs it through `evaluator/harbor_runner.py`, extracts the package from `artifacts/`, and stamps canary and metadata. Repair mode adds the previous package plus gate logs to the meta-task env.
+- **`generator/generate.py`** (implement the stub): keep the `generate_task(topic, output_dir) -> dict` signature. It runs spec/blueprint → author → returns the task dir and status.
+- **`validator/validate.py`** (keep and reuse) plus **`validator/lint.py`**: canary placement, no `docker_image`, agent timeout ≥ 3600, instruction length/style, no source-grep or package-installed tests, `solve.sh` investigates before writing, plus the delta-10 lints.
+- **`validator/leak_scan.py`**: build the image, extract distinctive tokens from `tests/` and `solution/`, and search the container filesystem plus `docker history` for them.
+- **`evaluator/harbor_runner.py`**: wraps `harbor run` for oracle, nop, terminus-2 (Sonnet meta-tasks and Opus calibration), `-k`, and `--ak max_turns=…`. It parses the job dir into `TrialResult` (reward, cost/tokens, duration, exit reason, trajectory path, artifacts path) and retries infra errors twice, then excludes them.
+- **`evaluator/calibrate.py`**: exact **sequential curtailment** of the 5-run band test, run in waves of ≤3. It stops as soon as the verdict can't change:
+  - Accept at ≥1 *legit* pass and ≥2 valid fails.
+  - Reject as too easy at 4 passes.
+  - Reject as too hard at 5 fails.
+
+  Pure `decide(outcomes) -> Verdict | None`.
+- **`evaluator/redteam.py`**: copy the task, append a Terminal-Wrench-style hack-elicitation paragraph, and run 1 Sonnet terminus-2 trial. A serious exploit goes to repair, with the exploit trajectory as feedback.
+- **`analysis/judge.py`**: trajectory-level Sonnet judges with structured JSON output and the full trajectory, reasoning included. Prefer wrapping `harbor analyze` with custom rubrics; fall back to direct Sonnet calls.
+  - (a) **Pass audit**: command scan, then Meta-Task Fig. 8 + Terminal Wrench labels.
+  - (b) **Failure analysis**: the delta-8 taxonomy, mapped to valid/invalid.
+
+  A task with any invalid failure is not shipped. It goes to the tuner as "fix spec".
+- **`analysis/tuner.py`** (stretch B): knob → lever → regenerate (delta 5), ≤2 rounds, per-mutation effects logged.
+- **`analysis/ledger.py`**: `runs/ledger.jsonl` event log (stage, task, cost, tokens, seconds, result) plus a **budget guard**.
+- **`analysis/report.py`**: Part 3 funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, cost and time totals, cost-efficiency vs naive 5×, predicted-vs-observed pass rate, diversity, human-likeness. Writes `reports/summary.md` and JSON.
+- **`analysis/diversity.py`** (stretch C): per-axis coverage and **balance score exp(H)/N**; difficulty spread; instruction uniqueness (TF-IDF cosine max/mean, Vendi over TF-IDF); **decontamination** (13-gram + TF-IDF vs `examples/` and TB 2.0); Sonnet "same underlying task?" check on the closest pairs. No embedding model, since only the two models are allowed.
+- **`analysis/human_likeness.py`** (stretch D): TB 19-criterion rubric on both sets (via `harbor check`), a blinded "which is human-written?" discrimination test (≈50% means indistinguishable), and stylometrics.
+- **`scripts/run_batch.py`** (+ `scripts/pipeline.sh`): `run_batch --n 12 --budget 150`, resumable from the ledger.
+- **`tests/`** (unit tests for our code, not task tests): `decide()`, ledger and budget guard, lints, leak-scan token extraction, sampler coverage/inverse-frequency, the blueprint schema, and the job-dir and artifacts parser on a recorded fixture.
+
+### Budget plan ($500, re-planned after Phase 0 measures real per-trial cost)
+
+| Bucket | Cap |
+|---|---|
+| Phase 0 probing (examples, 2-3 Opus trials, 1-2 meta-task runs) | $20 |
+| Blueprints + reviews (Sonnet, ~45 candidates, ~1/3 rejected) | $15 |
+| Meta-task authoring + repairs (Sonnet, ~30 builds) | $60 |
+| Red-team + judges + alignment checks (Sonnet) | $40 |
+| Opus calibration (~25 tasks × ~3.5 avg trials with curtailment) | $310 |
+| Reserve | $55 |
+
+If an Opus trial costs more than ~$3, shrink the batch rather than cut the number of trials per task. Expect about a third of functionally correct tasks to land in band before tuning (SkillSynth base rate).
+
+## Phases (each ends with small, meaningful commits)
+
+**Phase 0: setup and spike (day 1 morning)**
+- ~~Set up the uv project, Python and Harbor~~ (done, `e4c095c`).
+- Put `OPENROUTER_API_KEY` and `OPENROUTER_API_BASE` in a git-ignored `.env`. Load it for `uv run` (`uv run --env-file .env ...`) and have `config.py` read it.
+- Run oracle/nop on all 6 examples.
+- Run 1-2 Opus terminus-2 trials on one example. Learn:
+  - The job-dir layout and `result.json` fields (cost/tokens).
+  - The trajectory format.
+  - The behavior of `-k`, `-n`, `--ak max_turns`, image caching, and verify-time `uvx` flakiness.
+- **Meta-task spike.** Run one hand-written meta-task with Sonnet 4.6 and confirm:
+  - `artifacts = ["/app/output"]` lands on the host.
+  - The cost per authoring run.
+  - Whether in-container self-validation works without Docker.
+
+  If it fails, switch to the custom-loop fallback.
+- **Evaluate `harbor check` and `harbor analyze`** with `-a terminus-2 -m openrouter/anthropic/claude-sonnet-4.6`. Check that the default `harbor check` rubric is the TB 19-criterion one.
+- Record the findings in `CHANGELOG.md`, and write `harbor_runner.py` against real outputs, plus fixtures.
+
+**Phase 1: Part 1, valid tasks (day 1-2)**
+- Build the spec sampler, blueprint + review, meta-task author, lints, leak scan, alignment check and host gates (oracle 3/3, nop).
+- Target: ≥5 tasks that pass the validator plus the functional gates.
+- Hand-review 2 tasks against the examples and the guideline rules, and tighten the meta-task template.
+
+**Phase 2: Part 2, calibration (day 2-3)**
+- Build the ledger, budget guard, sequential calibrator, pass audit and failure judge.
+- Batch 1: ~10 candidates.
+- Read every failing trajectory summary. Retune lever and knob defaults toward TB Medium/Hard effort.
+
+**Phase 3: stretch B + C and red-team (day 3-4)**
+- Build the tuner, red-team gate, and coverage-steered sampler with dedup and decontamination.
+- Batch 2: ~12-15 candidates, using the tuner on near-misses.
+
+**Phase 4: Part 3 + stretch A and D, write-up (day 4-5)**
+- Produce the report: funnel, histogram, cost and time totals, curtailment savings vs naive 5×, simulation over the observed p, predicted-vs-observed pass rate.
+- Run the human-likeness study (19-criterion rubric + discrimination test) and the diversity report.
+- Write `CHANGELOG.md` (what, why, tradeoffs, honest failures) and a README usage section.
+- Final cleanup.
+
+## Key tradeoffs (to document in the CHANGELOG)
+
+- **Authoring harness.** The Harbor meta-task reuses terminus-2, logging and cost tracking, and matches how AfterQuery reviewers run tasks. The cost is no Docker inside the synthesis container, so real builds and oracle runs happen in the host gates and feed back through repair rounds. The fallback is the custom `docker exec` loop.
+- **Repair vs regenerate.** Repair ≤2 rounds, then regenerate from the blueprint, since bad first drafts rarely recover (SkillSynth).
+- **Verifier.** Keep the examples' verify-time `uvx` isolated interpreter (resists stdlib patching) and accept the network and latency cost. Revisit only if Phase 0 shows flakiness.
+- **Turn cap.** `max_turns=200` caps runaway cost. A run that hits the cap is an *invalid* failure: rerun once, otherwise exclude the task.
+- **Calibration rule.** Exact curtailment is lossless versus 5 full runs. An optional aggressive early-reject after 0/3 is reported only as a measured tradeoff, not used for shipping.
+- **"Don't cheat" line.** Not in instructions by default (it shifts pass rates). Defense comes from the leak scan, red-team and pass audit.
+- **Writing styles.** Meta-Task varies instruction styles for diversity, but the guideline paper favors terse instructions. We restrict to terse-compatible styles and let human-likeness scores decide.
+- **Models.** Sonnet is used for authoring, blueprinting, judging and red-teaming, and Opus only for calibration. Using Sonnet as a judge or hacker is the only interpretation of the model rule we rely on, and it's noted explicitly.
+
+## Verification
+
+- `uv run pytest tests/`: unit tests for `decide()`, ledger and budget, lints, leak-scan extraction, sampler, blueprint schema, and the runner/artifacts parser on fixtures.
+- `bash scripts/validate.sh output/<task>` passes for every shipped task.
+- `harbor run -p output/<task> -a oracle` gives reward 1 (3/3) and `-a nop` gives 0, re-run independently of the pipeline for every shipped task.
+- For each shipped task, the ledger shows its pass distribution and the judge labels for every trial, and `reports/summary.md` explains why the model fails it (valid failure modes only).
+- Spot-check: rerun one shipped task 5× naively and confirm it lands in band (estimate reproducibility, budget permitting).
+- Check that total spend in the ledger matches the gateway's reported usage, if the gateway exposes it.
+
+## Critical files
+
+- Already updated for the uv environment: `pyproject.toml`, `uv.lock`, `.python-version`, `scripts/*.sh`, `generator/requirements.txt`, `validator/requirements.txt`.
+- Modify: `generator/generate.py`, `generator/config.py` (read `.env`, price table, budget), `pyproject.toml` (dependencies via `uv add`), `scripts/*.sh` (new entry points), `CHANGELOG.md`, `README.md` (uv-based usage section).
+- Reuse: `validator/validate.py` (`validate_task()`), `generator/config.py` constants (`CANARY_LINE`, band params), `examples/*` (format reference only), the Harbor reward contract (`harbor/src/harbor/verifier/verifier.py`), `strip_canary` (`harbor/src/harbor/models/task/task.py`), Harbor `artifacts` collection (`harbor/trial/artifact_handler.py` in the installed package), and the `harbor check` / `harbor analyze` commands.
+- New: `generator/{spec,blueprint,author}.py`, `generator/metatask/`, `validator/{lint,leak_scan}.py`, `evaluator/{harbor_runner,calibrate,redteam}.py`, `analysis/{judge,tuner,ledger,report,diversity,human_likeness}.py`, `scripts/run_batch.py`, `tests/`, `docs/research/README.md`.

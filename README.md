@@ -177,3 +177,47 @@ Include:
 - `CHANGELOG.md` describing what you did, why, and any design tradeoffs
 - Your git commit history (we read it)
 
+
+---
+
+## Running this implementation
+
+Everything below was added for the work trial; the sections above are AfterQuery's spec. Design, decisions and measured results are in `docs/plan.md`, `docs/harbor-notes.md`, `CHANGELOG.md` and `reports/summary.md`.
+
+### Setup
+
+```bash
+uv sync                      # Python 3.13 + pinned harbor==0.24.0 (see pyproject.toml)
+cp .env.example .env         # then set OPENROUTER_API_KEY (an OpenRouter key)
+make tb-reference            # download the 425 published Terminal-Bench tasks used by the novelty gate
+make usage                   # live spend / remaining credit on the key
+```
+
+### Generate, gate and calibrate
+
+```bash
+make batch N=3 SEED=1 BUDGET=20             # blueprint -> authoring meta-task -> gates, N candidates
+uv run --env-file .env python -m scripts.calibrate_candidates   # red-team + Opus calibration; ship learnable tasks to output/
+uv run --env-file .env python -m analysis.report                # reports/summary.md (funnel, cost, distribution, diversity)
+bash scripts/generate.sh "fix a memory bug in a C ring buffer"  # one gated task from a topic (template entry point)
+```
+
+Cheaper ways to exercise the code: `make dry-run` (fixtures, no model calls, real gates) and `DEV_MODE=1 make batch` (every model call goes to a cheap dev model; results stay in `output-dev/` and are never shipped or reported).
+
+### Pipeline in one picture
+
+```
+spec (inverse-frequency over a 10-axis taxonomy)
+  -> blueprint (Sonnet) -> rubric review + novelty gate (425 published TB tasks + our own)
+  -> authoring meta-task (terminus-2 + Sonnet in a container; artifacts=/app/output)
+  -> gates: structure, lint, leak scan -> oracle 3/3 + nop -> harbor check (16 criteria)
+            -> novelty re-check -> red-team (hack elicitation)      [failures feed repair rounds]
+  -> calibration: terminus-2 + Opus 4.8, exact curtailment of the 5-run band, every trial judged
+  -> output/<task>/ (learnable only) + README with why the model fails it
+```
+
+### Evidence
+
+- `runs/ledger.jsonl`: every stage of every candidate (cost, time, result, inputs hash).
+- `runs/candidates/<id>/`: spec, blueprint, gate decisions, the authored task, calibration with per-trial judge labels.
+- `output/`: shipped (learnable) tasks. `make test` / `make lint` / `make plan` for checks and checklist progress.

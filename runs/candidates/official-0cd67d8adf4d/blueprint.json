@@ -1,0 +1,60 @@
+{
+ "slug": "netflow-aggregator-rust-repair",
+ "title": "NetFlow Aggregator Protocol Repair",
+ "scenario": "A research scientist is attempting to reproduce a published network traffic analysis result. The lab has a small in-house Rust codebase (~1,200 lines across several modules) that implements a NetFlow v9 aggregation service: it listens on UDP, parses flow records, aggregates them by (src_ip, dst_ip, protocol) key, and answers a simple TCP query protocol returning JSON summaries. The service was working six months ago but someone did a 'large-scale refactoring' that split the packet parsing and aggregation logic across new modules \u2014 the service starts but produces wrong query results on the scientist's test traffic capture.",
+ "instruction_draft": "```\n$ cargo run -- --udp 9995 --tcp 9996\nListening on UDP :9995, TCP :9996\n^C\n$ python3 /app/tools/replay_capture.py captures/sample_flows.pcap\nReplayed 48 packets\n$ echo '{\"query\":\"top_talkers\",\"limit\":5}' | nc localhost 9996\n{\"flows\":[]}\n```\n\nThe NetFlow aggregation service at `/app` is not returning correct results when queried after traffic is replayed into it. The service must be repaired so that:\n\n1. After UDP flow records are replayed into port 9995, TCP queries on port 9996 return accurate aggregated flow data matching the actual traffic.\n2. Each query response is valid JSON with a `flows` array; each entry contains `src_ip`, `dst_ip`, `proto`, `packets`, and `bytes` fields with correct values.\n3. The `top_talkers` query returns flows sorted descending by `bytes`, limited to the requested count.\n4. The `by_proto` query accepts a `proto` field (integer) and returns all flows matching that protocol number, sorted descending by `bytes`.\n5. The `src_filter` query accepts a `src_prefix` field in CIDR notation and returns all flows whose source IP falls within that prefix, sorted descending by `bytes`.\n6. Aggregation is correct: multiple flow records with the same (src_ip, dst_ip, proto) key must have their `packets` and `bytes` summed together across all received UDP datagrams.\n7. The service must handle NetFlow v9 template records and data records correctly: data records received before their corresponding template has been seen must be buffered and processed once the template arrives.\n\nThe source is in `/app/src/`. Captured test traffic is in `/app/captures/`. A replay tool is at `/app/tools/replay_capture.py`. The verifier will replay fresh traffic captures and issue all three query types.",
+ "requirements": [
+  "After UDP flow records are replayed, TCP queries return non-empty accurate aggregated flow data",
+  "Each flow entry in responses contains src_ip, dst_ip, proto, packets, and bytes with correct values",
+  "top_talkers query returns flows sorted descending by bytes, limited to the requested count",
+  "by_proto query filters flows by protocol number and returns them sorted descending by bytes",
+  "src_filter query filters flows whose source IP falls within a given CIDR prefix, sorted descending by bytes",
+  "Multiple flow records sharing (src_ip, dst_ip, proto) key have packets and bytes summed correctly",
+  "Data records received before their template is seen are buffered and processed once the template arrives"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm with rustc/cargo installed via apt (rust stable from bookworm repos), plus python3-scapy for the replay tool",
+  "~1,200-line Rust codebase in /app/src/ split across: main.rs (CLI, thread spawn), udp_listener.rs (socket recv loop), parser.rs (NetFlow v9 byte parsing), aggregator.rs (HashMap aggregation), query_handler.rs (TCP server, JSON serialization)",
+  "BUG 1 (hidden invariant): During refactor, the template registry was moved into parser.rs as a local variable per-call instead of shared state \u2014 each call to parse_datagram() gets a fresh empty template map, so templates parsed in one datagram are never available when data records arrive in subsequent datagrams. The fix requires making the template registry Arc<Mutex<HashMap>> shared across calls.",
+  "BUG 2 (shallow check trap): The aggregation key in aggregator.rs uses only (src_ip, dst_ip) \u2014 the proto field was accidentally dropped from the key struct's PartialEq/Hash derivation during refactor (proto field exists in the struct but is not included in a manual Hash impl that was added). Flows of different protocols between the same host pair are merged, and bytes/packets are wrong. The fix requires correcting the Hash + PartialEq implementations to include proto.",
+  "The sample capture file /app/captures/sample_flows.pcap contains only flows where each (src_ip, dst_ip) pair uses exactly one protocol \u2014 so BUG 2 is invisible on the sample but fails hidden tests that include same-pair multi-protocol flows",
+  "The template record in sample_flows.pcap always arrives before data records in the sample \u2014 so BUG 1 is invisible on the sample (empty results happen to be from BUG 2 alone on sample) but hidden tests send data records first",
+  "A working /app/tools/replay_capture.py that uses scapy to read a .pcap and replay UDP packets to localhost:9995 with 1ms inter-packet delay",
+  "Several additional .pcap files in /app/captures/ showing the format but all having the same property that hides both bugs",
+  "A /app/tools/gen_capture.py utility that can generate synthetic NetFlow v9 pcap files with configurable flows (used by verifier at test time)",
+  "Cargo.toml with serde, serde_json, clap dependencies pinned to specific versions that compile without network access (vendored in /app/.cargo/vendor/)"
+ ],
+ "internal_hint": "The engineer must: (1) read the code to discover that parser.rs has a function signature `fn parse_datagram(buf: &[u8]) -> Result<ParsedDatagram>` that constructs a local `HashMap<u16, Template>` inside the function body \u2014 templates parsed in one UDP packet vanish immediately, so data-record packets that arrive after the template packet see an empty registry and are silently dropped. Fix: thread the template registry as `Arc<Mutex<HashMap<u16, Template>>>` through the UDP listener and into parse_datagram. (2) Find that aggregator.rs has `impl Hash for FlowKey { fn hash<H: Hasher>(&self, state: &mut H) { self.src_ip.hash(state); self.dst_ip.hash(state); } }` \u2014 proto is omitted. The derived PartialEq includes proto so the map can have logically-different keys that hash to the same bucket and collide, meaning flows with different protocols between the same hosts corrupt each other's byte/packet counts. Fix: add `self.proto.hash(state)` to the Hash impl. Both bugs must be fixed; fixing only one still fails the hidden tests.",
+ "trap": "A naive solver who only replays the provided sample capture and checks that `top_talkers` returns non-empty results may fix only BUG 2 (the aggregation key hash) because on the sample the template always precedes data records so BUG 1 never fires. The service appears to work. But the hidden verifier tests replay captures where (a) data records arrive in the first datagram before the template datagram, and (b) the same (src_ip, dst_ip) pair appears with both TCP (proto=6) and UDP (proto=17) traffic. Both conditions are absent from all provided sample captures. Fixing only the Hash impl passes the sample but fails hidden test scenario A (out-of-order template) and hidden test scenario B (multi-protocol same-pair aggregation correctness).",
+ "tests": [
+  "Test 1 (basic correctness): gen_capture.py generates a pcap with 5 distinct flows, template before data, single protocol per pair. Replay, query top_talkers limit=5. Check all 5 flows present with correct bytes/packets sums.",
+  "Test 2 (out-of-order template, hidden): gen_capture.py generates a pcap where the data record datagram is packet #1 and the template datagram is packet #2. Replay, query by_proto. Check flows are present and correct \u2014 fails if BUG 1 not fixed.",
+  "Test 3 (multi-protocol same pair, hidden): gen_capture.py generates flows where 192.168.1.1->10.0.0.1 appears with proto=6 (500 bytes) and proto=17 (300 bytes). Query top_talkers, verify two separate entries exist each with correct byte count \u2014 fails if BUG 2 not fixed.",
+  "Test 4 (src_filter CIDR, hidden): gen_capture.py generates flows from 10.1.0.x and 10.2.0.x addresses. Query src_filter with src_prefix=10.1.0.0/24. Verify only 10.1.0.x flows returned, sorted by bytes descending.",
+  "Test 5 (aggregation across multiple datagrams, hidden): gen_capture.py generates 3 UDP datagrams each containing data records for the same flow key (same src, dst, proto). Total bytes = sum across all 3. Query and verify the single aggregated entry has the correct total.",
+  "Test 6 (combined stress, hidden): Template arrives mid-stream (datagram 4 of 10), flows span multiple protocols and CIDR prefixes. All three query types checked for correctness simultaneously."
+ ],
+ "verifier_knob": {
+  "name": "number of request scenarios",
+  "value": "6 test scenarios",
+  "effect": "Reducing to 2 scenarios (basic + one hidden) makes it easier since fewer edge-case combinations are tested; increasing to 8+ by adding more CIDR boundary cases and larger flow counts with aggregation across many datagrams makes it harder"
+ },
+ "expected_failure_modes": [
+  "Agent fixes the Hash impl (BUG 2) because it's the more obvious structural bug visible from reading aggregator.rs, tests against the sample capture, sees non-empty results, and declares success without discovering BUG 1 in parser.rs",
+  "Agent fixes the template registry threading (BUG 1) but misses the Hash impl issue because the sample capture never has two flows with the same src/dst pair and different protocols",
+  "Agent rewrites the query handler JSON serialization without addressing either root cause, producing well-formed but incorrect values",
+  "Agent finds BUG 1 by running the sample and seeing empty results, fixes it, but does not test multi-protocol scenarios and misses BUG 2",
+  "Agent does not explore the code deeply enough to find that Hash is manually implemented (overriding the derived version) and assumes derive(Hash) is in effect"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "networking",
+ "tags": [
+  "rust",
+  "networking",
+  "refactoring",
+  "protocol",
+  "data-processing",
+  "aggregation"
+ ]
+}

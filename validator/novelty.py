@@ -13,6 +13,7 @@ tb-reference` -> data/tb-reference/<set>/<task>/) plus examples/. Three uses:
 TF-IDF is implemented here (no embedding model: only Sonnet/Opus are allowed).
 """
 
+import json
 import math
 import re
 import tomllib
@@ -154,13 +155,30 @@ def default_index() -> Index:
 
 
 def own_tasks(candidates_dir: Path, exclude: str = "") -> tuple[RefTask, ...]:
-    """Our earlier generated tasks, so the gate also rejects near-duplicates of our own work."""
+    """Our other candidates, so the gate also rejects near-duplicates of our own work.
+
+    A candidate's authored instruction if it has one, else its accepted blueprint:
+    a candidate being (re-)authored has no instruction.md for a while, and a
+    concurrent build must still see it.
+    """
     refs = []
-    for inst in sorted(Path(candidates_dir).glob("*/task/instruction.md")):
-        cand_id = inst.parent.parent.name
-        if cand_id != exclude:
+    for cand in sorted(p for p in Path(candidates_dir).iterdir() if p.is_dir()):
+        if cand.name == exclude:
+            continue
+        inst, bp, gate = (
+            cand / "task" / "instruction.md",
+            cand / "blueprint.json",
+            cand / "blueprint_gate.json",
+        )
+        if inst.exists():
             text = inst.read_text()
-            refs.append(RefTask(f"ours/{cand_id}", text, _gist(text, inst.parent / "task.toml")))
+            refs.append(RefTask(f"ours/{cand.name}", text, _gist(text, inst.parent / "task.toml")))
+        elif bp.exists() and gate.exists() and json.loads(gate.read_text()).get("accepted"):
+            b = json.loads(bp.read_text())
+            text = "\n".join(
+                [b["title"], b["scenario"], b["instruction_draft"], *b["requirements"]]
+            )
+            refs.append(RefTask(f"ours/{cand.name}", text, f"{b['title']}: {b['scenario'][:160]}"))
     return tuple(refs)
 
 
@@ -234,14 +252,24 @@ Return only JSON: {{"verdicts": [{{"ref_id": "...", "verdict": "same|variant|dis
 "reason": "one sentence"}}]}}"""
 
 
+OWN_K = 2  # our own tasks the judge always sees, however low their cosine
+
+
 def judge_same_task(candidate: str, index: Index | None = None, k: int = 3, chat=None) -> dict:
-    """Sonnet verdicts against the k nearest references. Returns verdicts, cost, novel flag."""
+    """Sonnet verdicts against the k nearest references plus the OWN_K nearest of our own
+    tasks. Returns verdicts, cost, novel flag.
+
+    Outcome-only instructions are short, so two of our tasks on the same theme can sit at
+    cosine ~0.1 and miss the top k; the judge sees them anyway (our corpus is small).
+    """
     from analysis.llm import chat as default_chat
     from analysis.llm import extract_json
 
     chat = chat or default_chat
     index = index or default_index()
-    near = index.nearest(candidate, k=k)
+    ranked = index.nearest(candidate, k=len(index.refs))
+    near = ranked[:k]
+    near += [(r, c) for r, c in ranked[k:] if r.ref_id.startswith("ours/")][:OWN_K]
     refs = "\n\n".join(
         f"[{r.ref_id}] (cosine {s:.2f})\n{_CANARY.sub('', r.instruction).strip()[:1500]}"
         for r, s in near

@@ -55,7 +55,9 @@ def _check_task_toml(task_path: Path, errors: list[str], warnings: list[str]) ->
 
     # schema_version (Harbor accepts `version` as a legacy alias).
     if "schema_version" not in cfg and "version" not in cfg:
-        warnings.append("task.toml has no `schema_version` (Harbor defaults it, but set it explicitly).")
+        warnings.append(
+            "task.toml has no `schema_version` (Harbor defaults it, but set it explicitly)."
+        )
 
     # [task] package info — required for a publishable dataset task.
     task = cfg.get("task")
@@ -147,7 +149,11 @@ def _check_scripts(task_path: Path, errors: list[str], warnings: list[str]) -> N
     tests_dir = task_path / "tests"
     if tests_dir.is_dir():
         test_script = next(
-            (tests_dir / f"test{ext}" for ext in (".sh", ".bat") if (tests_dir / f"test{ext}").exists()),
+            (
+                tests_dir / f"test{ext}"
+                for ext in (".sh", ".bat")
+                if (tests_dir / f"test{ext}").exists()
+            ),
             None,
         )
         if test_script is None:
@@ -155,13 +161,19 @@ def _check_scripts(task_path: Path, errors: list[str], warnings: list[str]) -> N
         else:
             # The reward contract: test.sh must write /logs/verifier/reward.{txt,json}.
             body = test_script.read_text()
-            if "reward.txt" not in body and "reward.json" not in body and "rewards.json" not in body:
+            if (
+                "reward.txt" not in body
+                and "reward.json" not in body
+                and "rewards.json" not in body
+            ):
                 errors.append(
                     "tests/test.sh never writes /logs/verifier/reward.txt "
                     "(or reward.json) — Harbor reads the reward from there."
                 )
         if not list(tests_dir.glob("*.py")):
-            warnings.append("tests/ has no .py files (fine for non-pytest tasks, unusual otherwise).")
+            warnings.append(
+                "tests/ has no .py files (fine for non-pytest tasks, unusual otherwise)."
+            )
 
 
 def _check_canary(task_path: Path, warnings: list[str]) -> None:
@@ -174,11 +186,11 @@ def _check_canary(task_path: Path, warnings: list[str]) -> None:
         task_path / "environment" / "Dockerfile",
         *(task_path / "tests").glob("*.py"),
     ]
-    has_canary = any(
-        p.exists() and "canary" in p.read_text().lower() for p in candidates
-    )
+    has_canary = any(p.exists() and "canary" in p.read_text().lower() for p in candidates)
     if not has_canary:
-        warnings.append("No canary marker found in solve.sh / Dockerfile / tests (recommended for benchmark data).")
+        warnings.append(
+            "No canary marker found in solve.sh / Dockerfile / tests (recommended for benchmark data)."
+        )
 
 
 def _harbor_cross_check(task_path: Path, errors: list[str], warnings: list[str]) -> None:
@@ -187,7 +199,9 @@ def _harbor_cross_check(task_path: Path, errors: list[str], warnings: list[str])
         from harbor.models.task.config import TaskConfig  # type: ignore
         from harbor.models.task.task import Task  # type: ignore
     except Exception:
-        warnings.append("harbor not importable — skipped native schema cross-check (`pip install harbor`).")
+        warnings.append(
+            "harbor not importable — skipped native schema cross-check (`pip install harbor`)."
+        )
         return
 
     toml_path = task_path / "task.toml"
@@ -208,7 +222,11 @@ def validate_task(task_dir: str) -> dict:
     """Validate a task directory. Returns {passed, errors, warnings}."""
     task_path = Path(task_dir)
     if not task_path.is_dir():
-        return {"passed": False, "errors": [f"Directory does not exist: {task_dir}"], "warnings": []}
+        return {
+            "passed": False,
+            "errors": [f"Directory does not exist: {task_dir}"],
+            "warnings": [],
+        }
 
     errors: list[str] = []
     warnings: list[str] = []
@@ -220,7 +238,9 @@ def validate_task(task_dir: str) -> dict:
         if not (task_path / dirname).is_dir():
             errors.append(f"Missing required directory: {dirname}/")
 
-    if (task_path / "instruction.md").exists() and not (task_path / "instruction.md").read_text().strip():
+    if (task_path / "instruction.md").exists() and not (
+        task_path / "instruction.md"
+    ).read_text().strip():
         errors.append("instruction.md is empty.")
 
     cfg = _check_task_toml(task_path, errors, warnings)

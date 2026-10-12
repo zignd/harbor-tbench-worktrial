@@ -4,6 +4,16 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 19:24 -03:00 · Self-dedup gaps: in-flight candidates and short instructions
+- **Noticed:** Batch 2 blueprint `rust-codec-regression-service` was accepted next to the pilot's `rust-codec-deploy-regression`, but the pilot never reached the judge. Two gaps:
+  1. `own_tasks` indexed only authored `instruction.md` files. The pilot was being re-authored at that moment, so it had none.
+  2. The judge sees only the top 3 by cosine. Outcome-only instructions are short, so the two Rust tasks scored just 0.092.
+- **Fixes:**
+  - A candidate without an instruction is indexed by its **accepted blueprint** (rejected blueprints don't count).
+  - The judge always also sees the **2 nearest of our own tasks**, however low their cosine. Our corpus is small, so it costs little.
+- **Re-check of the accepted blueprint** (both logged as `blueprint_recheck`, ~$0.02): with the fixed index, and then directly against the pilot, the verdict was **distinct**. The pilot is a performance regression recovered from git history. The new one is correctness bugs (endianness, zero-length frames) in an HTTP codec service. It keeps building.
+- 113 tests pass.
+
 ### 19:18 -03:00 · Sampler steers harder; Batch 2 restarted on a diverse plan
 - Batch 2's first plan (seed 3) drew **"file formats and recovery" 4 of 8 times and SQL 4 of 8**. A simulation over 300 seeds showed this was a ~1.3% draw. Still, plain inverse frequency, `1/(count+1)`, is soft: 18% of 8-spec batches repeat a domain 3+ times, and 38% repeat a language.
 - **`STEER_POWER = 2`**: weights are now `base / (count + 1)^2`. That cuts domain 3+ repeats to 5% and language to 12%, and keeps the draw random.

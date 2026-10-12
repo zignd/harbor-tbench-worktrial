@@ -1,0 +1,64 @@
+{
+ "slug": "csv-chunk-recovery-pipeline",
+ "title": "Repair Chunked CSV Recovery Pipeline",
+ "scenario": "A data engineer has inherited a Python ETL pipeline that ingests large CSVs by splitting them into fixed-size chunks, processing each chunk independently, and reassembling results. The pipeline lives in a git repository with roughly 18 months of history. A recent batch run silently produced wrong row counts and duplicate records in the output, but no exception was raised. The repository contains the ingestion library (~600 lines), a CLI driver (~200 lines), test fixtures, and several utility modules that are not involved in the bug.",
+ "instruction_draft": "```\n$ python run_pipeline.py --input data/sample.csv --output out/result.csv\nProcessed 12 chunks, 24000 rows written.\n$ wc -l out/result.csv\n24001 out/result.csv\n$ python verify_output.py out/result.csv\nDuplicate primary keys detected: 47\nRow count mismatch: expected 20000, got 24000\n```\n\nYou have inherited the pipeline at `/app`. The `run_pipeline.py` script reads a CSV, splits it into chunks of configurable size, runs each chunk through `pipeline/transform.py`, and concatenates the results to an output CSV.\n\nFix the pipeline so that:\n1. The output CSV contains exactly one row per unique primary key from the input (no duplicates, no omissions); the primary key column is `record_id`.\n2. The row count of the output equals the row count of the input minus any rows that fail schema validation (rows failing validation must be written to `out/rejected.csv` instead).\n3. The pipeline must handle inputs where the header row appears at the start of every chunk file on disk (a condition that arises when chunks are written by an external tool) without producing duplicate header rows or miscounting.\n4. The pipeline must produce identical output when run on any valid CSV input of up to 500 000 rows, including inputs whose row count is not evenly divisible by the chunk size.\n5. All fixes must be committed to the repository; the final `git log --oneline` must show at least one new commit authored by you.\n\nThe verifier will run the fixed pipeline against five hidden CSV inputs and check that duplicate-key rate = 0 and row-count accuracy \u2265 99.9%.",
+ "requirements": [
+  "Output CSV has exactly one row per unique record_id from the input (zero duplicate keys).",
+  "Row count of output equals input rows minus schema-rejected rows; rejected rows go to out/rejected.csv.",
+  "Pipeline correctly handles chunk files that each begin with a header row (no duplicate headers in output, no header miscounted as data).",
+  "Pipeline produces correct output for inputs whose total row count is not divisible by the configured chunk size.",
+  "At least one new git commit is present in the repository history after the fix."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm",
+  "apt: git",
+  "pip: pandas==2.2.2 click==8.1.7",
+  "Git repo at /app initialised with ~15 commits of plausible history spanning 18 months.",
+  "File /app/pipeline/__init__.py (empty)",
+  "File /app/pipeline/chunker.py (~180 lines): splits input CSV into chunk files on disk; BUG 1: always writes the header to every chunk file (correct for some external consumers, but the reader must handle this).",
+  "File /app/pipeline/transform.py (~220 lines): applies column-type coercion and schema validation; BUG 2: the deduplication step uses `.drop_duplicates()` but only on a subset of columns that does NOT include record_id, so duplicate record_ids survive.",
+  "File /app/pipeline/assembler.py (~160 lines): concatenates chunk results; BUG 3: when reading chunk files it uses `pd.read_csv(chunk_path)` without `header=0` skip logic, so the repeated header rows from each chunk are silently treated as data rows, inflating counts and injecting garbage record_id values.",
+  "File /app/run_pipeline.py (~200 lines): CLI driver wiring chunker -> transform -> assembler.",
+  "File /app/verify_output.py (~80 lines): standalone checker that prints duplicate key counts and row mismatch (used in the terminal dump above).",
+  "File /app/data/sample.csv: 20000-row CSV with columns record_id,name,amount,date,status; chunk size default 2000 so 10 chunks; chosen so the sample does NOT reveal the not-divisible-by-chunk-size bug.",
+  "File /app/pipeline/utils.py (~120 lines): logging helpers, not involved in bugs.",
+  "File /app/pipeline/schema.py (~90 lines): schema definition and row validator, correct.",
+  "File /app/tests/test_transform.py (~60 lines): unit tests for transform only, all pass, do not exercise assembler or chunker interaction.",
+  "Hidden verifier inputs: five CSVs generated at verify time with seeded randomness \u2014 sizes 1000, 7777, 50000, 100003, 499999 rows \u2014 testing: exact divisibility edge, non-divisible, large scale, non-divisible large, near-limit."
+ ],
+ "internal_hint": "Three interacting bugs must all be found and fixed: (1) chunker.py writes a CSV header to every chunk, not just the first; (2) assembler.py reads each chunk with pd.read_csv which treats those repeated headers as data rows, producing ghost rows with literal column-name strings as record_ids; (3) transform.py deduplicates on ['name','amount'] instead of ['record_id'], so true duplicates in the input survive. The not-divisible edge case exposes an off-by-one in the chunker's slice logic (it drops the remainder). A skilled engineer: (a) reads git log to find recent commits touching chunker and assembler, (b) runs the sample and inspects out/result.csv head/tail to see literal 'record_id' strings as rows, (c) traces assembler.py to find missing skiprows/header handling, (d) checks transform.py dedup columns, (e) tests with a 7-row input against chunk_size=3 to find the remainder bug. The fix: assembler reads chunks with header=0 and skips subsequent header rows; transform deduplicates on record_id; chunker writes header only to first chunk OR assembler uses pd.read_csv(..., skiprows=lambda i: i==0) for non-first chunks; chunker slice must include the remainder chunk.",
+ "trap": "An agent that fixes only the assembler header-handling (the most visible symptom from the terminal dump) will pass the sample but fail hidden inputs: the dedup-on-wrong-columns bug means inputs with genuine duplicate record_ids still produce duplicates, and the off-by-one in the chunker drops the last partial chunk entirely for non-divisible inputs, causing a row-count shortfall that pushes accuracy below 99.9% on the 7777- and 100003-row hidden inputs. An agent that fixes dedup and assembler but not the chunker remainder will fail the non-divisible cases. All three must be fixed together.",
+ "tests": [
+  "T1 (sample regression): run pipeline on data/sample.csv; assert zero duplicate record_ids in result.csv and row count == 20000.",
+  "T2 (non-divisible small): hidden 7777-row CSV, chunk_size=2000 (remainder 1777); assert output row count == 7777 and duplicate key rate == 0.",
+  "T3 (genuine duplicates in input): hidden 50000-row CSV with 500 intentional duplicate record_ids; assert output contains exactly 49500 rows (duplicates collapsed to one each) and rejected.csv has expected schema-fail rows.",
+  "T4 (large non-divisible): hidden 100003-row CSV; assert row count accuracy >= 99.9% and zero duplicate keys.",
+  "T5 (near-limit): hidden 499999-row CSV; assert row count accuracy >= 99.9% and zero duplicate keys within 120-second wall time.",
+  "T6 (git commit check): assert git log in /app shows at least one commit with timestamp after container build time and that the working tree is clean.",
+  "T7 (rejected.csv present): for an input with 10 deliberately malformed rows, assert rejected.csv exists and contains exactly 10 rows."
+ ],
+ "verifier_knob": {
+  "name": "row_count_accuracy_threshold",
+  "value": "0.999",
+  "effect": "Lowering to 0.99 makes the task easier (the remainder off-by-one bug alone cannot fail it); raising to 1.0 makes it harder (any dropped row fails); current 0.999 requires fixing the remainder bug for large inputs but tolerates tiny floating-point counting issues."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the assembler header issue (visible from terminal dump) and misses the dedup-on-wrong-columns bug in transform.py, passing the sample but failing T3.",
+  "Agent fixes assembler and transform but misses the chunker remainder off-by-one, failing T2 and T4 due to missing last partial chunk.",
+  "Agent rewrites the pipeline from scratch without committing, failing T6.",
+  "Agent discovers two of the three bugs by reading the most recently changed files but does not trace the chunker's slice logic for non-divisible inputs.",
+  "Agent fixes all bugs but introduces a regression that changes the schema-validation logic, causing T7 to fail."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "file-formats",
+ "tags": [
+  "csv",
+  "pandas",
+  "git",
+  "data-pipeline",
+  "bug-hunting",
+  "shell-scripting"
+ ]
+}

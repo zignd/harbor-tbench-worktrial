@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from analysis.llm import Reply
@@ -83,3 +84,29 @@ def test_own_tasks_are_indexed_but_never_compared_with_themselves(tmp_path):
         "examples/log-summary-date-ranges",
         "ours/official-a",
     }
+
+
+def test_candidate_without_instruction_is_indexed_by_its_accepted_blueprint(tmp_path):
+    bp = {"title": "Rust codec regression", "scenario": "a framing codec broke",
+          "instruction_draft": "fix the codec", "requirements": ["round-trips frames"]}  # fmt: skip
+    for name, accepted in [("official-a", True), ("official-r", False)]:
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "blueprint.json").write_text(json.dumps(bp))
+        (tmp_path / name / "blueprint_gate.json").write_text(json.dumps({"accepted": accepted}))
+    refs = novelty.own_tasks(tmp_path)
+    assert [r.ref_id for r in refs] == ["ours/official-a"]  # rejected blueprints don't count
+    assert "round-trips frames" in refs[0].instruction
+
+
+def test_judge_always_sees_our_nearest_own_tasks_even_at_low_cosine():
+    seen = {}
+
+    def fake_chat(prompt, **kwargs):
+        seen["prompt"] = prompt
+        return Reply('{"verdicts": []}', "m", 1, 0, 1, 0.0, 0.0)
+
+    own = novelty.RefTask("ours/official-x", "rust packet codec latency regression", "g")
+    index = Index(_example_index().refs + (own,))
+    result = novelty.judge_same_task("backup job for a postgres database", index, chat=fake_chat)
+    assert "[ours/official-x]" in seen["prompt"]
+    assert ("ours/official-x", 0.0) in [(r, round(c, 1)) for r, c in result["nearest"]]

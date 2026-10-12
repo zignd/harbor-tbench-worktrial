@@ -1,0 +1,61 @@
+{
+ "slug": "rust-codec-regression-service",
+ "title": "Binary Frame Codec Regression",
+ "scenario": "You maintain a Rust crate called `framecodec` that encodes and decodes variable-length binary frames over a socket. A regression was introduced two commits ago that broke the running decode service. The container has the full source tree (~1,200 lines across several modules), a running HTTP control plane on port 7000 that accepts raw frame bytes and returns decoded JSON, and a test harness binary. The obvious symptom is that the service crashes on frames with a multi-byte length prefix, but that is a red herring: the real bugs are in two separate places.",
+ "instruction_draft": "A regression in the `framecodec` service has been reported by a downstream user. The service runs on port 7000 inside this container; it accepts POST requests to `/decode` with a raw binary body and returns a JSON object with fields `type`, `seq`, and `payload` decoded from the frame. It also accepts POST to `/encode` with a JSON body `{\"type\": N, \"seq\": N, \"payload\": \"<hex>\"}` and returns the raw binary frame as the response body.\n\nAfter the regression the service misbehaves. Your job is to restore it so that every valid frame round-trips correctly: encoding a message and then decoding the result must reproduce the original `type`, `seq`, and `payload` exactly. Additionally, the `seq` field must be decoded as a big-endian unsigned 32-bit integer (not little-endian), and frames whose payload length field encodes a value of zero must decode to an empty payload string `\"\"` rather than returning an error. Restart the service after any fix so it is answering requests on port 7000 when the verifier runs.",
+ "requirements": [
+  "POST /decode with a valid binary frame returns JSON with correct `type` (u8), `seq` (big-endian u32), and `payload` (hex string).",
+  "POST /encode with JSON {type, seq, payload_hex} returns binary bytes that, when round-tripped through /decode, reproduce the original fields exactly.",
+  "The `seq` field is decoded as big-endian u32 (not little-endian).",
+  "A frame with a zero-length payload decodes to payload field `\"\"` (empty string) without error.",
+  "The service is listening on port 7000 when the verifier runs."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm base; install Rust stable via rustup (pinned 1.78.0), curl, procps.",
+  "Project at /app/framecodec/ with Cargo.toml and src/ directory (~1200 lines total across: src/main.rs, src/codec.rs, src/frame.rs, src/server.rs, src/util.rs, src/stats.rs).",
+  "src/frame.rs defines the Frame struct and the wire format: [1 byte type][4 bytes seq BE][2 bytes payload_len BE][payload_len bytes payload].",
+  "Bug 1 (misleading symptom): src/codec.rs decode() reads seq with `u32::from_le_bytes` instead of `u32::from_be_bytes`. This makes seq wrong on any frame where seq != 0 with symmetric bytes. The service does NOT crash on this \u2014 it silently returns wrong seq values.",
+  "Bug 2 (the crash, which is the red herring's true nature): src/codec.rs has an off-by-one: when payload_len == 0 it tries to slice `&buf[header_end..header_end]` but first checks `if payload_len == 0 { return Err(...) }` \u2014 i.e., it returns an error on zero-length payloads instead of returning an empty payload.",
+  "The obvious panic/crash on 'multi-byte length prefix' is a misleading log message in src/server.rs that fires when the HTTP body is shorter than 7 bytes (the minimum frame header) \u2014 it logs 'multi-byte length prefix error' due to a misleadingly named error variant, but the actual bugs are the two above.",
+  "src/server.rs is a minimal axum HTTP server (axum 0.7 pinned) that calls codec::decode and codec::encode.",
+  "A pre-built reference test binary at /app/framecodec/tools/frame_gen (compiled for x86_64 linux) generates test frames and can be used to probe the service, but its source is not present.",
+  "A startup script /app/start.sh builds with `cargo build --release` and runs the binary in background, logging to /app/service.log.",
+  "The service is NOT pre-started; the solver must build and start it.",
+  "src/stats.rs and src/util.rs contain plausible but uninvolved helper code (~300 lines total) to make the codebase realistically sized.",
+  "Cargo.toml pins axum = \"0.7.5\", tokio = { version = \"1.37\", features = [\"full\"] }, serde = { version = \"1\", features = [\"derive\"] }, serde_json = \"1\", hex = \"0.4\"."
+ ],
+ "internal_hint": "A skilled engineer: (1) reads the logs, sees 'multi-byte length prefix error', searches for that string, finds it in server.rs and traces it to body-too-short validation \u2014 realizes this is not the core bug. (2) Reads codec.rs, spots `from_le_bytes` for seq, knows the spec says big-endian \u2014 fixes to `from_be_bytes`. (3) Notices the `if payload_len == 0 { return Err(...) }` guard that should instead return an empty payload. Removes/replaces it with correct empty-slice handling. (4) Rebuilds and restarts the service. Both fixes are required; fixing only one fails the verifier on either seq correctness or zero-payload tests.",
+ "trap": "A naive agent sees the 'multi-byte length prefix' log, searches for parsing of multi-byte values, finds the little-endian seq decode, fixes that, tests with a single frame where seq happens to be a small value (e.g., seq=1), gets plausible-looking output, and declares victory. The hidden tests include: (a) frames with seq values whose LE and BE interpretations differ (e.g., seq=0x01020304), and (b) frames with exactly zero-length payload. Either the endianness bug or the zero-payload bug alone causes test failures. An agent that fixes only the endian bug passes the sample but fails zero-payload tests; an agent that fixes only the zero-payload bug fails endianness tests on non-trivial seq values.",
+ "tests": [
+  "Test 1 (basic round-trip): POST /encode {type:5, seq:1, payload:\"deadbeef\"}, then POST /decode with the returned bytes; verify type=5, seq=1, payload=\"deadbeef\".",
+  "Test 2 (endianness): POST /encode {type:2, seq:16909060, payload:\"aabb\"} (seq=0x01020304, LE would give 0x04030201=67305985); POST /decode result; verify seq==16909060 exactly.",
+  "Test 3 (zero-length payload): POST /encode {type:7, seq:42, payload:\"\"}, POST /decode result; verify type=7, seq=42, payload=\"\".",
+  "Test 4 (large seq round-trip): POST /encode {type:255, seq:4294967295, payload:\"ff\"}, decode, verify seq=4294967295.",
+  "Test 5 (multi-byte payload): POST /encode {type:1, seq:305419896, payload:\"0102030405060708090a0b0c\"}, decode, verify all fields match. (seq=0x12345678, LE=0x78563412=2018915346 \u2014 would fail if LE).",
+  "Test 6 (service liveness): HTTP GET /healthz or any endpoint returns a non-5xx response, confirming service is up.",
+  "All tests are generated at verify time with fresh seq values computed from a seeded PRNG \u2014 the sample payloads in the instruction are not used verbatim."
+ ],
+ "verifier_knob": {
+  "name": "number_of_request_scenarios",
+  "value": "6",
+  "effect": "Reducing to 2 (basic round-trip + endianness only) makes it easier because zero-payload edge case is not checked; raising to 10 adds max-payload-length frames (65535 bytes), type=0 frames, and seq=0 frames that stress additional boundary conditions."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the endianness bug, misses the zero-payload Err() guard, passes basic tests but fails Test 3.",
+  "Agent fixes only the zero-payload bug, misses the little-endian seq decode, passes Test 3 but fails Tests 2 and 5.",
+  "Agent is misled by the 'multi-byte length prefix' log message, spends time refactoring the HTTP body length check, never inspects codec.rs closely enough.",
+  "Agent fixes both bugs but forgets to rebuild and restart the service (or kills the old process without starting a new one), so port 7000 is not answering.",
+  "Agent tests with seq=1 (where LE==BE for values <256), believes endianness is correct, submits without fixing it."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "build-and-packaging",
+ "tags": [
+  "rust",
+  "binary-protocol",
+  "systems-programming",
+  "regression",
+  "endianness",
+  "edge-cases"
+ ]
+}

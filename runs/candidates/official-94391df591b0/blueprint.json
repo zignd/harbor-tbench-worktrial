@@ -1,0 +1,56 @@
+{
+ "slug": "log-ingestion-filter-repair",
+ "title": "Incident Log Filter Recovery",
+ "scenario": "After a production incident, the on-call DBA discovered that the metrics ingestion pipeline has been silently dropping valid log records and letting corrupted ones through. The pipeline is a Node.js service (~1,200 lines across several modules) that reads newline-delimited JSON log files, validates each record, and writes accepted records to a clean output file. A post-mortem audit revealed the filter is wrong in at least two independent ways. The environment contains the service code, a sample corpus of log files from the incident window, and a reference schema document.",
+ "instruction_draft": "Last night's incident left our log ingestion pipeline in a broken state. The service lives at /app and reads NDJSON log files from /app/logs/, validates each record against the schema at /app/schema.json, and writes accepted records to /app/output/clean.ndjson.\n\nTwo things must be true when you are done: (1) every record that satisfies the schema is present in the output and no record that violates the schema appears in the output; (2) the service must complete ingestion of a 50,000-record file in under 4 seconds on this machine. The current code fails both properties. Find and fix the defects.",
+ "requirements": [
+  "Every NDJSON record that conforms to schema.json must appear in clean.ndjson after the service runs.",
+  "No NDJSON record that violates schema.json may appear in clean.ndjson.",
+  "The service must process a 50,000-record input file in under 4 seconds (wall-clock, single run).",
+  "The output file must contain exactly the accepted records, one per line, in input order."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; installs Node.js 20 (pinned via nodesource), no npm packages requiring internet (all node_modules pre-installed as part of the image build).",
+  "A Node.js service at /app/src/ with files: index.js (entry point, ~120 lines), validator.js (~300 lines, contains Bug #1: an Ajv schema compilation that is rebuilt on every record instead of once, causing O(n^2) performance; also contains a subtly wrong $ref resolution that accepts records with a null 'severity' field even though the schema marks severity as required and typed string), pipeline.js (~200 lines, streams and orchestration), schema_loader.js (~80 lines), utils.js (~150 lines), metrics.js (~100 lines, plausible but uninvolved), config.js (~60 lines), and logger.js (~80 lines).",
+  "schema.json at /app/schema.json: a JSON Schema draft-7 object requiring fields: timestamp (string, ISO8601 pattern), level (enum: [debug,info,warn,error]), severity (string, non-null, required), service (string), message (string), and optionally metadata (object). The $ref bug in validator.js points to a definitions key named 'severity_type' but the actual definition key in schema.json is 'severityType' (camelCase), so Ajv silently ignores the $ref and treats severity as unconstrained \u2014 records with severity: null pass when they must not.",
+  "Sample logs at /app/logs/sample.ndjson: 200 records, roughly 160 valid and 40 invalid. The invalid records include: missing required fields, wrong types, and 8 records with severity: null. The sample has zero records with severity: null that should be accepted, so the $ref bug is invisible on the sample.",
+  "A generator script at /app/tools/gen_corpus.js (read-only, used by verifier) that produces deterministic NDJSON corpora of arbitrary size given a seed; the verifier uses this to produce the 50,000-record performance file and the adversarial correctness corpus.",
+  "package.json with ajv@8 and ajv-formats@2 pre-installed in node_modules.",
+  "README.md explaining the pipeline, schema, and the expected run command: `node /app/src/index.js --input <file> --output /app/output/clean.ndjson`.",
+  "A /app/output/ directory (writable).",
+  "The hidden invariant: the $ref key mismatch (definitions.severity_type vs definitions.severityType) is discoverable only by reading schema.json carefully and cross-referencing validator.js, or by testing with a record that has severity: null."
+ ],
+ "internal_hint": "Bug #1 (performance): validator.js calls `new Ajv().compile(schema)` inside the per-record validate() function, rebuilding the compiled validator on every call. Moving the compile() call to module initialization (outside the function) reduces complexity from O(n) schema compilations to O(1). Bug #2 (correctness): The JSON Schema in schema.json defines a reusable type under `definitions.severityType` (camelCase), and the severity field's schema uses `{ '$ref': '#/definitions/severity_type' }` (snake_case). Ajv resolves an unknown $ref as a no-op under some configurations, making severity effectively optional and accepting null. The fix is to align the $ref key to match the actual definitions key (`severityType`). A skilled engineer runs the service on the sample, notices it finishes slowly but appears to pass, then checks timing on a larger file, finds the O(n) compile, fixes it, re-runs, gets the timing passing. Then they check the schema carefully, construct a record with severity: null, observe it passes when it should not, trace the $ref mismatch, fix it. Both fixes are independent and both must be present.",
+ "trap": "A naive agent fixes only the performance bug (moving compile() outside the loop), verifies against the provided sample (which contains no severity:null records that should be rejected), sees all 160 valid records accepted and 40 invalid records rejected, declares success. The hidden adversarial corpus includes hundreds of records with severity: null; the correctness test fails because those records are incorrectly accepted. Alternatively, an agent that fixes only the $ref bug passes the sample correctness check but fails the 50,000-record timing test. Both bugs must be fixed to pass all tests.",
+ "tests": [
+  "Correctness test \u2014 benign corpus: verifier generates 10,000 records (seeded) with all valid combinations of required fields and runs the fixed service; every record must appear in output.",
+  "Correctness test \u2014 malicious corpus: verifier generates 5,000 invalid records including: severity: null (200 records), severity: 42 (integer, 200 records), missing level field (300 records), timestamp not matching ISO8601 pattern (300 records), extra required field absent (500 records); none may appear in output.",
+  "Correctness test \u2014 mixed corpus: verifier generates 8,000 records where exactly 4,217 are valid (seeded); output must contain exactly those 4,217 records in input order.",
+  "Performance test: verifier generates a 50,000-record NDJSON file (seeded) and times `node /app/src/index.js --input <file> --output /tmp/perf_out.ndjson`; wall-clock time must be under 4 seconds.",
+  "Schema adherence spot-check: verifier injects a record `{timestamp:'2024-01-01T00:00:00Z', level:'info', severity: null, service:'svc', message:'hi'}` into a single-record input file and asserts the output is empty.",
+  "Order preservation test: verifier generates 1,000 mixed records, extracts the valid subset in order, runs the service, and diffs output against expected ordered subset."
+ ],
+ "verifier_knob": {
+  "name": "corpus_size",
+  "value": "10000 benign + 5000 malicious for correctness; 50000 for performance",
+  "effect": "Increasing corpus size catches more edge cases in the schema validation and makes the performance threshold harder to meet if the fix is incomplete; decreasing it makes both bugs easier to mask with partial fixes."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the performance bug, verifies on the sample corpus (no severity:null records), declares success; adversarial corpus reveals unchecked null severity.",
+  "Agent fixes only the $ref mismatch, verifies correctness on sample, times performance on sample (200 records is fast even with O(n) compiles), declares success; 50,000-record timing test fails.",
+  "Agent patches the $ref by making severity optional rather than fixing the key name, so null is still accepted.",
+  "Agent rewrites the validator from scratch using a different library, introduces a new subtle bug in the ISO8601 pattern check that fails on timezone-offset timestamps in the hidden corpus.",
+  "Agent moves compile() outside validate() but into a closure that still recreates it on each pipeline invocation rather than truly at module load, giving only a partial speedup that fails the 50k timing test."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "devops",
+ "tags": [
+  "nodejs",
+  "json-schema",
+  "performance",
+  "log-processing",
+  "incident-recovery",
+  "adversarial-corpus"
+ ]
+}

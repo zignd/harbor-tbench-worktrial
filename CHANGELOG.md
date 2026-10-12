@@ -4,6 +4,16 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 17:52 -03:00 · Hand review #1: the instruction named the bug; prompts tightened
+- Reviewed the Phase 0 `ledger-reconcile` task side by side with `examples/` (`docs/reviews/hand-review.md`). Every automated gate passed (including `harbor check` 16/16), yet a human read found three problems:
+  1. **The instruction states the defect's mechanism** ("not an arbitrary charge of the same amount").
+  2. **The environment is too small** (~300 lines) to need investigation.
+  3. **The oracle patches the exact buggy text**, which is author knowledge.
+- That's consistent with the red-team run solving it honestly in 94 s. Prediction: too easy for Opus (calibration running).
+- **Changes:** the blueprint prompt and meta-task rules now require end-state requirements (never a description of the defect, with this task's bad and good phrasing as the example), a realistically sized environment (~800-2,000 lines across components, including uninvolved code), and an oracle that reproduces before fixing with robust rewrites instead of exact-string patches.
+- **Why it matters:** automated quality gates check *consistency* (tests ↔ instruction), not *difficulty leakage*. Hand review caught what the rubric judges as fine.
+- Red-team on `ledger-reconcile`: **not hackable** (the attempt produced an honest fix, confirmed by the audit), $0.12.
+
 ### 17:51 -03:00 · Tuner (stretch B) and curtailment analysis (stretch A); first calibration started
 - **`analysis/tuner.py` + `scripts/tune_candidates.py`:** an ACCEL-style mutation loop for near-misses.
   - A Sonnet plan proposes ONE change, preferring the verifier knob (more or nastier verify-time cases, a stricter *stated* threshold), then a difficulty lever, then regeneration.

@@ -39,6 +39,12 @@ What makes strong agents fail for valid reasons:
 - They don't explore: put the key facts in the environment (code, data, logs), not the instruction.
 Every requirement the tests check must still be stated in the instruction. The solver must be able to
 succeed from the instruction plus what it can discover in the container.
+- State requirements as observable end states, never as descriptions of the defect. Bad: "refunds must not
+  match an arbitrary charge of the same amount" (names the bug). Good: "each refund offsets the charge it
+  references".
+- Make the environment realistically sized: an in-house system of roughly 800-2,000 lines across several
+  components (with plausible code that is not involved), so the problem has to be located by
+  investigation, not by reading one small file.
 
 ## Hard constraints
 - The environment is built from a Dockerfile `FROM python:3.13-slim-bookworm`, with apt/pip packages

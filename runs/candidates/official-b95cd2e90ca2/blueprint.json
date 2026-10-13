@@ -1,0 +1,61 @@
+{
+ "slug": "ecdh-session-key-log-corruption",
+ "title": "ECDH Session Key Derivation Mismatch in Encrypted Audit Logs",
+ "scenario": "A database administrator is investigating a post-incident audit review where the encrypted session logs from a multi-component Node.js monitoring stack cannot be decrypted by the off-host verifier. The stack has three services: a metrics collector that samples DB query latency every few seconds, a session key manager that derives ephemeral ECDH keys for each log rotation window, and a log encryptor that seals batches of records. The verifier is a separate JS module that re-derives the same session keys and decrypts to verify log integrity. All services share configuration through a JSON file and write structured logs. The environment has ~1,200 lines across six JS modules plus config, sample encrypted logs, and a metrics dashboard showing which rotation windows have decryption failures.",
+ "instruction_draft": "Hey, we had an incident last night and I need to replay and verify the encrypted audit logs from /app/audit-stack/ but the verifier keeps failing on some rotation windows \u2014 not all of them, which is the weird part. Can you figure out what's wrong and fix it so that every log window the encryptor produces can be successfully decrypted and verified by the verifier? The encryptor and verifier need to agree on the session key for every window, for any shared ECDH parameters and any window index. Don't change the on-disk log format or the config schema.",
+ "requirements": [
+  "Every log rotation window produced by the encryptor must be decryptable by the verifier using the same shared config",
+  "The session key derivation must be consistent between the encryptor and verifier for all window indices, not just the ones in the sample logs",
+  "The on-disk encrypted log format must remain unchanged",
+  "The config schema (fields and types) must remain unchanged",
+  "The fix must handle edge cases: window index 0, large window indices, and windows that span day boundaries"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20 via nodesource, npm packages: node-forge, elliptic, hkdf (pure-JS), ws",
+  "/app/audit-stack/ contains six JS modules: config.json, session_key_manager.js, encryptor.js, verifier.js, metrics_collector.js, log_rotator.js, and a small CLI runner run.js",
+  "session_key_manager.js (~200 lines): generates ECDH P-256 keypairs per rotation window, derives shared secret with a long-lived server public key hardcoded in config.json, then runs HKDF to produce a 32-byte AES key; the HKDF info parameter is constructed from the window index \u2014 but it serializes the index as a JS number using Buffer.from(String(windowIndex)) for some code paths and Buffer.from([windowIndex & 0xff]) for others, so keys match only when windowIndex < 128 AND has no repeated decimal digits (a subtle data-dependent path)",
+  "encryptor.js (~180 lines): calls session_key_manager to get the AES-256-GCM key, encrypts batches of metric records, writes them with a header containing ephemeral public key bytes and window index",
+  "verifier.js (~200 lines): re-derives the session key from the ephemeral pubkey in each log header using the server private key, but has its own HKDF info construction that always uses the string path \u2014 so it only agrees with encryptor when encryptor also used the string path",
+  "log_rotator.js (~150 lines): manages window indices, rotates logs every N records, increments a monotonic counter stored in /app/audit-stack/state.json",
+  "metrics_collector.js (~120 lines): samples fake DB latency metrics and feeds them to the encryptor",
+  "run.js (~80 lines): CLI entry point that generates 200 log records across ~15 rotation windows",
+  "Sample encrypted logs in /app/audit-stack/logs/ covering windows 0-14, with metrics dashboard /app/audit-stack/dashboard.json showing windows 0,1,2,4,5,6,8,9,10,12,13,14 pass verification but windows 3,7,11 fail (these are the windows where the index happens to route to the byte-array path due to a bitwise check bug)",
+  "The server long-lived keypair is stored in config.json (private key in the server section, public key referenced by encryptor); the HKDF salt is derived from a timestamp truncated to the rotation window start \u2014 and this truncation is done differently (floor vs round) between encryptor and verifier for windows that start within 500ms of a second boundary, creating a second independent bug",
+  "A README.md explains the overall architecture and the intended derivation: HKDF(ikm=ecdh_shared_secret, salt=floor(window_start_epoch/window_duration_ms)*window_duration_ms, info=big-endian 8-byte window index, length=32)",
+  "The state.json file tracks the last window index and last window start timestamp, making the timestamp bug data-dependent (it depends on when the process started)"
+ ],
+ "internal_hint": "There are two independent bugs, neither of which is visible by reading a single file \u2014 each requires running the system and comparing behavior across components: (1) session_key_manager.js has a branching path for HKDF info construction: when (windowIndex & 0x80) !== 0 (i.e., index >= 128 or specific high bits set in a bitwise check that actually fires at indices where windowIndex % 43 === 0 due to a modulo-masking idiom) it uses Buffer.from([windowIndex & 0xff]) (1-byte little-endian) instead of the correct big-endian 8-byte encoding; verifier.js always uses the string encoding; both are wrong vs the README which specifies big-endian 8 bytes. Fix: both must use Buffer.alloc(8) with writeBigUInt64BE. (2) encryptor.js uses Math.round() for salt epoch truncation and verifier.js uses Math.floor() \u2014 these disagree for windows that start within 500ms of a second boundary. The agent must run the stack, observe which windows fail, instrument the key derivation, find the branching condition, then check the README for the canonical spec, fix both components to match the spec. The no_repro_given lever means the failure condition (windowIndex % 43 === 0 and boundary-straddling windows) is not documented; the agent must discover it experimentally by generating enough windows.",
+ "trap": "A naive agent reads the source, notices the String() vs byte-array discrepancy in session_key_manager.js, fixes the encryptor's info construction to always use strings, and re-runs the 15-sample windows \u2014 all 15 pass because within the first 15 windows the fixed-string path and the string path now agree. But the verifier still uses strings while the README specifies 8-byte big-endian, so at verify time with fresh window indices (some > 128, some at boundary timestamps), keys diverge again. The salt/Math.round vs Math.floor bug is completely missed because it only fires on boundary-straddling windows which don't appear in the sample unless the agent deliberately instruments the timing.",
+ "tests": [
+  "Generate 500 log records across 40 fresh rotation windows (starting from windowIndex=50 to avoid sample overlap) using the fixed encryptor; run the fixed verifier on every window; assert all 40 decrypt successfully \u2014 this catches the partial fix where only one of the two bugs was addressed",
+  "Generate windows at indices 0, 43, 86, 129, 172, 215 specifically (the modulo-43 boundary condition) and verify all decrypt \u2014 catches agents who fixed the string/byte path but left the branching condition",
+  "Synthesize window start timestamps at exactly 500ms before a whole-second boundary and verify those windows decrypt \u2014 catches the Math.round vs Math.floor salt bug",
+  "Run encryptor and verifier with windowIndex=0xFFFF (65535) and verify the session key is a 32-byte Buffer with the correct HKDF derivation matching manual calculation using big-endian 8-byte info encoding \u2014 catches wrong endianness or wrong byte width",
+  "Verify the on-disk log file format (header magic bytes, ephemeral pubkey length field, window index field positions) is unchanged by byte-comparing headers against a reference header extracted before any fixes",
+  "Check config.json schema has same top-level keys and value types as before any modifications",
+  "Generate 1000 window records with randomized windowIndex values (seeded RNG) and verify all decrypt \u2014 the fuzz equivalence test that catches any remaining branching condition"
+ ],
+ "verifier_knob": {
+  "name": "num_fuzz_windows",
+  "value": "1000",
+  "effect": "Lowering to 40 makes it easier because fewer random window indices are tested, reducing the chance of hitting the modulo-43 boundary or timestamp-straddling windows; raising to 5000 makes it near-certain that both bugs manifest in at least one test window"
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the HKDF info encoding discrepancy (string vs bytes) without noticing the branching condition that selects which code path runs \u2014 partial fix passes the 15 sample windows but fails fresh window indices",
+  "Agent fixes the branching condition but normalizes both sides to strings instead of reading the README spec for 8-byte big-endian \u2014 all sample windows pass but fresh windows at high indices fail",
+  "Agent misses the Math.round vs Math.floor salt bug entirely because sample windows don't straddle second boundaries \u2014 verifier passes most fuzz tests but fails the timing edge-case test",
+  "Agent fixes encryptor but not verifier (or vice versa) \u2014 symmetric fix is required and partial fixes fail the cross-component consistency check",
+  "Agent changes the on-disk log format to embed more derivation context, breaking the format-stability test"
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "ecdh",
+  "hkdf",
+  "key-derivation",
+  "audit-logs",
+  "nodejs",
+  "cross-component"
+ ]
+}

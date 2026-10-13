@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "sql-reconciler-dual-aggregation-bug",
+  "title": "Finance Reconciliation Aggregation Engine",
+  "scenario": "A small in-house build-and-packaging shop tracks vendor invoices and payment disbursements in a SQLite database managed by a Python pipeline under /app/reconciler/. The pipeline runs nightly to produce a reconciliation report: for each vendor, it sums invoices and payments, flags discrepancies, and writes results to /app/output/reconciliation.csv. A finance-ops engineer noticed the December close report showed every vendor balanced \u2014 but manual spot-checks against raw bank statements reveal three vendors are actually out of balance by hundreds of dollars. The codebase is about 1,200 lines across a schema module, an ETL loader, a SQL aggregation engine, two helper libraries, and a CLI runner.",
+  "instruction_draft": "You are a finance-ops engineer. The nightly reconciliation pipeline at /app/reconciler/ is reporting every vendor as balanced, but manual audits confirm several vendors are genuinely out of balance. Your job is to produce a corrected reconciliation.csv at /app/output/reconciliation.csv.\n\nThe reconciliation must satisfy all of the following:\n1. Each row in reconciliation.csv corresponds to exactly one vendor_id.\n2. The `invoice_total` column must equal the sum of all invoice amounts for that vendor across all invoice_lines entries, regardless of line status.\n3. The `payment_total` column must equal the sum of all payment amounts for that vendor, but refunds (payment_type = 'refund') must be subtracted rather than added.\n4. The `balance` column must equal invoice_total minus payment_total.\n5. The `status` column must be 'BALANCED' if the absolute balance is less than 0.01, otherwise 'DISCREPANCY'.\n6. The output must include every vendor present in the vendors table, even vendors with no invoices or payments (showing 0.00 for totals).\n7. The pipeline must produce identical results when re-run on the same database; write your fix into the existing codebase so that running `python /app/reconciler/run.py` regenerates the correct output.",
+  "requirements": [
+   "reconciliation.csv has exactly one row per vendor_id from the vendors table",
+   "invoice_total is the sum of all invoice_lines.amount for that vendor regardless of line status",
+   "payment_total = sum(payments.amount WHERE type != 'refund') - sum(payments.amount WHERE type = 'refund')",
+   "balance = invoice_total - payment_total",
+   "status = 'BALANCED' if abs(balance) < 0.01 else 'DISCREPANCY'",
+   "vendors with no invoices or payments appear with 0.00 totals",
+   "running python /app/reconciler/run.py regenerates the correct reconciliation.csv"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install sqlite3; pip install nothing beyond stdlib",
+   "/app/reconciler/schema.sql \u2014 creates tables: vendors(vendor_id, name), invoices(invoice_id, vendor_id, created_at), invoice_lines(line_id, invoice_id, amount, status), payments(payment_id, vendor_id, amount, payment_type, created_at)",
+   "/app/reconciler/db.py \u2014 initializes and seeds the database from /app/data/seed.sql into /app/reconciler/ledger.db at startup; about 120 lines",
+   "/app/reconciler/agg.py \u2014 the SQL aggregation engine (~200 lines); contains TWO interacting bugs: (1) the invoice aggregation query JOINs invoice_lines with a WHERE status = 'approved' filter, silently dropping 'pending' and 'disputed' lines; (2) the payment aggregation query does a plain SUM(amount) treating refunds as positive, never subtracting them \u2014 but both bugs partially cancel for most vendors so the net balance appears correct for the majority of vendors in the seed data",
+   "/app/reconciler/etl.py \u2014 loads raw CSV exports into the DB (~180 lines); correct but plausible-looking",
+   "/app/reconciler/report.py \u2014 formats and writes reconciliation.csv (~150 lines); correct",
+   "/app/reconciler/utils.py \u2014 currency rounding helpers (~100 lines); contains a third-decimal rounding quirk that only matters when the above two bugs are fixed, because a vendor with a net balance of exactly $0.005 would flip status \u2014 this is the edge-case interaction that trips shallow fixers",
+   "/app/reconciler/run.py \u2014 CLI entry point, calls db.py then agg.py then report.py (~80 lines)",
+   "/app/data/seed.sql \u2014 inserts 12 vendors; 8 have only 'approved' invoice lines so bug #1 doesn't matter for them; 3 vendors have 'pending' or 'disputed' lines that are significant; 2 vendors have refund payments; 1 vendor has both a disputed line AND a refund, so fixing only one bug leaves it wrong; 1 vendor has a balance of exactly $0.005 after correct calculation, hitting the rounding edge case in utils.py",
+   "/app/output/ \u2014 empty directory, reconciliation.csv written here by run.py",
+   "The seed data is fixed and deterministic; verifier regenerates reconciliation.csv by running run.py after the solver's edits, then checks it against expected values computed from raw seed.sql"
+  ],
+  "internal_hint": "Difficulty source: NOT visible by reading alone \u2014 the two bugs in agg.py interact in the seed data such that most vendors show correct balances, so reading the file shows suspicious-looking SQL but the sample output looks fine for 9 of 12 vendors. The solver must RUN the pipeline, compare its output against raw SQL queries on the database, and observe which vendors are wrong. Bug 1 (status filter on invoice_lines) and Bug 2 (refunds not negated) are independent in code but interact on one vendor: fixing only Bug 1 leaves that vendor wrong because it now has a nonzero refund component; fixing only Bug 2 leaves it wrong because the disputed line is still excluded. The utils.py rounding is a third subtlety: after both bugs are fixed, one vendor's balance rounds to $0.005, and the existing round_currency() function uses Python's default banker's rounding (round(x, 2) rounds 0.005 to 0.00), so that vendor will be incorrectly marked BALANCED unless the solver also fixes the rounding to use ROUND_HALF_UP or equivalent \u2014 or the verifier catches it as a DISCREPANCY. The resolution path: (1) run run.py, look at output; (2) manually query the DB to compute expected totals; (3) diff to find discrepant vendors; (4) read agg.py and find the WHERE status='approved' and the SUM sign bug; (5) fix both; (6) re-run and notice the rounding edge case; (7) fix utils.py.",
+  "trap": "A solver that reads agg.py, spots the WHERE status='approved' filter and fixes it, then re-runs and sees most vendors now balanced will declare victory. The hidden tests include: (a) the vendor with a refund AND a disputed line (still wrong if only one bug fixed); (b) the vendor whose post-fix balance is exactly $0.005 (wrong status with banker's rounding). A solver that fixes both SQL bugs but misses the rounding edge case passes 10/12 vendors but fails the metric threshold.",
+  "tests": [
+   "Run python /app/reconciler/run.py and parse /app/output/reconciliation.csv; check that exactly 12 rows are present (one per vendor in vendors table)",
+   "For each vendor, recompute invoice_total by querying invoice_lines directly (all statuses) and compare to CSV; all 12 must match within 0.001",
+   "For each vendor, recompute payment_total = SUM(amount WHERE type!='refund') - SUM(amount WHERE type='refund') and compare to CSV; all 12 must match within 0.001",
+   "Check balance = invoice_total - payment_total for all 12 rows within 0.001",
+   "Verify status column: for the vendor with net balance $0.005, status must be 'DISCREPANCY' (not 'BALANCED'); for all truly balanced vendors abs(balance)<0.01 must yield 'BALANCED'",
+   "The vendor with both a disputed invoice line and a refund payment must show both adjustments reflected correctly",
+   "Vendors with no invoices and no payments must appear with invoice_total=0.00, payment_total=0.00, balance=0.00, status='BALANCED'",
+   "Re-run python /app/reconciler/run.py a second time and verify reconciliation.csv is byte-identical (determinism check)",
+   "Metric threshold: at least 11 of 12 vendor rows must have correct invoice_total, payment_total, balance, and status (threshold knob \u2014 raising to 12/12 makes the rounding edge case mandatory)"
+  ],
+  "verifier_knob": {
+   "name": "correct_vendor_threshold",
+   "value": "12",
+   "effect": "At 11/12, a solver fixing both SQL bugs but missing the rounding edge case still passes. At 12/12 (current setting), all vendors including the $0.005 balance case must be correct, making the rounding fix mandatory. Lowering to 10/12 allows missing the interaction vendor and makes the task easier."
+  },
+  "expected_failure_modes": [
+   "Solver reads agg.py, fixes the WHERE status='approved' filter only, re-runs, sees most vendors balanced, declares done \u2014 misses the refund subtraction bug",
+   "Solver fixes both SQL bugs but never tests the vendor with balance=$0.005, so the banker's rounding issue causes that vendor's status to be wrong",
+   "Solver fixes the refund bug by making refunds negative in the payment INSERT rather than in the aggregation query, which produces wrong results for vendors whose refunds were already stored as negative amounts in the seed data",
+   "Solver notices the two SQL bugs by code reading and patches them, but doesn't run the pipeline to verify, so misses that utils.py round_currency() uses banker's rounding",
+   "Solver queries the DB manually to verify their fix but uses Python's round() which also does banker's rounding, so their manual check agrees with the broken output and they don't catch the bug"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "finance",
+   "debugging",
+   "edge-cases",
+   "interacting-bugs",
+   "reconciliation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/reconciler/agg.py  # read the aggregation engine to spot bugs",
+   "python /app/reconciler/run.py  # run pipeline to see current output",
+   "cat /app/output/reconciliation.csv  # observe all-BALANCED output",
+   "sqlite3 /app/reconciler/ledger.db 'SELECT v.vendor_id, COALESCE(SUM(il.amount),0) FROM vendors v LEFT JOIN invoices i USING(vendor_id) LEFT JOIN invoice_lines il USING(invoice_id) GROUP BY v.vendor_id'  # compute true invoice totals",
+   "sqlite3 /app/reconciler/ledger.db 'SELECT vendor_id, SUM(CASE WHEN payment_type=\\'refund\\' THEN -amount ELSE amount END) FROM payments GROUP BY vendor_id'  # compute true payment totals",
+   "# From agg.py read: spot WHERE status=\\'approved\\' filter on invoice_lines",
+   "# From agg.py read: spot plain SUM(amount) not accounting for refunds",
+   "vi /app/reconciler/agg.py  # fix bug 1: remove WHERE status=\\'approved\\'",
+   "vi /app/reconciler/agg.py  # fix bug 2: change SUM(amount) to SUM(CASE WHEN payment_type=\\'refund\\' THEN -amount ELSE amount END)",
+   "python /app/reconciler/run.py  # regenerate",
+   "cat /app/output/reconciliation.csv  # check - 11/12 look right",
+   "cat /app/reconciler/utils.py  # check rounding helper",
+   "# Notice round_currency() uses Python built-in round() = banker's rounding",
+   "python3 -c 'print(round(0.005, 2))'  # confirm outputs 0.0 not 0.01",
+   "vi /app/reconciler/utils.py  # fix to use Decimal with ROUND_HALF_UP",
+   "python /app/reconciler/run.py  # regenerate final",
+   "cat /app/output/reconciliation.csv  # verify all 12 rows correct"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Both SQL bugs in agg.py are directly visible by reading the file \u2014 the WHERE status='approved' and the plain SUM(amount) are unambiguously suspicious code patterns; an agent reading agg.py first will fix both without needing to run and diff, undermining the 'must run to discover' difficulty premise",
+   "The instruction says the metric threshold knob is set to 12/12, meaning the rounding fix is mandatory, but the threshold description says 'at least 11 of 12' with a knob to raise to 12/12 \u2014 this creates ambiguity about whether the rounding edge case is strictly required or optional depending on how the verifier is configured",
+   "The seed data is deterministic and fixed, but the blueprint doesn't specify whether ledger.db is pre-populated or built by db.py at runtime \u2014 if db.py re-seeds from seed.sql on every run.py invocation, the determinism check (byte-identical on second run) may be fragile if any timestamp or ordering is non-deterministic",
+   "The instruction tells the solver 'the pipeline runs nightly to produce a reconciliation report' and to fix the codebase, but doesn't explicitly say they must NOT rewrite agg.py wholesale or replace it with a new correct query \u2014 a solver who rewrites correctly should pass but might miss the utils.py rounding trap",
+   "The banker's rounding edge case ($0.005) depends on a very specific seed value that the solver must trust is actually present; if the verifier computes expected values using Python round() as well, it might silently agree with the wrong answer"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 reflects that both SQL bugs in agg.py are directly visible by reading the file \u2014 a competent agent will cat agg.py first, immediately spot the WHERE status='approved' filter and the plain SUM(amount) for refunds, fix both, then check utils.py as a matter of course. The task's difficulty premise ('not visible by reading alone') is false for the primary bugs, and the speedrun reaches a likely-correct solution in ~17 commands including the rounding fix. The blueprint is otherwise well-constructed (clear requirements, realistic scenario, good verifiability), but fails the genuine_difficulty bar because static code reading yields the fix without requiring dynamic investigation.",
+  "fixes": [
+   "Make the SQL bugs less syntactically obvious: instead of a naked WHERE status='approved', bury the filter inside a CTE or a view definition in schema.sql so the aggregation query looks correct at first glance; similarly, disguise the refund bug as a sign issue in the seed data (refunds stored as negative amounts) so the SUM looks correct but double-negates",
+   "Add a fourth interacting issue that is truly runtime-only, e.g., a currency conversion helper that applies the wrong exchange rate only when the invoice currency column matches a specific value present in only 2 of 12 vendors \u2014 this forces the solver to actually run the pipeline and diff outputs rather than fix by code reading",
+   "To make the rounding edge case genuinely tricky, remove the utils.py hint and instead embed the rounding logic inline in report.py with a comment like '# round to 2dp for display' using Python's round() \u2014 solvers won't think to audit a display-layer formatting call for a correctness bug"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a broken financial reconciliation pipeline that incorrectly handles refunds, producing wrong vendor/merchant balances, with the fix requiring correct refund subtraction logic \u2014 the core bug and approach are nearly identical despite different framing and output formats."
+    },
+    {
+     "ref_id": "terminal-bench-pro/normalize-invoice-pdfs-to-csv",
+     "verdict": "distinct",
+     "reason": "This task is about extracting and normalizing data from PDF invoices into CSV, not debugging a reconciliation pipeline with incorrect aggregation logic."
+    },
+    {
+     "ref_id": "terminal-bench/intrastat-meldung",
+     "verdict": "distinct",
+     "reason": "This task involves navigating a compliance workflow to file government trade declarations, not debugging a SQL/Python aggregation pipeline."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "This task is about fixing chunk-based CSV pipeline bugs causing duplicate/missing rows, not a financial reconciliation aggregation logic error."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "This task is about fixing a SQL query for running totals and ranking within partitions, not a vendor invoice/payment reconciliation pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.182
+    ],
+    [
+     "terminal-bench-pro/normalize-invoice-pdfs-to-csv",
+     0.165
+    ],
+    [
+     "terminal-bench/intrastat-meldung",
+     0.14
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.136
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.104
+    ]
+   ],
+   "cost_usd": 0.013665
+  },
+  "novel": false
+ },
+ "cost_usd": 0.054051
+}

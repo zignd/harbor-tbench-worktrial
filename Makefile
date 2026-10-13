@@ -40,7 +40,7 @@ BUDGET ?= 20
 status: ## One-screen view of background work: processes, containers, authoring turns, ledger, spend
 	@uv run --quiet python -m scripts.status
 
-watch: ## Live status, refreshed every 30 s, changed lines highlighted (Ctrl-C to stop); EVERY=1 to change
+watch: ## Live status, refreshed every 30 s, scrollable TUI, changed lines highlighted (q to quit); EVERY=1 to change
 	@uv run --quiet python -m scripts.status --watch $(or $(EVERY),30)
 
 plan: ## Show docs/plan.md checklist progress per phase (ARGS=--remaining lists open items)

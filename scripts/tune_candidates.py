@@ -40,14 +40,9 @@ def main() -> int:
     args = parser.parse_args()
     ledger = Ledger()
     for cand_dir in sorted(CANDIDATES_DIR.iterdir()):
-        cal_file = cand_dir / "calibration.json"
-        if (args.only and cand_dir.name not in args.only) or not cal_file.exists():
+        if args.only and cand_dir.name not in args.only:
             continue
-        if (cand_dir / "tuning.json").exists():
-            continue
-        if json.loads(cal_file.read_text())["verdict"] not in ("too_easy", "too_hard"):
-            continue
-        tune_one(cand_dir, ledger, rounds=args.rounds)
+        tune_one(cand_dir, ledger, rounds=args.rounds)  # skips what doesn't need tuning
     return 0
 
 

@@ -1,0 +1,72 @@
+{
+ "slug": "release-build-query-filter-validator",
+ "title": "Build Query Filter Validator for Release Pipeline",
+ "scenario": "A release engineer is unblocking a CI failure in the data-export service. The service exposes a SQLite-backed filter engine: callers submit a JSON filter spec and the engine executes a parameterised SQL query, returning matching rows. The CI job runs a corpus of filter specs through a reference binary and compares its output with the output from a bash validator script at /opt/release/validate_filters.sh. The bash script was just refactored by an intern and the build has been red ever since\u2014but only two of the twenty provided smoke-test specs fail, so the intern claims the script is 'basically fine'. The release engineer needs the validator to pass every spec in the hidden corpus, not just the smoke tests.",
+ "instruction_draft": "The CI pipeline for the data-export service is broken. The build job runs `/opt/release/validate_filters.sh <spec_file>` for each filter spec in `/opt/release/specs/` and compares the output with `/opt/release/reference_binary` run on the same spec. Every spec must produce byte-identical output from both programs.\n\nYour job is to make `validate_filters.sh` produce correct output for every valid spec the CI harness will throw at it. A valid spec is a JSON object with up to five keys\u2014`table`, `columns`, `where`, `order_by`, and `limit`\u2014each described in `/opt/release/SPEC_FORMAT.md`. The `where` clause is a recursive AND/OR/NOT tree of comparison predicates; your script must translate it faithfully into a single SQLite query and print results as pipe-delimited rows (header first).\n\nThe script must reject invalid specs\u2014malformed JSON, unknown tables, columns not belonging to the referenced table, unsupported operators, non-integer limits, and `order_by` columns absent from the `columns` list\u2014by printing `ERROR: <reason>` to stdout and exiting 1. All valid specs must exit 0 and print correct results. The database lives at `/opt/release/data/export.db`.",
+ "requirements": [
+  "validate_filters.sh <spec_file> translates a valid JSON filter spec into a SQLite query and prints pipe-delimited rows (header row first) to stdout, exiting 0",
+  "where clauses are recursive AND/OR/NOT trees of comparison predicates; the script must handle arbitrary nesting depth without evaluating in the wrong order or dropping conditions",
+  "For invalid specs (malformed JSON, unknown table, column not in table, unsupported operator, non-integer limit, order_by column not in columns list) the script prints 'ERROR: <reason>' to stdout and exits 1",
+  "Results are ordered exactly as specified by order_by (stable, ascending unless DESC is indicated in the spec); ties broken by SQLite's natural row order",
+  "Output is byte-identical to the reference binary for every valid spec in the CI corpus",
+  "NULL values in output are printed as the literal string NULL",
+  "String comparison predicates are case-sensitive",
+  "The BETWEEN operator includes both endpoints",
+  "Numeric comparisons use SQLite's type affinity rules (no forced casting in the generated SQL)",
+  "The script handles specs with no where clause (return all rows), no order_by, and no limit correctly"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm with sqlite3, jq, bash installed via apt",
+  "SQLite database at /opt/release/data/export.db with three tables: 'orders' (order_id INTEGER, customer TEXT, amount REAL, status TEXT, created_date TEXT, region TEXT), 'products' (product_id INTEGER, name TEXT, category TEXT, price REAL, stock INTEGER, active INTEGER), 'events' (event_id INTEGER, source TEXT, severity INTEGER, message TEXT, ts TEXT, resolved INTEGER). Each table has ~5000 rows of plausible synthetic data generated with a fixed seed.",
+  "/opt/release/SPEC_FORMAT.md: full markdown spec of the JSON format including the recursive where tree, supported operators (=, !=, <, >, <=, >=, LIKE, NOT LIKE, BETWEEN, IN, IS NULL, IS NOT NULL), DESC suffix for order_by fields, and the exact ERROR message formats",
+  "/opt/release/reference_binary: compiled C program (source not present) that correctly implements all spec semantics and serves as ground truth; it reads the spec from argv[1] and the DB path from env var EXPORT_DB (defaulting to /opt/release/data/export.db)",
+  "/opt/release/validate_filters.sh: the broken bash script (~120 lines) that the intern refactored; it has TWO interacting bugs: (1) the WHERE-clause builder emits OR conditions inside parentheses only one level deep\u2014nested AND inside OR is silently flattened so deeply-nested trees produce wrong SQL; (2) the column-existence validator checks column names against a hardcoded global list across all tables rather than per-table, so 'amount' (valid for orders) incorrectly validates for 'products', producing a SQLite error at runtime instead of the required ERROR exit",
+  "/opt/release/specs/: twenty smoke-test spec JSON files; exactly two of them (spec_14.json with a three-level nested NOT/OR/AND where clause, and spec_17.json which references 'amount' on the 'products' table) currently fail; the other eighteen pass by luck because they use flat where clauses on tables that share column names",
+  "The CI harness at verify time generates 200 fresh specs from a seeded generator covering: deeply nested AND/OR/NOT (depth 3-5), cross-table column name collisions, BETWEEN with NULLs, IN with a single element, IS NULL on integer columns, LIKE with % and _, order_by with DESC, limit=0 (valid, returns header only), specs with all five keys, specs with only table+columns",
+  "EXPORT_DB environment variable is set to /opt/release/data/export.db in the shell that runs validate_filters.sh"
+ ],
+ "internal_hint": "Difficulty comes from TWO interacting causes that hide each other during shallow testing. Bug 1 (algorithmic, not visible by reading without running): the WHERE-clause recursive builder uses a bash function that correctly wraps the top level but, when it recurses into nested children, it concatenates their output with the operator but omits wrapping parentheses\u2014so `AND(OR(a,b),c)` becomes `a OR b AND c` (wrong precedence) instead of `(a OR b) AND c`. The smoke tests don't exercise depth > 2, so this passes 18/20. Bug 2 (data-dependent, only shows at runtime): the column validator uses a single associative array built from all columns of all tables; the intern's refactor merged them. So `amount` passes validation for `products`, the script then generates `SELECT amount FROM products ...` which SQLite rejects with an error, but the script catches sqlite3 exit code \u2260 0 and prints a generic DB error instead of `ERROR: column 'amount' not in table 'products'`. Fixing bug 2 makes spec_17 pass but leaves the nesting bug latent. Fixing bug 1 makes spec_14 pass. The hidden corpus has 40+ specs that test nesting depth \u2265 3 (which the smoke tests never reach) and 15+ cross-table column collision specs. A solver who only runs the smoke tests and patches the two visible failures will still fail ~55 hidden specs. The correct fix requires: (a) rewriting the recursive WHERE builder to emit fully parenthesised SQL at every recursion level, and (b) building per-table column sets from `PRAGMA table_info()` at validation time. The solver must discover both bugs by experimenting with inputs the smoke tests don't cover\u2014running the reference binary on hand-crafted specs to observe discrepancies, then instrumenting the bash script.",
+ "trap": "The shallow fix: a solver who reads the script, spots that spec_14 (nested NOT/OR/AND) fails, and adds one extra layer of parentheses to the WHERE builder\u2014and spots that spec_17 uses a cross-table column, and patches the validation to use sqlite3 PRAGMA for the specific table in spec_17\u2014will pass all 20 smoke tests. But the parenthesisation fix is ad-hoc (adds parens at depth 2 only) so depth-3 nesting still fails, and the PRAGMA fix may be applied only to the error-handling path rather than the validation path, leaving the column check incorrect for tables the agent didn't test. The hidden corpus specifically targets depth 3, 4, 5 nesting and 8 different cross-table collision pairs. An agent that stops after the smoke tests pass will fail ~55/200 hidden specs.",
+ "tests": [
+  "Smoke regression: all 20 original specs must pass byte-identical comparison with reference binary",
+  "Nesting depth 3: 30 specs with three-level AND/OR/NOT trees across all three tables; script output must match reference binary exactly",
+  "Nesting depth 4-5: 15 specs; any precedence error produces wrong rows",
+  "Cross-table column collision: 20 specs where a column name valid in table A is used in table B; script must emit ERROR: column '<name>' not in table '<table>' and exit 1",
+  "IS NULL / IS NOT NULL on integer columns across all three tables: 10 specs",
+  "BETWEEN with boundary values (including NULLs in data): 10 specs; endpoints must be inclusive",
+  "IN with single element and IN with 10+ elements: 10 specs",
+  "order_by with DESC, multi-column order_by, order_by column absent from columns list (must error): 15 specs",
+  "limit=0 (valid, header only), limit=1, limit larger than row count: 8 specs",
+  "Malformed JSON specs (trailing comma, missing closing brace): 5 specs; must exit 1 with ERROR prefix",
+  "Unknown table name: 5 specs; must exit 1 with ERROR prefix",
+  "Unsupported operator (e.g. REGEXP): 5 specs; must exit 1 with ERROR prefix",
+  "Non-integer limit (e.g. '10.5', 'all'): 5 specs; must exit 1 with ERROR prefix",
+  "No where clause, no order_by, no limit (minimal spec): 10 specs; must return all rows in SQLite default order",
+  "LIKE with % wildcard and _ wildcard, case-sensitive: 8 specs",
+  "NULL values appear literally as NULL in pipe-delimited output (not empty string): 5 specs that query rows with NULL fields"
+ ],
+ "verifier_knob": {
+  "name": "corpus_size",
+  "value": "200 specs (30 nesting, 20 cross-table, remainder split across other cases)",
+  "effect": "Reducing to 50 specs (only depth-2 nesting, fewer collision pairs) lets a shallow fix pass; increasing to 400 specs with depth-6 nesting and more NULL edge cases raises required correctness further"
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the two visible smoke-test failures with ad-hoc patches (extra parens at depth 2, PRAGMA only for spec_17's table) and stops; passes smoke tests but fails ~55 hidden depth-3+ and collision specs",
+  "Agent rewrites the WHERE builder correctly but uses a global column list (not per-table PRAGMA) for validation; passes nesting tests but fails all cross-table collision specs",
+  "Agent uses per-table PRAGMA for validation but applies it lazily (only when SQLite errors) instead of pre-validating; cross-table collision specs produce wrong error messages or exit codes",
+  "Agent generates correct SQL for AND/OR but forgets parentheses around NOT operands; NOT(AND(a,b)) becomes NOT a AND b which SQLite parses differently",
+  "Agent handles BETWEEN incorrectly (exclusive endpoints or wrong column order) because BETWEEN semantics are only exercised in hidden specs",
+  "Agent prints empty string instead of NULL for null fields; passes most tests but fails the NULL-display specs"
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "data-querying",
+ "tags": [
+  "sql",
+  "bash",
+  "sqlite",
+  "algorithmic",
+  "two-interacting-bugs",
+  "adversarial-corpus"
+ ]
+}

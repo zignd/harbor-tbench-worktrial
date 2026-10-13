@@ -1,0 +1,152 @@
+{
+ "blueprint": {
+  "slug": "npm-plugin-abi-bridge-config",
+  "title": "Native Plugin ABI Bridge Configuration",
+  "scenario": "A platform team is migrating a Node.js analytics service to use a new versioned plugin architecture. The service loads compiled native addons (`.node` binaries) through a JavaScript plugin registry that applies ABI version negotiation, capability flags, and routing rules. The compiled registry binary (`/opt/plugin-registry/registry.node`) is a black-box native addon with no source available; the JavaScript orchestration layer in `/app/` calls into it. The system worked in staging but silently produces wrong routing decisions on real traffic because certain capability flag combinations were never exercised by the small staging dataset.",
+  "instruction_draft": "Hey, we need the plugin routing system at `/app` working correctly before the Monday migration. The native registry at `/opt/plugin-registry/registry.node` negotiates ABI versions and routes requests to plugins based on capability flags, but it's producing wrong plugin selections on some real traffic. There's a `package.json`, an `orchestrator.js`, and a `config.json` that wires everything together. The config is clearly incomplete or wrong \u2014 some required fields are missing or have bad values. Figure out how the registry actually behaves by running it against different inputs, then fix `config.json` so that: (1) every plugin entry has the correct `abiVersion` field matching what the registry reports for that plugin ID, (2) the `routingRules` array covers all five capability flag combinations the registry recognizes and maps each to the right plugin, (3) the `fallbackPlugin` field names an actually-registered plugin, and (4) the `featureGates` object enables exactly the features the registry says are stable (not experimental). Don't touch the compiled binary or `orchestrator.js`.",
+  "requirements": [
+   "config.json has a correct abiVersion for each of the four plugin entries matching what the registry reports",
+   "config.json routingRules covers all five capability flag combinations the registry recognizes",
+   "Each routingRules entry maps to the correct plugin as the registry enforces",
+   "config.json fallbackPlugin names a plugin that is actually registered",
+   "config.json featureGates enables exactly the features the registry marks as stable, and does not enable experimental ones"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with Node.js 20 installed via apt",
+   "/opt/plugin-registry/registry.node: compiled native addon (no source); built in Dockerfile using node-gyp from a C source file that is then deleted; exposes: require('./registry').getPluginAbi(pluginId), require('./registry').getCapabilityMap(), require('./registry').getFeatureStatus(), require('./registry').resolvePlugin(capabilityFlags)",
+   "The registry binary encodes: four plugin IDs ('analytics-v1','analytics-v2','events-core','events-extended') with distinct ABI versions (3, 5, 3, 7); five capability flag bitmask patterns (0x01, 0x02, 0x03, 0x05, 0x07) each routing to a specific plugin; four features where two are 'stable' and two are 'experimental'",
+   "/app/orchestrator.js: ~120-line JS file that requires the registry, loads config.json, validates it, and exports a route(flags) function; validates all required config fields and throws descriptive errors for missing/wrong ones; not to be modified",
+   "/app/config.json: present but intentionally broken: abiVersion values are all wrong (set to 1), routingRules covers only 3 of 5 capability patterns and has two wrong plugin mappings, fallbackPlugin is set to 'nonexistent-plugin', featureGates enables one experimental feature and disables one stable feature",
+   "/app/package.json: declares dependency on the local registry, orchestrator entry point",
+   "/app/test-harness.js: a 60-line script that exercises route() with various flag values and prints results; solver can use this to observe behavior",
+   "/app/plugins/: four stub .js files (analytics-v1.js, analytics-v2.js, events-core.js, events-extended.js) each exporting a minimal process() function",
+   "Dockerfile builds registry.node from C source, deletes C source, copies all JS files, runs npm install"
+  ],
+  "internal_hint": "The difficulty comes from two interacting levers. First, opaque_component: the registry.node binary must be characterized by experiment \u2014 the solver must call getPluginAbi() for each plugin ID, getCapabilityMap() to learn all five bitmask\u2192plugin mappings, getFeatureStatus() to discover which features are stable vs experimental, then cross-check resolvePlugin() calls. Second, observe_not_read: the broken config.json only manifests wrong behavior when fed real capability flag values (e.g., 0x05 and 0x07 were not in staging), so reading config.json alone doesn't reveal all the gaps. The solver must: (1) write a small probe script that calls each registry method, (2) record the four ABI versions, five routing rules, and feature statuses, (3) rewrite config.json with all correct values. The trap is that 0x03 routes to analytics-v2 (not analytics-v1 as the broken config says) and 0x05/0x07 are entirely missing from routingRules \u2014 a solver who only tests 0x01 and 0x02 will miss both.",
+  "trap": "A solver who only tests the capability flags present in the broken config (0x01, 0x02, 0x03) will fix those three rules and miss the 0x05 and 0x07 entries entirely. The verifier generates fresh routing calls with all five flag values including 0x05 and 0x07, causing KeyError/wrong-plugin failures. Additionally, a solver who guesses featureGates by name rather than probing getFeatureStatus() will likely flip the wrong ones.",
+  "tests": [
+   "Parse config.json and check each plugin entry has an abiVersion field equal to what registry.node.getPluginAbi(pluginId) returns (tested for all four plugin IDs)",
+   "Parse config.json routingRules and verify it contains exactly five entries covering bitmasks 0x01, 0x02, 0x03, 0x05, 0x07",
+   "For each of the five bitmasks, call orchestrator.route(flags) and verify it returns the same plugin ID as registry.node.resolvePlugin(flags)",
+   "Check config.json fallbackPlugin value exists in the plugins directory and is a registered plugin ID",
+   "Call getFeatureStatus() on the registry, then verify config.json featureGates has true for every stable feature and false/absent for every experimental feature",
+   "Run orchestrator.js require and verify no validation errors are thrown (covers missing-field detection)",
+   "Verify config.json is valid JSON and contains all required top-level keys: plugins, routingRules, fallbackPlugin, featureGates"
+  ],
+  "verifier_knob": {
+   "name": "number of capability flag combinations checked",
+   "value": "5",
+   "effect": "Lowering to 3 (only flags in original broken config) makes it much easier since the solver can partially fix and pass; raising to 8 (adding edge-case OR combinations) makes it harder by requiring deeper characterization of the registry's bitmask logic"
+  },
+  "expected_failure_modes": [
+   "Agent probes only the flags present in the broken config and misses 0x05 and 0x07 routing rules",
+   "Agent reads config.json and guesses the correct values without running the registry, getting ABI versions or feature statuses wrong",
+   "Agent fixes routing rules but sets featureGates by guessing feature names rather than probing getFeatureStatus(), enabling an experimental feature",
+   "Agent fixes abiVersion for plugins that appear in routingRules but ignores plugins not referenced there (events-extended has ABI 7 and must still be correct)",
+   "Agent modifies orchestrator.js to work around the registry instead of fixing config.json"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "native-addon",
+   "configuration",
+   "black-box",
+   "nodejs",
+   "plugin-routing",
+   "abi-negotiation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /app && cat config.json",
+   "cat orchestrator.js",
+   "node -e \"const r=require('/opt/plugin-registry/registry.node'); console.log(r.getPluginAbi('analytics-v1'), r.getPluginAbi('analytics-v2'), r.getPluginAbi('events-core'), r.getPluginAbi('events-extended'))\"",
+   "node -e \"const r=require('/opt/plugin-registry/registry.node'); console.log(JSON.stringify(r.getCapabilityMap()))\"",
+   "node -e \"const r=require('/opt/plugin-registry/registry.node'); console.log(JSON.stringify(r.getFeatureStatus()))\"",
+   "Write corrected config.json with all four ABI versions, all five routing rules from getCapabilityMap(), correct fallbackPlugin, stable features only in featureGates",
+   "node -e \"const o=require('./orchestrator'); [1,2,3,5,7].forEach(f=>console.log(f, o.route(f)))\" to verify"
+  ],
+  "speedrun_commands": 7,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "node-gyp build may fail in Dockerfile due to Python 3.13 / bookworm dependency conflicts with specific node-gyp versions",
+   "Node.js installed via apt may not be exactly version 20 without pinning, causing native addon ABI mismatch at runtime",
+   "getCapabilityMap() returning integer keys vs string keys could cause subtle JSON transcription issues for the solver",
+   "If the C source deletion in Dockerfile fails silently, solver might accidentally read the source and trivialize the task"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies the task: the registry exposes getCapabilityMap() and getFeatureStatus() APIs that directly enumerate all five routing rules and all feature statuses in a single call each, reducing the entire task to ~7 commands of API-calling and JSON transcription. The 'opaque_component' and 'observe_not_read' difficulty levers are completely nullified by these introspection APIs\u2014there is no need to probe by experiment or run against real traffic. The trap (missing 0x05/0x07) only catches agents who ignore getCapabilityMap(), which a frontier agent will not do.",
+  "fixes": [
+   "Remove getCapabilityMap() and getFeatureStatus() from the registry API; instead expose only resolvePlugin(flags) and getPluginAbi(pluginId), forcing the solver to discover capability patterns by systematic fuzzing of resolvePlugin() across a flag space",
+   "Make getFeatureStatus() return only per-feature queries (getFeatureStatus('featureName')) rather than a bulk dump, and don't document the feature names\u2014force the solver to discover them by probing orchestrator.js error messages or test-harness output",
+   "Add a secondary trap: make some routing rules context-dependent (e.g., flag 0x03 routes differently based on a registry state set during initialization), so simply calling resolvePlugin() once per flag isn't sufficient"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/implement-depgraph-dependency-resolver",
+     "verdict": "distinct",
+     "reason": "Dependency resolution and topological sorting is a completely different problem from ABI version negotiation and capability-flag-based plugin routing configuration."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "variant",
+     "reason": "Both tasks involve a black-box compiled binary that must be reverse-engineered through experimentation to fix a JavaScript orchestration/configuration layer, though the specific domain (canary traffic sampling vs. plugin ABI routing) differs."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-jni-unsatisfiedlinkerror-path",
+     "verdict": "distinct",
+     "reason": "Fixing a native library path error in a Java JNI application is a straightforward path configuration problem, not black-box binary exploration to infer routing behavior."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Fixing weighted aggregation calculations in a sales service is a data correctness bug in source code, not black-box ABI/capability-flag exploration."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "variant",
+     "reason": "Both tasks require experimentally probing a black-box compiled binary/library to understand its actual behavior and then building/fixing a JavaScript/Python orchestration layer around it, making them structurally very similar despite different domains."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/implement-depgraph-dependency-resolver",
+     0.144
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.082
+    ],
+    [
+     "terminal-bench-pro/fix-jni-unsatisfiedlinkerror-path",
+     0.074
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.065
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.062
+    ]
+   ],
+   "cost_usd": 0.014301000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051942
+}

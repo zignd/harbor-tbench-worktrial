@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "schema-transform-binary-config",
+  "title": "Schema Transform Pipeline Config Migration",
+  "scenario": "A platform team ships a data-normalization pipeline: a compiled C binary (`/opt/schemaxform/schemaxform`) reads JSON records from stdin, applies field transforms according to a JSON config file, and writes normalized records to stdout. The binary was built without source being retained in the repo. A new feature \u2014 per-tenant field aliasing with type coercion \u2014 was specified in an internal RFC and must be wired up in the Node.js orchestrator (`/app/orchestrator/`) that calls the binary and assembles per-tenant configs. The orchestrator currently uses a single shared config and ignores tenant-specific overrides from a Redis-backed tenant registry.",
+  "instruction_draft": "Hey, we finally got schemaxform updated to support per-tenant alias maps and type coercion but nobody hooked it up. The binary lives at /opt/schemaxform/schemaxform and the orchestrator is in /app/orchestrator/. There's a tenant registry at /app/registry/tenants.json with alias/coercion specs for each tenant. The orchestrator needs to build a per-tenant config for the binary and run it per-tenant batch. End state: running `node /app/orchestrator/index.js` processes /app/data/input.ndjson and writes one output file per tenant to /app/output/<tenant_id>.ndjson, where every record uses the aliased field names and has values coerced to the declared types. The binary silently drops records it can't process \u2014 make sure your configs are right or you'll get empty output files.",
+  "requirements": [
+   "Running `node /app/orchestrator/index.js` exits with code 0",
+   "Output directory /app/output/ contains one .ndjson file per tenant_id found in /app/registry/tenants.json",
+   "Each output record uses the aliased field names declared in that tenant's alias_map in tenants.json",
+   "Each output record has values coerced to the declared types in that tenant's type_coercions map",
+   "No output file is empty \u2014 each tenant's file contains at least as many records as there are input records matching that tenant_id",
+   "The config JSON written to the binary matches the exact schema the binary accepts (discovered by experimentation)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20, gcc, and builds /opt/schemaxform/schemaxform from a C source that is deleted after compilation; the binary is stripped",
+   "The binary accepts a config file path as --config <path> and reads NDJSON from stdin, writes NDJSON to stdout; it silently drops records when config keys are missing or misnamed",
+   "The binary's config schema is NOT documented; it must be discovered by probing: it requires a top-level 'version' integer (must be 2, not 1), 'aliases' object (not 'alias_map'), 'coercions' object (not 'type_coercions'), and 'strict' boolean",
+   "The binary ignores unknown top-level keys silently, producing output that looks correct on trivial input but drops multi-type records when 'strict' is false vs true \u2014 this only manifests on heterogeneous real data",
+   "The C source uses: if (cfg_version != 2) { drop all records silently }; aliases/coercions key names differ from the RFC/tenants.json naming convention",
+   "/app/registry/tenants.json has 4 tenants, each with alias_map and type_coercions keys (RFC naming, not binary naming)",
+   "/app/data/input.ndjson has ~200 records tagged with tenant_id, with heterogeneous value types per field across records",
+   "/app/orchestrator/index.js exists but uses a single hardcoded config path and does not split by tenant or read tenants.json",
+   "/app/orchestrator/config-builder.js is a stub with TODO comments",
+   "A sample one-record smoke test is provided in /app/test/smoke.sh that passes even with a broken config (because single-type trivial data doesn't trigger the strict-mode drop bug)",
+   "The binary accepts --probe flag which outputs 'schemaxform v2 ready' and exits \u2014 confirming version but not revealing config schema",
+   "/app/RFC-alias-coercion.md describes the intended feature using alias_map and type_coercions naming (matching tenants.json but NOT the binary)"
+  ],
+  "internal_hint": "Two interlocking difficulties: (1) opaque_component \u2014 the binary's config schema uses different key names ('aliases', 'coercions') than the RFC and tenants.json ('alias_map', 'type_coercions'), and requires 'version': 2 not 1; these facts are only discoverable by probing with varied configs and observing record counts. (2) observe_not_read \u2014 the 'strict': false bug only manifests on heterogeneous data: with strict=false the binary emits only records where all coercions succeed without error, silently dropping ~30% of records; the smoke test uses a single homogeneous record so it passes regardless. The agent must: run the binary with candidate configs against the real input.ndjson, count output records, vary config keys to find the correct schema, discover the strict flag's effect on heterogeneous data, implement the orchestrator to split by tenant and build correct per-tenant configs, and map tenants.json field names to binary field names.",
+  "trap": "The smoke test in /app/test/smoke.sh passes with strict=false and wrong key names applied to trivial single-record input, so agents who validate only against the smoke test will produce output files with 30-60% of expected records silently dropped. Verifier generates fresh heterogeneous input records at verify time and checks per-tenant record counts match expected counts (all input records for that tenant, not a subset).",
+  "tests": [
+   "Verify /app/output/ contains exactly 4 .ndjson files, one per tenant_id in tenants.json",
+   "Verify each output file is non-empty and contains the correct number of lines (matching the count of input records with that tenant_id, verified against a fresh generated input at verify time with known tenant distribution)",
+   "Verify that field names in output records match the alias_map values for that tenant (e.g., input field 'user_id' aliased to 'uid' appears as 'uid' in output)",
+   "Verify that coerced field values have the correct JavaScript types matching type_coercions (e.g., a field declared as 'number' contains a JSON number not a string)",
+   "Verify with a fresh 4-tenant input NDJSON (generated at verify time with heterogeneous field types) that no records are dropped \u2014 output line count per tenant equals input line count per tenant",
+   "Verify `node /app/orchestrator/index.js` exits 0 and does not write to /app/output/undefined.ndjson or /app/output/null.ndjson"
+  ],
+  "verifier_knob": {
+   "name": "tenant_count_and_record_heterogeneity",
+   "value": "4 tenants, 200 records, 3 distinct value types per coerced field",
+   "effect": "Increasing tenant count and type heterogeneity makes the strict-flag bug affect more output files; decreasing heterogeneity allows strict=false to accidentally pass more records, masking the bug"
+  },
+  "expected_failure_modes": [
+   "Agent reads RFC and tenants.json, uses 'alias_map'/'type_coercions' key names directly in binary config without probing \u2014 binary silently drops all records, output files are empty",
+   "Agent uses version:1 in config (guessing from --probe output format) \u2014 binary silently drops all records",
+   "Agent discovers correct key names but leaves strict:false \u2014 passes smoke test but fails on heterogeneous verify-time data with ~30% record loss",
+   "Agent builds per-tenant orchestration correctly but hardcodes config keys from RFC naming \u2014 correct structure, wrong keys, all output empty",
+   "Agent probes binary only with the provided sample data (homogeneous types) and concludes strict:false is fine, missing the heterogeneous-data drop"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "opaque-binary",
+   "configuration",
+   "nodejs",
+   "constraint-satisfaction",
+   "modality-translation",
+   "platform-engineering"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/registry/tenants.json",
+   "cat /app/RFC-alias-coercion.md",
+   "cat /app/orchestrator/index.js && cat /app/orchestrator/config-builder.js",
+   "head -5 /app/data/input.ndjson",
+   "/opt/schemaxform/schemaxform --probe",
+   "# Probe with RFC naming (version:1, alias_map, type_coercions): echo record | schemaxform --config /tmp/cfg1.json \u2192 0 output",
+   "# Probe with version:2, alias_map, type_coercions \u2192 0 output",
+   "# Probe with version:2, aliases (not alias_map), type_coercions \u2192 records appear for aliasing",
+   "# Probe with version:2, aliases, coercions (not type_coercions) \u2192 coercions work",
+   "# Test strict:false vs strict:true using homogeneous data \u2192 both seem fine",
+   "# Test strict:false vs strict:true using heterogeneous data (mixed string/number) \u2192 strict:false drops ~30%",
+   "# Confirm: correct schema is {version:2, aliases:{}, coercions:{}, strict:true}",
+   "# Write config-builder.js: map alias_map\u2192aliases, type_coercions\u2192coercions, set version:2, strict:true",
+   "# Write index.js: read tenants.json, group input.ndjson by tenant_id, per-tenant: build config, pipe to binary, write output/<tenant_id>.ndjson",
+   "node /app/orchestrator/index.js",
+   "ls /app/output/",
+   "wc -l /app/output/*.ndjson",
+   "head -1 /app/output/tenant1.ndjson  # verify aliased field names",
+   "# Verify numeric coercions are numbers not strings in output",
+   "cat /app/test/smoke.sh && bash /app/test/smoke.sh"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The binary's exact behavior with partial configs is not fully specified \u2014 if 'strict:true' drops records for reasons beyond type coercion failure (e.g., missing fields), a correct solution could still fail on fresh verify-time data depending on what fields the verifier generates",
+   "Verifier regenerates fresh input at verify time \u2014 if the heterogeneous type distribution changes (e.g., more records become uncoercible), expected counts could differ from what agent computed during development, causing false failures",
+   "The type coercion semantics are underspecified: if a field declared 'number' receives '3.14abc', does strict:true drop the record or coerce to NaN? The C source behavior on edge cases isn't documented and could cause unexpected drops on verifier-generated data",
+   "Node.js child_process handling of the binary (stdin piping, backpressure, large NDJSON) could introduce flakiness on 200-record input if implemented naively with exec() rather than spawn() with streaming",
+   "If the verifier uses a different tenant distribution than the development input.ndjson, agents who hardcode expected counts rather than computing dynamically would fail for valid reasons unrelated to the task's intended difficulty"
+  ],
+  "verdict": "accept",
+  "reasons": "This is a well-constructed hard task with two interlocking genuine difficulties (opaque binary config schema discovery and strict-mode behavior on heterogeneous data) that require active experimentation rather than passive reading. The smoke test trap is clever and realistic \u2014 it mirrors real engineering failures where unit tests pass but production data reveals silent drops. The verifier's fresh-data regeneration at verify time properly prevents hollow solutions from passing. The ~20-command speedrun is at the borderline, but the key insight (testing strict mode on heterogeneous data specifically) is non-obvious enough that frontier agents will frequently miss it, making genuine_difficulty defensible at 4.",
+  "fixes": [
+   "Specify the coercion edge-case behavior more precisely (e.g., 'uncoercible values cause record drop when strict:true; NaN is considered a failed coercion') to eliminate invalid failure risk on verifier-generated edge-case values",
+   "Add a note that the verifier's input uses the same tenant_id values and proportions as /app/data/input.ndjson but regenerated, so agents can trust their development counts as targets",
+   "Consider adding a second trap layer: make the binary accept 'aliases' OR 'alias_map' on simple input but only honor 'aliases' on multi-field records, increasing the surface area that requires probing and raising genuine_difficulty closer to 5"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing bugs in a Node.js NDJSON validation/ingestion pipeline for correctness and performance; the candidate is about implementing per-tenant config generation and orchestration for a black-box binary."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a canary deployment orchestrator's rollback logic and telemetry handling; the candidate is about wiring per-tenant config construction and batch processing into a data-normalization pipeline."
+    },
+    {
+     "ref_id": "terminal-bench/data-anonymization",
+     "verdict": "distinct",
+     "reason": "That task is about building a CSV anonymization CLI with cross-file entity consistency and memory constraints; the candidate is about integrating per-tenant alias/coercion configs into a Node.js orchestrator calling a binary."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a TCP audit service with HMAC-SHA256 over a binary WAL record format; the candidate is about orchestrating a data-normalization binary with per-tenant JSON configs."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about debugging a silent AES-CTR decryption bug in a refactored C library; the candidate is about building per-tenant config pipelines for a Node.js orchestrator."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-94391df591b0",
+     0.204
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.168
+    ],
+    [
+     "terminal-bench/data-anonymization",
+     0.124
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.119
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.088
+    ]
+   ],
+   "cost_usd": 0.014712
+  },
+  "novel": true
+ },
+ "cost_usd": 0.052182000000000006
+}

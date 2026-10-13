@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "bundler-plugin-abi-migration",
+  "title": "Bundle Plugin ABI Migration",
+  "scenario": "A platform team is migrating their internal JavaScript build system from a legacy in-house bundler to a new version. The new bundler ships a compiled native plugin host (`/usr/local/bin/pluginhost`) that loads `.bundle` plugins via a private ABI. The old plugin source tree is in `/app/plugins/` (Node.js + config), and the bundler reads its pipeline from `/app/bundler.config.json`. The pluginhost binary is the opaque component \u2014 no source, just a binary that accepts plugins conforming to a specific calling convention and configuration schema discovered only by running it.",
+  "instruction_draft": "Hey \u2014 we just upgraded the bundler infra and the new `pluginhost` binary keeps rejecting our plugins. The old plugin pipeline worked fine but now nothing transforms correctly. Can you figure out what the new binary expects and get the full pipeline working again? The end state we need: running `/usr/local/bin/pluginhost --config /app/bundler.config.json --input /app/fixtures/sample.js --out /app/out/result.js` should produce a correctly transformed output file, `pluginhost` should exit 0, and `/app/out/result.js` should pass the format contract (specific header comment, no bare `require()` calls replaced by the ABI-injected module system, and correct source-map comment at the end). The config at `/app/bundler.config.json` and any plugin files under `/app/plugins/` are yours to modify. Don't touch `/app/fixtures/`.",
+  "requirements": [
+   "`/usr/local/bin/pluginhost --config /app/bundler.config.json --input /app/fixtures/sample.js --out /app/out/result.js` exits with code 0",
+   "`/app/out/result.js` exists after the run",
+   "`/app/out/result.js` begins with the magic header comment `// @bundled` on its first line",
+   "`/app/out/result.js` contains no bare `require(` calls (all module references are rewritten via the ABI-injected `__require(` wrapper)",
+   "`/app/out/result.js` ends with a source-map comment line matching `//# sourceMappingURL=result.js.map`",
+   "`/app/out/result.js.map` exists and is valid JSON with keys `version`, `sources`, `mappings`",
+   "`/app/bundler.config.json` is valid JSON and contains the correct `pluginAbiVersion` field matching what `pluginhost` expects",
+   "Each plugin `.js` file listed in the config exports a `transform(src, opts)` function (not a default export object) \u2014 verified by pluginhost loading the plugin and calling it"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm as base; install Node.js 20.x, build-essential",
+   "Compile a C binary `/usr/local/bin/pluginhost` from source (source NOT included in final image) that: (1) reads `bundler.config.json` and validates a `pluginAbiVersion` field must equal `2` (not `1`, which is what the old config has); (2) dynamically requires each plugin path listed in config's `plugins` array using Node's `--require` mechanism via a child node process; (3) expects each plugin to export a named function `transform(src, opts)`, not a default-exported object; (4) rewrites `require(` \u2192 `__require(` in the JS source; (5) prepends `// @bundled\\n`; (6) appends `\\n//# sourceMappingURL=<basename>.map`; (7) writes a minimal source map JSON; (8) exits non-zero with a descriptive message on any ABI mismatch",
+   "The binary accepts `--config`, `--input`, `--out` flags; emits distinct error messages for: wrong abiVersion, plugin not found, plugin export shape wrong, missing config keys",
+   "Plant `/app/bundler.config.json` with `pluginAbiVersion: 1` (old, wrong value) and a `plugins` array pointing to `/app/plugins/transform-esm.js` and `/app/plugins/transform-minify.js`",
+   "Plant `/app/plugins/transform-esm.js` that does `module.exports = { transform: function(src, opts) { ... } }` (object wrapper \u2014 wrong shape, should be a bare named export `module.exports = function transform(...)`)",
+   "Plant `/app/plugins/transform-minify.js` that uses the correct export shape but references a config key `opts.level` that must be present in the per-plugin options in the config (the config is missing this key, causing a runtime TypeError when pluginhost calls the plugin on real input)",
+   "Plant `/app/fixtures/sample.js` with several `require('fs')` and `require('./util')` calls and a non-trivial function body (~60 lines)",
+   "Plant `/app/fixtures/util.js` as a sibling (pluginhost doesn't need to resolve it, but its presence is realistic)",
+   "Create `/app/out/` directory (empty)",
+   "Keep pluginhost binary stripped (`strip`) so no symbol table; source is deleted from image",
+   "Install jq for the solver's convenience; no internet in container"
+  ],
+  "internal_hint": "Difficulty comes from two interacting opaque-component behaviors that only surface at runtime: (1) pluginhost rejects the config silently-ish (exits 1 with 'ABI version mismatch: got 1, expected 2') \u2014 solver must run the binary and read its stderr to discover the expected value, then patch bundler.config.json. (2) After fixing the version, pluginhost loads the plugin but fails with 'plugin export must be a function, got object' \u2014 solver must run again to see this error, then restructure transform-esm.js to export a bare function. (3) After fixing the export shape, pluginhost calls transform-minify with opts but opts.level is undefined, causing a TypeError \u2014 solver must run again to see the stack trace, then add `level` to the plugin's options in bundler.config.json. Three separate run-observe-fix cycles are required; none of these causes are visible by reading the config or plugin source in isolation because the constraint (ABI version = 2, export shape, required opts key) lives exclusively in the compiled binary. The solver must experiment, read stderr carefully, and make three independent changes.",
+  "trap": "A naive agent reads the config and plugins, notices `pluginAbiVersion: 1` looks plausible, tries to guess the right value (might try `2` correctly) but then misses the plugin export shape issue \u2014 the plugin file looks syntactically correct so the agent may not change it. Even if the agent fixes the first two issues, it will miss the missing `level` opt in the config because transform-minify.js only throws when called on real input (the TypeError only appears in pluginhost stderr after it loads the plugin and calls `transform(src, opts)` on the fixture). A solution that patches the config version and nothing else will fail all three binary-state checks.",
+  "tests": [
+   "Run `pluginhost --config /app/bundler.config.json --input /app/fixtures/sample.js --out /app/out/result.js` and assert exit code 0",
+   "Assert `/app/out/result.js` exists",
+   "Assert first line of `/app/out/result.js` is exactly `// @bundled`",
+   "Assert `/app/out/result.js` contains no occurrences of the literal string `require(` (all replaced by `__require(`)",
+   "Assert last non-empty line of `/app/out/result.js` matches regex `^//# sourceMappingURL=result\\.js\\.map$`",
+   "Assert `/app/out/result.js.map` exists and `python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert \"version\" in d and \"sources\" in d and \"mappings\" in d' /app/out/result.js.map` exits 0",
+   "Assert `python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d[\"pluginAbiVersion\"]==2' /app/bundler.config.json` exits 0",
+   "Run pluginhost on a fresh generated fixture (a different JS file with more `require()` calls, generated at verify time) with the same config; assert exit 0 and output meets all format constraints \u2014 this catches solutions that hardcode output rather than fixing the pipeline"
+  ],
+  "verifier_knob": {
+   "name": "number_of_abi_mismatches",
+   "value": "3",
+   "effect": "Raising to 4-5 (e.g. adding a required plugin ordering constraint or a hash-check field in the config) makes more run-observe cycles necessary; lowering to 1 (only the version mismatch) makes it solvable in a single fix cycle and too easy"
+  },
+  "expected_failure_modes": [
+   "Agent patches pluginAbiVersion correctly but does not run the binary to discover the export shape error; submits thinking it is done; fails the plugin-load state checks",
+   "Agent fixes AbiVersion and export shape but never adds the missing `level` opt to the plugin config; binary exits non-zero on the real fixture; all output-file checks fail",
+   "Agent guesses the binary wants abiVersion 2 without running it (lucky), but guesses the wrong plugin export shape fix (wraps the function in another object, or uses ES module syntax which Node's require doesn't support); pluginhost still rejects",
+   "Agent produces a hardcoded output file instead of fixing the pipeline; passes sample checks but fails the verify-time fresh fixture test"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "javascript",
+   "compiled-binary",
+   "configuration",
+   "abi",
+   "opaque-component",
+   "bundler"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/bundler.config.json  # see pluginAbiVersion:1, plugins array, note missing 'level' in plugin opts",
+   "cat /app/plugins/transform-esm.js  # spot module.exports = { transform: fn } \u2014 wrong shape",
+   "cat /app/plugins/transform-minify.js  # see opts.level usage, cross-ref config: level missing",
+   "sed -i 's/\"pluginAbiVersion\": 1/\"pluginAbiVersion\": 2/' /app/bundler.config.json",
+   "Edit transform-esm.js to change module.exports = { transform: function(src,opts){...} } to module.exports = function transform(src,opts){...}",
+   "/usr/local/bin/pluginhost --config /app/bundler.config.json --input /app/fixtures/sample.js --out /app/out/result.js  # likely still fails: opts.level TypeError",
+   "Edit /app/bundler.config.json to add 'level' key to transform-minify plugin options",
+   "/usr/local/bin/pluginhost --config /app/bundler.config.json --input /app/fixtures/sample.js --out /app/out/result.js  # exits 0",
+   "cat /app/out/result.js  # verify // @bundled header, no require(, source map comment",
+   "python3 -c 'import json; d=json.load(open(\"/app/out/result.js.map\")); assert \"version\" in d'  # verify map"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The wrong export shape (module.exports = { transform: fn } vs module.exports = fn) is directly visible by reading transform-esm.js source \u2014 a strong agent does not need to run the binary to discover this, undermining the 'opaque component' difficulty claim for that issue.",
+   "The missing 'level' key can also be spotted by reading transform-minify.js and comparing against bundler.config.json without running anything \u2014 only if the config structure is not explicit does this require runtime observation.",
+   "If pluginhost stderr is not printed clearly or the error messages are less descriptive than specified, the solver may be blocked unfairly by environment build issues.",
+   "The fresh-fixture verify-time test requires careful build: the generated JS must contain require() calls and the pluginhost must handle them identically \u2014 if the generated fixture triggers edge cases not in the original, the test could be flaky.",
+   "strip on the binary is mentioned but the binary still runs Node as a child process \u2014 if the container Node.js path is not standard, pluginhost could fail non-deterministically depending on PATH."
+  ],
+  "verdict": "reject",
+  "reasons": "The task's central difficulty claim \u2014 that all three issues require running the opaque binary to discover \u2014 is false: the export shape error (module.exports wrapping) is directly readable in the source, and a strong agent reading files before running will spot two of the three bugs without executing anything. This reduces the speedrun to ~10 commands and collapses genuine_difficulty to 2. Additionally, the 'level' key issue may also be statically discoverable by cross-referencing transform-minify.js against the config, further weakening the observe_not_read property the task is designed around.",
+  "fixes": [
+   "Make the export shape error truly opaque: instead of a structurally different module.exports pattern, use a shape that looks correct syntactically (e.g., module.exports = function(src, opts){} \u2014 an anonymous function) but the binary checks for a *named* function (fn.name === 'transform') \u2014 this is not visible by reading source without knowing the binary's constraint.",
+   "Make the 'level' issue require runtime observation: remove any reference to opts.level from transform-minify.js source (have it call an internal helper that fails), so the failure is only visible from the binary's TypeError output, not from source reading.",
+   "Add a fourth, genuinely opaque failure mode (e.g., a checksum or hash of the plugin file that pluginhost validates) to push the number of required run-observe-fix cycles above what source-reading can shortcut, ensuring genuine_difficulty reaches 3+."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/extract-elf",
+     "verdict": "distinct",
+     "reason": "That task is about parsing an ELF binary to extract memory values into JSON; the candidate is about reverse-engineering a plugin ABI from a binary and wiring up a JS plugin pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/make-doom-for-mips",
+     "verdict": "distinct",
+     "reason": "That task is about cross-compiling a C game for MIPS; the candidate is about discovering and conforming to a native plugin host ABI for a JS build system."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/make-mips-interpreter",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a MIPS CPU interpreter; the candidate is about ABI reverse-engineering and plugin configuration for a JS bundler."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "variant",
+     "reason": "Both tasks involve a pre-compiled opaque binary whose behavior must be discovered at runtime and then the surrounding JS code fixed to satisfy a defined end-to-end success contract, though the domain differs (canary orchestrator vs. plugin bundler)."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a chunked CSV processing pipeline with data-integrity bugs; the candidate is about ABI discovery and plugin configuration for a binary plugin host."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/extract-elf",
+     0.176
+    ],
+    [
+     "terminal-bench-2-1/make-doom-for-mips",
+     0.16
+    ],
+    [
+     "terminal-bench-2-1/make-mips-interpreter",
+     0.145
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.126
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.097
+    ]
+   ],
+   "cost_usd": 0.013392000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.050559
+}

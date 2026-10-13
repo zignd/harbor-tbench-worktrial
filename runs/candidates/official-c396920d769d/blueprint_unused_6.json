@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "rust-numeric-invariant-aggregator",
+  "title": "Streaming Numeric Aggregator: Hidden Invariant Repair",
+  "scenario": "A data engineering team maintains a Rust streaming-aggregation pipeline that ingests telemetry batches, computes statistical summaries, and writes results to a SQLite database. The previous engineer left two months ago, and the pipeline has been producing subtly wrong answers on production data. The compiled pipeline binary ships in the container; its source is at /app/pipeline/src but the opaque reference binary at /app/reference/aggregator was the last known-good version. The pipeline handles variable-length windows of sensor readings grouped by device ID.",
+  "instruction_draft": "A data pipeline at /app/pipeline is producing incorrect aggregation results. The last known-good behavior is captured by the reference binary at /app/reference/aggregator. After running both on the test data at /app/data/, your team noticed the SQLite database at /app/output/results.db has rows that differ from the reference output at /app/output/reference.db.\n\nYour tasks:\n\n1. The pipeline source at /app/pipeline/src must be fixed so that `cargo build --release` at /app/pipeline produces a binary whose output on any input dataset matches the reference binary exactly. Specifically: for every (device_id, window_id) pair, the values in columns `mean`, `variance`, `percentile_90`, and `count` must match the reference to within 1e-9 (absolute), and the `checksum` column must match exactly (byte-for-byte integer equality).\n\n2. The fixed pipeline must process /app/data/large_batch.bin in under 4 seconds wall-clock time when run as: `/app/pipeline/target/release/aggregator /app/data/large_batch.bin /app/output/results.db` on the provided hardware (1 CPU, 2 GB RAM). The reference binary processes the same file in approximately 1.8 seconds.\n\n3. After your fix, run the pipeline on /app/data/large_batch.bin and ensure /app/output/results.db exists with correct results.\n\nThe reference binary accepts the same arguments: `/app/reference/aggregator <input.bin> <output.db>`\n\nYou may probe the reference binary on any inputs you generate. The binary format for input files is documented at /app/docs/format.md.",
+  "requirements": [
+   "cargo build --release succeeds at /app/pipeline",
+   "For every (device_id, window_id) in any valid input, the pipeline's mean, variance, percentile_90, and count columns match the reference binary output to within 1e-9 absolute error",
+   "The checksum column matches the reference binary output exactly (integer equality) for every row",
+   "The pipeline processes /app/data/large_batch.bin in under 4 seconds wall-clock time",
+   "/app/output/results.db exists and contains correct results after running the fixed pipeline on large_batch.bin"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install rustc/cargo (stable), sqlite3, libsqlite3-dev via apt",
+   "Reference binary /app/reference/aggregator compiled from a hidden correct Rust implementation; ships as ELF binary only, no source",
+   "Pipeline source at /app/pipeline/src/ (~900 lines across main.rs, stats.rs, codec.rs, db.rs, window.rs)",
+   "Bug 1 (visible in source but semantically subtle): variance computed as E[X^2] - E[X]^2 using online Welford algorithm, but the Bessel correction divisor uses `n` instead of `n-1` for sample variance \u2014 this matches reference only for windows of size >= 2, BUT the hidden test includes singleton windows where reference uses population variance (n=1 denominator stays 1), so solvers who blindly apply Bessel correction break singletons",
+   "Bug 2 (not visible by reading \u2014 only observable by running): the checksum column is computed as a multiplicative hash of the sorted device readings, but the source code uses an integer type (u32) that overflows differently than the reference's u64 wrapping arithmetic \u2014 the source code comment says 'FNV-1a rolling hash' and the code looks correct syntactically, but the type annotation on the accumulator is wrong (u32 vs u64); this only shows up when any window has more than ~8 readings because smaller datasets don't trigger overflow",
+   "Bug 3 (hidden invariant, discoverable only by probing reference with crafted data): the 90th percentile is computed with linear interpolation between sorted elements, but the reference uses a specific interpolation formula (lower + fraction*(upper-lower)) applied to 0-indexed ranks using (n-1)*0.9, not the naive ceiling(0.9*n)-1 index; source uses the naive formula which matches on window sizes where 0.9*n is an integer but diverges on most real window sizes",
+   "Performance issue: the pipeline rebuilds a BTreeMap for sorting every window from scratch; the reference uses a fixed-capacity stack-allocated sort for windows <= 64 elements; fixing the algorithm bugs alone produces correct but slow results (~7-8s); the solver must also replace the heap allocation with a stack-based sort (e.g., using a fixed array + insertion sort for small windows) to meet the 4s threshold",
+   "Input format documented at /app/docs/format.md: binary little-endian, header (magic u32=0xAB1234CD, version u8=2, num_windows u32), then per-window (device_id u32, window_id u32, count u16, then count f64 readings)",
+   "Test data: /app/data/small_batch.bin (50 windows, 1-20 readings each, for quick correctness checks), /app/data/medium_batch.bin (500 windows), /app/data/large_batch.bin (50000 windows, 1-200 readings each, ~40MB)",
+   "Precomputed /app/output/reference.db generated by running reference binary on small_batch.bin and medium_batch.bin",
+   "Python script /app/tools/gen_input.py for generating test inputs with controlled window sizes (so solver can probe reference on crafted edge cases)",
+   "Python script /app/tools/compare_db.py for diffing two SQLite databases by (device_id, window_id)",
+   "Plausible but uninvolved code: /app/pipeline/src/network.rs (TCP server stub, ~150 lines, not compiled into release binary) and /app/pipeline/src/compress.rs (LZ4 wrapper, unused in main path)"
+  ],
+  "internal_hint": "Difficulty comes from three interacting sources: (1) The variance bug is visible in source but has a hidden corner case (singleton windows) that makes the naive fix (add Bessel correction) wrong \u2014 discovered only by probing reference on size-1 windows. (2) The checksum u32/u64 overflow is a type annotation that looks correct; it only manifests at runtime with larger windows, so the solver must generate inputs with >8 readings and compare outputs to find it. (3) The percentile interpolation formula diverges only on non-integer quantile positions; the solver must probe reference on windows of sizes like 7, 11, 13 (where 0.9*(n-1) is not an integer) to discover the exact formula. The performance fix requires noticing that BTreeMap allocation dominates; replacing with a stack-sort for small windows brings the time within spec. A partial fix that corrects variance and checksum but uses wrong percentile passes small_batch but fails medium/large tests at verify time.",
+  "trap": "Naive solvers fix the variance Bessel correction universally (breaking n=1 case), fix the hash type (getting checksum right for small windows), and stop after passing small_batch.bin comparison. The verifier generates fresh inputs including singleton windows (exposing the Bessel overcorrection), windows of size 7/11/13/17 (exposing the percentile formula), and windows of size 20+ (exposing any remaining hash issues). A solver who only tests on provided sample data will have 2-3 bugs remaining at verify time. Additionally, a solver who fixes all three bugs but keeps the BTreeMap will pass correctness but fail the performance threshold.",
+  "tests": [
+   "Build test: cargo build --release succeeds at /app/pipeline within 120s",
+   "Correctness test 1: verifier generates 200 windows of size 1 (singleton), runs fixed pipeline and reference binary, checks variance column matches to 1e-9 (catches over-applied Bessel correction)",
+   "Correctness test 2: verifier generates windows of sizes [7, 11, 13, 17, 19, 23] (sizes where 0.9*(n-1) is not an integer), checks percentile_90 matches reference to 1e-9 (catches wrong interpolation formula)",
+   "Correctness test 3: verifier generates 100 windows each with 15-25 readings (triggers u32 overflow in hash), checks checksum column matches reference exactly",
+   "Correctness test 4: verifier generates mixed dataset with all window sizes 1-50, runs both binaries, asserts all four numeric columns match and checksum matches across all rows",
+   "Performance test: time the fixed binary on /app/data/large_batch.bin, assert wall-clock < 4.0 seconds (measured with Python subprocess timeout)",
+   "State check: /app/output/results.db exists, has schema (device_id INTEGER, window_id INTEGER, mean REAL, variance REAL, percentile_90 REAL, count INTEGER, checksum INTEGER), and row count matches reference for large_batch.bin run"
+  ],
+  "verifier_knob": {
+   "name": "num_independent_state_properties",
+   "value": "5",
+   "effect": "Raising to 7 adds: checksum must match on windows size 50-200 (harder overflow), and pipeline must produce identical results when run twice on same input (determinism check). Lowering to 3 drops singleton variance and performance checks, making it passable with two-bug fix."
+  },
+  "expected_failure_modes": [
+   "Fixes variance with universal Bessel correction, breaking singleton windows \u2014 passes sample data, fails verifier's size-1 test",
+   "Discovers the u32 hash bug but uses wrong accumulator type (i64 instead of u64) \u2014 fails on windows with readings that produce negative intermediate values under signed overflow",
+   "Uses numpy-style percentile (exclusive interpolation) instead of reference's specific formula \u2014 passes sizes where formula coincidentally agrees, fails on verifier's size-7/11/13 test",
+   "Fixes all three correctness bugs but keeps BTreeMap sort \u2014 correct output but 7-8s on large_batch.bin, fails performance threshold",
+   "Correctly identifies percentile formula by probing but implements the interpolation with off-by-one in index calculation (1-indexed vs 0-indexed rank) \u2014 wrong on ~half of window sizes"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "rust",
+   "reverse-engineering",
+   "statistics",
+   "performance",
+   "hidden-invariant",
+   "binary-probing"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/format.md",
+   "cat /app/pipeline/src/stats.rs",
+   "cat /app/pipeline/src/main.rs",
+   "grep -n 'checksum\\|hash\\|u32\\|u64' /app/pipeline/src/*.rs",
+   "python3 /app/tools/gen_input.py --sizes 1,1,1 -o /tmp/singleton.bin",
+   "/app/reference/aggregator /tmp/singleton.bin /tmp/ref_singleton.db && sqlite3 /tmp/ref_singleton.db 'SELECT * FROM results'",
+   "/app/pipeline/target/release/aggregator /tmp/singleton.bin /tmp/pipe_singleton.db",
+   "python3 /app/tools/compare_db.py /tmp/ref_singleton.db /tmp/pipe_singleton.db",
+   "python3 /app/tools/gen_input.py --sizes 7,11,13,17 -o /tmp/pct_test.bin",
+   "/app/reference/aggregator /tmp/pct_test.bin /tmp/ref_pct.db && /app/pipeline/target/release/aggregator /tmp/pct_test.bin /tmp/pipe_pct.db",
+   "python3 /app/tools/compare_db.py /tmp/ref_pct.db /tmp/pipe_pct.db",
+   "python3 /app/tools/gen_input.py --sizes 20,25,30 -o /tmp/hash_test.bin",
+   "/app/reference/aggregator /tmp/hash_test.bin /tmp/ref_hash.db && /app/pipeline/target/release/aggregator /tmp/hash_test.bin /tmp/pipe_hash.db",
+   "python3 /app/tools/compare_db.py /tmp/ref_hash.db /tmp/pipe_hash.db",
+   "edit stats.rs: fix variance to conditional (n==1: divide by 1, n>1: divide by n-1), fix percentile to use rank=(n-1)*0.9 with linear interpolation, fix hash accumulator u32->u64; replace BTreeMap sort with stack array + insertion sort for windows <=200",
+   "cd /app/pipeline && cargo build --release 2>&1 | tail -30",
+   "time /app/pipeline/target/release/aggregator /app/data/large_batch.bin /app/output/results.db",
+   "python3 /app/tools/compare_db.py /app/output/reference.db /app/output/results.db"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The gen_input.py tool may not support the exact --sizes flag syntax implied; if the interface differs, probing steps break and the solver is stuck without a way to generate targeted edge cases",
+   "The performance threshold (4s) is hardware-dependent; on a slower or busier 1-CPU container the BTreeMap fix alone may not be sufficient, or even the correct solution may flake above 4s",
+   "If the reference binary is not statically linked or has glibc version dependencies, it may fail to run in the python:3.13-slim-bookworm container (ELF binary from a different build environment)",
+   "The variance singleton behavior (population vs sample) is not documented anywhere the solver can read \u2014 it is only discoverable by probing, but if gen_input.py has a minimum count constraint or the binary rejects singleton windows, the solver cannot discover this bug",
+   "The instruction says 'match reference to within 1e-9' but does not specify how NaN/Inf readings in sensor data are handled; if large_batch.bin contains such values, behavior could be undefined",
+   "Bug 2 description says u32 overflow differs from u64 wrapping \u2014 Rust u32 and u64 both use wrapping arithmetic in release mode, so the actual divergence must come from truncation of intermediate products, which is plausible but needs careful implementation to ensure the reference binary actually uses u64 consistently"
+  ],
+  "verdict": "accept",
+  "reasons": "The task is well-constructed with three orthogonally discoverable bugs and a performance gate, making shallow verification genuinely ineffective \u2014 a frontier agent that only reads source or only tests on provided sample data will fail at verification. The verifier's use of fresh crafted inputs (singleton windows, specific sizes for percentile, large windows for overflow) is robust and deterministic. Minor risks around tool interfaces and hardware-dependent performance threshold should be addressed before deployment.",
+  "fixes": [
+   "Document the gen_input.py interface explicitly in /app/docs/format.md or a README so solvers know exactly how to generate targeted edge cases (e.g., --count N --window-size K flags)",
+   "Add a 10-15% performance margin or state the hardware specification precisely (CPU model, clock speed) so the 4s threshold is reliably achievable on the exact container hardware without flaking",
+   "Verify the reference binary runs correctly in python:3.13-slim-bookworm by statically linking it or documenting any required shared libraries; add a smoke-test step in the environment build that confirms /app/reference/aggregator executes on small_batch.bin",
+   "Add one sentence to the instructions hinting that the reference binary handles edge cases (e.g., 'Window sizes of 1 are valid inputs and the reference handles them correctly') to avoid ambiguity about whether singleton windows are intentional test cases without giving away the variance formula secret",
+   "Clarify in the instruction whether the checksum formula is FNV-1a or not (the source comment says it is, but the actual bug is a type issue) \u2014 solvers may waste time investigating the wrong hash algorithm rather than the type annotation"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering an opaque binary's transformation to fix downstream SQL rollups, whereas the candidate task involves finding and fixing a source-level bug in Rust aggregation logic by comparing against a reference binary."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a chunked CSV pipeline with deduplication and row-count correctness issues in Python, whereas the candidate task involves repairing statistical aggregation math (mean, variance, percentile, checksum) in a Rust streaming pipeline."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task focuses on finding a fast-path regression in spectral entropy computation for a cryptographic RNG auditing service, whereas the candidate task is about fixing hidden invariant bugs in a Rust telemetry aggregation pipeline's statistical summaries."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task involves fixing NetFlow v9 binary parsing and template-state management for per-counterparty byte attribution, whereas the candidate task involves repairing statistical aggregation logic (mean, variance, percentile, checksum) in a Rust pipeline."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline's GeoIP attribution and adding a missing Flask API endpoint, whereas the candidate task involves repairing hidden numerical bugs in a Rust streaming statistical aggregator."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.255
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.242
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.204
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.176
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.174
+    ]
+   ],
+   "cost_usd": 0.01578
+  },
+  "novel": true
+ },
+ "cost_usd": 0.069621
+}

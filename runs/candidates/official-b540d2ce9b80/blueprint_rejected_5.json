@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "schema-codec-binary-negotiation",
+  "title": "Schema Codec Feature-Flag Migration",
+  "scenario": "A platform team is migrating a Node.js data pipeline that encodes tenant event records using a compiled C binary (`/opt/codec/schemac`) that reads a feature-flag config to decide which fields to encode, what wire format to emit, and how to version-stamp output blobs. The binary ships without source and has no man page. The old config format is being sunset; the pipeline must be extended with new encoding features the binary already supports but the JS orchestration layer has never used.",
+  "instruction_draft": "Hey, we need to finish the migration of the event codec pipeline. The compiled encoder at /opt/codec/schemac accepts a JSON config at /etc/codec/config.json and a newline-delimited JSON stream on stdin, writing length-prefixed binary blobs to stdout. We want to enable three things that aren't working yet: (1) zstd compression on the output blobs instead of the current raw encoding, (2) schema versioning stamps on every blob header (the binary supports this but it's not turned on), and (3) field-level nullability enforcement that rejects records missing required fields rather than silently padding them. The downstream consumer at /app/consumer/index.js reads the binary blobs and must successfully decode all three features without crashes. Once you're done, running `node /app/pipeline/run.js` with the sample data at /app/data/events.ndjson should produce /app/output/events.bin and /app/output/summary.json showing all records encoded and zero padding events. The consumer must also correctly decode blobs produced from fresh event payloads not in the sample data.",
+  "requirements": [
+   "Running `node /app/pipeline/run.js` exits with code 0",
+   "/app/output/events.bin exists and contains valid length-prefixed blobs",
+   "/app/output/summary.json exists with field `total_encoded` equal to the number of input records and `padding_events` equal to 0",
+   "The blobs use zstd compression (detectable by the blob header magic bytes the binary emits)",
+   "Every blob header contains a schema version stamp (non-zero version field at the offset the binary uses)",
+   "Records missing required fields are rejected (appear in summary.json as `rejected_count`, not encoded)",
+   "The consumer /app/consumer/index.js decodes blobs produced from fresh event payloads (not in events.ndjson) without throwing"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm (node 20 and zstd installed via apt)",
+   "Compiled binary /opt/codec/schemac built in Dockerfile from a C source that is NOT present in the final image \u2014 only the stripped binary is copied in",
+   "The binary reads /etc/codec/config.json with keys: compression (string: 'none'|'zstd'), versioning (bool), nullability (bool), schema_id (int), required_fields (array of strings)",
+   "The initial /etc/codec/config.json has compression='none', versioning=false, nullability=false \u2014 the three features to enable",
+   "The binary's wire format: 4-byte magic (0x5343 0x4200 + 1-byte compression_flag + 1-byte version_flag), 2-byte schema_id, 4-byte schema_version (0 if versioning disabled, monotonic counter from config epoch otherwise), 4-byte payload_len, payload bytes",
+   "The binary silently pads missing required fields with zero-bytes when nullability=false, emitting a padding_event marker in its stderr JSON log",
+   "When nullability=true, the binary exits non-zero per-record and writes a rejection reason to stderr; the orchestrator must handle this and count rejections",
+   "The binary's schema_version counter is seeded from a 32-bit value derived from the schema_id and the config file's inode+mtime \u2014 so it is NOT zero-based and must be discovered by running the binary",
+   "/app/pipeline/run.js: the Node.js orchestrator that spawns schemac, pipes events.ndjson, collects stdout blobs, parses stderr for padding/rejection events, writes output files \u2014 currently incomplete/wrong in multiple ways",
+   "/app/consumer/index.js: decodes the binary blob format \u2014 currently hardcoded to expect compression=none and version=0, will crash on zstd blobs or non-zero version fields",
+   "/app/data/events.ndjson: 40 records, 8 of which are missing a required field (email)",
+   "/app/data/schema.json: the schema definition listing required_fields including 'email', 'user_id', 'event_type'",
+   "A stub /app/pipeline/run.js exists but has three bugs: it does not update the config before invoking schemac, it does not parse stderr for rejection/padding events, and it does not handle the binary's per-record non-zero exit code for rejected records",
+   "/app/consumer/index.js has two bugs: it does not handle the compression_flag byte (skips decompression), and it treats schema_version as always 0 (hardcoded offset arithmetic)"
+  ],
+  "internal_hint": "Difficulty comes from two sources. First, the opaque binary: the config key names, wire format offsets, and version-stamp seeding behavior are not documented anywhere in the image \u2014 the solver must probe by running schemac with different config values and hexdumping output to discover the magic bytes, field offsets, and the non-trivial schema_version value (it is NOT 1). Second, observe_not_read: the padding behavior (nullability=false silently encoding bad records) only manifests when events.ndjson is actually piped through \u2014 the stub run.js produces output that looks complete, but summary.json is wrong because padding_events is missing from stderr parsing. The solver must: (1) experiment with schemac to learn the wire format by trying configs and hexdumping; (2) discover the version seed formula by varying schema_id and observing version byte changes; (3) fix /etc/codec/config.json to enable all three features; (4) fix run.js to correctly parse stderr (binary logs rejection and padding as JSON lines) and handle per-record exits; (5) fix consumer/index.js to decompress zstd payload and use correct offset for schema_version. The schema_version seed being inode+mtime-derived means the solver cannot hardcode it \u2014 they must read it from the first blob and propagate it to the consumer, or make the consumer read it from the blob header dynamically.",
+  "trap": "A naive agent enables the three config flags, re-runs, sees events.bin is produced and exit 0, checks summary.json shows total_encoded=40 and stops. Hidden tests pipe fresh event payloads (including records missing required fields) through the pipeline and decode with consumer/index.js \u2014 the consumer crashes because it still has hardcoded offset arithmetic assuming version=0 (the actual version stamp is non-zero and shifts all subsequent field offsets by 4 bytes). Additionally, hidden tests check that padding_events=0 AND rejected_count=8 in summary.json, which only passes if run.js correctly parses stderr and nullability=true causes rejections not padding.",
+  "tests": [
+   "Run `node /app/pipeline/run.js` and assert exit code 0",
+   "Assert /app/output/events.bin exists and byte 2 of the first blob equals 0x01 (zstd compression flag)",
+   "Assert /app/output/events.bin blob headers have non-zero 4-byte schema_version field at offset 6",
+   "Assert /app/output/summary.json has total_encoded=32, rejected_count=8, padding_events=0",
+   "Generate 20 fresh event records (10 valid, 10 missing required fields) at verify time, pipe through schemac with the installed config, decode with consumer/index.js, assert 10 decoded successfully and consumer does not throw",
+   "Assert decoded payloads from fresh events match the original JSON fields (round-trip correctness)",
+   "Assert that /app/output/summary.json key 'padding_events' is present and equals 0 (not absent or non-zero)"
+  ],
+  "verifier_knob": {
+   "name": "fresh_event_count",
+   "value": "20 records at verify time",
+   "effect": "Raising to 50+ with more varied field combinations increases the chance of hitting consumer offset bugs on edge-case payloads; lowering to 5 makes the consumer bug less likely to surface if the agent partially fixed offset arithmetic"
+  },
+  "expected_failure_modes": [
+   "Agent enables config flags and checks sample output but never fixes consumer/index.js \u2014 hidden tests with fresh payloads crash the consumer",
+   "Agent fixes consumer offset for schema_version but hardcodes the version number it observed from the sample run \u2014 fresh events with a different schema_id produce a different seed value and the consumer misparses",
+   "Agent fixes run.js to parse stderr but misidentifies the rejection JSON key name (must probe actual schemac stderr output), so rejected_count stays wrong",
+   "Agent assumes zstd decompression in consumer is a simple library call but uses wrong frame offset (payload starts after the header, not at byte 0 of the blob) \u2014 decompression fails on fresh payloads with different lengths",
+   "Agent does not discover that nullability=true changes schemac exit code per-record and does not update run.js to treat non-zero per-record exits as rejections, causing run.js itself to abort on first rejected record"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "opaque-binary",
+   "wire-format",
+   "nodejs",
+   "configuration",
+   "reverse-engineering",
+   "codec"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/run.js",
+   "cat /app/consumer/index.js",
+   "cat /etc/codec/config.json",
+   "cat /app/data/schema.json",
+   "cat /app/data/events.ndjson | head -5",
+   "echo '{\"user_id\":\"u1\",\"event_type\":\"login\",\"email\":\"a@b.com\"}' | /opt/codec/schemac > /tmp/blob_none.bin 2>/tmp/err_none.txt; echo exit=$?",
+   "xxd /tmp/blob_none.bin | head -4",
+   "cat /tmp/err_none.txt",
+   "cp /etc/codec/config.json /etc/codec/config.json.bak && echo '{\"compression\":\"zstd\",\"versioning\":true,\"nullability\":true,\"schema_id\":1,\"required_fields\":[\"email\",\"user_id\",\"event_type\"]}' > /etc/codec/config.json",
+   "echo '{\"user_id\":\"u1\",\"event_type\":\"login\",\"email\":\"a@b.com\"}' | /opt/codec/schemac > /tmp/blob_zstd.bin 2>/tmp/err_zstd.txt; echo exit=$?",
+   "xxd /tmp/blob_zstd.bin | head -4  # learn magic bytes, offsets, schema_version value",
+   "cat /tmp/err_zstd.txt  # learn stderr JSON format for accepted records",
+   "echo '{\"user_id\":\"u1\",\"event_type\":\"login\"}' | /opt/codec/schemac > /tmp/blob_rej.bin 2>/tmp/err_rej.txt; echo exit=$?",
+   "cat /tmp/err_rej.txt  # learn rejection stderr JSON key names",
+   "# Fix /app/pipeline/run.js: add stderr parsing using discovered JSON keys for rejection/padding, handle per-record non-zero exits as rejections",
+   "# Fix /app/consumer/index.js: read compression_flag from header byte 2, read schema_version dynamically from header bytes 6-9, adjust payload offset to 12, add zstd decompression for compression_flag=1",
+   "node /app/pipeline/run.js",
+   "cat /app/output/summary.json",
+   "xxd /app/output/events.bin | head -2  # verify byte 2 = 0x01, bytes 6-9 non-zero",
+   "node -e \"const fs=require('fs'); const buf=fs.readFileSync('/app/output/events.bin'); console.log('byte2=',buf[2].toString(16),'ver=',buf.readUInt32BE(6));\"  # spot check",
+   "echo '{\"user_id\":\"u99\",\"event_type\":\"test\",\"email\":\"x@y.com\"}' | /opt/codec/schemac | node /app/consumer/index.js  # fresh payload consumer test"
+  ],
+  "speedrun_commands": 21,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The schema_version seed is inode+mtime-derived: if the Docker image is rebuilt or the config file is touched during solving, the seed changes, making any hardcoded version value wrong \u2014 this is intentional by design but could cause confusion if the verifier re-derives the seed differently than the solve environment",
+   "The 'fresh event payloads at verify time' test requires the verifier to pipe records through schemac with the solver's installed config \u2014 if the verifier runs in a different process/container where /etc/codec/config.json has a different mtime, the schema_version seed differs, potentially causing a consumer that reads version dynamically to still work (good) but one that hardcodes it to fail in a potentially non-reproducible way",
+   "The instruction does not mention that the consumer will be tested with fresh payloads at verify time \u2014 a solver who reads the instruction carefully might not realize consumer.js needs to handle arbitrary version stamps, only learning this from the trap after failing hidden tests; this is a deliberate difficulty lever but borders on undisclosed requirement",
+   "Flaky if /opt/codec/schemac stderr JSON key names are not stable or differ between invocations (e.g., 'rejection_reason' vs 'reason') \u2014 the solver must probe exactly and the test must match exactly what schemac emits",
+   "The per-record non-zero exit code handling in run.js: if the binary exits non-zero for rejected records and run.js uses child_process.exec or similar that treats any non-zero exit as a pipeline error, fixing this requires architectural changes to run.js that may take significant time and could be done multiple valid ways"
+  ],
+  "verdict": "reject",
+  "reasons": "The average score is 3.4, below the 3.6 threshold. Genuine difficulty scores only 3 because a strong agent reading both source files and doing ~20 binary probes can mechanically solve this; the wire format is fully discoverable by hexdump and the two consumer bugs are visible by reading source. The clarity issue \u2014 the instruction never tells the solver that the consumer will be tested with fresh payloads at verify time \u2014 means a core discriminating test is undisclosed, which risks being perceived as unfair rather than genuinely hard. The solvability score of 3 reflects that under-an-hour is tight but achievable, though the inode+mtime seed discovery adds real friction.",
+  "fixes": [
+   "Raise genuine difficulty: make the config key names non-obvious (e.g., use 'compress_algo' instead of 'compression', 'enforce_schema' instead of 'nullability') so the solver cannot guess them and must probe the binary more carefully \u2014 this adds 3-5 necessary commands and increases failure rate for agents that try to guess",
+   "Improve clarity: explicitly state in the instruction that 'the consumer must correctly decode blobs produced from fresh event payloads not in the sample data' so the fresh-payload test is a disclosed requirement, not a hidden trap that makes failures feel unfair",
+   "Add a second opaque component difficulty: make the wire format use a variable-length header field (e.g., the schema_id is length-prefixed based on a flag byte) so that offset arithmetic cannot be done purely from the spec and requires probing multiple schema_ids to discover the pattern",
+   "Fix invalid failure risk: document that the verifier uses the same container/config file as the solver so inode+mtime is stable across solve and verify phases, or change the version seed to be purely schema_id-derived (still non-trivial but deterministic), eliminating environment-dependent flakiness"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing bugs in a Node.js NDJSON schema validation service with a performance constraint; the candidate task is about configuring a compiled binary codec to enable compression, versioning, and nullability features."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/extract-elf",
+     "verdict": "distinct",
+     "reason": "That task is about parsing ELF binary memory values into JSON; the candidate task is about configuring and integrating a compiled codec binary with a Node.js pipeline."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a log enrichment pipeline with a GeoIP binary and Flask API endpoints; the candidate task is about enabling codec features (compression, versioning, nullability) in a different binary-driven pipeline."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a TCP audit service with HMAC computation over a binary WAL record format; the candidate task is about configuring a schema codec binary for compression and versioning features."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-processing bugs causing duplicate/missing rows in a CSV pipeline; the candidate task is about enabling new encoding features in a compiled binary codec and wiring them into a Node.js pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-94391df591b0",
+     0.194
+    ],
+    [
+     "terminal-bench-2-1/extract-elf",
+     0.137
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.132
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.122
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.122
+    ]
+   ],
+   "cost_usd": 0.014262
+  },
+  "novel": true
+ },
+ "cost_usd": 0.07087500000000001
+}

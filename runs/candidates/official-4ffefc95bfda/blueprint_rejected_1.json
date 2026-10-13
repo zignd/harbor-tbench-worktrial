@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "gl-reconcile-sql-engine-repair",
+  "title": "General Ledger Reconciliation SQL Engine",
+  "scenario": "A finance-ops team runs a small in-house reconciliation codebase (~1,200 lines across several Python modules and SQL files) that matches journal entries against bank statement lines. The pipeline ingests raw transaction CSVs, stages them into SQLite, then runs a multi-step SQL reconciliation that produces a `reconciled` table and a summary `discrepancy_report`. The system worked for months, but after a schema migration two weeks ago, nightly reconciliation reports have been silently wrong\u2014matched amounts drift, and some entries that should be flagged as unreconciled are instead marked clean.",
+  "instruction_draft": "You are a finance-ops engineer handed the reconciliation codebase at `/app/recon/`. The nightly pipeline is invoked with `python /app/recon/run.py --db /app/data/ledger.db` and it populates a `reconciled` table and a `discrepancy_report` view inside that SQLite database. A reconciliation is correct when: (1) every `reconciled` row whose `status` is `'matched'` references a bank statement line whose `amount` equals the journal entry `amount` with the same `reference_code`, not merely any line with the same amount; (2) the `net_discrepancy` column in `discrepancy_report` equals the sum of all unmatched journal-entry amounts minus the sum of all unmatched bank-statement amounts for that account, computed after currency normalisation (all amounts in the ledger are stored as integer minor-units in their original currency; the normalisation table `fx_rates` converts them to USD cents at the rate recorded on the transaction date, not today's rate); and (3) the `flagged_count` in `discrepancy_report` per account must equal the exact count of journal entries that have no matching bank line for that account. Run the pipeline against the sample data in `/app/data/` and make it satisfy all three conditions. The verifier will run your repaired pipeline against at least 8 additional ledger datasets with varying account structures, multi-currency entries, same-amount/different-reference edge cases, and accounts where every entry is matched.",
+  "requirements": [
+   "Each 'matched' reconciled row must join bank lines on both reference_code AND amount, not amount alone.",
+   "net_discrepancy must use the fx_rates row whose effective_date equals the transaction's posting_date, not the most recent rate.",
+   "flagged_count must count unmatched journal entries per account, not total unmatched rows across all accounts.",
+   "The pipeline must run to completion with `python /app/recon/run.py --db /app/data/ledger.db` and populate both reconciled and discrepancy_report."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install sqlite3; pip install nothing extra (only stdlib used).",
+   "/app/recon/ contains: run.py (orchestrator, ~180 lines), loader.py (CSV ingestion, ~150 lines), match.py (calls SQLite with embedded SQL strings, ~220 lines), report.py (builds discrepancy_report view, ~140 lines), utils.py (currency helpers, ~100 lines), schema.sql (~80 lines).",
+   "Bug 1 (data-dependent, not visible by reading alone): match.py's matching SQL does `JOIN bank_lines b ON b.amount = je.amount_usd_cents` \u2014 it dropped `AND b.reference_code = je.reference_code` in the migration. With the sample data most reference codes are unique so it appears correct; only when two entries share an amount but differ in reference does it mismatch. The sample data has no such collision; the hidden tests do.",
+   "Bug 2 (interacting): report.py computes net_discrepancy by calling utils.to_usd(amount, currency) which fetches the LATEST fx_rate for that currency (ORDER BY effective_date DESC LIMIT 1) instead of the rate on posting_date. For the sample data all fx_rates have a single historical row per currency so both are identical. Hidden tests include currencies with two historical rate rows. Fixing bug 1 alone makes flagged_count look correct on the sample, hiding bug 2.",
+   "The discrepancy_report is a SQL VIEW defined in report.py; flagged_count is a correlated subquery that counts unmatched rows from the full reconciled table rather than filtering to the current account \u2014 this is a third subtle error exposed only by multi-account hidden datasets. It can be found by inspecting the SQL string in report.py and running queries.",
+   "/app/data/ledger.db is pre-populated from sample CSVs via an init script run at image build time; sample data has single-rate currencies, unique reference codes per account, and only one account \u2014 all edge cases absent.",
+   "The sample data CSVs are also present at /app/data/sample_journal.csv and /app/data/sample_bank.csv so the solver can inspect structure.",
+   "schema.sql creates: journal_entries(id, account_id, reference_code, amount, currency, posting_date), bank_lines(id, account_id, reference_code, amount_usd_cents, posting_date), fx_rates(currency, effective_date, rate_to_usd_cents), reconciled(je_id, bank_id, status), discrepancy_report view.",
+   "Plausible uninvolved code: loader.py has CSV parsing and deduplication logic that works correctly; utils.py has a correct minor-unit formatter used elsewhere."
+  ],
+  "internal_hint": "Difficulty comes from two interacting data-dependent bugs: (1) the JOIN condition in match.py is missing reference_code, invisible on sample data because all amounts happen to be unique within each account; (2) the fx lookup in report.py uses the latest rate instead of the posting-date rate, invisible on sample data because each currency has exactly one rate row. A third bug in the correlated subquery for flagged_count in report.py counts unmatched rows across all accounts instead of filtering to account_id, invisible on single-account sample data. Fixing bug 1 changes which rows are flagged, which makes bug 2 and bug 3 surface only on multi-account, multi-rate hidden inputs. The solver must: run the pipeline and inspect the reconciled table; notice JOIN is on amount only by reading match.py SQL strings; add reference_code to the JOIN; then re-run and check discrepancy values against hand-computed expectations with multi-rate data or by reading report.py carefully to find the fx subquery and the correlated-subcount bug.",
+  "trap": "A solver that (a) reads match.py, spots the missing reference_code, patches it, re-runs, sees the sample data passes, and stops \u2014 will fail hidden tests that have same-amount/different-reference collisions and multi-rate currencies. A solver that also fixes the fx lookup but does not fix the correlated subquery in flagged_count will fail multi-account hidden tests where flagged_count is inflated. The sample data is designed so all three bugs are latent: single account, unique amounts, one rate row per currency.",
+  "tests": [
+   "Test 1 \u2014 reference collision: inject two journal entries for the same account with the same amount_usd_cents but different reference_codes, only one having a matching bank line; verify that exactly one row is 'matched' and one is 'unmatched' in reconciled.",
+   "Test 2 \u2014 fx rate date sensitivity: insert a currency with two fx_rate rows (different effective_dates) and journal entries posted on each date; verify net_discrepancy uses each entry's own posting_date rate, not the later rate.",
+   "Test 3 \u2014 multi-account flagged_count: create two accounts, one fully matched and one fully unmatched; verify discrepancy_report shows flagged_count=0 for the matched account and flagged_count=N for the unmatched account, not the global unmatched total.",
+   "Test 4 \u2014 all-matched account: an account where every journal entry has a corresponding bank line with matching reference_code; verify net_discrepancy=0 and flagged_count=0.",
+   "Test 5 \u2014 combined stress: 8 accounts, mixed currencies, some reference collisions, two historical rate rows per currency; verify all three correctness conditions simultaneously; threshold: all 8 account rows in discrepancy_report must be correct (net_discrepancy within 0 USD cents and exact flagged_count).",
+   "Metric threshold: accuracy = fraction of account rows in discrepancy_report with both correct net_discrepancy and correct flagged_count across all hidden datasets; must be >= 0.95 (i.e., at most 1 wrong account row per 20)."
+  ],
+  "verifier_knob": {
+   "name": "accuracy_threshold",
+   "value": "0.95",
+   "effect": "Lowering to 0.80 allows partial fixes (e.g., only the JOIN bug) to pass; raising to 1.0 requires all three bugs fixed perfectly with no off-by-one in any account row."
+  },
+  "expected_failure_modes": [
+   "Agent reads match.py, adds reference_code to JOIN, sample passes, stops \u2014 fails hidden collision tests.",
+   "Agent fixes JOIN and fx lookup but misses the correlated subquery bug in flagged_count \u2014 fails multi-account tests.",
+   "Agent fixes all three bugs in match.py and report.py SQL strings but introduces a Python string-formatting error that breaks the pipeline on databases with more than one account.",
+   "Agent rewrites the matching logic from scratch using Python instead of SQL, introduces a different join semantics that fails on NULL reference_codes in some hidden inputs.",
+   "Agent notices the fx bug and patches utils.to_usd to accept a date argument but forgets to thread the posting_date through the call sites in report.py, so the fix has no effect."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "sql-debugging",
+  "tags": [
+   "sql",
+   "debugging",
+   "finance",
+   "edge-cases",
+   "two-interacting-bugs",
+   "reverse-engineering"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/recon/match.py  # read matching SQL",
+   "cat /app/recon/utils.py  # read fx lookup logic",
+   "cat /app/recon/report.py  # read discrepancy_report view SQL",
+   "cat /app/recon/schema.sql  # confirm column names",
+   "# Bug 1 spotted: match.py JOIN missing AND b.reference_code = je.reference_code",
+   "# Bug 2 spotted: utils.to_usd uses ORDER BY effective_date DESC LIMIT 1, ignores posting_date",
+   "# Bug 3 spotted: flagged_count correlated subquery missing WHERE account_id = outer.account_id",
+   "edit match.py: add AND b.reference_code = je.reference_code to JOIN condition",
+   "edit utils.py: add date parameter to to_usd(), filter fx_rates WHERE effective_date = posting_date",
+   "edit report.py: pass posting_date into to_usd() call at each call site",
+   "edit report.py SQL: add AND account_id = <outer_account_id> to flagged_count subquery",
+   "python /app/recon/run.py --db /app/data/ledger.db",
+   "sqlite3 /app/data/ledger.db 'SELECT * FROM discrepancy_report'",
+   "sqlite3 /app/data/ledger.db 'SELECT status, COUNT(*) FROM reconciled GROUP BY status'",
+   "# Verify: matched rows have correct reference_code pairing, counts look right",
+   "# Done \u2014 all three bugs fixed in ~16 steps"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The blueprint claims bugs are 'not visible by reading alone' but all three bugs are trivially visible by reading the SQL strings in match.py and report.py \u2014 this framing is factually incorrect and undermines the difficulty model.",
+   "Schema ambiguity: bank_lines column is described as both 'amount_usd_cents' in schema.sql and 'b.amount' in the bug description \u2014 if actual column name differs from what the fix assumes, solver's patch could fail with a column-not-found error that is an environment artifact, not a logic failure.",
+   "Threading the posting_date through utils.to_usd() may break other callers in utils.py or loader.py not described in the instruction, causing pipeline failures on hidden datasets that are not attributable to the bugs being tested.",
+   "If the discrepancy_report VIEW SQL spans multiple lines in report.py, naive string edits (sed) could corrupt indentation or Python string literals, causing a syntax error rather than a logic fix \u2014 this is an environment brittleness, not a real failure.",
+   "The instruction does not explicitly state there are exactly three bugs to fix; an agent that fixes two and sees sample data pass may stop, which is a valid failure, but the instruction's hints are asymmetric \u2014 requirement (3) for flagged_count strongly implies the third bug to careful readers."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three bugs are statically visible by reading the SQL strings in match.py and report.py \u2014 the 'data-dependent' framing is incorrect. A skilled agent will read the files, spot all three bugs in under 10 commands, and apply targeted fixes, making this solvable in ~16 steps well within Opus's demonstrated capability. The average score (4.0) nominally passes the threshold but genuine_difficulty at 2 is a hard floor failure per the rubric ('tasks whose bugs are visible by reading the source... score at most 2'). The task is well-designed in all other respects but needs the bugs to be genuinely non-obvious from static reading.",
+  "fixes": [
+   "Make at least one bug non-visible from static reading: e.g., implement the incorrect fx join as a dynamic Python string built from a config dict that looks plausible, so the error only manifests when tracing execution flow, not by reading a single SQL string.",
+   "Add a fourth plausible-looking function in utils.py that appears to validate the JOIN condition but actually runs after the fact, creating misdirection that costs agents 3-5 additional commands to rule out.",
+   "Replace the literal SQL strings in match.py with a SQL template loaded from a .sql file at runtime \u2014 bugs in .sql files require the agent to also discover which .sql file is loaded and inspect it, adding 2-3 commands and breaking the linear read-and-fix speedrun.",
+   "Ensure the sample data has at least one multi-account scenario (even if trivially matched) so the correlated subquery bug produces a wrong-but-nonzero output on sample data, forcing the agent to run and validate rather than just read and patch.",
+   "Add a fourth subtle bug that only manifests when bugs 1-3 are fixed: e.g., a GROUP BY in the discrepancy_report VIEW that is correct for single-currency accounts but wrong for accounts with mixed currencies \u2014 this forces the agent to validate after each fix rather than batch all fixes."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both involve fixing a ledger reconciliation tool where transactions are incorrectly matched by amount alone rather than by a unique identifier, but the candidate adds multi-currency FX normalization, per-account discrepancy aggregation, and SQLite schema migration debugging as distinct additional requirements."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is purely about fixing a SQL query for running totals and ranking; the candidate is about repairing a multi-step reconciliation pipeline with schema migration bugs, FX normalization, and join-key correctness."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-based CSV processing with deduplication and idempotency; the candidate is about SQL reconciliation correctness with FX rates and reference-code matching."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a binary normalizer and fixing rollup SQL for sensor data; the candidate is about repairing a financial journal-entry reconciliation pipeline."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task is about fixing ETL aggregation for revenue totals and distinct user counts; the candidate focuses on bank-statement reconciliation with reference-code join correctness and multi-currency FX normalization."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.206
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.149
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.134
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.127
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.109
+    ]
+   ],
+   "cost_usd": 0.014346
+  },
+  "novel": false
+ },
+ "cost_usd": 0.064086
+}

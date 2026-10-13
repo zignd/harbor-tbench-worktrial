@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "udp-rate-limiter-token-bucket",
+  "title": "UDP Rate Limiter Token Bucket Repair",
+  "scenario": "A release engineer is preparing a UDP gateway service written in C for production deployment. The service implements per-source token-bucket rate limiting to protect downstream servers from flooding. The repository has a 6-month git history showing the feature was added incrementally, and the CI pipeline recently started failing on the adversarial traffic corpus. The service compiles and passes the included smoke test, but the release is blocked because the rate limiter silently misclassifies packets when the corpus includes specific combinations of source addresses and burst patterns.",
+  "instruction_draft": "The UDP gateway at /opt/gateway enforces per-source token-bucket rate limiting before forwarding packets to the backend. Each source IP is allowed a configured burst capacity and a sustained fill rate; packets that exceed the allowance must be dropped and logged, and all packets within allowance must be forwarded with their payload intact.\n\nYour job is to make the gateway correctly classify every packet in the adversarial corpus that the CI harness at /opt/verify/run_tests.sh will replay against the running service. The gateway binary is built from /opt/gateway/src/ with `make` and listens on UDP port 9000; the backend collector listens on port 9001. A configuration file at /opt/gateway/config.toml sets burst and rate per token bucket. The gateway must: (1) forward every packet from a source that is within its token allowance, (2) drop and log every packet from a source that has exceeded its allowance, (3) never corrupt a forwarded packet's payload, and (4) produce per-source accounting that is consistent with the token-bucket fill formula: tokens = min(burst, tokens + rate * elapsed_seconds). The smoke test passes; the adversarial corpus does not.",
+  "requirements": [
+   "Every packet from a source within its token-bucket allowance is forwarded to the backend unchanged",
+   "Every packet from a source that has exceeded its allowance is dropped (not forwarded) and written to the drop log",
+   "Forwarded packet payloads are byte-for-byte identical to the originals",
+   "Per-source token accounting follows tokens = min(burst, tokens + rate * elapsed_seconds) with no rounding shortcuts",
+   "The gateway handles at least 256 concurrent source IPs without state collision",
+   "The service starts, binds, and processes the corpus without crashing or hanging"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y gcc make libtoml-dev python3 python3-pip; pip install scapy",
+   "Git repository at /opt/gateway with 6 months of commits; the rate limiter was added in a mid-history commit, refactored twice",
+   "Source files: src/main.c (~300 lines, UDP recv/send loop, config loading), src/ratelimit.c (~250 lines, token bucket state machine), src/ratelimit.h, src/hashmap.c (~150 lines, open-addressing hash for per-source state), src/hashmap.h, Makefile, config.toml",
+   "Bug 1 (observe_not_read): ratelimit.c computes elapsed time using integer subtraction of struct timespec.tv_sec only, discarding tv_nsec entirely; this causes tokens to refill in 1-second jumps rather than continuously, so sub-second bursts that should be partially allowed are either fully dropped or fully passed depending on wall-clock alignment \u2014 invisible by reading but revealed when the corpus replays packets with inter-arrival times of 200-800 ms",
+   "Bug 2 (shallow_check_trap): hashmap.c has a probe collision bug: when two source IPs hash to the same slot, the second IP's state overwrites the first's accounting silently (linear probe doesn't check key equality before writing) \u2014 the smoke test uses only one source IP so it passes, but the corpus uses 32+ sources and some are guaranteed to collide",
+   "Bug 3 (mathematical, observe_not_read): config.toml rate is parsed as integer tokens/second and stored as uint32_t, but the multiplication rate * elapsed_seconds overflows for rates above 65535 when elapsed exceeds ~65 seconds, wrapping to a small number and causing a source to be rate-limited after a long idle period when it should have a full bucket \u2014 only appears when corpus includes sources that go idle for > 60 seconds between bursts",
+   "Smoke test at /opt/gateway/test/smoke.sh sends 10 packets from one source, checks 8 are forwarded (burst=8) and 2 are dropped; this passes with all three bugs present",
+   "Verifier at /opt/verify/run_tests.sh starts the gateway, replays corpus via Python/scapy sending UDP datagrams, compares forwarded set and drop log against oracle; corpus generated fresh at verify time with seeded randomness",
+   "Backend collector at /opt/verify/collector.py listens on 9001 and records every received packet with source and payload",
+   "Drop log written by gateway to /tmp/gateway_drops.log, one line per dropped packet: 'DROP src_ip seq_id'",
+   "Corpus oracle precomputed by a reference Python token-bucket simulation that is byte-exact and uses floating-point time",
+   "Plausible but uninvolved code: src/stats.c (~100 lines, per-minute throughput counters that are computed but never used in the test harness)"
+  ],
+  "internal_hint": "Three interacting bugs, all requiring runtime observation to locate. Bug 1 (integer-only time): ratelimit.c struct timespec subtraction uses only .tv_sec; fix by computing elapsed as tv_sec_diff + tv_nsec_diff/1e9 using double arithmetic. Bug 2 (hashmap key collision): hashmap.c linear probe writes state without comparing the stored key; fix by adding a key equality check before accepting a slot as a match. Bug 3 (uint32_t overflow in refill): the product `rate * elapsed_whole_seconds` should be computed as uint64_t or double before clamping to burst; fix the cast. The solver must run the gateway against real packet sequences to observe misclassifications \u2014 reading ratelimit.c shows a subtraction but the significance of the missing tv_nsec is not obvious without seeing sub-second timing failures. The hashmap bug is invisible until multiple sources are used simultaneously. The overflow bug only manifests after >60s idle periods in the corpus.",
+  "trap": "A naive agent reads ratelimit.c, notices the integer subtraction, fixes it, rebuilds, reruns the smoke test (which still passes), and submits. The hashmap collision bug means the corpus still fails on multi-source cases. An agent that also fixes the hashmap but misses the overflow bug will pass all short-burst corpus entries but fail the idle-then-burst cases. Each partial fix passes more corpus entries but a clean run requires all three.",
+  "tests": [
+   "Corpus set A (32 source IPs, inter-arrivals 100-900ms, burst=8, rate=4/s): verifier checks that each source's forwarded count and drop count matches the reference Python token-bucket oracle; fails with Bug 1 (time rounding) and Bug 2 (hashmap collision)",
+   "Corpus set B (64 source IPs with guaranteed hash collisions via crafted IPs, all sub-burst traffic): every packet must be forwarded; fails with Bug 2 alone if Bug 1 is fixed",
+   "Corpus set C (4 source IPs, each sends 5 packets, idles 70 seconds, sends 10 more): after the idle period each source should have a full bucket (burst=8); fails with Bug 3 (uint32_t overflow) even if Bugs 1 and 2 are fixed",
+   "Corpus set D (payload integrity): forwarded packets are compared byte-by-byte with originals including payloads containing null bytes and non-ASCII data",
+   "Corpus set E (adversarial timing): packets arrive at exactly burst capacity boundary; one more packet must be dropped; tests that the token arithmetic is strictly correct, not off-by-one",
+   "Drop log format check: every dropped packet appears in /tmp/gateway_drops.log with correct source IP and the corpus sequence ID embedded in the payload"
+  ],
+  "verifier_knob": {
+   "name": "corpus_sources",
+   "value": "32 sources in corpus A, 64 in corpus B",
+   "effect": "Increasing source count increases the probability of hashmap collisions hitting the corpus and exposes Bug 2 more reliably; decreasing toward 1 source makes the task easier by hiding Bug 2 entirely"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the tv_sec time bug, verifies with the smoke test (which uses one source and coarse timing), concludes the fix is complete, and submits \u2014 fails corpus B and C",
+   "Agent fixes time bug and hashmap but uses integer arithmetic for the refill product, missing the overflow \u2014 fails corpus C",
+   "Agent rewrites the token bucket from scratch in floating point but copies the hashmap collision bug from the original, or introduces a new key-comparison bug \u2014 fails corpus B",
+   "Agent notices the overflow in config parsing but applies the fix only to parsing (casting to uint64_t at load time) while leaving the multiplication in ratelimit.c still using uint32_t intermediate \u2014 fails corpus C",
+   "Agent runs only the smoke test to validate and stops, never constructing a multi-source test scenario to reveal Bug 2"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "networking",
+   "token-bucket",
+   "rate-limiting",
+   "git-history",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/gateway/src/ratelimit.c",
+   "cat /opt/gateway/src/hashmap.c",
+   "cat /opt/gateway/config.toml",
+   "cat /opt/gateway/src/main.c",
+   "# Identify Bug 1: timespec subtraction uses only .tv_sec, discards tv_nsec",
+   "# Identify Bug 2: hashmap linear probe writes without key equality check",
+   "# Identify Bug 3: rate * elapsed computed as uint32_t, overflows after ~65s",
+   "sed -i 's/elapsed = ts_now.tv_sec - ts_prev.tv_sec/elapsed = (ts_now.tv_sec - ts_prev.tv_sec) + (ts_now.tv_nsec - ts_prev.tv_nsec) / 1e9/' /opt/gateway/src/ratelimit.c",
+   "# Edit ratelimit.c to use double for elapsed computation",
+   "# Edit hashmap.c to add key equality check in probe loop before accepting slot",
+   "# Edit ratelimit.c to cast rate to uint64_t before multiplying by elapsed_seconds",
+   "make -C /opt/gateway",
+   "bash /opt/gateway/test/smoke.sh",
+   "bash /opt/verify/run_tests.sh"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Verifier generates corpus fresh at verify time with seeded randomness \u2014 if the RNG seed differs between the agent's test run and the verifier's run, the agent cannot validate against the exact corpus that will be graded",
+   "Sub-second inter-arrival timing via scapy on a 1-CPU container is potentially flaky: if the container is loaded, packet send timing may not be accurate enough to distinguish 200ms vs 800ms inter-arrivals, causing the oracle and actual forwarded counts to diverge nondeterministically",
+   "The gateway is started by the verifier script but no port-ready handshake is described \u2014 a race condition where the verifier starts sending packets before the gateway has bound UDP 9000 could cause spurious failures",
+   "The drop log at /tmp/gateway_drops.log is not cleared between test corpus sets A-E \u2014 if the verifier does not reset state between runs, drop log checks could accumulate stale entries causing false failures",
+   "libtoml-dev availability in python:3.13-slim-bookworm is not guaranteed; the package name may differ (libtoml is not a standard Debian package) and could cause build failure unrelated to the bugs being tested"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task under the acceptance criteria (average falls below 3.6: (4+4+4+2+4)/5 = 3.6, borderline, but genuine_difficulty is 2 which fails the 'every score at least 3' requirement). All three bugs are directly observable by reading ~700 lines of C source \u2014 the tv_sec-only timespec subtraction, the missing key equality in linear probe, and the uint32_t overflow are textbook C mistakes that a strong agent will identify statically in a single reading pass without needing to run the corpus. The 'observe_not_read' framing is not credible given how visually distinctive these bugs are. Additionally, there are meaningful flakiness risks from timing-sensitive corpus replay on a single-CPU container and the absence of a port-ready synchronization mechanism.",
+  "fixes": [
+   "To make the bugs genuinely require runtime observation: obfuscate Bug 1 by computing elapsed correctly in one code path but using a cached integer snapshot in the hot path (a real-world performance optimization gone wrong that reads plausibly correct); obfuscate Bug 2 by making the hashmap probe appear to check key equality but actually compare a hash of the key rather than the key itself (passes casual inspection); obfuscate Bug 3 by storing rate as a float in memory but the overflow occurs in an intermediate cast back to uint32_t during a specific refill path that only triggers after the token count drops below a threshold",
+   "Fix the corpus timing flakiness by having the verifier replay a pre-recorded pcap file with fixed timestamps using tcpreplay rather than live scapy sends, making timing deterministic regardless of CPU load",
+   "Add an explicit port-ready synchronization: the gateway should write a 'READY' line to stdout or a named pipe after bind(), and the verifier should wait for it before sending any corpus packets",
+   "Specify the exact drop log reset behavior: document whether /tmp/gateway_drops.log is truncated on gateway start (it should be), and have the verifier verify this by checking the log contains only entries from the current run",
+   "Replace libtoml-dev with a concrete alternative (e.g., use a simple key=value parser in the gateway C code, or use cJSON, or specify 'apt-get install libtoml-dev || apt-get install libtoml0-dev' with a fallback) to avoid package-name build failures"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet codec for correctness and performance benchmarks; the candidate is about repairing a C UDP rate-limiter's token-bucket logic against an adversarial corpus."
+    },
+    {
+     "ref_id": "terminal-bench-pro/retrieve-vault-root-token",
+     "verdict": "distinct",
+     "reason": "That task is about locating and extracting a HashiCorp Vault root token; the candidate is about debugging and fixing C token-bucket rate-limiting logic in a UDP gateway."
+    },
+    {
+     "ref_id": "terminal-bench/risk-scorer-replay",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a Python ML risk scorer to match production behavior; the candidate is about fixing per-source token-bucket accounting in a C UDP gateway."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust NetFlow v9 aggregation service with flow-record parsing and querying; the candidate is about repairing token-bucket rate-limiter logic in a C UDP gateway."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a shared-library aggregation engine; the candidate is about fixing C token-bucket rate-limiting in a UDP forwarding gateway."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ae2e414b859f",
+     0.15
+    ],
+    [
+     "terminal-bench-pro/retrieve-vault-root-token",
+     0.137
+    ],
+    [
+     "terminal-bench/risk-scorer-replay",
+     0.129
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.1
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.097
+    ]
+   ],
+   "cost_usd": 0.014601000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05944800000000001
+}

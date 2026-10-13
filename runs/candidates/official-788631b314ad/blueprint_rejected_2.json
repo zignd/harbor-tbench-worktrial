@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "tcp-checksum-relay-repair",
+  "title": "TCP Relay Checksum Engine Repair",
+  "scenario": "A release engineer at a network infrastructure company is trying to ship a TCP relay daemon written in C. The relay forwards raw TCP segments between two endpoints, recomputing checksums for modified payloads. The git repository has about 1,200 lines across six source files: a main event loop, a packet parser, a checksum module, a ring-buffer allocator, a connection tracker, and a stats reporter. CI has been failing since a refactor three commits ago, but the unit tests in the repo all pass on the provided sample captures. The real failure only surfaces when the relay processes live traffic with specific payload patterns.",
+  "instruction_draft": "The TCP relay daemon in /repo is failing validation against our traffic corpus: segments it forwards are being rejected by the receiving stack as having bad checksums. The relay must correctly recompute the TCP checksum for every forwarded segment, including those with IP options, odd-length payloads, non-zero urgent pointers, and payloads whose content changes the pseudo-header contribution. Build the fixed relay binary at /repo/relay and ensure it passes all corpus inputs: for each input .pcap in the corpus, relay --verify <file> must exit 0, meaning every forwarded segment in the capture has a valid TCP checksum as verified by a reference implementation. The existing sample captures in /repo/tests/samples/ are not sufficient to confirm correctness; the full corpus covers boundary cases not represented there.",
+  "requirements": [
+   "The relay binary exists at /repo/relay and compiles cleanly from source in /repo.",
+   "relay --verify <pcap_file> exits 0 for every benign corpus input (correctly checksummed forwarded segments).",
+   "relay --verify <pcap_file> exits non-zero for every malicious corpus input (segments with invalid or corrupted checksums).",
+   "Correctness holds for segments with IP options (IP header length > 20 bytes), affecting the pseudo-header source/destination extraction.",
+   "Correctness holds for odd-length TCP payloads (the final byte must be zero-padded before summing).",
+   "Correctness holds for segments where the urgent pointer is non-zero (must be included in checksum, not zeroed).",
+   "Correctness holds when the payload length in the pseudo-header is computed as total IP length minus IP header length, not as a stored field.",
+   "The ring-buffer allocator must not corrupt segment data between read and checksum computation (allocator bug interacts with checksum bug on large payloads)."
+  ],
+  "environment": [
+   "Git repository at /repo with ~1,200 lines of C across: main.c (event loop, ~200 lines), packet.c + packet.h (parser, ~280 lines), checksum.c + checksum.h (checksum engine, ~150 lines), ringbuf.c + ringbuf.h (ring buffer, ~200 lines), conntrack.c + conntrack.h (connection tracker, ~180 lines), stats.c + stats.h (reporter, ~100 lines), and Makefile.",
+   "Git history with at least 8 commits; the breaking refactor is 3 commits ago and touched both checksum.c and ringbuf.c simultaneously, making the interaction non-obvious.",
+   "checksum.c has TWO bugs: (1) when IP options are present, it reads src/dst IP from fixed offsets 12/16 instead of computing them from the actual IP header length, corrupting the pseudo-header; (2) for odd-length payloads, the final byte is added directly without zero-padding, causing off-by-one accumulation errors on certain values.",
+   "ringbuf.c has ONE bug introduced in the same commit: when a segment spans a ring-buffer wraparound boundary, the copy to the scratch buffer reads `len` bytes from the start pointer without handling the wrap, silently truncating and corrupting segments > half the ring size. This interacts with the checksum bug: small test payloads never wrap, so tests pass.",
+   "The provided sample captures in /repo/tests/samples/ use short payloads with no IP options and even lengths, so all three bugs are invisible to the existing tests.",
+   "relay --verify mode: reads each TCP segment from the pcap, runs it through the relay's checksum recomputation logic, and compares to a reference RFC 793 checksum computed inline by the verifier helper (shipped as a small verified-correct C reference in /repo/tools/ref_checksum.c, compiled separately by the Makefile into /repo/tools/ref_check).",
+   "Dockerfile installs: build-essential, libpcap-dev, python3, python3-pip, scapy (for corpus generation at verify time), git.",
+   "The verifier generates the hidden corpus at verify time using a Python/Scapy script seeded deterministically: it generates benign captures (correct checksums, varied IP option lengths 0/4/8/12 bytes, payload lengths 1-1500 bytes including odd values, urgent pointer set/unset, payloads crossing ring-buffer boundary at size > 512 bytes) and malicious captures (intentionally wrong checksums in the same range of cases).",
+   "Corpus size knob: 200 total captures (120 benign, 80 malicious), covering all boundary combinations."
+  ],
+  "internal_hint": "Difficulty comes from two levers: (1) observe_not_read \u2014 the three bugs (two in checksum.c, one in ringbuf.c) only manifest on specific data patterns (IP options, odd payloads, large payloads crossing a ring boundary), none of which appear in the repo's sample captures; the solver must generate or observe failing cases by running the binary against crafted inputs; (2) shallow_check_trap \u2014 fixing only the obvious checksum bugs (IP option offset and odd-length padding) passes any test that doesn't send large payloads, but the ringbuf wraparound corruption causes random checksum mismatches on segments > ~512 bytes, which only appear in the hidden corpus. The solver must: (a) read git log to identify the refactor commit, (b) diff it to find both checksum.c and ringbuf.c changed, (c) instrument or run the binary against crafted pcaps to observe which cases fail, (d) fix the IP-options offset bug in pseudo-header construction, (e) fix the odd-length zero-padding, and (f) fix the ringbuf wraparound copy. A solver that only fixes the checksum bugs will pass ~60% of corpus inputs (all small-payload cases) but fail the large-payload wraparound cases.",
+  "trap": "A naive solver reads checksum.c, spots the IP-options offset bug and the missing zero-pad, fixes both, verifies against the sample captures (which all pass), and submits. The hidden corpus includes 40+ benign captures with payloads > 512 bytes that cross the ring-buffer boundary; these are silently corrupted by the ringbuf.c wraparound bug before the checksum is computed, so the recomputed checksum is wrong even after the checksum.c fixes. The solver must also discover and fix the ringbuf.c bug, which requires either running the binary on large inputs and observing failures, or carefully reading the git diff to see that ringbuf.c was also modified in the breaking commit.",
+  "tests": [
+   "For each benign corpus pcap (IP options present, payload even-length, small): relay --verify exits 0.",
+   "For each benign corpus pcap (no IP options, payload odd-length, small): relay --verify exits 0.",
+   "For each benign corpus pcap (IP options + odd-length payload, small): relay --verify exits 0.",
+   "For each benign corpus pcap (payload > 512 bytes, no IP options, even-length, crosses ring boundary): relay --verify exits 0. (Tests ringbuf fix.)",
+   "For each benign corpus pcap (payload > 512 bytes, IP options present, odd-length): relay --verify exits 0. (Tests all three fixes together.)",
+   "For each malicious corpus pcap (checksum deliberately corrupted, any payload size): relay --verify exits non-zero.",
+   "For each malicious corpus pcap with IP options and corrupted checksum: relay --verify exits non-zero.",
+   "The relay binary compiles without warnings from source using the repo Makefile.",
+   "relay --verify run on the original sample captures in /repo/tests/samples/ continues to exit 0 (regression guard)."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 captures (120 benign, 80 malicious)",
+   "effect": "Raising corpus size and coverage (more IP option lengths, more payload sizes near boundary, more urgent pointer combinations) makes the shallow-fix trap harder to escape and forces the solver to handle more edge cases. Lowering it reduces the chance the ringbuf bug is exposed and lets partial fixes pass."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the checksum.c bugs (IP options offset and odd-length padding) after reading the diff, verifies against sample captures, submits \u2014 fails all large-payload corpus inputs due to uncorrected ringbuf wraparound.",
+   "Solver fixes all three bugs but introduces a regression in the pseudo-header length calculation (using the wrong field for payload length), causing failures on fragmented or options-bearing segments not in the samples.",
+   "Solver rewrites checksum.c from scratch correctly but does not discover the ringbuf.c bug because it was not in the same function as the checksum logic, missing the cross-file interaction.",
+   "Solver fixes the ringbuf.c wraparound but uses memmove incorrectly (fails when src and dst overlap in specific ring configurations), causing intermittent failures on the corpus.",
+   "Solver identifies both source files in the git diff but misunderstands the ringbuf API, patching the wrong copy path and leaving the wraparound case still broken for writes but not reads."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "tcp",
+   "checksum",
+   "git-history",
+   "networking",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /repo && git log --oneline  # identify the refactor commit 3 back",
+   "git diff HEAD~3 HEAD~2 -- checksum.c ringbuf.c  # see both files changed",
+   "cat checksum.c  # read full checksum module, spot IP-options offset bug and odd-length bug",
+   "cat ringbuf.c   # read full ring buffer, spot wraparound copy bug",
+   "# Fix 1: change fixed offsets 12/16 in pseudo-header construction to use (ihl*4)+offset",
+   "# Fix 2: add zero-pad for odd-length payload before final byte accumulation",
+   "# Fix 3: fix ringbuf wraparound copy to handle split across boundary with two-part memcpy",
+   "make  # compile, check for warnings",
+   "relay --verify tests/samples/sample1.pcap  # regression on existing samples",
+   "relay --verify tests/samples/sample2.pcap  # regression on existing samples"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction hints that the refactor 'touched both checksum.c and ringbuf.c simultaneously' \u2014 this makes the ringbuf bug easily discoverable by git diff, undermining the shallow_check_trap intended to catch agents who only fix checksum.c. The trap is self-defeating because the instruction itself points to both files.",
+   "All three bugs are fully described in the blueprint's environment section with enough specificity (fixed offsets 12/16, 'len bytes from start pointer without handling the wrap') that static code reading suffices \u2014 no dynamic observation of live traffic is needed, invalidating the observe_not_read lever.",
+   "The corpus is generated deterministically at verify time by a Python/Scapy script; if scapy version or pcap library behavior differs from the Dockerfile pin, checksums in generated captures could differ, causing flaky results against the reference implementation.",
+   "The 'relay --verify' mode compares against ref_checksum.c compiled separately \u2014 if the reference implementation itself has a subtle discrepancy (e.g., byte-order handling on the target platform), benign captures could spuriously fail, creating invalid failures.",
+   "The ringbuf fix requires understanding the ring-buffer API well enough to write a correct two-part memcpy; if the replacement uses memmove incorrectly or miscomputes the wrap point, it could pass small-payload tests but fail differently, making failure modes harder to attribute.",
+   "Difficulty scoring: with ~10-13 commands and all bugs findable by static reading of source, genuine_difficulty should score 2, which causes automatic reject per the rubric."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because the instruction explicitly names both affected files (checksum.c and ringbuf.c) in the same commit, and all three bugs are described with enough specificity that a skilled agent can find and fix them by reading ~200 lines of source after a single git diff \u2014 no dynamic corpus observation required. The intended 'shallow_check_trap' is neutralized by the instruction text itself pointing to both files. Additionally, the corpus generation at verify time using Scapy introduces a flakiness risk if library versions are not tightly pinned, which could produce invalid failures on technically correct solutions.",
+  "fixes": [
+   "Remove the explicit mention that 'the breaking refactor touched both checksum.c and ringbuf.c simultaneously' from the scenario text \u2014 instead say only 'CI has been failing since a refactor three commits ago' and let the solver discover which files changed via git diff. This restores the shallow_check_trap's effectiveness.",
+   "Obfuscate the bug descriptions: instead of naming the exact wrong offsets (12/16) and the exact wrong operation ('reads len bytes from the start pointer'), describe only the observable symptom (corrupted checksums on live traffic) so the bugs require dynamic observation or careful code reading to locate.",
+   "Add a third or fourth modified file in the breaking commit (e.g., a benign change to stats.c or conntrack.c) to increase the surface area the solver must search, making it non-trivial to identify which changes are causally related to the failures.",
+   "Pin exact Scapy and libpcap versions in the Dockerfile and pre-generate the corpus as static files (committed as binary blobs or generated in a setup step with a frozen seed), eliminating runtime generation variability that could cause flaky reference-vs-relay checksum mismatches.",
+   "To achieve genuine_difficulty >= 3, introduce a fourth bug or require the solver to handle a subtle interaction where fixing ringbuf.c naively (e.g., two-part memcpy without correct length arithmetic) passes most corpus inputs but fails a specific boundary case, forcing iterative testing rather than one-shot static repair."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet codec for correctness and performance, not TCP checksum recomputation in C."
+    },
+    {
+     "ref_id": "terminal-bench-pro/bash-ddos-traffic-analyzer",
+     "verdict": "distinct",
+     "reason": "That task is about writing a shell script to detect DDoS patterns in log files, not fixing TCP checksum computation."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/git-leak-recovery",
+     "verdict": "distinct",
+     "reason": "That task is about recovering and cleaning up a leaked secret from git history, unrelated to TCP checksum logic."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a NetFlow v9 aggregation service for correct flow data, not TCP checksum recomputation."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about computing HMAC-SHA256 tags over WAL records in an audit service, not TCP checksum recomputation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ae2e414b859f",
+     0.147
+    ],
+    [
+     "terminal-bench-pro/bash-ddos-traffic-analyzer",
+     0.106
+    ],
+    [
+     "terminal-bench-2-1/git-leak-recovery",
+     0.097
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.096
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.09
+    ]
+   ],
+   "cost_usd": 0.013419
+  },
+  "novel": true
+ },
+ "cost_usd": 0.048774
+}

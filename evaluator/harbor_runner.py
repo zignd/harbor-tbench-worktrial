@@ -11,6 +11,7 @@ Layout and fields are documented in docs/harbor-notes.md. Outcome classes:
 - fatal:       configuration errors (bad key, unknown model). Abort.
 """
 
+import contextlib
 import json
 import os
 import shutil
@@ -21,7 +22,8 @@ from datetime import datetime
 from pathlib import Path
 
 from analysis.openrouter import Price, fetch_prices
-from generator.config import ENV_FILE, JOBS_DIR, RUNS_DIR
+from evaluator.slots import machine_slots
+from generator.config import ENV_FILE, ENV_SLOTS, JOBS_DIR, RUNS_DIR
 
 INFRA_RETRIES = 2
 
@@ -172,8 +174,13 @@ def run_job(
     agent_kwargs: dict | None = None,
     jobs_dir: Path | str = JOBS_DIR,
     extra_args: list[str] | None = None,
+    limit_envs: bool = True,
 ) -> list[TrialResult]:
     """Run one `harbor run` job and return its parsed trials (raises on fatal errors).
+
+    Holds `concurrent` of the machine-wide ENV_SLOTS environment slots while it runs, so
+    the machine never exhausts Docker's network address pools (Opus calibration passes
+    `limit_envs=False`: it has its own trial slots).
 
     The job dir is always fresh: Harbor *resumes* an existing job dir with the
     same config (keeping its finished trials), which would silently reuse stale
@@ -207,7 +214,13 @@ def run_job(
     if Path(ENV_FILE).exists() and not os.environ.get("OPENROUTER_API_KEY"):
         cmd += ["--env-file", ENV_FILE]
     cmd += extra_args or []
-    proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    slots = (
+        machine_slots(concurrent, ENV_SLOTS, Path(JOBS_DIR) / ".env-slots")
+        if limit_envs
+        else contextlib.nullcontext()
+    )
+    with slots:
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
     job_dir = jobs_dir / job_name
     if not job_dir.exists():
         raise RuntimeError(f"harbor run produced no job dir: {proc.stderr[-1000:]}")

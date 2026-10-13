@@ -1,0 +1,160 @@
+{
+ "blueprint": {
+  "slug": "schema-transpiler-binary-config",
+  "title": "Schema Transpiler Binary Configuration",
+  "scenario": "A platform engineering team is migrating their data pipeline infrastructure. They have a compiled schema transpiler binary (`/opt/transpiler/schemaxlate`) that reads a JSON configuration file and converts between internal Avro schemas and wire-format protobuf descriptors. The binary was written by a contractor, ships without source, and the configuration format is only partially documented in a README. The team needs to wire it into a new Node.js packaging pipeline (`/app/`) that bundles schemas for three downstream services.",
+  "instruction_draft": "Hey \u2014 we're moving the schema pipeline over to the new bundler and I need your help finishing the config for `schemaxlate`. The binary lives at `/opt/transpiler/schemaxlate` and there's a partial README at `/opt/transpiler/README.md`. The Node.js bundler in `/app/` calls it to transpile schemas for the `billing`, `inventory`, and `events` services. Right now `node /app/bundle.js` fails or produces wrong output. Get it working so all three services' output `.proto` descriptor files appear under `/app/dist/` and each one passes the schema round-trip check (i.e. the bundler's built-in `node /app/verify.js` exits 0). The config file the bundler generates for the binary must live at `/app/transpiler.config.json`. Don't touch the binary.",
+  "requirements": [
+   "Running `node /app/bundle.js` must exit 0",
+   "Files `/app/dist/billing.proto`, `/app/dist/inventory.proto`, and `/app/dist/events.proto` must exist after `node /app/bundle.js` runs",
+   "Running `node /app/verify.js` must exit 0 (round-trip check for all three service schemas)",
+   "The config file `/app/transpiler.config.json` must exist and be valid JSON",
+   "The binary at `/opt/transpiler/schemaxlate` must not be modified"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base, but Node.js 20 LTS installed via apt",
+   "Compiled C binary `/opt/transpiler/schemaxlate` (built in Dockerfile FROM a small C source that is NOT included in the image \u2014 only the binary ships). The binary: (1) reads a JSON config from the path given by its first argument; (2) has three required top-level config keys whose names differ from the README's examples \u2014 `schema_dialect` (README says `dialect`), `field_coercion` (README omits this entirely, but the binary silently zero-fills if absent and produces truncated output), and `namespace_policy` with allowed values `'strict'`, `'relaxed'`, or `'passthrough'` (README only mentions `'strict'` and `'passthrough'`). The correct value for the migration is `'relaxed'` because the input Avro schemas use mixed-case namespaces \u2014 this must be discovered by running the binary against sample inputs. (3) Exits non-zero and writes an error to stderr for unrecognized keys. (4) Accepts optional `services` array to control which schemas are processed; if omitted it processes all found in the `input_dir`. (5) Writes `.proto` files to `output_dir`.",
+   "README at `/opt/transpiler/README.md` that documents `dialect`, `namespace_policy` (only `strict`/`passthrough`), and `output_dir`/`input_dir` \u2014 does NOT mention `schema_dialect` rename, `field_coercion`, or `relaxed` namespace policy",
+   "Input Avro schema files at `/app/schemas/billing.avsc`, `/app/schemas/inventory.avsc`, `/app/schemas/events.avsc` \u2014 the inventory and events schemas use mixed-case namespaces (`com.Platform.Inventory`, `Com.Events.Stream`) that trigger truncation under `strict` and passthrough under `passthrough` (leaving invalid proto output), but produce correct output under `relaxed`",
+   "Node.js app `/app/bundle.js` (~120 lines): reads `/app/transpiler.config.json`, validates required keys against a hardcoded list (`schema_dialect`, `field_coercion`, `namespace_policy`, `input_dir`, `output_dir`), spawns the binary, then copies outputs to `/app/dist/`. Currently fails because `transpiler.config.json` either doesn't exist or has wrong keys.",
+   "Node.js verifier `/app/verify.js` (~80 lines): for each `.proto` file in `/app/dist/`, it uses a pure-JS proto parser to check that all field numbers are non-zero, all namespaces are valid proto package identifiers (lowercase dotted), and the service name matches the filename stem. Under `strict` or `passthrough`, the inventory and events `.proto` files have malformed package lines that fail this check.",
+   "Supporting Node.js modules in `/app/lib/` (~400 lines total): config validator, proto parser, file utilities \u2014 plausible but not involved in the root cause",
+   "A `package.json` with `protobufjs` as a dependency (pre-installed), no other exotic deps",
+   "The Dockerfile builds the C binary from a source file that is deleted after compilation (`RUN ... && rm /tmp/schemaxlate.c`), so no source is available in the image",
+   "A sample script `/opt/transpiler/examples/run_example.sh` that uses the old key names (`dialect` etc.) from the README \u2014 running it verbatim fails with 'unrecognized key' errors, which is a clue that the key names changed"
+  ],
+  "internal_hint": "Two difficulty levers are real: (1) observe_not_read \u2014 the `field_coercion` key is not documented anywhere; its absence causes the binary to silently produce truncated proto field definitions that only manifest as wrong field numbers when verify.js parses the output. The agent must run the binary, observe truncated output, and experiment to discover `field_coercion` must be present (any non-empty string value works, e.g. `'preserve'`). (2) opaque_component \u2014 the `namespace_policy` value `'relaxed'` is not in the README; the agent must try `'strict'` (proto package lines are left as `com.Platform.Inventory`, which is invalid proto syntax), try `'passthrough'` (same result), and observe that neither produces valid output for mixed-case schemas, then probe by trying other strings until `'relaxed'` works (the binary exits 0 with well-formed lowercase dotted output). The key rename (`dialect` \u2192 `schema_dialect`) is caught immediately by bundle.js's validation error on first run. Resolution: (a) run `node /app/bundle.js`, read the error about missing key `schema_dialect`; (b) create `transpiler.config.json` with correct key names; (c) run the binary directly against a mixed-case schema with `strict` \u2014 observe malformed package in output; (d) try `passthrough` \u2014 same; (e) try `relaxed` \u2014 correct lowercase dotted package; (f) discover `field_coercion` by running binary, seeing truncated fields, adding the key; (g) run verify.js to confirm.",
+  "trap": "An agent that sets `namespace_policy: 'passthrough'` (documented in README) will get exit-0 from the binary but the `.proto` files will have mixed-case package identifiers that fail verify.js's lowercase-dotted check. Similarly, an agent that omits `field_coercion` gets binary exit-0 but truncated field numbers that fail verify.js. A shallowly-verifying agent who only checks that the binary exits 0 and the files exist will miss both failures. The verify.js tests at verify-time regenerate the dist/ folder from scratch (deleting `/app/dist/` before re-running bundle.js) so pre-placed proto files don't help.",
+  "tests": [
+   "Delete `/app/dist/` and run `node /app/bundle.js`; check exit code is 0",
+   "Check that `/app/dist/billing.proto`, `/app/dist/inventory.proto`, `/app/dist/events.proto` all exist",
+   "Run `node /app/verify.js`; check exit code is 0 (this internally checks field numbers \u2265 1 and package names match `^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)*$` for all three protos)",
+   "Check that `/app/transpiler.config.json` is valid JSON with keys `schema_dialect`, `field_coercion`, `namespace_policy`, `input_dir`, `output_dir` present",
+   "Check that `namespace_policy` value in the config is not `'strict'` or `'passthrough'` (both produce invalid output for mixed-case schemas)",
+   "Verify-time: replace `/app/schemas/events.avsc` with a fresh schema using namespace `Com.Audit.Trail` (another mixed-case namespace not in the original set), delete `/app/dist/`, re-run `node /app/bundle.js` and `node /app/verify.js` \u2014 both must exit 0 (confirms the config generalizes, not just works on the three sample schemas)"
+  ],
+  "verifier_knob": {
+   "name": "number of independent state properties checked",
+   "value": "6",
+   "effect": "Lowering to 3 checks only file existence and bundle.js exit code \u2014 easy. At 6, the verify.js round-trip, the config key presence, the namespace_policy value constraint, and the fresh-schema generalization test are all required, each catching a different partial solution. Raising to 8 would add checksum validation of field numbers and a test with a schema containing deeply nested namespaces."
+  },
+  "expected_failure_modes": [
+   "Agent uses `namespace_policy: 'passthrough'` (documented in README) and never runs verify.js against inventory/events schemas \u2014 binary exits 0 but verify fails",
+   "Agent omits `field_coercion` key \u2014 binary exits 0 but proto files have zero field numbers, verify.js fails",
+   "Agent reads the README example which uses old key name `dialect`, sets that, bundle.js validation fails, agent assumes binary is broken rather than that key was renamed",
+   "Agent builds a config that works for billing (simple lowercase namespace) but doesn't notice inventory/events are failing because it only spot-checks one proto file",
+   "Agent discovers `relaxed` namespace policy but still omits `field_coercion`, so two separate experiments are needed and agent stops after fixing one"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "opaque-binary",
+   "configuration",
+   "javascript",
+   "schema-migration",
+   "observe-not-read",
+   "protobuf"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/transpiler/README.md",
+   "node /app/bundle.js  # fails: no transpiler.config.json",
+   "cat /app/bundle.js  # reads required keys list: schema_dialect, field_coercion, namespace_policy, input_dir, output_dir",
+   "cat /app/schemas/inventory.avsc  # observe mixed-case namespace com.Platform.Inventory",
+   "cat /app/schemas/events.avsc  # observe Com.Events.Stream",
+   "echo '{\"schema_dialect\":\"avro\",\"field_coercion\":\"preserve\",\"namespace_policy\":\"strict\",\"input_dir\":\"/app/schemas\",\"output_dir\":\"/app/dist\"}' > /app/transpiler.config.json",
+   "node /app/bundle.js  # exits 0",
+   "node /app/verify.js  # fails: malformed package identifiers",
+   "cat /app/dist/inventory.proto  # see com.Platform.Inventory - invalid proto package",
+   "# update config namespace_policy to 'passthrough', re-run",
+   "node /app/bundle.js && node /app/verify.js  # still fails",
+   "cat /app/dist/inventory.proto  # still mixed-case",
+   "# update config namespace_policy to 'relaxed'",
+   "node /app/bundle.js  # exits 0",
+   "node /app/verify.js  # exits 0 - all three protos valid"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The field_coercion key is listed explicitly in bundle.js's hardcoded validation list, which an agent reads naturally after first failure \u2014 this collapses the observe_not_read difficulty lever entirely, making the key trivially discoverable by reading source rather than by experimentation",
+   "The namespace_policy 'relaxed' value must be guessed from an undocumented set; if the binary silently accepts arbitrary strings (returning exit 0 with wrong output), an agent could try many plausible values (loose, normalize, lowercase, flexible, permissive) before reaching 'relaxed', making this partially luck-dependent and potentially time-consuming beyond the 1-hour budget",
+   "The generalization test at verify-time replaces events.avsc and expects bundle.js to process it \u2014 if an agent includes an explicit services array in transpiler.config.json (which bundle.js docs suggest is optional), the new schema may not be processed, causing a spurious verify failure that the task instructions give no warning about",
+   "If the binary rejects the field_coercion value string (e.g., 'preserve' is unrecognized as a value, not just a key), the agent has no way to know valid values since neither README nor bundle.js documents them \u2014 this could cause confusion about whether the key name or value is wrong"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: bundle.js explicitly lists field_coercion in its hardcoded required-keys validation array, so any agent who reads bundle.js after the first failure immediately discovers the 'undocumented' key without any binary experimentation \u2014 the primary observe_not_read lever is neutralized. With ~15 commands to a solution, a frontier agent would solve this reliably. The average score is 4.0 but genuine_difficulty scores 2, which should disqualify it.",
+  "fixes": [
+   "Remove field_coercion from bundle.js's hardcoded validation list \u2014 bundle.js should only validate the keys it needs (schema_dialect, namespace_policy, input_dir, output_dir) and pass the full config object through to the binary transparently. The field_coercion discovery must come from observing the binary's truncated output, not from reading Node.js source.",
+   "To increase namespace_policy difficulty: instead of an opaque guess, make the README's example script (/opt/transpiler/examples/run_example.sh) show a value like 'compat' that also fails, and have the binary's stderr hint 'unrecognized namespace_policy: compat; expected one of [strict, passthrough, relaxed]' only after an incorrect value \u2014 giving a discoverable but non-obvious path",
+   "Add a warning in the task instruction that the generalization test will use a novel schema not in the original set, or ensure bundle.js always processes all schemas in input_dir regardless of the services array, to prevent spurious failures on the verify-time test"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/make-doom-for-mips",
+     "verdict": "distinct",
+     "reason": "That task involves cross-compiling a C game to MIPS ELF; this task involves configuring a JSON config file for a schema transpiler binary to produce protobuf descriptors."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/extract-elf",
+     "verdict": "distinct",
+     "reason": "That task involves parsing ELF binary memory layouts; this task involves wiring a schema transpiler binary via JSON configuration."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log ingestion pipeline's correctness and performance bugs in Node.js source code; this task involves reverse-engineering and configuring an undocumented binary's JSON config format."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a canary deployment orchestrator's rollback logic; this task involves configuring a schema transpiler binary via a partially documented JSON config."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline with a GeoIP binary and Flask API; this task involves configuring a schema transpiler binary to produce protobuf descriptors for three services."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/make-doom-for-mips",
+     0.166
+    ],
+    [
+     "terminal-bench-2-1/extract-elf",
+     0.152
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.144
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.11
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.094
+    ]
+   ],
+   "cost_usd": 0.013041
+  },
+  "novel": true
+ },
+ "cost_usd": 0.06294000000000001
+}

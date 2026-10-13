@@ -148,6 +148,7 @@ def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Ca
                 attempts=k,
                 concurrent=k,
                 agent_kwargs={"max_turns": MAX_TURNS},
+                limit_envs=False,  # held in opus_slots above
             )
         if not counted:
             verdict = "infra"

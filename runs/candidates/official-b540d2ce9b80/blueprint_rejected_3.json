@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "native-addon-abi-bridge-config",
+  "title": "Node.js Native Addon ABI Bridge Configuration",
+  "scenario": "A platform engineering team is migrating a Node.js analytics service from node 18 to node 22. The service depends on a compiled native addon (`/opt/addons/metricsd.node`) that exposes a C++ metrics aggregation engine. The addon binary was built for a specific Node.js ABI version and exposes an undocumented configuration surface through environment variables and a JSON config file that the binary reads at initialization \u2014 the config schema was never written down. The service itself is ~1200 lines across several JS modules that call the addon. The team has lost the build config and the original source. The binary must be characterized by experiment to understand its configuration protocol before the new packaging can work.",
+  "instruction_draft": "Hey, so the new Docker image for the metrics service keeps producing wrong aggregation output when we run it against real traffic data. The addon seems to load fine but the output values are off in ways that only show up with multi-window data. We need the final image to produce a `package.json` at `/app/package.json` that sets `\"main\"` to `./src/index.js`, defines `\"engines\": {\"node\": \">=22.0.0\"}`, and includes a `\"metricsd\"` key in the config object (under a top-level `\"config\"` field) with whatever settings make the addon aggregate correctly. The addon reads its config from `/app/metricsd.config.json` at startup. You also need to make sure `/app/metricsd.config.json` is present with the right fields so the service produces correct P50/P95/P99 percentile output when given the included test fixture. Run `node /app/src/index.js --verify` to check your work. The Dockerfile should build cleanly with `docker build -t metrics-svc .`",
+  "requirements": [
+   "package.json exists at /app/package.json with `main` set to `./src/index.js`",
+   "package.json has an `engines` field with `{\"node\": \">=22.0.0\"}`",
+   "package.json has a `config.metricsd` object with the correct configuration keys",
+   "metricsd.config.json exists at /app/metricsd.config.json with all required fields the addon expects",
+   "The service correctly reports P50, P95, and P99 percentiles matching expected values when run against /app/test/fixtures/traffic.ndjson",
+   "The Dockerfile builds without error from scratch (`docker build`)",
+   "The `node /app/src/index.js --verify` command exits 0 and prints PASS for all three percentile checks"
+  ],
+  "environment": [
+   "Dockerfile FROM node:22-slim-bookworm (not python base \u2014 adjust constraint: use node:22-slim-bookworm as base)",
+   "Pre-compiled binary /opt/addons/metricsd.node (ABI 127, node 22 compatible) \u2014 a real compiled C addon that reads /app/metricsd.config.json",
+   "The addon accepts config fields: `windowMs` (integer, window size), `buckets` (integer, histogram bucket count), `precision` (string: 'hdr' or 'linear'), `overflow` (string: 'clamp' or 'wrap') \u2014 the combination matters; wrong values silently produce wrong percentiles",
+   "The addon default behavior (no config file, or wrong precision mode) uses 'linear' bucketing which is inaccurate for high-variance data; 'hdr' mode is required for correct P95/P99 on skewed distributions",
+   "The 'overflow' field defaults to 'wrap' which corrupts values above the bucket range; must be set to 'clamp'",
+   "`windowMs` must match the fixture's data window (30000ms, discoverable by inspecting traffic.ndjson timestamps)",
+   "`buckets` must be >= 1000 for sufficient P99 resolution (the binary silently degrades resolution below this)",
+   "/app/src/index.js \u2014 main service entry point (~300 lines), calls require('/opt/addons/metricsd.node'), reads metricsd.config.json, has a --verify flag that runs assertions against traffic.ndjson",
+   "/app/src/aggregator.js \u2014 aggregation logic wrapper (~200 lines)",
+   "/app/src/reporter.js \u2014 output formatting (~150 lines)",
+   "/app/src/pipeline.js \u2014 data ingestion pipeline (~250 lines)",
+   "/app/src/utils.js \u2014 utility functions (~200 lines)",
+   "/app/test/fixtures/traffic.ndjson \u2014 5000 lines of realistic skewed latency data (Pareto distribution) with timestamps spanning a 30-second window",
+   "/app/test/expected.json \u2014 expected P50, P95, P99 values to within 2% tolerance",
+   "No package.json initially (the migration removed it), no metricsd.config.json",
+   "The binary's behavior with wrong config is only visible when run against skewed multi-modal data (traffic.ndjson), not with simple synthetic data the agent might generate"
+  ],
+  "internal_hint": "Difficulty comes from two interacting opaque-component levers: (1) the compiled binary must be characterized by experiment since there is no source \u2014 the solver must probe it with different config values and observe output changes; (2) the bug only manifests on real skewed data (the traffic fixture), not on synthetic uniform data a solver might construct to test. The resolution path: (a) run the service with no config and observe wrong percentiles; (b) probe the binary's behavior by trying different config fields \u2014 the binary logs a warning to stderr listing unrecognized fields, which reveals the accepted schema; (c) discover that `precision: 'linear'` (default) vs `precision: 'hdr'` changes P99 dramatically on skewed data; (d) discover that `overflow: 'wrap'` vs `overflow: 'clamp'` corrupts high-value buckets; (e) discover windowMs must match the data window by reading fixture timestamps; (f) discover buckets must be >= 1000 by testing and observing resolution degradation in P99. All four config fields interact \u2014 fixing only precision while leaving overflow='wrap' still fails P99. The verifier checks exact percentile ranges against traffic.ndjson at verify time.",
+  "trap": "A naive agent will: (1) write a plausible-looking metricsd.config.json based on guessing common field names like `window`, `percentiles`, `mode` \u2014 the binary silently ignores unknown fields and runs in broken default mode; (2) test against a simple synthetic dataset they generate (uniform distribution) where P50/P95/P99 happen to pass even with wrong precision mode; (3) miss the overflow='clamp' requirement because it only affects values in the tail of skewed distributions; (4) set buckets=100 (a common default) which degrades P99 resolution but the degradation only appears at verify time on the real traffic fixture. The shallow verification path (test with a few data points) passes, but the verifier runs against traffic.ndjson and checks all three percentiles against expected.json within 2% tolerance.",
+  "tests": [
+   "Check /app/package.json exists, parses as valid JSON, has `main: './src/index.js'`, `engines.node: '>=22.0.0'`, and a `config.metricsd` object",
+   "Check /app/metricsd.config.json exists, parses as valid JSON, has `precision: 'hdr'`, `overflow: 'clamp'`, `windowMs: 30000`, `buckets` >= 1000",
+   "Run `node /app/src/index.js --verify` against /app/test/fixtures/traffic.ndjson and check exit code 0",
+   "Verify the --verify output contains PASS for P50, P95, and P99 checks",
+   "At verify time, generate a fresh Pareto-distributed latency dataset with a different seed and run the service against it, checking that P95 and P99 are within 2% of scipy-computed ground truth \u2014 this catches agents who hardcode expected values",
+   "Run `docker build -t metrics-svc .` from the task directory and verify exit code 0",
+   "Check that the Dockerfile does not COPY the metricsd.config.json from a hardcoded location but instead the config is generated or present in /app at runtime"
+  ],
+  "verifier_knob": {
+   "name": "number of independent state properties checked",
+   "value": "7 properties: package.json main, package.json engines, package.json config.metricsd presence, metricsd.config.json all 4 required fields with correct values, and percentile accuracy on fresh generated data",
+   "effect": "Reducing to 3 properties (just package.json fields and exit code) makes it solvable by guessing; raising to 9+ (adding field-value range checks for buckets, windowMs tolerance window, per-percentile tolerance tightened to 0.5%) makes it significantly harder"
+  },
+  "expected_failure_modes": [
+   "Agent guesses metricsd.config.json schema without probing the binary, uses wrong field names that are silently ignored",
+   "Agent tests with synthetic uniform data where linear precision accidentally passes, misses that HDR mode is needed for skewed distributions",
+   "Agent sets overflow='wrap' (a common default) and doesn't discover the corruption it causes in high-value tail buckets",
+   "Agent sets buckets=100 or 256 (common power-of-2 choices) and gets degraded P99 resolution that only fails on the real fixture",
+   "Agent fixes precision and overflow but sets wrong windowMs (e.g., 60000ms) causing multi-window data to be split incorrectly",
+   "Agent writes a Dockerfile that fails to copy the addon from /opt/addons into the image build context, causing the docker build to fail or the addon to be missing at runtime"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "native-addon",
+   "opaque-binary",
+   "configuration",
+   "node.js",
+   "percentiles",
+   "packaging"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls /opt/addons/ && ls /app/src/ && cat /app/src/index.js",
+   "cat /app/src/aggregator.js && cat /app/test/expected.json",
+   "node /app/src/index.js --verify 2>&1  # baseline failure",
+   "echo '{}' > /app/metricsd.config.json && node /app/src/index.js --verify 2>&1  # binary stderr reveals accepted fields",
+   "echo '{\"unknown\":1}' > /app/metricsd.config.json && node /app/src/index.js --verify 2>&1  # confirm stderr warning lists valid keys",
+   "head -3 /app/test/fixtures/traffic.ndjson && tail -3 /app/test/fixtures/traffic.ndjson  # discover windowMs=30000",
+   "echo '{\"windowMs\":30000,\"buckets\":1000,\"precision\":\"hdr\",\"overflow\":\"clamp\"}' > /app/metricsd.config.json",
+   "node /app/src/index.js --verify  # confirm PASS",
+   "cat > /app/package.json with main, engines, config.metricsd",
+   "node /app/src/index.js --verify  # confirm still passes",
+   "cp /opt/addons/metricsd.node ./metricsd.node  # stage for docker build context",
+   "cat > Dockerfile  # FROM node:22-slim-bookworm, COPY src, COPY addon, CMD",
+   "docker build -t metrics-svc .",
+   "docker run metrics-svc node /app/src/index.js --verify"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The binary's stderr warning behavior (listing accepted field names) is the only path to schema discovery but is never guaranteed in the environment spec \u2014 if not implemented this way, the task becomes unsolvable or trivially guessable",
+   "The fresh-seed Pareto verifier test requires exact alignment between traffic.ndjson generation parameters and the verify-time generation parameters; underdocumented distribution parameters risk flaky P50/P95/P99 tolerance failures",
+   "The Dockerfile COPY constraint ('does not COPY metricsd.config.json from hardcoded location') is ambiguous \u2014 runtime generation via entrypoint script vs. build-time COPY are both valid but the test may not handle both",
+   "The binary at /opt/addons/metricsd.node must be in the Docker build context for COPY to work, but the blueprint does not specify how the build context is structured relative to /opt/addons/ \u2014 agents may produce a valid Dockerfile that docker build fails because the context doesn't include the binary",
+   "The dual config surface (package.json config.metricsd field vs. metricsd.config.json) is confusing \u2014 the instruction implies both must have 'the right settings' but only metricsd.config.json actually drives the binary; agents may waste effort ensuring package.json config.metricsd matches exactly and break on wrong assumptions about which one is authoritative"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies the task: the binary self-documents its schema via stderr warnings (per the internal hint's resolution path step b), reducing what should be opaque-component characterization to a trivial 2-3 probe loop. A capable agent will discover all four required config fields within the first few commands by reading stderr, collapsing the core difficulty lever. Additionally, the Dockerfile build context problem (the binary lives at /opt/addons/ on the host but must be COPYed into the image) is underspecified and creates a likely invalid failure mode unrelated to the task's learning objectives.",
+  "fixes": [
+   "Remove the stderr warning that lists accepted field names \u2014 instead, the binary should silently ignore unknown fields (as stated in the trap section) and only the observed output behavior changes; schema discovery must come from behavioral experimentation, not self-documentation",
+   "Specify exactly how the Docker build context is structured (e.g., the task provides a build/ directory with metricsd.node pre-staged, or the Dockerfile uses a multi-stage build from a registry image that contains the addon)",
+   "Clarify or eliminate the package.json config.metricsd requirement \u2014 either make it actually drive the binary (and metricsd.config.json is auto-generated from it) or drop it from the config surface; the current dual-config design confuses the requirement without adding difficulty",
+   "Add a deliberate red herring: a metricsd.config.json.example file with plausible but wrong field names (e.g., 'mode', 'window', 'resolution') that the binary silently ignores \u2014 this forces behavioral probing rather than copying an example"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/extract-elf",
+     "verdict": "distinct",
+     "reason": "That task is about parsing an ELF binary to extract memory values into JSON; the candidate is about characterizing a Node.js native addon's config protocol and building a Docker image."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "variant",
+     "reason": "Both tasks require reverse-engineering an undocumented compiled binary's behavior through experimentation (black-box probing) to produce correct aggregation output, with the core challenge being the same: discover the hidden config/protocol by experiment rather than documentation."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log ingestion pipeline for correctness and performance; the candidate is about reverse-engineering a native addon's config surface."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a canary deployment orchestrator's rollback logic; the candidate is about characterizing a native addon config protocol."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted aggregation in a sales service with known source code; the candidate is about reverse-engineering an undocumented binary's config schema."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/extract-elf",
+     0.17
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.167
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.166
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.159
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.146
+    ]
+   ],
+   "cost_usd": 0.01389
+  },
+  "novel": false
+ },
+ "cost_usd": 0.06294
+}

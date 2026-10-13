@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "cidr-aggregator-git-regression",
+  "title": "CIDR Route Aggregation Engine Regression",
+  "scenario": "A release engineer at a network infrastructure company is preparing the v2.4.1 hotfix branch of `netagg`, an in-house C daemon that aggregates BGP-learned IPv4 CIDR prefixes into minimal non-overlapping supernets before writing them to a kernel FIB. A CI run on the hotfix branch flagged that the aggregation output has silently diverged from the v2.3.0 baseline on production route tables \u2014 the unit tests all pass, but the nightly regression diff between the two branches shows thousands of extra routes in the FIB. The repository has full history (v2.2.0 \u2192 v2.3.0 \u2192 v2.4.0 \u2192 hotfix) and the production PCAP replay logs for the last 30 days are stored in `/data/replays/`. The daemon reads prefixes from stdin (one per line, CIDR notation) and prints the aggregated supernets to stdout.",
+  "instruction_draft": "The `netagg` aggregation daemon in `/repo` (branch `hotfix/v2.4.1`) produces more output prefixes than v2.3.0 for the same input, even though all supplied unit tests pass. Your job is to make the daemon on the hotfix branch produce output that is prefix-for-prefix identical to the v2.3.0 output on every valid IPv4 CIDR input \u2014 including edge cases involving adjacent ranges, host routes (/32), the default route (0.0.0.0/0), and inputs that span power-of-two aligned boundaries. The aggregated output must be sorted in ascending order by network address, then by prefix length, with no duplicates and no two output prefixes where one is a subnet of the other. Build the fixed daemon as `/repo/netagg` and confirm it passes `/repo/tests/run_tests.sh`.",
+  "requirements": [
+   "The compiled binary `/repo/netagg` reads IPv4 CIDR prefixes (one per line) from stdin and writes the minimal aggregated supernet set to stdout, one CIDR per line.",
+   "Output is sorted ascending by 32-bit network address, then by prefix length (shorter masks first), with no duplicates.",
+   "No output prefix may be a proper subnet of another output prefix.",
+   "Output must be prefix-for-prefix identical to the v2.3.0 reference binary `/repo/netagg-v2.3.0` on all valid IPv4 CIDR inputs.",
+   "The binary must pass `/repo/tests/run_tests.sh` without modification to the test script.",
+   "Adjacent same-length prefixes that together form a power-of-two aligned supernet must be merged into that supernet (transitively, until no further merges are possible).",
+   "Host routes (/32) and the default route (0.0.0.0/0) must be handled correctly.",
+   "Inputs containing duplicates or out-of-order lines must produce correct deduplicated aggregated output."
+  ],
+  "environment": [
+   "Git repository at /repo with four tags: v2.2.0, v2.3.0, v2.4.0, hotfix/v2.4.1 (current HEAD). History is real: each tag has a genuine commit diff.",
+   "v2.3.0 has a correct implementation of the radix-trie-based CIDR aggregation algorithm in ~700 lines across src/trie.c, src/trie.h, src/aggregate.c, src/main.c.",
+   "Between v2.3.0 and v2.4.0 a performance patch was applied that rewrote the merge-upward loop in src/aggregate.c. The patch introduced a subtle off-by-one: the loop condition compares prefix_len > 0 but should compare prefix_len >= 0 to also attempt merging at the /0 boundary; AND the adjacent-sibling detection uses (addr >> (32 - prefix_len)) ^ 1 but for prefix_len == 32 this shifts by 0 bits without masking the host bits, so adjacent /32 host routes that should merge into a /31 are not merged.",
+   "Between v2.4.0 and hotfix/v2.4.1 a second patch added ECMP weight fields and a new output formatter. The formatter re-sorts by weight then by address instead of by address then by prefix length, silently breaking the sort contract. The test suite only checks a 5-prefix sample that happens to have the same order under both sort keys.",
+   "The bugs are NOT visible by reading a single file: the /32 merge failure only manifests on inputs with adjacent host routes; the sort-order failure only manifests when two prefixes share the same network address with different lengths (e.g. 10.0.0.0/8 and 10.0.0.0/24 both in output, which requires crafted inputs not in the test suite).",
+   "Reference binary /repo/netagg-v2.3.0 is a compiled ELF of the v2.3.0 source \u2014 solver can run it for comparison but cannot read its source directly in the hotfix branch (source is accessible via git checkout).",
+   "Makefile at /repo/Makefile builds with 'make' producing /repo/netagg.",
+   "/repo/tests/run_tests.sh runs 8 small hand-crafted cases; all 8 pass on both v2.3.0 and the broken hotfix (the tests do not include adjacent /32 pairs nor same-address different-length outputs).",
+   "/data/replays/ contains 30 gzipped text files of real production prefix lists (5000-80000 prefixes each) that expose the divergence when fed to both binaries.",
+   "A helper script /repo/tests/compare.sh takes two binaries and a prefix file and diffs their outputs \u2014 solver can use this to observe failures.",
+   "Dockerfile installs gcc, make, git, python3; pins gcc 12 and glibc 2.36."
+  ],
+  "internal_hint": "Difficulty comes from two interacting bugs that are only observable at runtime: (1) the /32 adjacency merge failure (bit-shift undefined behavior / wrong mask for full 32-bit prefix) only shows when two adjacent host routes like 192.168.1.0/32 and 192.168.1.1/32 are in the input \u2014 the test suite has no such pair; (2) the output sort-order bug only shows when aggregation produces two prefixes with the same 32-bit network address but different lengths (e.g. if 10.0.0.0/24 and 10.0.0.0/8 are both legitimate outputs), because the formatter sorts by ECMP weight as primary key. The solver must: (a) notice the test suite passes but production replays diverge, (b) run compare.sh or diff outputs on replay files to find concrete failing inputs, (c) reduce a failing input to a minimal case to understand each bug, (d) check git log between v2.3.0 and hotfix to find the two relevant commits, (e) fix both: restore prefix_len >= 0 loop bound, add host-bit mask for /32 adjacency check, and fix the comparator to sort by address then length. A solver that only fixes the merge bug (visible from git diff of the performance patch) will still fail hidden tests that exercise the sort-order bug, because the sort bug requires carefully crafted inputs not in the test suite.",
+  "trap": "A naive solver reads the git diff of the v2.3.0\u2192v2.4.0 performance patch, finds the off-by-one in the merge loop, fixes it, runs the 8-test suite, sees all pass, and stops. The hidden corpus includes inputs with adjacent /32 pairs (exposing the bit-shift mask bug, a second defect in the same loop) and inputs that produce same-address outputs of different lengths (exposing the sort-order bug introduced in the hotfix commit). Both bugs are in different commits and only observable by running the binary on crafted data, not by reading the loop once.",
+  "tests": [
+   "Compile /repo/netagg with 'make' in /repo \u2014 must succeed with exit 0.",
+   "/repo/tests/run_tests.sh must exit 0 (existing 8-case suite).",
+   "Adversarial corpus test 1 \u2014 adjacent host routes: input '10.0.0.0/32\\n10.0.0.1/32\\n10.0.0.2/32\\n10.0.0.3/32', expected output '10.0.0.0/30'. Tests /32 merge transitivity.",
+   "Adversarial corpus test 2 \u2014 single adjacent /32 pair: input '172.16.5.4/32\\n172.16.5.5/32', expected '172.16.5.4/31'. Tests /32\u2192/31 merge.",
+   "Adversarial corpus test 3 \u2014 no spurious merge for non-adjacent /32: input '1.2.3.0/32\\n1.2.3.2/32', expected '1.2.3.0/32\\n1.2.3.2/32' (no merge, they differ by 2).",
+   "Adversarial corpus test 4 \u2014 sort order with same-network-address outputs: input that yields both 192.168.0.0/16 and 192.168.0.0/24 as independent outputs (the /24 is not subsumed); output must list 192.168.0.0/16 before 192.168.0.0/24 (ascending prefix length = wider mask first).",
+   "Adversarial corpus test 5 \u2014 default route absorption: input containing 0.0.0.0/0 plus arbitrary other prefixes; output must be exactly '0.0.0.0/0'.",
+   "Adversarial corpus test 6 \u2014 full /31 ladder: 128 adjacent /32 pairs spanning 0.0.0.0\u20130.0.0.255, expected single output '0.0.0.0/24'.",
+   "Adversarial corpus test 7 \u2014 output matches /repo/netagg-v2.3.0 on each of 20 verify-time generated inputs (random prefix sets of 50\u2013500 entries drawn from seeded RNG, covering all edge cases above); diff must be empty.",
+   "Adversarial corpus test 8 \u2014 idempotency: feeding /repo/netagg output back into /repo/netagg must produce identical output (aggregation is already minimal).",
+   "Adversarial corpus test 9 \u2014 duplicate input handling: input with 50 repeated identical prefixes must produce one output line.",
+   "Adversarial corpus test 10 \u2014 output from /repo/netagg matches /repo/netagg-v2.3.0 on the first 5 replay files in /data/replays/ (diff must be empty)."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "20 generated inputs + 5 replay files",
+   "effect": "Raising adds more seeded random prefix sets and more replay files, increasing coverage of tricky alignment cases; lowering to only the 8 unit tests would let both bugs go undetected."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the loop-bound off-by-one from the v2.4.0 diff, misses the /32 host-bit mask bug in the same loop, and ships.",
+   "Solver fixes both merge bugs but does not discover the sort-order regression in the hotfix formatter commit, because the sort bug requires specific output shapes not in the unit tests.",
+   "Solver discovers the sort bug but implements the comparator incorrectly (e.g. sorts by prefix_len descending instead of ascending), passing casual inspection but failing tests with mixed-length outputs.",
+   "Solver runs compare.sh on one replay file, sees no diff after partial fix, concludes the fix is complete without checking all corpus inputs.",
+   "Solver reads the git log but misidentifies the formatter sort-key change as intentional ECMP behavior and does not revert it."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "networking",
+   "c",
+   "git-history",
+   "cidr-aggregation",
+   "observe-not-read",
+   "shallow-check-trap"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /repo && git log --oneline v2.3.0..HEAD",
+   "git diff v2.3.0 v2.4.0 -- src/aggregate.c",
+   "git diff v2.4.0 HEAD -- src/aggregate.c src/main.c",
+   "# Identify: (1) prefix_len > 0 should be >= 0, (2) missing host-bit mask for /32 adjacency XOR, (3) formatter sorts by weight instead of addr+len",
+   "# Fix all three in src/aggregate.c and src/main.c",
+   "make",
+   "/repo/tests/run_tests.sh",
+   "printf '10.0.0.0/32\\n10.0.0.1/32\\n' | ./netagg",
+   "/repo/tests/compare.sh ./netagg ./netagg-v2.3.0 /data/replays/replay_01.gz",
+   "# All pass \u2014 done"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Test 4 is logically self-contradictory: a correct CIDR aggregator cannot output both 192.168.0.0/16 and 192.168.0.0/24 simultaneously because the /24 is always subsumed by the /16 \u2014 this test is impossible to pass with a correct implementation and will cause invalid failures.",
+   "The 'observe-not-read' difficulty lever is undermined: all three bugs are directly visible in two git diffs (v2.3.0\u2192v2.4.0 and v2.4.0\u2192hotfix), so a skilled agent reading git history discovers all bugs statically without needing runtime observation.",
+   "The description claims the /32 shift is 'undefined behavior' but addr >> 0 is well-defined in C; the actual bug is missing masking of host bits, not UB \u2014 this misdescription could confuse the environment builder and lead to incorrect scaffolding.",
+   "The trap relies on agents NOT examining the hotfix commit diff, but competent agents routinely run 'git diff v2.3.0..HEAD' as a first step, seeing all changes at once and bypassing the intended multi-stage discovery.",
+   "Test 7 uses seeded RNG for generated inputs \u2014 if the seed or generation algorithm isn't precisely specified in the verifier, replay at verify time may differ from build time, causing flaky results."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails on genuine_difficulty (score 2) because all three bugs are directly discoverable by reading two git diffs, making the 'observe-not-read' framing false \u2014 a competent agent completes this in ~10 commands. More critically, Test 4 contains a logical impossibility: a correct CIDR aggregator cannot simultaneously output both 192.168.0.0/16 and 192.168.0.0/24 since the /24 is always subsumed by the /16, making this test impossible to pass with a correct implementation and constituting an invalid failure mode.",
+  "fixes": [
+   "To restore genuine difficulty: make at least one bug invisible in git diffs \u2014 e.g., introduce the /32 mask bug as a pre-existing flaw in v2.2.0 that was accidentally 'fixed' and then re-broken, so git diff doesn't highlight it; or hide the sort bug in a dependency/header file rather than the main formatter.",
+   "Fix Test 4 entirely: replace the self-contradictory 'same-network-address different-length independent outputs' with a valid scenario \u2014 e.g., test that 10.0.0.0/8 and 10.0.0.0/24 in INPUT produce only 10.0.0.0/8 in OUTPUT (subsumption test), or design an input where the sort order between two genuinely separate prefixes like 10.0.0.0/24 and 10.0.1.0/24 matters.",
+   "Strengthen the shallow-check trap by adding a test in run_tests.sh that passes even with the sort bug (already done), but also remove any git diff path to the sort bug \u2014 e.g., obfuscate the sort key change as a lambda or function pointer so it's not obviously a regression from diff alone.",
+   "Correct the UB claim: document the /32 bug accurately as 'missing host-bit mask causes incorrect sibling detection' rather than 'undefined behavior from shift-by-0', to avoid misleading the environment builder.",
+   "For Test 7, explicitly specify the RNG seed and generation algorithm in the verifier spec to ensure deterministic replay at verify time."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/hysteretic-aquifer-control",
+     "verdict": "distinct",
+     "reason": "Completely different domain (aquifer simulation vs. network routing) and problem type (calibration/control vs. bug regression)."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding and fixing a regression in a C/systems service using git history and a reference binary/branch, with a test suite to pass \u2014 the core debugging workflow is essentially the same, differing only in domain (packet codec vs. CIDR aggregation)."
+    },
+    {
+     "ref_id": "terminal-bench-science/3x2pt-inference",
+     "verdict": "distinct",
+     "reason": "Completely different domain (cosmological Bayesian inference vs. network prefix aggregation) with no overlapping techniques."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "While both involve network data, the NetFlow task is about fixing a broken aggregation service's data pipeline, whereas the candidate is about a CIDR prefix merging algorithm regression \u2014 different core problems."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "Both involve reverse-engineering or fixing a binary with a reference baseline, but the sensor normalization pipeline problem is entirely different from CIDR route aggregation."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/hysteretic-aquifer-control",
+     0.156
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.145
+    ],
+    [
+     "terminal-bench-science/3x2pt-inference",
+     0.13
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.106
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.074
+    ]
+   ],
+   "cost_usd": 0.015288
+  },
+  "novel": false
+ },
+ "cost_usd": 0.065187
+}

@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "plugin-loader-abi-negotiation",
+  "title": "Plugin Loader ABI Negotiation",
+  "scenario": "A platform engineer is migrating a JavaScript-based plugin system to a new host process. The host is a compiled C binary (/usr/local/bin/plughost) that loads .js plugins at runtime via an embedded V8-like engine, exposing a versioned ABI through a JSON negotiation handshake. The repo at /app contains roughly 1,200 lines of JavaScript across a plugin SDK, a build pipeline (webpack + custom packaging), and several example plugins. A new plugin manifest format (v2) was introduced to support capability declarations, but the packaged plugins are being rejected silently at runtime.",
+  "instruction_draft": "Hey \u2014 I need your help finishing the migration to the new plugin format. The plughost binary loads plugins from /app/dist/*.plg and writes structured JSON results to /app/run_output.json when you run it. Right now it runs but rejects every plugin silently (no errors, just no results). I need all three plugins (analytics, transform, and logger) to load successfully and produce output entries in run_output.json. The build system is at /app and running `npm run build` should produce the .plg files. The packaged format, the manifest fields, and the capability negotiation all need to be right \u2014 figure out what the binary actually expects by running it and observing what it does. Don't modify the binary.",
+  "requirements": [
+   "Running `npm run build` from /app produces /app/dist/analytics.plg, /app/dist/transform.plg, and /app/dist/logger.plg without errors",
+   "Running `/usr/local/bin/plughost /app/dist` produces /app/run_output.json",
+   "run_output.json contains a top-level 'plugins' array with exactly three entries",
+   "Each entry has a 'status' field equal to 'loaded'",
+   "Each entry has a 'name' field matching the plugin name (analytics, transform, logger)",
+   "Each entry has a 'capabilities' array containing at least the capabilities declared in that plugin's manifest",
+   "The 'transform' plugin entry contains an 'output' field with a processed result from the binary's test payload",
+   "The manifest 'api_version' field in each .plg file is exactly the value the binary requires (discoverable only by probing)",
+   "The .plg file format is a length-prefixed binary envelope wrapping a JSON manifest header and a JS payload (format discoverable by experiment)"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base, with nodejs 20, npm, and webpack installed via apt/npm",
+   "Compiled binary /usr/local/bin/plughost (statically linked, no source provided) that: (1) scans a directory for *.plg files, (2) reads a 4-byte little-endian magic (0x504C4732 = 'PLG2'), 4-byte manifest-length, then JSON manifest, then JS payload, (3) checks manifest fields: api_version must equal '2.4.1' (not '2.0' or '2.4' or '3.0'), capabilities must be a non-empty array of strings from an allowed set, entry_point must name an exported function, (4) runs the JS payload calling the entry_point with a fixed test payload {data:[1,2,3,4,5]}, (5) writes /app/run_output.json with results; on any format error silently skips the plugin with no stderr output",
+   "The binary accepts an optional --debug flag that writes /tmp/plughost_debug.log with per-plugin rejection reasons (this must be discovered by experiment -- running `plughost --help` or `strings` on it reveals the flag)",
+   "/app/package.json with build script that currently calls webpack and then a packaging script /app/scripts/pack-plugins.js",
+   "/app/scripts/pack-plugins.js currently writes .plg files with wrong magic bytes (uses 'PLG1' = 0x504C4731) and wraps manifest+JS as plain concatenated text without length prefix",
+   "/app/src/sdk/plugin-sdk.js: the plugin SDK that plugins import, ~200 lines, correct",
+   "/app/src/plugins/analytics/index.js, /app/src/plugins/transform/index.js, /app/src/plugins/logger/index.js: three plugins using the SDK, ~100 lines each, functionally correct JS but with api_version: '2.0' in their manifests (wrong)",
+   "/app/src/plugins/analytics/manifest.json, transform/manifest.json, logger/manifest.json: manifest files with api_version: '2.0' and incomplete capabilities arrays (logger is missing the 'log.write' capability the binary requires for logger-type plugins)",
+   "/app/webpack.config.js: correct webpack config that bundles each plugin to dist/",
+   "A /app/MIGRATION_NOTES.md file that mentions 'v2.4.1 ABI' and the binary envelope format in vague terms but does not give the exact magic bytes or length-prefix structure",
+   "The binary's --debug log clearly states the rejection reason for each plugin (wrong magic, wrong api_version, missing capability, etc.) when run with --debug"
+  ],
+  "internal_hint": "Difficulty comes from two interacting opaque-component levers: (1) the binary silently rejects malformed plugins with no output at all \u2014 the solver must discover the --debug flag (by running plughost --help or strings or strace) to see WHY plugins are rejected; (2) there are three independent problems: wrong magic bytes in pack-plugins.js (PLG1 vs PLG2), wrong api_version in all manifests ('2.0' vs '2.4.1'), and a missing capability in logger's manifest. Each fix is individually verifiable only by running the binary. A solver that finds and fixes only one or two of the three problems gets a partially populated run_output.json (0, 1, or 2 loaded plugins) and must re-examine debug output to find remaining issues. The api_version value '2.4.1' is hinted at in MIGRATION_NOTES.md but not stated precisely enough to avoid a wrong guess. The length-prefix binary format must be reverse-engineered by reading the debug log ('manifest parse error: expected length-prefixed JSON') or by running strings/hexdump on a sample .plg that the binary might generate as reference (there's a reference .plg in /app/examples/reference.plg that the solver can hexdump to learn the format). The observe_not_read lever: all three bugs only manifest when the binary actually runs \u2014 reading the JS and manifest files shows plausible-looking values without revealing that '2.0' != '2.4.1' or that PLG1 is wrong.",
+  "trap": "A solver that reads the source, guesses api_version from MIGRATION_NOTES.md as '2.4' (instead of '2.4.1'), and fixes the pack script but not the logger capability will produce a run_output.json with 0-2 loaded plugins. The verifier checks that all three plugins have status 'loaded', so any partial fix fails. The hidden test also checks the transform plugin's output field, verifying the JS actually ran \u2014 so a solver that fakes the JSON file rather than fixing the build also fails.",
+  "tests": [
+   "Check that /app/dist/analytics.plg, /app/dist/transform.plg, /app/dist/logger.plg all exist after `npm run build`",
+   "Check that each .plg file begins with magic bytes 0x50 0x4C 0x47 0x32 (PLG2 in little-endian)",
+   "Check that each .plg file has a valid 4-byte little-endian length field at offset 4 that matches the actual byte length of the JSON manifest that follows",
+   "Parse the JSON manifest from each .plg and check api_version === '2.4.1'",
+   "Parse the JSON manifest from logger.plg and check capabilities includes 'log.write'",
+   "Run /usr/local/bin/plughost /app/dist and check /app/run_output.json exists",
+   "Check run_output.json plugins array has length 3",
+   "Check each plugin entry has status === 'loaded'",
+   "Check the transform plugin entry has a non-null 'output' field (proving the JS payload executed)",
+   "Re-run the verifier with a fresh dist/ directory built from the solver's modified sources to ensure the build is reproducible"
+  ],
+  "verifier_knob": {
+   "name": "number of independent defects",
+   "value": "3 (magic bytes, api_version string, missing capability)",
+   "effect": "Reducing to 2 defects (e.g., drop the missing capability issue) lowers difficulty since partial exploration is more likely to succeed; raising to 4 (e.g., add a wrong entry_point field in one plugin) increases difficulty by requiring more debug-observe cycles"
+  },
+  "expected_failure_modes": [
+   "Agent reads MIGRATION_NOTES.md, guesses api_version as '2.4' or '2' instead of '2.4.1', fixes the other bugs, and produces 0 loaded plugins \u2014 stops too early after seeing run_output.json is created but doesn't check the status fields carefully",
+   "Agent fixes api_version and the binary format but misses the logger missing capability, producing only 2 loaded plugins, and declares success without verifying all three entries have status 'loaded'",
+   "Agent discovers --debug flag and reads the rejection reasons for the first plugin only, fixes that one, then assumes the other plugins are fine without re-running with --debug",
+   "Agent correctly fixes pack-plugins.js format but miscalculates the length prefix (off-by-one, wrong endianness, or includes magic in the length), causing all plugins to still be rejected with a different error",
+   "Agent modifies the binary's input by symlinking or renaming files rather than fixing the build pipeline, passing shallow checks but failing the reproducible-build rerun test"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "javascript",
+   "binary-format",
+   "opaque-component",
+   "constraint-satisfaction",
+   "build-pipeline",
+   "plugin-system"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/MIGRATION_NOTES.md",
+   "cat /app/src/plugins/analytics/manifest.json && cat /app/src/plugins/logger/manifest.json",
+   "cat /app/scripts/pack-plugins.js",
+   "/usr/local/bin/plughost --help  # discover --debug flag",
+   "cd /app && npm run build",
+   "/usr/local/bin/plughost --debug /app/dist",
+   "cat /tmp/plughost_debug.log  # reveals: wrong magic PLG1->PLG2, api_version 2.0->2.4.1, logger missing log.write",
+   "hexdump -C /app/examples/reference.plg | head -20  # confirm length-prefixed format",
+   "# Edit /app/scripts/pack-plugins.js: fix magic bytes to 0x504C4732, add 4-byte LE length prefix before JSON manifest",
+   "# Edit /app/src/plugins/analytics/manifest.json: api_version '2.0' -> '2.4.1'",
+   "# Edit /app/src/plugins/transform/manifest.json: api_version '2.0' -> '2.4.1'",
+   "# Edit /app/src/plugins/logger/manifest.json: api_version '2.0' -> '2.4.1', add 'log.write' to capabilities",
+   "cd /app && npm run build",
+   "/usr/local/bin/plughost /app/dist",
+   "cat /app/run_output.json  # verify 3 entries, all status loaded, transform has output field"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The --debug flag reveals all three bugs simultaneously in one run, collapsing the intended multi-iteration difficulty; a competent agent fixes all three in a single pass with no re-exploration needed",
+   "MIGRATION_NOTES.md 'vaguely hints' at v2.4.1 but if it's too clear, agents guess correctly without probing, bypassing the opaque-component lever entirely",
+   "The reference.plg file makes the binary format reverse-engineering trivial (hexdump + compare) rather than requiring real experimentation",
+   "If the binary's --help output is too verbose (lists all flags with descriptions), the discovery step is trivial; if --help doesn't exist, agents must use 'strings' which adds commands but isn't described as required",
+   "The length-prefix calculation in pack-plugins.js could be ambiguous: does the length include the null terminator, BOM, or trailing newline of the JSON? If the binary is strict about this, off-by-one failures could be flaky depending on JSON serialization",
+   "The 'reproducible-build rerun test' requires the solver's source edits to persist; if the verifier runs in a fresh container snapshot, it must restore the solver's edited files, which is a complex verifier requirement not explicitly described"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 fails the minimum threshold of 3. The --debug flag exposes all three bugs in a single command, and the reference.plg makes the binary format immediately readable via hexdump \u2014 together these collapse the intended multi-iteration opaque-component exploration into a linear 15-command fix. The three independent defects are not actually independent once the debug log is read; a competent agent sees all three simultaneously and fixes them in one pass. To reach genuine_difficulty \u2265 3, the task needs to either remove the --debug flag (forcing inference from binary behavior), make the reference.plg unavailable, or replace one of the bugs with something that requires multi-step behavioral experimentation rather than reading a log file.",
+  "fixes": [
+   "Remove the --debug flag entirely, forcing the agent to infer rejection reasons from run_output.json structure, binary exit codes, strace output, or by constructing minimal test .plg files manually \u2014 this restores the opaque-component difficulty lever",
+   "Remove the reference.plg file and instead require the agent to construct the binary format by trial-and-error (e.g., try plain JSON first, observe partial acceptance, deduce length-prefix requirement from run_output showing 0 plugins)",
+   "Replace the 'missing capability' bug with something harder to discover: e.g., the logger plugin's JS exports the wrong function name (mismatch between manifest entry_point and actual export), which only shows when the JS runs but the result is undefined \u2014 visible only by examining output field behavior, not from a static manifest check",
+   "Make MIGRATION_NOTES.md more misleading: say 'v2.4.x series' or list multiple candidate versions, so the agent must actually probe the binary rather than reading the file to find '2.4.1'",
+   "If --debug is kept, introduce a fourth bug that --debug does NOT expose (e.g., a webpack bundling issue that makes the transform plugin's exported function name get mangled), requiring the agent to read webpack output and test the JS independently"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/detect-c-feature-flags",
+     "verdict": "distinct",
+     "reason": "That task is about static binary analysis to detect compile-time feature flags; the candidate is about black-box probing a binary to reverse-engineer a plugin ABI/file format and fix a build pipeline."
+    },
+    {
+     "ref_id": "terminal-bench/bun-sourcemap-leak",
+     "verdict": "distinct",
+     "reason": "That task is about fixing source map leakage in a Bun/TypeScript release pipeline; the candidate is about reverse-engineering a binary plugin host's ABI negotiation protocol and file format."
+    },
+    {
+     "ref_id": "terminal-bench/rs-archive-clone",
+     "verdict": "distinct",
+     "reason": "That task is about black-box cloning a reference archive tool's behavior; the candidate is about fixing an existing plugin system to satisfy a compiled binary host's undocumented ABI requirements."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a buggy HMAC chain verifier with a protocol interface; the candidate is about reverse-engineering a binary's plugin format and ABI negotiation via experiment."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about characterizing a binary's numeric transformation function to fix a data pipeline; the candidate is about reverse-engineering a plugin host's file format and capability negotiation protocol."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/detect-c-feature-flags",
+     0.127
+    ],
+    [
+     "terminal-bench/bun-sourcemap-leak",
+     0.113
+    ],
+    [
+     "terminal-bench/rs-archive-clone",
+     0.106
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.088
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.075
+    ]
+   ],
+   "cost_usd": 0.01488
+  },
+  "novel": true
+ },
+ "cost_usd": 0.059436
+}

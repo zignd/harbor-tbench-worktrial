@@ -168,27 +168,82 @@ def main() -> int:
     return 0
 
 
-if __name__ == "__main__":
-    import sys
+HIGHLIGHT_SEC = 3.0  # how long a changed line stays highlighted
+
+
+def watch(every: int) -> int:
+    """Curses viewer: scroll with arrows/PgUp/PgDn/Home/End, q quits; changed lines are highlighted."""
+    import contextlib
+    import curses
+    import io
+    import threading
     import time
 
-    if "--watch" in sys.argv:  # refresh every N seconds (default 30) until Ctrl-C
+    state = {"lines": [], "changed": {}, "updated": 0.0, "busy": False}
+
+    def refresh_loop() -> None:
+        while True:
+            state["busy"] = True
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    main()
+            except Exception as exc:  # noqa: BLE001  keep the viewer alive on transient errors
+                buf.write(f"error: {exc}\n")
+            lines = buf.getvalue().splitlines()
+            now = time.time()
+            if state["lines"]:
+                old = set(state["lines"])
+                for ln in lines:
+                    if ln not in old:
+                        state["changed"][ln] = now
+            state["lines"], state["updated"], state["busy"] = lines, now, False
+            time.sleep(every)
+
+    def ui(scr: curses.window) -> None:
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        scr.timeout(200)
+        top = 0
+        threading.Thread(target=refresh_loop, daemon=True).start()
+        while True:
+            h, w = scr.getmaxyx()
+            lines = state["lines"]
+            page = max(h - 1, 1)
+            top = max(0, min(top, len(lines) - page))
+            scr.erase()
+            now = time.time()
+            for row, ln in enumerate(lines[top : top + page]):
+                hot = now - state["changed"].get(ln, 0) < HIGHLIGHT_SEC
+                scr.addnstr(row, 0, ln, w - 1, curses.color_pair(1) if hot else 0)
+            end = min(top + page, len(lines))
+            foot = f" {top + 1}-{end}/{len(lines)}  ↑↓ PgUp/PgDn Home/End scroll · q quit"
+            foot += "  · refreshing…" if state["busy"] else ""
+            scr.addnstr(h - 1, 0, foot, w - 1, curses.A_REVERSE)
+            scr.refresh()
+            key = scr.getch()
+            if key in (ord("q"), 27):
+                return
+            top += {
+                curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1,
+                curses.KEY_PPAGE: -page, curses.KEY_NPAGE: page,
+                curses.KEY_HOME: -10**9, ord("g"): -10**9,
+                curses.KEY_END: 10**9, ord("G"): 10**9,
+            }.get(key, 0)  # fmt: skip
+
+    try:
+        curses.wrapper(ui)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    if "--watch" in sys.argv:  # scrollable TUI, refreshed every N seconds (default 30)
         args = sys.argv[sys.argv.index("--watch") + 1 :]
         every = int(args[0]) if args and args[0].isdigit() else 30
-        import contextlib
-        import io
-
-        prev: list[str] = []
-        while True:
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                main()
-            lines = buf.getvalue().splitlines()
-            out = [
-                f"\033[1;43;30m{ln}\033[0m" if prev and (i >= len(prev) or prev[i] != ln) else ln
-                for i, ln in enumerate(lines)
-            ]
-            print("\033[2J\033[H" + "\n".join(out), flush=True)
-            prev = lines
-            time.sleep(every)
+        raise SystemExit(watch(every))
     raise SystemExit(main())

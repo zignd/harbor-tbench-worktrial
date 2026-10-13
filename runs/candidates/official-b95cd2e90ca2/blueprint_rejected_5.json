@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "encrypted-log-kdf-consistency",
+  "title": "Incident Log AES-GCM Key Derivation Drift",
+  "scenario": "A database administrator is investigating a post-incident audit where the log decryption service started silently producing corrupted plaintext on some records after a 'harmless' config refactor three weeks ago. The environment contains a Node.js log ingestion pipeline (~1,400 lines across 6 modules), a SQLite database of encrypted log entries written during the incident, a decryption CLI that runs without errors but produces garbage on certain entries, and a metrics dashboard showing per-hour decryption success rates that started diverging after the refactor date.",
+  "instruction_draft": "Hey, we're still trying to get the full picture of what happened during the DB incident last month. The encrypted audit logs from that window are in the SQLite db at /opt/logvault/logs.db. Run the decrypt CLI (`node /opt/logvault/cli.js decrypt`) on a range of entries and you'll see that some come out clean but others are corrupted garbage \u2014 no errors thrown, just wrong plaintext. The metrics in /opt/logvault/metrics/ show when it started. We need the decryption to produce correct plaintext for every log entry across the full date range, including the ones written before and after the config change. Fix whatever's broken so that decrypting any entry from the database yields its original plaintext. The test harness will encrypt fresh messages under both the old and new config paths and verify round-trip correctness for arbitrary inputs.",
+  "requirements": [
+   "Decrypting any log entry in logs.db must yield its original plaintext with no corruption or error",
+   "The fix must handle entries written before the config change and entries written after it",
+   "Round-trip encrypt-then-decrypt must be correct for arbitrary fresh inputs under both code paths",
+   "No errors should be thrown during decryption of any valid entry"
+  ],
+  "environment": [
+   "Node.js 20 installed; no internet access",
+   "SQLite3 npm package and better-sqlite3 installed",
+   "/opt/logvault/ directory with ~1,400 lines across: cli.js (entry point), lib/db.js (SQLite interface), lib/crypto.js (AES-128-GCM encrypt/decrypt), lib/kdf.js (key derivation: PBKDF2 with configurable params), lib/config.js (loads /opt/logvault/config.json), lib/metrics.js (reads/writes /opt/logvault/metrics/), and lib/schema.js (log record structure)",
+   "config.json has fields: masterKey (hex string), kdfIterations (integer), kdfSaltField (string, either 'entry_id' or 'timestamp'), kdfDigest (string)",
+   "logs.db contains ~800 encrypted log entries spanning a 6-week period; entries have columns: entry_id (UUID), timestamp (ISO string), payload_enc (blob), iv (blob), tag (blob), kdf_version (integer 1 or 2)",
+   "The planted bug 1: kdf.js derives the per-entry AES key using PBKDF2 where the salt is built from config.kdfSaltField; after the refactor, kdfSaltField was changed from 'entry_id' to 'timestamp' in config.json, but kdf.js always reads the salt field name from config at decrypt time rather than using the kdf_version stored on each row to select the original derivation path \u2014 so entries with kdf_version=1 are decrypted using the new salt field, producing wrong keys",
+   "The planted bug 2: in crypto.js, the IV is stored and retrieved as a hex string in the database, but during decryption the Buffer.from(row.iv) call omits the 'hex' encoding argument \u2014 this works by accident when iv is ASCII-safe hex but silently corrupts when the hex string contains bytes whose UTF-8 encoding differs from Latin-1, which happens non-uniformly across entries depending on their randomly-generated IVs",
+   "metrics/ directory contains per-hour JSON files showing decryption_success_rate dropping from 1.0 to ~0.6 on the date of the config change, giving the solver a timestamp anchor",
+   "A seed script pre-populates logs.db with deterministic entries (seeded PRNG) split between kdf_version=1 (old config) and kdf_version=2 (new config) entries, and correctly stores original plaintexts in a separate /opt/logvault/oracle.db accessible only to the test harness",
+   "cli.js decrypt command accepts --entry-id or --range flags; it exits 0 even on corrupted output",
+   "Plausible uninvolved code: lib/metrics.js aggregation logic, lib/schema.js validation, lib/db.js pagination \u2014 none of these contain the bugs"
+  ],
+  "internal_hint": "Difficulty source: 'not visible by reading a single file' \u2014 the bugs interact across config.json, kdf.js, and crypto.js, and only manifest on specific entries depending on their kdf_version and IV bytes. The solver must run the CLI on actual entries, compare output to expected plaintext, notice that failures cluster on kdf_version=1 entries AND on entries with certain IV patterns, then instrument kdf.js to find that kdf_version is ignored during decryption (bug 1), and instrument crypto.js to find the missing 'hex' argument in Buffer.from (bug 2). The metrics files anchor the investigation to the config change date. Fix: (1) in kdf.js, use row.kdf_version to select salt field ('entry_id' for v1, 'timestamp' for v2); (2) in crypto.js, change Buffer.from(row.iv) to Buffer.from(row.iv, 'hex') and Buffer.from(row.tag) to Buffer.from(row.tag, 'hex').",
+  "trap": "A solver who only tests with a few entries from the post-refactor period may fix only bug 1 (kdf_version routing) and pass those tests, but still fail on entries whose IVs happen to have no high-bit hex digits \u2014 the IV encoding bug affects a non-obvious subset. The fuzz_equivalence tests generate fresh entries under both kdf_version paths with random IVs (many of which will trigger the high-bit IV condition), so partial fixes that only address the kdf_version routing still fail ~40% of generated inputs.",
+  "tests": [
+   "Test 1 (existing entries): For each entry in logs.db, run cli.js decrypt and compare against oracle.db; every plaintext must match exactly \u2014 this catches both bugs on the pre-existing data",
+   "Test 2 (fresh kdf_version=1 round-trip): Generate N fresh messages, encrypt them using the v1 code path (salt=entry_id, random UUID), insert into a temp DB, decrypt, assert plaintext equality \u2014 catches kdf_version routing bug",
+   "Test 3 (fresh kdf_version=2 round-trip): Same as Test 2 but using the v2 code path (salt=timestamp) \u2014 verifies the new path still works after fix",
+   "Test 4 (IV encoding stress): Generate fresh messages with IVs specifically containing high-bit bytes (e.g. IVs whose hex includes 'a'-'f' in positions that produce multi-byte UTF-8 if misinterpreted), encrypt, decrypt, assert correctness \u2014 directly targets bug 2",
+   "Test 5 (cross-version consistency): Encrypt a message under v1, then attempt decrypt specifying wrong kdf_version, assert it produces wrong output (sanity check that version routing is actually enforced); encrypt under v1, decrypt with correct v1 routing, assert correct output",
+   "Test 6 (metrics invariant): The decryption success rate reported in metrics/ for the post-fix run of all entries must equal 1.0 across all hours \u2014 catches any remaining partial failure"
+  ],
+  "verifier_knob": {
+   "name": "N (number of fresh round-trip test inputs per test case)",
+   "value": "50",
+   "effect": "Raising N increases the probability that the IV encoding bug is triggered (since it depends on random IV byte values); at N=10 a lucky solver with only bug 1 fixed might pass, at N=50 the probability of all IVs being ASCII-safe is negligible so bug 2 is reliably caught; lowering to N=5 makes the task easier"
+  },
+  "expected_failure_modes": [
+   "Agent fixes kdf_version routing (bug 1) only, tests with a few entries that happen to have ASCII-safe IVs, declares done \u2014 fails Test 4 and Test 6",
+   "Agent finds the IV encoding bug (bug 2) only by reading crypto.js and misses the kdf_version routing issue because it doesn't investigate which entries fail \u2014 fails Tests 2 and 5",
+   "Agent correctly fixes both bugs but breaks the v2 encryption path while fixing kdf.js (e.g. hardcodes salt field instead of using version branching) \u2014 fails Test 3",
+   "Agent patches kdf.js to always use entry_id as salt regardless of version, which makes v1 decryption work but breaks v2 round-trips \u2014 fails Test 3",
+   "Agent reads metrics files and assumes the bug started exactly at config change timestamp, investigates only post-change entries, and misses that pre-change entries with certain IVs also fail \u2014 fails Test 1 for the IV-encoding subset"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "cryptography",
+   "nodejs",
+   "aes-gcm",
+   "key-derivation",
+   "devops",
+   "incident-response"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/logvault/config.json",
+   "cat /opt/logvault/lib/kdf.js",
+   "cat /opt/logvault/lib/crypto.js",
+   "cat /opt/logvault/cli.js",
+   "sqlite3 /opt/logvault/logs.db \"SELECT entry_id, kdf_version, timestamp FROM logs LIMIT 20\"",
+   "node /opt/logvault/cli.js decrypt --entry-id <sample-v1-uuid>  # observe garbage",
+   "# In kdf.js: see config.kdfSaltField used directly, kdf_version column never consulted",
+   "# In crypto.js: see Buffer.from(row.iv) missing 'hex' arg, Buffer.from(row.tag) same issue",
+   "sed -i 's/Buffer.from(row.iv)/Buffer.from(row.iv, \"hex\")/g' /opt/logvault/lib/crypto.js",
+   "sed -i 's/Buffer.from(row.tag)/Buffer.from(row.tag, \"hex\")/g' /opt/logvault/lib/crypto.js",
+   "# Edit kdf.js: replace config.kdfSaltField lookup with: row.kdf_version===1 ? 'entry_id' : 'timestamp'",
+   "node -e \"/* quick inline edit of kdf.js */\"",
+   "node /opt/logvault/cli.js decrypt --entry-id <v1-uuid>  # verify correct plaintext",
+   "node /opt/logvault/cli.js decrypt --entry-id <v2-uuid>  # verify correct plaintext"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Buffer.from missing 'hex' argument bug may not reliably corrupt output on all Node.js 20 builds/platforms \u2014 V8 string internals and Buffer allocation behavior can vary, so the 'silent corruption on high-bit hex bytes' behavior needs to be carefully validated during environment construction to ensure it actually manifests on the target platform",
+   "The claim that '~40% of generated inputs' trigger the IV encoding bug depends heavily on IV generation and platform string handling; if the test harness uses a different entropy source or the platform happens to behave consistently, the bug may appear on 0% or 100% of fresh inputs rather than ~40%, making Test 4 either trivially pass or trivially fail",
+   "The oracle.db approach introduces a build-time dependency: the seed script must deterministically reproduce the same plaintexts on the grading machine as on the build machine; any PRNG or date-handling difference breaks Test 1 entirely",
+   "cli.js exiting 0 even on corrupted output means Test 1 requires the test harness to do its own byte-level comparison against oracle.db rather than using exit codes \u2014 the harness complexity is high and a bug in the harness could produce false failures",
+   "kdf.js fix requires passing row data (entry_id or timestamp) into the KDF function at decrypt time \u2014 if cli.js doesn't pass the full row to kdf.js, the fix may require changes to cli.js or db.js as well, making the scope larger than described and potentially causing agents who only edit kdf.js and crypto.js to fail"
+  ],
+  "verdict": "reject",
+  "reasons": "The two bugs are both directly visible by reading the source files (kdf.js ignores kdf_version; crypto.js omits 'hex' in Buffer.from), making this solvable in ~14 commands by any skilled agent who simply reads the 6 short modules \u2014 genuine_difficulty scores 2, which is below the minimum threshold of 3. Additionally, the 'silent corruption from missing hex encoding' behavior of Buffer.from in Node.js 20 is platform-sensitive and may not reliably manifest, creating an invalid failure risk that undermines verifiability. The oracle.db seeding approach introduces build-machine/grading-machine PRNG consistency requirements that could cause false failures.",
+  "fixes": [
+   "Increase genuine difficulty by obfuscating the bugs: instead of a straightforward missing string argument, make the IV encoding bug appear in a utility function shared across modules with a correct-looking default parameter, or have the bug only trigger through an indirect code path (e.g., the IV is base64-encoded in the DB but the bug is in a base64-vs-hex mismatch hidden inside a helper); this forces the agent to trace execution rather than just read files",
+   "Add a third interacting bug (e.g., PBKDF2 iteration count is off-by-one between encrypt and decrypt paths due to a config migration that added +1 for new entries only) so that fixing two bugs still leaves partial failures, requiring more investigation cycles",
+   "Replace the oracle.db approach with a self-contained verification scheme: store HMAC-SHA256 of each plaintext in logs.db itself (keyed with a separate known key), so the test harness can verify correctness without a separate oracle DB whose seeds must match across machines",
+   "Ensure the IV encoding corruption is guaranteed to manifest on Node.js 20 by constructing test IVs with specific high-bit byte patterns (e.g., IVs starting with bytes 0x80-0xFF in hex), and document the exact Node.js behavior being relied upon so environment builders can validate it"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a post-refactor silent decryption corruption bug in a modular codebase where some records decrypt correctly and others produce wrong plaintext without errors, differing mainly in language (Node.js vs C), cipher mode (AES-GCM vs AES-CTR), and storage/tooling details."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "The reference task is about HMAC chain verification and a line-oriented protocol server, not AES key derivation drift or silent plaintext corruption."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference task is about building an HTTP query service over a compiled aggregation engine, unrelated to cryptographic decryption bugs."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference task is about fixing a log enrichment pipeline and Flask API endpoints, not cryptographic key derivation or decryption correctness."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference task is about schema validation correctness and performance in a log ingestion service, not AES-GCM decryption or cipher key derivation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.237
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.173
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.166
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.142
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.139
+    ]
+   ],
+   "cost_usd": 0.014343
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051822
+}

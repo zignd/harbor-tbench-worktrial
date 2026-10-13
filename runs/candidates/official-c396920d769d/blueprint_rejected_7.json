@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "rust-segment-index-reconstructor",
+  "title": "Time-Series Segment Index Reconstructor",
+  "scenario": "You are a data engineer who has inherited a time-series analytics pipeline written in Rust. The pipeline ingests sensor readings, partitions them into fixed-width time segments, and builds an inverted index mapping each sensor ID to its segment offsets for fast range queries. A compiled binary `indexer` (no source) handles the segment encoding; you must write a Rust crate `segment_query` that correctly reads the binary's output and answers range queries. The pipeline currently produces wrong query answers on real production data, and a stated throughput requirement must also be met.",
+  "instruction_draft": "You have inherited a Rust time-series pipeline at `/app`. When you run `cargo run --release -p orchestrator -- --data /app/data/sample.bin --query /app/data/queries.json` it exits 0 and prints `ALL OK`, but the CI verifier (`/app/verify`) fails on production inputs with exit code 1.\n\nYour job:\n1. Diagnose why the query engine returns wrong results on production inputs.\n2. Implement or repair `segment_query/src/lib.rs` (you may also edit any source file under `orchestrator/` or `common/`, but you may NOT replace or recompile `/app/bin/indexer`) so that `/app/verify` exits 0.\n3. Query throughput must be at or above 5,000,000 segment-lookups per second when measured by `/app/verify` on a 10-million-segment index. A correct-but-slow implementation fails.\n\nThe environment contains everything you need to discover the invariant. `/app/bin/indexer` is an opaque binary; probe it to learn its encoding format.",
+  "requirements": [
+   "The command `/app/verify` exits 0 on the hidden production dataset.",
+   "Range queries return exactly the set of segment offsets whose time interval overlaps the query interval, with no false positives and no false negatives.",
+   "Throughput on a 10-million-segment index is at or above 5,000,000 segment-lookups per second as measured by `/app/verify`.",
+   "The file `/app/bin/indexer` is not modified or replaced.",
+   "The produced index files are read by `segment_query/src/lib.rs`; the orchestrator must continue to compile and link against it."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: rustc/cargo 1.78 (via rustup), build-essential, and nothing else unusual.",
+   "A Rust workspace at /app with four members: orchestrator, segment_query, common, and a bench helper.",
+   "common/src/lib.rs defines: SegmentRecord { sensor_id: u32, start_ts: i64, end_ts: i64, payload_offset: u64 }, IndexHeader, and QueryRequest/QueryResponse types. About 200 lines.",
+   "orchestrator/src/main.rs: parses CLI args, calls /app/bin/indexer as a subprocess to build the index, deserializes the index file, calls segment_query::query_range, prints results. About 350 lines.",
+   "segment_query/src/lib.rs: a stub that does linear scan \u2014 correct but O(N). About 80 lines. This is what the solver must replace with a correct fast implementation.",
+   "A compiled binary /app/bin/indexer (built from hidden Rust source during Docker build, then source deleted). It reads a raw binary sensor log and writes an index file.",
+   "The hidden invariant planted in the binary: indexer encodes segment end timestamps as (end_ts - start_ts) as a u32 (duration), not as absolute i64. The common types show end_ts: i64, misleading the solver into thinking absolute timestamps are stored. The stub query engine reads end_ts as absolute i64 (wrong) \u2014 it works on sample data where all durations fit and happen to produce the same comparison results, but fails on production data where sensors have long-running segments whose end_ts field, misread as absolute i64, wraps or produces negative durations.",
+   "A secondary hidden invariant: segment records in the index are sorted by start_ts within each sensor bucket, but the bucket table itself is sorted by sensor_id XOR 0xDEAD (a scrambled order). The stub does linear scan so sensor ordering doesn't matter, but any naive binary-search implementation that assumes sensor_id-ordered buckets will return wrong results for sensors with id > 0x7FFF.",
+   "Sample data /app/data/sample.bin: 50,000 segments, all with short durations (< 2^16), sensors with IDs 1-20. The stub linear scan passes this.",
+   "Production data generated at verify time: 10,000,000 segments, sensors with IDs 1-65535 (including IDs > 0x7FFF), durations up to 2^30. The linear scan is too slow; a naive binary search with wrong bucket ordering or wrong end_ts decoding fails.",
+   "/app/verify: a Python script that generates the production dataset, runs the full pipeline, checks query results against a ground-truth oracle, measures throughput, and exits 0 only if both correctness and throughput pass.",
+   "The workspace compiles cleanly as shipped; cargo test passes on sample data.",
+   "The bench helper provides a timing harness that segment_query can use during development."
+  ],
+  "internal_hint": "Difficulty comes from two hidden invariants that only reveal themselves when probing the binary on real data: (1) the binary stores segment duration (u32) in the field that common/src/lib.rs labels end_ts: i64 \u2014 discoverable by writing small test inputs, running indexer, and hexdumping the output; (2) bucket table ordering uses sensor_id XOR 0xDEAD, discoverable by running indexer with sensors of known IDs and inspecting bucket offsets. The stub linear scan is correct but O(N), so the solver must build an interval tree or sorted-bucket binary search \u2014 but must decode duration correctly and handle the scrambled bucket table. A skilled engineer: (a) writes a 10-record test input, runs indexer, hexdumps the output and compares to what they expect \u2014 noticing the 8-byte end_ts field contains small values matching durations not absolute timestamps; (b) writes sensors with IDs 1, 2, 57005 (0xDEAD) and inspects bucket ordering; (c) implements correct O(log N) lookup with proper duration decoding; (d) profiles to meet the 5M/s threshold.",
+  "trap": "A solver who reads the common types and assumes end_ts is stored as absolute i64 will build a seemingly-correct range query. It passes on sample data (short durations, small sensor IDs) but fails on production data where: long-duration segments have their end_ts field misread as a huge or negative i64 causing wrong interval comparisons; and sensors with IDs > 0x7FFF land in wrong bucket positions under the XOR-scrambled ordering. A solver who implements correct duration decoding but naive sensor_id-ordered bucket search also fails on half the sensors. Both failure modes are invisible until the production dataset is tested.",
+  "tests": [
+   "Correctness test on 10M-segment production dataset with sensor IDs 1-65535 and durations up to 2^30: every query response matches ground-truth oracle (generated deterministically with seed 42).",
+   "False-negative test: queries whose interval exactly touches a segment boundary (start == query_end or end == query_start) are handled per the specified half-open interval semantics [start, end).",
+   "Bucket ordering test: sensors with IDs that differ only in the bit positions affected by XOR 0xDEAD are correctly resolved to their buckets.",
+   "Throughput test: /app/verify times 10M segment-lookups and asserts >= 5,000,000 per second; the O(N) linear scan fails this at ~200,000/s.",
+   "Binary integrity test: /app/bin/indexer has unchanged SHA-256 hash compared to the Dockerfile-recorded value.",
+   "Compilation test: the workspace builds with `cargo build --release` without errors after the solver's changes."
+  ],
+  "verifier_knob": {
+   "name": "num_sensors",
+   "value": "65535",
+   "effect": "Lowering to 20 (sample size) makes the XOR-bucket invariant irrelevant since all small IDs sort the same way; raising to 65535 forces the solver to discover and handle the scrambled bucket table for all ID ranges."
+  },
+  "expected_failure_modes": [
+   "Solver reads common/src/lib.rs, assumes end_ts is absolute i64, builds a correct-looking interval tree, passes sample tests, fails production correctness silently.",
+   "Solver discovers the duration encoding but implements binary search over buckets assuming natural sensor_id ordering \u2014 correct for IDs 1-20 in sample, wrong for IDs > 0x7FFF in production.",
+   "Solver implements correct decoding and bucket lookup but the implementation is O(N log N) per query rather than O(log N), failing the 5M/s throughput bar.",
+   "Solver modifies /app/bin/indexer or replaces it, failing the binary integrity check.",
+   "Solver probes the binary with only short-duration inputs and misses the duration encoding issue, concluding end_ts is absolute."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "rust",
+   "reverse-engineering",
+   "binary-format",
+   "performance",
+   "time-series",
+   "hidden-invariant"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/common/src/lib.rs  # understand SegmentRecord, IndexHeader, input format",
+   "cat /app/segment_query/src/lib.rs  # read the stub linear scan",
+   "cat /app/orchestrator/src/main.rs  # understand how indexer is invoked and index parsed",
+   "ls /app/data/ && xxd /app/data/sample.bin | head -40  # understand input binary format",
+   "python3 -I -c \"import struct; open('/tmp/t1.bin','wb').write(struct.pack('<IqqQ', 1, 1000, 2000, 0) * 3)\" # craft minimal input with known values",
+   "/app/bin/indexer /tmp/t1.bin /tmp/t1.idx  # run indexer on tiny known input",
+   "xxd /tmp/t1.idx  # inspect output: notice end_ts field has small value (duration 1000) not absolute i64",
+   "python3 -I -c \"import struct; open('/tmp/t2.bin','wb').write(struct.pack('<IqqQ', 0xDEAD, 1000, 2000, 0) + struct.pack('<IqqQ', 1, 1000, 2000, 0))\" # probe bucket ordering with sensor 0xDEAD",
+   "/app/bin/indexer /tmp/t2.bin /tmp/t2.idx",
+   "xxd /tmp/t2.idx  # inspect bucket table order: spot XOR 0xDEAD scramble",
+   "python3 -I -c \"import struct; open('/tmp/t3.bin','wb').write(struct.pack('<IqqQ', 1, 1000, 1000 + 2**28, 0))\" # large duration test",
+   "/app/bin/indexer /tmp/t3.bin /tmp/t3.idx && xxd /tmp/t3.idx  # confirm duration stored as u32, not abs i64",
+   "# Now implement segment_query/src/lib.rs: decode duration as u32, reconstruct end_ts = start_ts + duration; binary search with XOR 0xDEAD bucket ordering",
+   "nano /app/segment_query/src/lib.rs  # write correct implementation ~200 lines",
+   "cargo build --release  # verify compilation",
+   "cargo run --release -p orchestrator -- --data /app/data/sample.bin --query /app/data/queries.json  # confirm sample still passes",
+   "/app/verify  # run full production check",
+   "# If throughput <5M/s: profile, use unsafe indexing, SIMD or sorted binary search per bucket",
+   "nano /app/segment_query/src/lib.rs  # optimize hot path",
+   "cargo build --release && /app/verify  # confirm both correctness and throughput pass"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Input format to /app/bin/indexer is not documented in the instruction \u2014 if it differs from what the solver infers from common/src/lib.rs, crafting valid probe inputs is impossible without further reverse engineering, making the task unsolvable in the time budget.",
+   "The struct layout of the binary sensor log (endianness, field order, padding) must exactly match what indexer expects; if not specified, a solver's probe inputs may silently produce no records and give misleading hexdump results.",
+   "If the Docker build takes >10 min (compiling 10M-record verify script + Rust workspace) on 1 CPU / 2 GB, the environment may be impractical to iterate in.",
+   "The throughput threshold (5M/s) may be flaky depending on Docker host performance \u2014 a correct implementation might pass on a fast host and fail on a slow CI runner, making the throughput test environment-dependent.",
+   "The verifier generates the production dataset at verify time; if Python's random seed behavior differs across Python versions or platforms, the ground-truth oracle may not be deterministic across environments.",
+   "Half-open interval semantics [start, end) are mentioned in tests but not clearly stated in the instruction text \u2014 a solver who implements closed intervals would fail the boundary test without a clear stated requirement to reference."
+  ],
+  "verdict": "reject",
+  "reasons": "Solvability scores 2 because the blueprint never documents the binary input format that /app/bin/indexer expects, yet the entire solve strategy depends on crafting valid probe inputs \u2014 if the solver cannot construct valid inputs, neither hidden invariant is discoverable and the task is unsolvable. The throughput threshold is also potentially flaky across Docker host speeds, creating invalid failures. The task should be accepted only after the input format is explicitly documented (e.g., in a README or via a sample-data format spec) and the throughput bar is validated against the slowest target CI environment.",
+  "fixes": [
+   "Document the binary sensor log input format (field layout, endianness, record structure) in a README or in-environment spec file \u2014 this is prerequisite to probing the indexer binary and must not itself be a hidden invariant.",
+   "Explicitly state the half-open interval semantics [start, end) in the instruction text, not just in the internal test notes, so solvers know the exact boundary behavior required.",
+   "Validate the 5M/s throughput threshold against actual 1 CPU / 2 GB Docker performance, and add a \u00b120% tolerance or use relative measurement (e.g., 'at least 10x faster than the stub') to avoid environment-dependent flakiness.",
+   "Add a small documented example: 'run /app/bin/indexer with a 1-record input and compare hexdump to what you expect' \u2014 this scaffolds the probing approach without giving away the invariants.",
+   "Confirm in the Dockerfile comments or a workspace README that common/src/lib.rs types describe the in-memory representation, not the on-disk binary format \u2014 this hint nudges solvers to probe rather than trust the types, without revealing what differs."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task focuses on reverse-engineering a normalization binary and fixing SQL rollup pipelines, while the candidate is about diagnosing and fixing a Rust inverted-index segment query engine with throughput requirements."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a shared library for windowed log aggregations, while the candidate involves repairing a Rust segment index reader for time-series range queries with performance constraints."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing SQL window functions for ranking and cumulative sums, while the candidate is about reverse-engineering a binary index format and implementing a correct, high-throughput Rust query library."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task repairs a NetFlow UDP/TCP aggregation service in Rust, while the candidate involves probing an opaque indexer binary to understand its encoding and implementing a correct segment-lookup library."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task fixes a canary deployment orchestrator's rollback logic in Node.js, while the candidate is a Rust data-engineering task requiring reverse-engineering a binary index format and meeting throughput benchmarks."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.149
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.118
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.116
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.107
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.102
+    ]
+   ],
+   "cost_usd": 0.015129
+  },
+  "novel": true
+ },
+ "cost_usd": 0.065136
+}

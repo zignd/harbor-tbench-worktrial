@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "invoice-reconcile-sql-engine-repair",
+  "title": "Invoice Reconciliation SQL Engine Repair",
+  "scenario": "A small finance-ops team maintains an in-house Python/SQLite reconciliation service (~1,200 lines across several modules) that matches vendor invoices to purchase orders, computes net balances, and flags exceptions. The pipeline ingests raw CSV uploads, normalises them into a staging schema, runs a multi-step SQL aggregation pass, and emits a final reconciliation report. Since a refactoring two sprints ago the exception counts and net balances in the output are wrong on some vendor accounts, but the pipeline exits 0 and the sample data that ships with the repo looks clean.",
+  "instruction_draft": "You are a finance-ops engineer at a mid-size company. The in-house invoice-reconciliation service lives at `/app/reconciler/`. Running `python -app/reconciler/run.py --input /app/data/sample.csv --out /tmp/report.json` produces a JSON report, but the figures in that report are incorrect for several vendors.\n\nYour job: investigate the codebase and its data pipeline, identify what is wrong, and fix it so the reconciliation report is accurate. The report format must stay identical. You are done when the automated verifier passes; it will feed the fixed service fresh vendor CSV files it generates at verify time and check the following:\n\n1. Each line item's net balance equals the sum of all non-voided charges minus the sum of all credit-memo amounts that carry a `ref_invoice_id` matching that line item's invoice ID\u2014credits without a matching `ref_invoice_id` must not reduce any invoice balance.\n2. The `exception_count` field for each vendor equals the number of invoices for that vendor whose absolute net balance exceeds the vendor's contractual tolerance (stored in the `vendor_config` table), using the tolerance in effect on the invoice date (vendors can have multiple tolerance records with validity periods).\n3. A vendor's `total_net` field equals the arithmetic sum of net balances across all its non-voided invoices; voided invoices must contribute zero regardless of their charge or credit lines.\n4. The verifier checks at least 30 vendor accounts generated at verify time, including accounts that have overlapping tolerance validity periods, credits with and without `ref_invoice_id`, and invoices that are voided after credits are posted against them.",
+  "requirements": [
+   "Credits reduce only the invoice balance of the invoice referenced by ref_invoice_id; unlinked credits do not affect any invoice balance.",
+   "exception_count counts invoices whose absolute net balance exceeds the tolerance in effect on the invoice date; if tolerance periods overlap the most-recently-inserted record for that date range wins.",
+   "total_net sums net balances of non-voided invoices only; voided invoices contribute exactly zero even when they have associated charge or credit lines.",
+   "The JSON report schema (keys, types, nesting) is unchanged from the current output.",
+   "All fixes are in the service source files; no schema changes to the CSV format are permitted."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install sqlite3 CLI, python packages: click, pandas (for the loader), pytest.",
+   "/app/reconciler/run.py  \u2014 CLI entry point; reads CSV, calls loader, calls sql_engine, writes JSON.",
+   "/app/reconciler/loader.py (~200 lines) \u2014 parses CSV, normalises column names, inserts into SQLite staging tables (invoices, line_items, credits, vendor_config). Bug 1 is here: when inserting credits it sets ref_invoice_id = NULL for ALL rows because a column-position off-by-one error silently drops the ref column (reads col index 5 instead of 6 after an earlier column reorder); the CSV actually has ref_invoice_id at position 6.",
+   "/app/reconciler/sql_engine.py (~350 lines) \u2014 contains the multi-CTE SQL query that computes net balances, exception counts, and totals. Bug 2 is here: the CTE that computes per-invoice net balance does a LEFT JOIN credits ON credits.invoice_id = invoices.id instead of ON credits.ref_invoice_id = invoices.id, meaning the schema already has the column but the join key is wrong; this interacts with Bug 1: fixing only Bug 1 (so ref_invoice_id is populated) still leaves incorrect results because the join in sql_engine uses the wrong column; fixing only Bug 2 (join key) still leaves incorrect results because loader nulls out ref_invoice_id so the join finds nothing. Both must be fixed together.",
+   "/app/reconciler/tolerance.py (~150 lines) \u2014 queries vendor_config for the active tolerance; subtle issue: ORDER BY valid_from DESC LIMIT 1 is correct but the WHERE clause uses valid_from <= invoice_date AND (valid_to IS NULL OR valid_to > invoice_date) \u2014 this is correct logic; no bug here, but agents may waste time here thinking this is the source.",
+   "/app/reconciler/report.py (~120 lines) \u2014 formats the JSON output; no bugs.",
+   "/app/reconciler/schema.sql \u2014 DDL for staging DB including invoices (id, vendor_id, invoice_date, voided INTEGER DEFAULT 0), line_items (invoice_id, amount), credits (id, invoice_id [the credit's own invoice], ref_invoice_id, amount), vendor_config (vendor_id, tolerance, valid_from, valid_to).",
+   "/app/data/sample.csv \u2014 8 vendors, 40 invoices, crafted so all credits happen to have no ref_invoice_id in the sample (credits are all standalone), so both bugs cancel each other on the sample: loader nulls ref_invoice_id (bug 1) and sql_engine joins on wrong column (bug 2), yet the sample totals appear correct because there are no linked credits in sample data.",
+   "/app/data/vendor_config.csv \u2014 tolerance records loaded at startup.",
+   "/app/tests/test_sample.py \u2014 runs on sample data, asserts totals match hardcoded expected values; passes on buggy code because sample has no linked credits.",
+   "The verifier generates fresh CSV at verify time with linked credits (ref_invoice_id populated), voided invoices with credits posted against them, and overlapping tolerance periods."
+  ],
+  "internal_hint": "Two interacting bugs, neither visible from reading one file in isolation, both required to fix:\n\nBug 1 (loader.py, data-path): The CSV column read for ref_invoice_id uses index 5; after a column reorder two sprints ago the ref_invoice_id is at index 6. This is not visible by reading loader.py alone because the column names are listed correctly in a comment \u2014 you have to run the loader on real data (or inspect what actually lands in the DB) to see that credits.ref_invoice_id is always NULL. `SELECT * FROM credits LIMIT 5` in the staging DB reveals all ref_invoice_id values are NULL.\n\nBug 2 (sql_engine.py, algorithmic): The net-balance CTE joins credits using `credits.invoice_id = invoices.id` rather than `credits.ref_invoice_id = invoices.id`. This means even after fixing Bug 1, credits join on the wrong key and net balances are still wrong for linked credits. If you fix only Bug 2 without fixing Bug 1, ref_invoice_id is always NULL so no credits match any invoice \u2014 the join correctly uses the right column but finds nothing.\n\nDiscovery path: (1) run on sample \u2192 looks correct; (2) insert a manual test row with a linked credit \u2192 net balance wrong; (3) inspect staging DB \u2192 ref_invoice_id is NULL \u2192 find loader bug; (4) fix loader \u2192 rerun \u2192 balances still wrong for linked credits; (5) examine the SQL CTE join condition \u2192 find wrong join key; (6) fix both \u2192 tests pass.\n\nThe tolerance and voided-invoice logic are correct; they are distractors that a thorough agent will investigate.",
+  "trap": "The sample data has zero linked credits, so both bugs cancel each other and the sample test passes on buggy code. An agent that fixes only one bug and re-runs the sample test sees it still pass and concludes the fix is complete. The hidden verifier uses fresh data with linked credits, which exposes the remaining bug. An agent that only reads sql_engine.py and fixes the join key but never runs the loader to inspect the DB will also fail, because ref_invoice_id remains NULL in the staging tables.",
+  "tests": [
+   "Generate 30+ vendor accounts at verify time with a mix of: linked credits (ref_invoice_id set), unlinked credits (ref_invoice_id NULL), voided invoices with credits posted before and after voiding, overlapping tolerance validity periods. Feed the generated CSV to the fixed service and check that each invoice's net_balance = sum(line_items) - sum(credits WHERE ref_invoice_id = invoice.id), credits with NULL ref_invoice_id contribute 0 to all invoice balances.",
+   "Check that voided invoices appear with net_balance = 0 in the report and are excluded from vendor total_net regardless of their charge or credit lines.",
+   "For tolerance: generate vendors with two overlapping tolerance records; verify exception_count uses the record whose valid_from is latest among records covering the invoice date.",
+   "Check that the JSON report schema (top-level keys: vendors list with vendor_id, total_net, exception_count, invoices list) is structurally identical to the sample output.",
+   "Regression: the sample data test must still pass after the fix (so the fix doesn't break backward compatibility).",
+   "Accuracy threshold: across all 30+ generated vendor accounts, the fraction of vendors with correct total_net AND correct exception_count must be >= 0.95 (verifier knob: threshold value)."
+  ],
+  "verifier_knob": {
+   "name": "accuracy_threshold",
+   "value": "0.95",
+   "effect": "Lowering to 0.80 makes partial fixes (one bug fixed) occasionally pass on lucky random seeds; raising to 1.00 requires perfect correctness on every generated account, eliminating any luck."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the SQL join key in sql_engine.py, re-runs the sample test (which passes), declares done \u2014 hidden test fails because loader still nulls ref_invoice_id.",
+   "Agent fixes only the loader column index, re-runs sample test (which passes), declares done \u2014 hidden test fails because the SQL join still uses the wrong column.",
+   "Agent reads both files, fixes both bugs, but introduces a regression in the voided-invoice logic (e.g., filters voided invoices from the credits join in a way that also drops legitimate credits on active invoices).",
+   "Agent spends most of the session investigating the tolerance.py file (which is correct) and runs out of time before finding the loader bug.",
+   "Agent re-seeds the staging DB incorrectly when testing manually (e.g., forgets to reload after fixing loader), observes seemingly correct output, and stops before verifying end-to-end."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "debugging",
+   "reverse-engineering",
+   "two-interacting-bugs",
+   "finance",
+   "data-pipeline"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/reconciler/loader.py | grep -n 'ref_invoice_id\\|\\[5\\]\\|\\[6\\]'",
+   "cat /app/reconciler/sql_engine.py | grep -n 'ref_invoice_id\\|LEFT JOIN credits\\|credits\\.invoice_id'",
+   "# Bug 1 found: loader.py reads col index 5 instead of 6 for ref_invoice_id",
+   "# Bug 2 found: sql_engine.py joins ON credits.invoice_id instead of credits.ref_invoice_id",
+   "sed -i 's/[5]/[6]/' /app/reconciler/loader.py  # fix off-by-one (exact pattern from grep)",
+   "sed -i 's/credits\\.invoice_id = invoices\\.id/credits.ref_invoice_id = invoices.id/' /app/reconciler/sql_engine.py",
+   "python /app/reconciler/run.py --input /app/data/sample.csv --out /tmp/report.json",
+   "cat /tmp/report.json",
+   "pytest /app/tests/test_sample.py -v"
+  ],
+  "speedrun_commands": 9,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'most-recently-inserted record wins' rule for overlapping tolerance periods relies on SQLite rowid/insertion order, which is not guaranteed to be stable after updates or vacuums \u2014 this could make the tolerance test flaky or ambiguous.",
+   "The sed fix for loader.py's index 5->6 is context-sensitive: if '5' appears elsewhere in the same expression (e.g., in a larger array slice or other index), the naive fix could corrupt unrelated code \u2014 the blueprint should specify exact line context.",
+   "An agent that reads both buggy files and fixes both in a single pass will solve this in ~9 commands, making the 'two interacting bugs' trap ineffective against strong agents, potentially causing valid solutions to be mistaken for lucky guesses by the reviewer.",
+   "The ambiguity between 'credits.invoice_id' (the credit's own invoice foreign key) and 'ref_invoice_id' in the schema is schema-design confusion \u2014 a real codebase would rarely have both columns with such similar semantics, which slightly reduces realism of Bug 2.",
+   "If the verifier generates data where voided invoices have credits with ref_invoice_id pointing to the voided invoice, the spec says net_balance=0 but also says credits reduce the referenced invoice's balance \u2014 these could conflict if not implemented carefully, potentially causing false failures."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 is a hard blocker: both bugs are statically visible by reading the source files, allowing a strong agent to solve the task in ~9 commands without running any code. The 'two interacting bugs that cancel on sample data' trap is ineffective against agents that do a thorough code review before testing, which is standard practice. Additionally, the 'most-recently-inserted record wins' semantics for overlapping tolerances is ambiguous and potentially flaky. The average score is 3.6 (4+4+4+2+4=18/5), which meets the threshold, but the genuine_difficulty score of 2 is below the minimum of 3 required for every criterion.",
+  "fixes": [
+   "Make Bug 1 harder to find statically: instead of a literal index off-by-one (trivially grep-able), hide it as a dynamic column-name lookup that maps 'ref_invoice_id' to the wrong position due to a CSV header normalization step (e.g., stripping a BOM or whitespace causes the header dict to miss the column, defaulting to None).",
+   "Make Bug 2 require runtime investigation: rather than a wrong column name visible in the SQL string, make the join key correct but the CTE alias shadow the column (e.g., the credits CTE renames ref_invoice_id to invoice_id via SELECT ref_invoice_id AS invoice_id, then the outer join uses the alias \u2014 correct behavior requires understanding the aliasing, not just grepping for the column name).",
+   "Replace 'most-recently-inserted record wins' with a clearer, deterministic rule for overlapping tolerance periods (e.g., 'the record with the latest valid_from date wins; if valid_from is equal, the higher tolerance value wins') to eliminate flakiness in the verifier.",
+   "Add a third subtle bug (e.g., in report.py's JSON serialization rounding) that only manifests for specific decimal values, increasing the command count needed and ensuring agents must run end-to-end tests rather than just reading source."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/normalize-invoice-pdfs-to-csv",
+     "verdict": "distinct",
+     "reason": "That task extracts and normalizes data from PDF invoices into CSV; the candidate task debugs and fixes a broken SQL/Python reconciliation pipeline with specific matching, tolerance, and voiding logic."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/financial-document-processor",
+     "verdict": "distinct",
+     "reason": "That task classifies and extracts totals from mixed document files; the candidate task repairs a multi-step SQL reconciliation engine with credit matching, tolerance periods, and void handling."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a broken Python/SQLite financial reconciliation tool where specific-reference matching is broken (credit/refund must offset only the referenced invoice/charge), silent wrong output, and idempotency concerns, making the central debugging challenge nearly identical despite added complexity around tolerance periods and voiding."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes a CSV chunking and deduplication pipeline with row-count and duplicate issues; the candidate task fixes financial reconciliation logic involving credit matching, tolerance periods, and invoice voiding."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task fixes incorrect aggregate totals in an ETL pipeline for revenue/user counts; the candidate task fixes invoice reconciliation logic involving credit-memo reference matching, vendor tolerance periods, and voided invoice handling."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/normalize-invoice-pdfs-to-csv",
+     0.354
+    ],
+    [
+     "terminal-bench-2-1/financial-document-processor",
+     0.18
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.155
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.1
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.099
+    ]
+   ],
+   "cost_usd": 0.014780999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056580000000000005
+}

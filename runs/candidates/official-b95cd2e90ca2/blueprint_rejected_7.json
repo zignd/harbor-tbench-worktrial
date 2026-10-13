@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "db-incident-kdf-stream-cipher",
+  "title": "Database Incident: Encrypted Log Stream Cipher Repair",
+  "scenario": "A database administrator is investigating a security incident where the audit trail encryption service stopped producing verifiable ciphertext after a recent deployment. The system uses a custom stream cipher built on top of HKDF-expanded keystreams: each database table gets its own derived subkey from a master secret, and log records are XOR-encrypted with a per-record keystream derived from that subkey plus a record nonce. The environment has ~1400 lines of Node.js across six modules (key management, stream cipher, log writer, log reader, a metrics exporter, and an incident replay harness), plus several days of production log files and a Prometheus-style metrics scrape showing anomalies. The planted bugs are data-dependent and only manifest on certain record sizes and nonce patterns that do not appear in the short sample the solver sees first.",
+  "instruction_draft": "Hey, something went sideways with the encrypted audit log service after Thursday's deploy. The reader is producing garbage for some records but not others \u2014 it decrypts fine in our smoke tests but the replay harness (`node /opt/auditlog/replay.js`) is failing on the real production logs in `/var/log/auditdb/`. The metrics exporter at `/opt/auditlog/metrics.js` is also reporting a mismatch between encrypted bytes written and bytes verified, which shouldn't happen. Fix the encryption/decryption service so that every record the writer produces can be round-tripped cleanly by the reader, and the byte counts in the metrics stay consistent across all table names and record sizes. The verifier will generate fresh records of various sizes and table names and confirm that encrypt\u2192decrypt gives back the original plaintext and that metrics stay consistent.",
+  "requirements": [
+   "For every (table_name, plaintext) pair the writer encrypts, the reader must recover the exact original plaintext",
+   "The HKDF subkey derivation must produce distinct subkeys for distinct table names",
+   "The per-record keystream must be a deterministic function of (subkey, nonce) only",
+   "The metrics exporter must report the same encrypted-byte count as the verified-byte count after a round-trip",
+   "Consistency must hold for table names of any byte length (1 through 64 bytes) and plaintexts up to 4096 bytes",
+   "The replay harness must exit 0 on the production logs in /var/log/auditdb/"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20, sets up /opt/auditlog/ with six JS modules",
+   "/opt/auditlog/kdf.js: HKDF implementation \u2014 bug 1: when table name length is a multiple of 8, the info buffer passed to HKDF is truncated by one byte due to an off-by-one in a Buffer.alloc call, producing a colliding subkey with the 7-byte prefix table name",
+   "/opt/auditlog/cipher.js: XOR stream cipher \u2014 bug 2: the keystream generator resets its internal counter to 0 mod 256 instead of accumulating, so records longer than 256 bytes have their keystream repeat, making decrypt(encrypt(p)) != p for |p| > 256",
+   "/opt/auditlog/writer.js: log record serializer, calls kdf.js and cipher.js, writes length-prefixed encrypted records to /var/log/auditdb/",
+   "/opt/auditlog/reader.js: log record deserializer, must mirror writer.js exactly",
+   "/opt/auditlog/metrics.js: tracks bytes_encrypted and bytes_verified counters \u2014 bug 3 (cross-component): metrics.bytes_verified counts the ciphertext length, not the plaintext length, causing a subtle mismatch for records where padding is added; this only appears when the two bugs above are not present (fixing them surfaces this)",
+   "/opt/auditlog/replay.js: reads production log files, decrypts each record, checks integrity via a SHA-256 footer embedded in each record, reports pass/fail",
+   "/var/log/auditdb/: three production log files generated at Dockerfile build time with a mix of table names and record sizes, some with 8-byte-multiple table names and some records over 256 bytes",
+   "A Prometheus metrics dump at /var/log/auditdb/metrics_snapshot.txt showing bytes_encrypted != bytes_verified",
+   "A short sample file /opt/auditlog/sample.log with only short records and non-multiple-of-8 table names that passes smoke tests even with the bugs present",
+   "All JS source files are present (not compiled binaries), but the bugs are subtle enough to require running the system on varied inputs to locate \u2014 the off-by-one is in a computed expression, the counter reset is in a branch taken only for large payloads, and the metrics bug only surfaces after the first two are fixed"
+  ],
+  "internal_hint": "Difficulty comes from three interacting bugs that mask each other: (1) the HKDF info truncation only fires for table names of length 0 mod 8, which are absent from sample.log; (2) the keystream counter wrap only fires for records > 256 bytes, also absent from sample.log; (3) the metrics mismatch only becomes observable once bugs 1 and 2 are fixed because previously the decrypt failures produce shorter 'recovered' lengths that accidentally make the counter match. The solver must run replay.js on production logs to see failures, instrument cipher.js or add logging to find the counter wrap, notice the table-name pattern for the HKDF bug (requires comparing subkeys across table names empirically or reading kdf.js carefully), then fix all three. A solver that fixes only bug 1 or only bug 2 will still see replay failures. A solver that fixes bugs 1 and 2 but misses bug 3 will pass replay but fail the metrics equivalence test.",
+  "trap": "The smoke test sample.log passes with zero fixes. The naive agent fixes the most visible bug (counter wrap in cipher.js, which may be spotted by reading), runs replay.js on sample.log, sees it pass, and submits \u2014 but the verifier generates table names of length 8, 16, 24, 32 and records of 300\u20134000 bytes, so the HKDF collision and counter bugs both fire. Even an agent that fixes both cipher bugs may miss the metrics off-by-one (bytes_verified counts ciphertext not plaintext), which only becomes observable post-fix.",
+  "tests": [
+   "For 200 randomly generated (table_name, plaintext) pairs where table names are drawn uniformly from lengths 1\u201364 and plaintexts from lengths 1\u20134096: run writer, then reader, assert recovered plaintext === original plaintext",
+   "For 50 pairs of table names with the same 7-byte prefix but different 8th byte (e.g. 'accounts' vs 'account_'), assert their HKDF subkeys are distinct",
+   "For 30 plaintexts of length > 256 bytes, assert decrypt(encrypt(p)) === p byte-for-byte",
+   "After a full round-trip batch, assert metrics.bytes_encrypted === metrics.bytes_verified",
+   "Run replay.js on /var/log/auditdb/ and assert exit code 0",
+   "Assert that encrypting the same (table_name, nonce, plaintext) twice produces identical ciphertext (determinism check)"
+  ],
+  "verifier_knob": {
+   "name": "num_generated_pairs",
+   "value": "200",
+   "effect": "Raising increases the probability of hitting all three bug-triggering patterns (multiples of 8, lengths > 256, post-fix metrics); lowering to 20 makes it likely that boundary cases are missed and the agent appears to pass with partial fixes"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the keystream counter wrap (the most obvious bug after running replay on production logs) and stops when sample.log passes",
+   "Agent fixes bugs 1 and 2 but does not discover the metrics off-by-one, which only surfaces on fresh verifier inputs",
+   "Agent reads kdf.js and patches the wrong expression (fixes the alloc size but not which byte is dropped), so collision still occurs for some lengths",
+   "Agent finds bugs 1 and 2 by reading source and patches them, but does not run replay.js to confirm, misses that metrics.js counts ciphertext bytes and submits",
+   "Agent discovers all three bugs but introduces a regression in the nonce encoding path that breaks determinism"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "cryptography",
+   "nodejs",
+   "incident-response",
+   "devops",
+   "logs",
+   "stream-cipher"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/auditlog/kdf.js",
+   "cat /opt/auditlog/cipher.js",
+   "cat /opt/auditlog/writer.js",
+   "cat /opt/auditlog/reader.js",
+   "cat /opt/auditlog/metrics.js",
+   "cat /opt/auditlog/replay.js",
+   "node /opt/auditlog/replay.js (observe failures)",
+   "identify counter % 256 reset bug in cipher.js from source read",
+   "edit cipher.js: fix keystream counter accumulation (remove mod 256 reset)",
+   "node /opt/auditlog/replay.js (still fails \u2014 HKDF bug remains)",
+   "re-read kdf.js carefully, spot Buffer.alloc off-by-one for table name lengths divisible by 8",
+   "edit kdf.js: fix Buffer.alloc size to include correct byte count",
+   "node /opt/auditlog/replay.js (exits 0)",
+   "cat /var/log/auditdb/metrics_snapshot.txt (see bytes_encrypted != bytes_verified)",
+   "re-read metrics.js, identify bytes_verified counts ciphertext not plaintext",
+   "edit metrics.js: change bytes_verified to accumulate plaintext length",
+   "write short test: encrypt/decrypt 50 pairs including 8-byte-multiple table names and >256 byte payloads, assert metrics equality",
+   "node test.js (all pass)",
+   "node /opt/auditlog/replay.js (final confirmation, exit 0)"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The metrics requirement ('byte counts stay consistent') is ambiguous in the instruction \u2014 it does not specify that bytes_verified must equal plaintext bytes (not ciphertext bytes), so a solver could reasonably implement metrics differently and still meet the stated requirement while failing the test",
+   "Bug 3 (metrics) is only observable after fixing bugs 1 and 2; if the verifier test for metrics runs independently without the cipher fixes, it could pass vacuously or produce misleading results depending on test ordering",
+   "The production log files are generated at Dockerfile build time using the buggy code \u2014 if the writer embeds SHA-256 footers using the buggy cipher, the replay harness checking those footers may require the bugs to be present to pass, creating a logical contradiction (fixing bugs breaks the footer verification on pre-generated logs)",
+   "If the SHA-256 footer in replay.js is computed over plaintext but the ciphertext was generated with buggy encryption, fixing the bugs may make replay.js fail to verify old records even with correct decryption \u2014 the task needs to clarify whether production logs are regenerated post-fix or whether footers survive the cipher fix",
+   "Nonce determinism test requires the writer to accept explicit nonces as input; if nonces are auto-generated (e.g., random), the determinism test cannot be run externally without API changes"
+  ],
+  "verdict": "reject",
+  "reasons": "The most critical invalid failure risk is a logical contradiction in the replay harness: production logs were written with buggy encryption and contain SHA-256 footers; fixing the cipher means the reader will decrypt to different bytes than were originally written, so footer verification will fail on old logs regardless of correctness \u2014 this makes the 'replay.js exits 0' requirement potentially unsatisfiable without regenerating production logs post-fix. Additionally, the metrics requirement is underspecified in the instruction (does not say bytes_verified should equal plaintext length), creating ambiguity that could invalidate failures. The bugs are source-readable and the speedrun reaches ~19 commands, placing genuine_difficulty at 3 which meets the threshold, but the logical contradiction in test design is a blocking issue.",
+  "fixes": [
+   "Resolve the production log contradiction: either (a) generate production logs with correct code and introduce the bugs only in source files so that replay.js can succeed after fixing, or (b) have replay.js regenerate/re-encrypt records at run time from a stored plaintext manifest, or (c) make replay.js check structural integrity (nonce/length consistency) rather than SHA-256 of decrypted content against a value encrypted with the buggy cipher",
+   "Make the metrics requirement explicit in the instruction: change 'byte counts stay consistent' to 'bytes_verified must equal the total plaintext bytes encrypted, not the ciphertext bytes' so the solver knows exactly what to fix in metrics.js",
+   "Add an explicit nonce-passing API to writer.js (or document that nonces are deterministic given record index) so the determinism test is implementable without ambiguity about how to supply the same nonce twice",
+   "To increase genuine_difficulty above 3, make at least one bug non-source-readable \u2014 e.g., compile cipher.js to a native addon, or make the off-by-one conditional on a runtime environment variable read at module load time, so agents cannot fix it purely by reading source"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both involve debugging a refactored multi-file encryption library where smoke tests pass but the real workload fails due to data-dependent bugs, differing only in language (Node.js vs C), cipher (HKDF-XOR vs AES-CTR), and the addition of a metrics consistency requirement."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about log schema validation correctness and performance, with no encryption or cipher logic involved."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 computation over a binary WAL record format served over TCP, not stream cipher encryption/decryption repair."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about a GeoIP enrichment pipeline and Flask API correctness, with no cryptography involved."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a SQLite metrics database with windowed aggregations, unrelated to encryption or stream ciphers."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.216
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.175
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.145
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.131
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.118
+    ]
+   ],
+   "cost_usd": 0.014535000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056658
+}

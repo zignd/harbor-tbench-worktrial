@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "build-pkg-manifest-hash-repair",
+  "title": "Package Manifest Hash Reconciler Repair",
+  "scenario": "You are a finance-ops engineer at a software-licensing company responsible for nightly reconciliation of installed-package manifests against a vendor billing ledger. An in-house Python/SQLite pipeline ingests JSON package manifests uploaded by client machines, normalises version strings, computes a canonical hash per package record, and then emits a reconciliation report showing which installed packages match what the vendor has billed. Over the past week, several clients have filed disputes: packages they paid for are flagged as 'unmatched' and packages that should be discrepancies are silently omitted from the mismatch report. The codebase is roughly 1,400 lines spread across a manifest ingestion service, a normalisation library, a SQL reconciliation engine, and a CLI report generator.",
+  "instruction_draft": "The reconciliation pipeline lives at /app. Running `python -m reconciler run --manifest /app/data/sample_manifest.json` produces a report, but the report is wrong on real client data. Your job is to make the pipeline produce a correct reconciliation report that satisfies all of the following observable properties:\n\n1. Every package record in the manifest whose normalised version string exactly matches a vendor billing entry (same package name, same normalised version) must appear in the report with status `matched`.\n2. Every manifest record whose normalised version string does NOT match any billing entry for that package name must appear with status `unmatched`.\n3. The canonical hash stored in the database for each ingested record must be the SHA-256 of the UTF-8 bytes of the string `{name}=={normalised_version}` (with exactly two equals signs and no extra whitespace).\n4. The reconciliation report's summary line must state correct integer counts of matched, unmatched, and total records \u2014 and those counts must be consistent with the detail rows.\n5. On any manifest that contains package entries where the version field uses a build-metadata suffix (e.g. `1.2.3+build.7`), the normalised version used for matching and hashing must strip the build-metadata portion (everything after and including the `+`), but must retain pre-release labels (e.g. `1.2.3-alpha.1` stays `1.2.3-alpha.1`).\n\nVerification will run the pipeline against several client manifests that differ from the sample. Produce a fixed pipeline; do not hard-code answers for specific inputs.",
+  "requirements": [
+   "Matched status assigned iff normalised version equals vendor billing entry for that package name",
+   "Unmatched status assigned when no billing entry matches normalised version for the package name",
+   "Canonical hash = SHA-256 of UTF-8 bytes of '{name}=={normalised_version}' with exactly two equals signs",
+   "Summary counts (matched, unmatched, total) are correct integers consistent with detail rows",
+   "Build-metadata suffix (after '+') stripped during normalisation; pre-release labels preserved"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install sqlite3; pip install click pydantic",
+   "/app/reconciler/__init__.py, __main__.py, ingest.py, normalise.py, hash_util.py, db.py, engine.py, report.py \u2014 ~1400 lines total",
+   "ingest.py: reads JSON manifest, calls normalise.version(), calls hash_util.canonical_hash(), inserts into SQLite; BUG A (data-dependent, not statically obvious): normalise.version() strips the pre-release label instead of the build-metadata suffix \u2014 it splits on '-' rather than '+', so '1.2.3+build.7' becomes '1.2.3+build.7' (unchanged, wrong), and '1.2.3-alpha.1' becomes '1.2.3' (stripped, wrong) \u2014 this bug only manifests on version strings that contain these patterns",
+   "hash_util.py: canonical_hash() computes SHA-256 of '{name}={normalised_version}' (ONE equals sign) rather than two \u2014 hash stored in DB is wrong, but sample manifest has no billing entry that checks the hash directly so the sample run appears fine",
+   "engine.py: reconciliation JOIN uses the stored hash column to match rather than (name, normalised_version) columns directly \u2014 so when hash_util is wrong, matches silently fail even if name+version match; fixing only the normalise bug leaves the hash-join broken; fixing only the hash bug without fixing normalise leaves version matching wrong",
+   "report.py: summary count query has a subtle GROUP BY that double-counts packages appearing twice in a manifest (duplicates within one manifest) \u2014 only triggers when a manifest has dup package names",
+   "db.py: schema migration logic skips adding the normalised_version column if the DB file already exists from a prior run \u2014 causes schema errors on re-runs until solver deletes or migrates the DB",
+   "/app/data/sample_manifest.json: 8 packages, no build-metadata versions, no pre-release versions, no duplicate names \u2014 sample run silently produces wrong hashes but they happen to all be 'unmatched' so counts look plausible",
+   "/app/data/vendor_billing.csv: 20 rows of (name, normalised_version, unit_price) loaded by ingest into billing table",
+   "/app/tests/: a handful of unit tests that pass even with the bugs (they mock the hash function)",
+   "Verification script generates fresh manifests with build-metadata versions, pre-release versions, duplicates, and checks all five requirements against actual pipeline output"
+  ],
+  "internal_hint": "Difficulty comes from two interacting causes that are NOT visible by static reading of any single file, plus one edge-case correctness requirement on version normalisation that the sample data never exercises. (1) BUG A \u2014 normalise.py splits version on the wrong separator ('-' instead of '+') for build-metadata stripping; this is data-dependent: the sample manifest has no such version strings so the bug never fires on sample data. (2) BUG B \u2014 engine.py's reconciliation JOIN uses the hash column, not (name, normalised_version); the hash is computed with one '=' in hash_util.py; fixing BUG A alone changes normalised versions but the JOIN still uses the wrong hashes so nothing matches. Fixing BUG B alone (switching the JOIN to name+normalised_version) makes the sample pass but hides BUG A until build-metadata versions appear. The solver must run the pipeline on non-sample data (or construct a test case) to observe the failure, then trace whether the failure is in normalisation, hashing, or matching \u2014 three separate modules. BUG C (db.py schema migration skip) forces the solver to deal with a stale DB if they run/re-run without cleaning, which surfaces organically during investigation. BUG D (report.py double-count on duplicates) is a fourth, weaker bug that only shows on duplicate package names. The fixes are: normalise.py: split on '+' and take index 0 for build-metadata, but only do so \u2014 leave '-' alone; hash_util.py: use '==' separator; engine.py: JOIN on (name, normalised_version) not hash; report.py: deduplicate or use DISTINCT; db.py: run ALTER TABLE or DROP+recreate on schema mismatch.",
+  "trap": "A solver that fixes only the normalise.py separator bug sees that build-metadata versions now strip correctly, but the engine still joins on the hash, and the hashes are still wrong (one '=' vs two), so reconciliation still fails on non-sample data. A solver that fixes only the hash to use '==' sees sample data pass because the JOIN now computes correct hashes for the sample's simple versions, but build-metadata versions still normalise incorrectly. Both partial fixes produce a pipeline that passes the sample and plausibly looks done, but fails the hidden manifests. The solver must discover and fix all interacting components.",
+  "tests": [
+   "Generate a manifest with 5 packages having plain versions matching billing entries \u2192 all 5 must be `matched`, summary total=5 matched=5 unmatched=0",
+   "Generate a manifest with 3 packages where version has build-metadata suffix (e.g. '2.1.0+nightly.42') that matches billing entry '2.1.0' after stripping \u2192 must appear as `matched`; if suffix not stripped correctly they appear as `unmatched` \u2192 test fails",
+   "Generate a manifest with 2 packages with pre-release label (e.g. '3.0.0-beta.2') where billing has '3.0.0-beta.2' exactly \u2192 must appear as `matched` (pre-release label must NOT be stripped)",
+   "Generate a manifest where one package has no billing entry at all \u2192 must appear as `unmatched`",
+   "Generate a manifest with a duplicate package name (same name, two entries) \u2192 summary total must equal number of manifest entries, not double-count",
+   "Verify the canonical hash stored in DB for an ingested record equals SHA-256('{name}=={normalised_version}'.encode('utf-8')) by querying the SQLite DB directly after ingest",
+   "Run the pipeline twice on the same manifest (simulating re-runs) without manual DB cleanup \u2192 must succeed without schema errors on the second run",
+   "Generate a manifest with mix of all version types (plain, build-metadata, pre-release, unmatched) \u2192 all status assignments and summary counts must be simultaneously correct"
+  ],
+  "verifier_knob": {
+   "name": "fraction_build_metadata_versions",
+   "value": "0.4",
+   "effect": "Increasing the fraction of build-metadata version strings in hidden test manifests makes BUG A more likely to surface and harder to miss; decreasing it makes the task easier because plain-version manifests may pass even with the normalise bug"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only normalise.py, verifies on sample, ships \u2014 hidden tests with build-metadata versions fail because engine still joins on wrong hash",
+   "Solver fixes only hash_util.py separator, verifies on sample, ships \u2014 normalisation is still wrong for build-metadata versions",
+   "Solver fixes normalise.py and hash_util.py but misses that engine.py joins on hash column \u2014 name+version match still broken because hash JOIN computes new correct hashes but old DB rows have old hashes",
+   "Solver fixes all three core bugs but misses report.py double-count \u2014 tests with duplicate package names produce wrong summary counts",
+   "Solver fixes everything but doesn't handle db.py schema migration \u2014 second run of the verifier fails with a schema error"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "sql",
+   "debugging",
+   "reverse-engineering",
+   "algorithmic",
+   "finance-ops",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/reconciler/normalise.py",
+   "cat /app/reconciler/hash_util.py",
+   "cat /app/reconciler/engine.py",
+   "cat /app/reconciler/report.py",
+   "cat /app/reconciler/db.py",
+   "cat /app/data/sample_manifest.json",
+   "cat /app/data/vendor_billing.csv",
+   "Edit normalise.py: split version on '+', take [0], leave '-' alone",
+   "Edit hash_util.py: change format string from '{name}={v}' to '{name}=={v}'",
+   "Edit engine.py: change reconciliation JOIN from hash column to (name, normalised_version) columns",
+   "Edit report.py: fix GROUP BY / add DISTINCT to prevent double-counting duplicate package names",
+   "Edit db.py: add ALTER TABLE or DROP+recreate logic when normalised_version column missing",
+   "python -m reconciler run --manifest /app/data/sample_manifest.json",
+   "Create /tmp/test_build_meta.json with package version '2.1.0+nightly.42', billing has '2.1.0'",
+   "python -m reconciler run --manifest /tmp/test_build_meta.json \u2014 expect matched",
+   "Create /tmp/test_prerelease.json with version '3.0.0-beta.2', billing has '3.0.0-beta.2'",
+   "python -m reconciler run --manifest /tmp/test_prerelease.json \u2014 expect matched",
+   "Create /tmp/test_dup.json with duplicate package name, run and check summary counts",
+   "python -m reconciler run --manifest /tmp/test_dup.json (second run, no DB cleanup) \u2014 check no schema error",
+   "sqlite3 /app/data/reconciler.db 'SELECT name, hash FROM records' \u2014 verify SHA-256 of 'name==normalised_version'"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 're-run without DB cleanup' test assumes the verifier does NOT reset the container/filesystem between runs; if the verifier uses a fresh container per test, this test is impossible to fail/pass correctly and may be vacuously satisfied or broken.",
+   "metric_threshold verifier with fraction_build_metadata_versions=0.4 implies partial credit scoring, but the individual test pass/fail logic is not specified \u2014 a solver fixing 4/5 bugs might pass the threshold and be incorrectly accepted.",
+   "db.py schema migration bug interacts with verifier ordering: if verifier always starts with a fresh DB, the migration bug never surfaces, making that test case vacuous.",
+   "The instruction says 'do not hard-code answers for specific inputs' but the verifier generates manifests at verify-time; if verifier logic leaks package names/versions (e.g., via predictable names), a solver could theoretically target them, though this is unlikely in practice.",
+   "All five bugs are independently and statically visible by reading the five relevant source files sequentially; the 'interacting causes' framing overstates the difficulty for a methodical agent, making genuine_difficulty lower than intended."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: all five bugs are statically visible by reading five source files sequentially (~5 reads + 5 edits + ~10 verification commands = ~20 commands), meaning a frontier agent doing systematic file review will find and fix everything without needing to run the pipeline on non-sample data to discover hidden failures. The 'interacting causes' trap only catches agents that skip reading engine.py, not methodical ones. Additionally, the re-run/schema-migration test has an invalid failure risk: if the verifier resets the container between test cases (common practice), the test is vacuously satisfied and the db.py bug goes undetected.",
+  "fixes": [
+   "To raise genuine_difficulty: obfuscate the bug locations by spreading logic across more files, or make the engine.py JOIN syntactically plausible (e.g., join on a computed expression that looks correct but isn't), so static reading doesn't immediately flag it \u2014 force the solver to run and observe failures.",
+   "To fix the re-run test: explicitly specify in the environment setup that the verifier runs all tests in a single container session with a shared DB directory, and document this in the instruction so the test is not vacuous.",
+   "To improve the metric_threshold verifier: define explicit pass/fail thresholds per test case (e.g., 'all 8 sub-tests must pass') rather than a single fraction knob, to prevent partial fixes from accidentally crossing the threshold.",
+   "Consider reducing the number of bugs from 5 to 3 (the three core interacting ones: normalise, hash, engine) and make the interaction harder to spot statically \u2014 e.g., the hash_util bug could be in a lambda buried in a larger expression, or engine.py could use a CTE that obscures the join column selection."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/implement-depgraph-dependency-resolver",
+     "verdict": "distinct",
+     "reason": "That task is about building a dependency resolver with topological sort and conflict detection; the candidate is about fixing a hash/normalisation/reconciliation pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/pypi-server",
+     "verdict": "distinct",
+     "reason": "That task is about packaging and hosting a PyPI server; the candidate is about debugging a reconciliation pipeline with hashing and version normalisation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/resolve-react-peer-deps",
+     "verdict": "distinct",
+     "reason": "That task resolves npm peer dependency conflicts; the candidate fixes a billing reconciliation pipeline with version string normalisation and SHA-256 hashing."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a log ingestion/validation pipeline for correctness and performance; the candidate is about fixing version normalisation, canonical hashing, and reconciliation logic."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes chunk-based CSV processing with deduplication and row count correctness; the candidate fixes version normalisation, SHA-256 hashing, and matched/unmatched status in a billing reconciliation pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/implement-depgraph-dependency-resolver",
+     0.177
+    ],
+    [
+     "terminal-bench-2-1/pypi-server",
+     0.175
+    ],
+    [
+     "terminal-bench-pro/resolve-react-peer-deps",
+     0.144
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.111
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.11
+    ]
+   ],
+   "cost_usd": 0.014118
+  },
+  "novel": true
+ },
+ "cost_usd": 0.064425
+}

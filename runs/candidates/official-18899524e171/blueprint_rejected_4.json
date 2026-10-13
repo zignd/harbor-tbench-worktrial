@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "release-query-engine-sentinel",
+  "title": "Release Build Query Sentinel",
+  "scenario": "A release engineer is trying to ship version 3.1 of an internal analytics platform. The CI gate runs a SQL-based sentinel script that validates query outputs from a SQLite database against expected checksums. The build has been broken for two days: the sentinel exits non-zero and the release is blocked. The environment contains a ~1,200-line Python/bash pipeline in /opt/sentinel/, a SQLite database at /var/db/analytics.db populated with ~50k rows of synthetic event data, and a bash entrypoint validate.sh that runs the sentinel queries and compares their aggregated results to pre-computed golden hashes.",
+  "instruction_draft": "The CI build at /opt/sentinel/ has been failing for two days and blocking the release. Running bash /opt/sentinel/validate.sh exits non-zero. Your job is to make validate.sh exit 0 by ensuring every sentinel query returns the correct aggregate result that matches its golden hash.\n\nThe sentinel queries compute weighted-percentile statistics over a sliding event window stored in /var/db/analytics.db. Each query must return exactly the correct INTEGER result for its time window: the golden hashes in /opt/sentinel/golden.sha256 are authoritative and were generated from a known-correct implementation. Do not modify golden.sha256, the database, or the test harness in validate.sh. Fix the query engine so that all sentinel queries produce correct results on the current database AND on any valid replacement database the CI system may substitute at verify time \u2014 the queries must be mathematically correct for all valid inputs, not just the current data.",
+  "requirements": [
+   "bash /opt/sentinel/validate.sh must exit 0",
+   "Each sentinel query must return the correct INTEGER weighted-percentile value for its declared time window",
+   "The golden.sha256 file must not be modified",
+   "The analytics.db database must not be modified",
+   "validate.sh must not be modified",
+   "The query engine must produce correct results on substitute databases generated at verify time, not just the current database"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with sqlite3, bash, python3-dev installed via apt",
+   "/opt/sentinel/ directory (~1,200 lines across 6 files): validate.sh entrypoint, query_engine.py (the broken component), aggregator.py, window.py, schema.sql, golden.sha256",
+   "/var/db/analytics.db: SQLite database with ~50k rows in tables: events(id, ts INTEGER, user_id, event_type, weight REAL, value REAL), sessions(id, user_id, start_ts, end_ts), config(key, value)",
+   "Bug 1 (interacting): query_engine.py computes weighted percentile using a WRONG SQL formula \u2014 it uses AVG(value) weighted by weight instead of the correct weighted-percentile interpolation. Specifically it uses SUM(value*weight)/SUM(weight) (weighted mean) instead of the true weighted percentile. For the current database's particular distribution, the weighted mean and weighted p50 are numerically close (within 2%), so a naive fix that computes weighted mean will pass the SHA check on p50 queries but fail on p25/p75/p90 queries in the hidden corpus where skew is higher.",
+   "Bug 2 (interacting, masked by Bug 1): window.py applies the sliding window filter with an OFF-BY-ONE in the boundary condition \u2014 it uses ts >= start AND ts < end (exclusive end) but the spec requires ts >= start AND ts <= end (inclusive end). The golden hashes were computed with inclusive-end windows. Because Bug 1 inflates the mean slightly, and the off-by-one drops boundary rows that are slightly high-valued, on the current symmetric distribution the two errors partially cancel and the wrong answer from both bugs combined happens to land within the hash tolerance range for ONLY the p50 queries. A solver who only fixes the off-by-one will still fail because the aggregation formula is wrong. A solver who only fixes the aggregation formula will still fail because the window boundary is wrong.",
+   "golden.sha256 contains SHA-256 hashes of the correct INTEGER results for 8 sentinel queries (p25, p50, p75, p90 each for two time windows)",
+   "The correct weighted percentile algorithm: sort rows by value, compute cumulative weights, find the interpolation point at target_fraction * total_weight using linear interpolation between the two bracketing rows",
+   "validate.sh runs query_engine.py for each of the 8 queries, pipes integer output through sha256sum, and compares to golden.sha256; exits 1 on any mismatch with a diff of which hashes failed",
+   "At verify time, the harness regenerates analytics.db with a different seeded random distribution (higher skew, non-symmetric) and re-runs validate.sh \u2014 this exposes any partial fix"
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the bugs only reveal themselves through running the system against real data with non-trivial distributions \u2014 reading query_engine.py and window.py individually makes each bug look plausible, and the interaction between them causes partial-cancel on the provided symmetric data; (2) the correct weighted-percentile algorithm requires non-trivial mathematical derivation (it is NOT a simple SQL aggregate \u2014 it requires sorting, cumulative-weight computation, and linear interpolation, which must be implemented in Python or via a multi-step SQLite CTE). The solver must: run validate.sh and observe which hashes fail; instrument the queries to see the numeric outputs; realize the window boundary is wrong by checking edge cases; realize the aggregation formula is wrong by deriving weighted percentile from first principles or documentation; implement both fixes correctly; verify on the current data; and have both fixes survive the hidden skewed distribution.",
+  "trap": "A naive fix patches only the off-by-one window boundary (visible from reading window.py) because validate.sh then passes more queries and the remaining p50 mismatches look like rounding. Alternatively, a solver who replaces SUM(value*weight)/SUM(weight) with a percentile approximation using SQLite's built-in mechanisms (which don't exist for weighted percentile) will produce plausible-looking output that passes 4/8 hashes on the symmetric current database but fails all 8 on the skewed hidden database. The shallow-check trap: the provided database has a near-symmetric weight distribution, so weighted-mean \u2248 weighted-median for p50. Any solution that doesn't implement true weighted-percentile interpolation will fail the hidden corpus where skew pushes p25/p75/p90 far from the weighted mean.",
+  "tests": [
+   "Run bash /opt/sentinel/validate.sh with the original analytics.db and assert exit code 0 \u2014 all 8 golden hashes must match",
+   "Substitute analytics.db with a verify-time generated database using seed=42 with right-skewed weight distribution (scipy.stats.lognormal weights), rerun validate.sh, assert exit 0",
+   "Substitute analytics.db with seed=99 using bimodal value distribution with heavy boundary-row concentration (stresses the inclusive/exclusive window boundary fix), assert exit 0",
+   "Substitute analytics.db with seed=7 targeting p90 query: generate data where p90 != weighted mean by >15%, assert the p90 query hash matches the correct interpolated value",
+   "Substitute analytics.db with seed=13 where the window boundary rows carry 30% of total weight (maximally stresses off-by-one), assert all 8 hashes match",
+   "Verify golden.sha256 is unmodified (SHA-256 of the file itself matches the fixture hash)",
+   "Verify analytics.db is unmodified (row count and schema unchanged from original)",
+   "Verify validate.sh is unmodified (file hash check)"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "5 substitute databases",
+   "effect": "Raising to 10-15 databases with wider distribution coverage (uniform, Zipf, near-degenerate with single heavy boundary row) makes it harder to accidentally pass with an approximate formula; lowering to 2 databases makes a weighted-mean approximation viable on lucky seeds"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the off-by-one window boundary, observes validate.sh passes more queries on the current database, concludes done \u2014 fails hidden skewed corpus on aggregation formula",
+   "Agent implements weighted percentile correctly but uses exclusive-end window boundary (the Python default range idiom), passes aggregation checks but fails boundary-heavy hidden databases",
+   "Agent implements a percentile approximation (e.g., nearest-rank without interpolation) that is close enough on the symmetric current database but diverges on skewed hidden databases",
+   "Agent modifies golden.sha256 to match its (wrong) implementation \u2014 caught by the golden file hash check",
+   "Agent rewrites the entire query engine correctly but introduces a new integer-truncation error instead of proper rounding, failing on hidden databases where the interpolated value falls near a 0.5 boundary",
+   "Agent spends too long exploring the ~1,200-line codebase looking for a third bug that doesn't exist, runs out of time after fixing only one of the two real bugs"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sqlite",
+   "sql",
+   "algorithmic",
+   "weighted-percentile",
+   "two-bugs",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/sentinel/validate.sh",
+   "cat /opt/sentinel/window.py",
+   "cat /opt/sentinel/query_engine.py",
+   "cat /opt/sentinel/aggregator.py",
+   "bash /opt/sentinel/validate.sh  # observe exit code and which hashes fail",
+   "# In window.py: identify ts < end (exclusive) \u2192 fix to ts <= end",
+   "sed -i 's/ts < end/ts <= end/' /opt/sentinel/window.py",
+   "# In query_engine.py: identify SUM(value*weight)/SUM(weight) is weighted mean not percentile",
+   "# Write correct weighted percentile: sort by value, cumulative weights, linear interpolation",
+   "nano /opt/sentinel/query_engine.py  # replace aggregation with correct weighted percentile",
+   "bash /opt/sentinel/validate.sh  # verify exit 0"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "scipy.stats not installed in container: verify-time database regeneration requires scipy for lognormal distribution; if missing, tests fail for infrastructure reasons not solver skill",
+   "Integer rounding mode ambiguity: the instruction says queries must return 'correct INTEGER' but does not specify whether to use floor(), round(), or ceiling() for the interpolated float; different implementations may produce off-by-one results that cause hash mismatches without being wrong",
+   "Linear interpolation edge case: when cumulative weight exactly equals target_fraction * total_weight, the interpolation formula is degenerate; golden hashes were computed with one handling, solvers may implement another, causing valid-but-different results",
+   "Both bugs are directly source-readable, making the claimed 'interaction/masking' difficulty illusory for a code-reading agent \u2014 the blueprint overstates genuine difficulty",
+   "validate.sh hash comparison without per-query labels may make debugging harder than intended if the error output is cryptic, potentially causing time loss rather than genuine algorithmic challenge"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 is disqualifying: both bugs are independently visible by reading two source files (wrong formula in query_engine.py, off-by-one in window.py), and a speedrun of ~11 commands would likely solve the task without needing to observe runtime behavior or understand the claimed error-cancellation interaction. The blueprint's difficulty narrative depends on agents being misled by runtime behavior, but source-reading agents bypass this entirely. Additionally, the integer rounding mode is unspecified, creating a risk of invalid failures on hidden databases where interpolated values fall near 0.5 boundaries.",
+  "fixes": [
+   "Remove the source-readable nature of Bug 1: instead of a wrong formula in a clearly named function, hide the aggregation error in a SQL CTE that is syntactically plausible and requires running on data with specific distributions to detect (e.g., off-by-one in cumulative weight boundary index selection, not a different formula entirely)",
+   "Specify the exact integer rounding convention in the instruction (e.g., 'use Python's built-in round() which applies banker's rounding') and ensure all golden hashes and verify-time databases were generated with that exact convention",
+   "Add a third subtle bug (e.g., weight normalization applied twice in aggregator.py, or a floating-point precision issue in the interpolation that only manifests with extreme weight ratios) to push the command count above 20 and ensure agents must observe runtime failure modes rather than just reading code",
+   "Ensure scipy is listed explicitly as a required container package, or replace scipy.stats.lognormal with a pure-Python/numpy implementation for the verify-time database generator to avoid infrastructure failures"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task fixes a SQL query for running totals and ranking; this task fixes a query engine computing weighted-percentile statistics validated by SHA-256 golden hashes."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task optimizes a known-correct SQL query for performance; this task debugs a broken query engine to produce mathematically correct weighted-percentile results."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task optimizes a PostgreSQL analytical query for performance while preserving output; this task fixes correctness of a SQLite-based weighted-percentile sentinel system."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both involve fixing a broken release pipeline where query/computation results must match golden references on hidden substitute data, with multiple constraints on what cannot be modified; the core challenge is the same."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task fixes a WAF rule engine misclassifying HTTP requests; this task fixes a SQL-based weighted-percentile query engine blocking a software release."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-31ca491030e9",
+     0.159
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.155
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.153
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.121
+    ],
+    [
+     "ours/official-10912a593843",
+     0.12
+    ]
+   ],
+   "cost_usd": 0.013215000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05372400000000001
+}

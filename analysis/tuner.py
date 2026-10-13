@@ -141,7 +141,13 @@ def directive(plan: dict) -> str:
 
 def _resume_rounds(cand_id: str, ledger) -> tuple[list[dict], dict | None]:
     """Rounds a crashed tuning run already finished, and the calibration they left."""
-    rounds = [e.result for e in ledger.events(stage="tune", task=cand_id)]
+    # A round whose authoring never ran (infra error: Docker out of networks, proxy down) is
+    # not a tuning result: it is redone, not counted.
+    rounds = [
+        e.result
+        for e in ledger.events(stage="tune", task=cand_id)
+        if e.result.get("gate_problems") != ["authoring failed"]
+    ]
     if not rounds:
         return [], None
     last = rounds[-1]
@@ -190,18 +196,28 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
         else:
             if resuming:  # interrupted mid-authoring: redo it from the saved snapshot and plan
                 plan, plan_cost = json.loads(plan_file.read_text()), 0.0
-            elif calibration["verdict"] == "invalid":
-                plan, plan_cost = fix_spec_plan(calibration), 0.0
             else:
-                plan, plan_cost = plan_mutation(
-                    cand.blueprint.to_markdown(spec), calibration, record["rounds"]
-                )
+                if calibration["verdict"] == "invalid":
+                    plan, plan_cost = fix_spec_plan(calibration), 0.0
+                else:
+                    plan, plan_cost = plan_mutation(
+                        cand.blueprint.to_markdown(spec), calibration, record["rounds"]
+                    )
+                # The snapshot the repair patches, and the plan a resume reuses: both kinds
+                # of round need them (the spec-fix branch once skipped them and crashed).
                 if previous.exists():
                     shutil.rmtree(previous)
                 shutil.copytree(cand.task_dir, previous)
                 plan_file.write_text(json.dumps(plan, indent=1))
             problems = _retune(cand, ledger, rnd, plan, previous)
         round_rec = {"round": rnd, "plan": plan, "gate_problems": problems}
+        if problems == ["authoring failed"]:
+            # Infrastructure, not the task: log it, keep no final record, and let a later
+            # run redo the round from the same snapshot and plan.
+            ledger.append(
+                Event("tune", cand.cand_id, {**round_rec, "result": "infra"}, cost_usd=plan_cost)
+            )
+            return {"start": record["start"], "rounds": record["rounds"], "final": "infra"}
         if problems:
             round_rec["result"] = "gates_failed"
             record["rounds"].append(round_rec)

@@ -1,0 +1,179 @@
+{
+ "blueprint": {
+  "slug": "pipeline-checksum-aggregator-repair",
+  "title": "Checksum Aggregator Silent Corruption",
+  "scenario": "A data engineering team maintains a Rust pipeline that ingests partitioned sensor readings, computes per-partition Adler-32 rolling checksums, and emits a compact aggregated summary used downstream for data-quality gating. The compiled binary ships without source; only the pipeline orchestrator scripts, sample data, and documentation are present. After a schema migration that added a new 'epoch' field to each record, the nightly summary reports started silently producing wrong aggregate values that pass format checks but fail reconciliation at the warehouse.",
+  "instruction_draft": "```\n$ ./pipeline --input data/sample.csv --output out/summary.json\nProcessing 1200 records across 12 partitions...\nDone. Written: out/summary.json\n\n$ ./verify_downstream out/summary.json\nFATAL: checksum mismatch on partition 7 (got 0x3f2a1100, expected 0x3f2a11de)\nFATAL: aggregate_xor field invalid (0x00000000 for non-empty run)\n```\n\nYou have inherited a sensor-data quality pipeline at `/app`. The pipeline binary at `/app/pipeline` reads partitioned CSV records and writes `/app/out/summary.json`. Downstream reconciliation fails on real data.\n\nYour task:\n1. Produce a replacement program at `/app/pipeline_fixed` (any language compiled to a native binary, or a Rust binary built via `/app/pipeline_fixed/Cargo.toml`) that reads the same CSV format and writes `summary.json` with correct content.\n2. The summary file must pass `/app/verify_downstream` on the provided sample data AND on fresh data generated at verify time.\n3. The pipeline must process at least 50,000 records/second on the 1-CPU container (measured by the verifier on a 200,000-record input).\n4. The `aggregate_xor` field must equal the XOR of all per-partition Adler-32 checksums, where each partition's checksum is computed only over the `sensor_id`, `value`, and `timestamp_ms` fields (not the `epoch` field).\n5. Partition boundaries are determined by `(record_index / partition_size)` using integer division where `partition_size` is embedded in the pipeline config at `/app/pipeline.toml`.\n\nInvestigate the binary's behaviour on the sample data to discover the exact checksum algorithm and field-selection invariant before building the replacement.",
+  "requirements": [
+   "A binary or script at /app/pipeline_fixed (or built from /app/pipeline_fixed/Cargo.toml) that accepts --input and --output flags matching the original pipeline's interface",
+   "summary.json passes /app/verify_downstream on the sample data in /app/data/sample.csv",
+   "summary.json passes /app/verify_downstream on a fresh 200,000-record CSV generated at verify time",
+   "The pipeline processes at least 50,000 records/second on the 1-CPU container (verified on the 200,000-record input)",
+   "aggregate_xor equals the XOR of all per-partition Adler-32 checksums",
+   "Each partition's Adler-32 is computed only over sensor_id, value, and timestamp_ms fields (not epoch)",
+   "Partition boundaries are computed as floor(record_index / partition_size) where partition_size comes from /app/pipeline.toml",
+   "summary.json contains the correct partition count, record count, per-partition checksum array, and aggregate_xor"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install Rust toolchain (rustup, cargo), and any apt packages needed for compilation",
+   "Compiled binary /app/pipeline built from hidden Rust source during Docker build; source NOT present in the image",
+   "Binary reads CSV with columns: record_index,sensor_id,value,timestamp_ms,epoch and produces summary.json",
+   "/app/data/sample.csv with 1200 records across 12 partitions (partition_size=100) including the epoch field",
+   "/app/pipeline.toml containing at minimum: partition_size = 100 and format_version = 2",
+   "/app/verify_downstream: a Python script that reads summary.json and checks partition_count, record_count, each per_partition_checksums[i], and aggregate_xor against recomputed correct values using its own Adler-32 implementation over sensor_id+value+timestamp_ms only",
+   "The compiled binary has a bug: it includes the epoch field in the Adler-32 computation (introduced by the schema migration), causing all checksums to be wrong on any data where epoch != 0",
+   "Sample data has epoch=0 for all rows (making the binary appear to work on sample), but verify_downstream uses epoch values from 1..N at verify time",
+   "/app/out/ directory exists and is writable",
+   "Documentation at /app/README.md describing the Adler-32 algorithm, the field list (but listing all 5 fields ambiguously as 'sensor fields'), and the partition logic",
+   "A reference test script /app/run_sample.sh that runs the binary on sample data and calls verify_downstream",
+   "A small Python script /app/tools/gen_data.py that generates synthetic CSV data for testing (epoch values randomized), which the solver can use to probe binary behaviour",
+   "The pipeline.toml also contains a checksum_fields entry (currently listing all 5 fields) that the fixed binary must ignore in favour of the hardcoded correct 3-field set discovered by experimentation"
+  ],
+  "internal_hint": "Root cause: The binary includes the epoch field in Adler-32 computation. The sample CSV has epoch=0 for all rows, so Adler-32 output is identical whether epoch is included or excluded (adding zeros does not change the checksum). The solver must generate test data with non-zero epoch values using gen_data.py, run the binary, and compare its output to a hand-computed Adler-32 over various field subsets. Once the solver generates epoch=1 rows and sees the binary's checksums diverge from a 3-field computation, they identify the invariant. The fix requires: (1) correct field selection (sensor_id, value, timestamp_ms only), (2) correct Adler-32 with MOD 65521, (3) partition boundary logic using pipeline.toml's partition_size, (4) XOR aggregation of all partition checksums, and (5) sufficient throughput (50k rec/s). A naive 'include all fields' implementation matches the binary on sample data but fails verify-time tests. The performance bar rules out a Python fallback with per-field string formatting in a loop.",
+  "trap": "The sample CSV has epoch=0 for all rows. The original binary includes epoch in its Adler-32, but XOR-ing zeros into an Adler-32 accumulator with MOD 65521 arithmetic doesn't change the result when the added byte is 0 (since 0+A1=A1 and 0+A2=A2 mod 65521). So any implementation that checks only against the sample passes, but fails the verify-time data where epoch cycles through 1..200000. A solver who reads the README (which lists all 5 fields ambiguously), implements all-5-field Adler-32, and validates only on sample.csv will ship a broken replacement. They must experimentally discover the 3-field invariant by generating non-zero-epoch data.",
+  "tests": [
+   "Run /app/pipeline_fixed --input /app/data/sample.csv --output /tmp/test_out/summary.json and run /app/verify_downstream /tmp/test_out/summary.json; must exit 0",
+   "Generate a 200,000-record CSV with randomized epoch in 1..9999 using /app/tools/gen_data.py at verify time; run /app/pipeline_fixed on it; verify_downstream must pass on the output",
+   "Time the pipeline_fixed run on the 200,000-record CSV; wall time must be <= 4 seconds (50k rec/s threshold on 1 CPU)",
+   "Check that the aggregate_xor in summary.json equals Python-computed XOR of per-partition Adler-32s over (sensor_id, value, timestamp_ms) only for the 200k-record input",
+   "Verify partition count in summary.json equals ceil(200000 / partition_size) where partition_size is read from pipeline.toml",
+   "Verify record_count in summary.json equals 200000",
+   "Check that /app/pipeline_fixed binary (or the built Rust binary) exists and is executable",
+   "Generate a second fresh CSV with partition_size modified to 250 (by editing pipeline.toml at verify time) and verify pipeline_fixed reads partition_size from the toml correctly"
+  ],
+  "verifier_knob": {
+   "name": "number of independent state properties checked",
+   "value": "8 checks (partition checksums, aggregate_xor, record_count, partition_count, throughput, field-exclusion correctness, toml-driven partition_size, binary existence)",
+   "effect": "Reducing to 4 checks (drop throughput, toml-driven partition_size, and second fresh CSV) makes partial implementations pass; raising to 10 by adding a second modified partition_size and a run with epoch in negative-range float strings would force deeper format handling"
+  },
+  "expected_failure_modes": [
+   "Solver validates implementation only against sample.csv (epoch=0), ships an all-5-field Adler-32, which passes sample but fails verify-time epoch>0 data",
+   "Solver discovers the 3-field invariant but implements Adler-32 with wrong modulus (2^16 = 65536 instead of 65521), producing off-by-small errors that diverge on large inputs",
+   "Solver writes a correct but slow Python or interpreted implementation that passes correctness checks but fails the 50k rec/s throughput bar",
+   "Solver reads pipeline.toml for partition_size but hard-codes it as 100 after seeing sample data, causing failure when verifier modifies toml to partition_size=250",
+   "Solver implements XOR aggregation but aggregates partition record-counts rather than checksums, producing aggregate_xor=0 (XOR of equal counts) which looks plausible but is wrong"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "reverse-engineering",
+   "rust",
+   "checksums",
+   "binary-analysis",
+   "performance",
+   "data-engineering"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/pipeline.toml",
+   "head -5 /app/data/sample.csv",
+   "cat /app/verify_downstream",
+   "python3 /app/tools/gen_data.py --rows 120 > /tmp/nonzero_epoch.csv  # generates non-zero epochs",
+   "/app/pipeline --input /tmp/nonzero_epoch.csv --output /tmp/probe_out.json",
+   "cat /tmp/probe_out.json",
+   "python3 -c \"import csv; ... compute adler32 over all 5 fields for partition 0 and compare to binary output\"",
+   "python3 -c \"import csv; ... compute adler32 over sensor_id+value+timestamp_ms only and compare to binary output\"",
+   "# Identify: 3-field subset matches verify_downstream, not binary (binary is buggy) -- or match verify expected values",
+   "mkdir -p /app/pipeline_fixed/src",
+   "cat > /app/pipeline_fixed/Cargo.toml  # [package] name=pipeline_fixed, edition=2021; [dependencies] csv, serde, toml, serde_json",
+   "cat > /app/pipeline_fixed/src/main.rs  # read --input/--output args, read pipeline.toml for partition_size, compute Adler-32 (MOD 65521) over sensor_id+value+timestamp_ms bytes, partition by floor(record_index/partition_size), XOR all partition checksums into aggregate_xor, write summary.json",
+   "cd /app/pipeline_fixed && cargo build --release 2>&1 | tail -5",
+   "mkdir -p /tmp/out && /app/pipeline_fixed/target/release/pipeline_fixed --input /app/data/sample.csv --output /tmp/out/summary.json",
+   "/app/verify_downstream /tmp/out/summary.json",
+   "python3 /app/tools/gen_data.py --rows 200000 > /tmp/large.csv",
+   "mkdir -p /tmp/out2 && time /app/pipeline_fixed/target/release/pipeline_fixed --input /tmp/large.csv --output /tmp/out2/summary.json",
+   "/app/verify_downstream /tmp/out2/summary.json",
+   "# Confirm throughput >= 50k rec/s from timing",
+   "sed -i 's/partition_size = 100/partition_size = 250/' /app/pipeline.toml",
+   "/app/pipeline_fixed/target/release/pipeline_fixed --input /tmp/large.csv --output /tmp/out3/summary.json",
+   "/app/verify_downstream /tmp/out3/summary.json"
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Adler-32 byte encoding is underspecified: the instruction says 'computed over sensor_id, value, timestamp_ms fields' but doesn't state whether bytes are raw UTF-8 of each field value concatenated, comma-separated CSV bytes, or another encoding. If verify_downstream uses a different encoding than what the solver infers from experimentation, the solver gets correct checksums on the probed binary data but wrong on verify-time data.",
+   "pipeline_fixed path conflict: the instruction allows /app/pipeline_fixed as both a bare executable and a directory containing Cargo.toml \u2014 these are mutually exclusive; if the test runner looks for /app/pipeline_fixed as an executable but solver built via Cargo into a subdirectory, the binary existence check (test 7) may fail even with a correct solution.",
+   "gen_data.py interface is not specified in the instruction; if its CLI flags differ from what the solver assumes, the probing workflow to discover the 3-field invariant is disrupted (though solver can still read gen_data.py source).",
+   "verify_downstream modifies pipeline.toml at verify time but the blueprint does not specify restoration between tests, potentially causing test ordering dependencies (partition_size=250 test pollutes subsequent runs).",
+   "Cargo compile time on a 1-CPU container could approach 3-5 minutes for a fresh build with multiple dependencies (csv, serde, serde_json, toml crates), which is significant but not blocking for solvability.",
+   "The instruction says 'any language compiled to a native binary' but also specifically mentions Rust; a C or Go solution should also be valid, but verify_downstream's throughput threshold was presumably calibrated for Rust, and a C solution might barely meet or miss it depending on CSV parsing library choices."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has strong verifiability (8 independent checks, fresh verify-time data with non-zero epochs closes the sample validation gap) and excellent realism (schema migration silently breaking checksums is a genuine data engineering incident). The primary difficulty lever \u2014 the hidden epoch=0 invariant \u2014 is well-constructed and requires active experimentation to discover, though the scaffolding (gen_data.py, clear hint to 'investigate the binary') somewhat lowers the ceiling on genuine_difficulty to a 3. The average score is 4.2, above the 3.6 threshold, and all individual scores meet the minimum of 3.",
+  "fixes": [
+   "Clarify the Adler-32 byte encoding explicitly in the instruction (e.g., 'bytes are the UTF-8 encoding of each field value concatenated without separator') to eliminate a source of invalid failures.",
+   "Resolve the /app/pipeline_fixed path ambiguity: either require a bare executable at /app/pipeline_fixed OR a Cargo workspace at /app/pipeline_fixed/ with the built binary at a specified location \u2014 not both options simultaneously, since a directory and a file cannot share the same path.",
+   "Specify gen_data.py's CLI interface (flags for row count and epoch range) in the environment description so solvers can use it reliably without reading its source first.",
+   "Add a note that verify_downstream restores pipeline.toml to its original state after the partition_size=250 test, or run it as the final test to avoid ordering issues."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Python chunked CSV pipeline with duplicate/dropped rows, not about reverse-engineering a binary's checksum algorithm and reimplementing it correctly."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing SQL window functions for running totals and ranking, entirely unrelated to binary reverse-engineering or checksum aggregation."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks require characterizing a closed binary's transformation by experiment and then replicating its behavior in a replacement pipeline, though the specific algorithm (ADC normalization vs. Adler-32 checksum) differs."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation correctness and performance in a Node.js log ingestion service, not about reverse-engineering a binary checksum algorithm."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a TCP audit service with HMAC-SHA256 over a specific binary record format, not about reverse-engineering a data pipeline's checksum behavior."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.196
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.162
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.156
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.145
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.131
+    ]
+   ],
+   "cost_usd": 0.014622
+  },
+  "novel": false
+ },
+ "cost_usd": 0.071868
+}

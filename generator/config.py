@@ -58,6 +58,11 @@ METATASK_REPAIR_MAX_TURNS = int(os.environ.get("METATASK_REPAIR_MAX_TURNS", "70"
 # matters more than cost, so it only fires near the real 200k limit.
 METATASK_SUMMARIZE_THRESHOLD = int(os.environ.get("METATASK_SUMMARIZE_THRESHOLD", "20000"))
 OPUS_CONCURRENCY = int(os.environ.get("OPUS_CONCURRENCY", "5"))
+# Every Harbor run creates a Docker network, and Docker's default address pools allow ~31 in
+# total, shared with every other project on this machine (all pools exhausted at ~20 of ours:
+# authoring runs, gates and Opus trials at once). Authoring, gates, quality checks and the
+# red-team share ENV_SLOTS concurrent environments; Opus trials have their own OPUS_CONCURRENCY.
+ENV_SLOTS = int(os.environ.get("ENV_SLOTS", "14"))
 # Machine-wide cap on functional gates (docker build + oracle x3 + nop): CPU-heavy, and a
 # CPU-starved oracle looks flaky. Authoring is API-bound and isn't capped this way.
 GATE_CONCURRENCY = int(os.environ.get("GATE_CONCURRENCY", "3"))

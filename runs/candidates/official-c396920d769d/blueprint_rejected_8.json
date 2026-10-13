@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "rust-numeric-codec-invariant-discovery",
+  "title": "Fixed-Point Pipeline Invariant Recovery",
+  "scenario": "You are a data engineer who has inherited a Rust financial time-series pipeline that compresses sensor readings using a fixed-point arithmetic encoder built six months ago. The compiled binary encoder (`/opt/encode_fixed`) ships without source, but the decoder and pipeline harness are in `/app/pipeline/`. A recent audit found that a batch of 10,000 sensor records produced by the pipeline fails an internal consistency check \u2014 the pipeline claims success but the recovered values are systematically wrong above a certain magnitude threshold. The pipeline source is ~1,400 lines across six files.",
+  "instruction_draft": "```\n$ cargo run --release -- --validate /data/sensor_batch_001.bin\nValidating 10000 records...\nChecksum OK: 10000/10000\nRange violations: 847\nFirst violation at record 1203: decoded=14219.87, expected_max=9999.99\n```\n\nYou have inherited a Rust fixed-point compression pipeline at `/app/pipeline/`. The opaque encoder binary is at `/opt/encode_fixed` (no source available). The pipeline takes raw `f32` sensor readings, encodes them with the binary, stores them in `/data/`, and your Rust decoder at `/app/pipeline/src/decoder.rs` recovers the values.\n\nYour task: extend the pipeline with a new `normalize` stage that must be inserted between encoding and storage. The normalize stage must transform encoded records so that all decoded values fall within `[0.0, 9999.99]` \u2014 the valid sensor range \u2014 without losing precision for in-range values. Write the stage in Rust and wire it into the pipeline harness. The final pipeline must:\n1. Process at least 50,000 records per second end-to-end (encode \u2192 normalize \u2192 store \u2192 decode \u2192 validate) on the provided hardware.\n2. Produce decoded output where every record's value falls within `[0.0, 9999.99]`.\n3. Preserve all in-range source values with absolute error \u2264 0.005 after the full round-trip.\n4. Write the count of clamped (out-of-range) records to `/data/clamp_report.json` as `{\"clamped\": N, \"total\": M}`.\n\nThe verifier will run your pipeline on a fresh batch of 200,000 records not present in `/data/` and check all four properties.",
+  "requirements": [
+   "A normalize stage written in Rust is present and wired into the pipeline between encode and decode",
+   "All decoded values fall within [0.0, 9999.99] on fresh 200k-record batches",
+   "In-range values survive the full round-trip with absolute error \u2264 0.005",
+   "End-to-end throughput \u2265 50,000 records/second on provided hardware",
+   "/data/clamp_report.json contains correct {\"clamped\": N, \"total\": M} after each pipeline run"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install rust (via rustup), cargo, python3",
+   "Compile and install the opaque encoder binary at /opt/encode_fixed \u2014 it encodes f32 values as 32-bit little-endian fixed-point with scale factor 2^14 (16384), BUT applies a hidden offset of +32768 to the raw fixed-point integer before writing (i.e., stored_int = round(value * 16384) + 32768); no source ships",
+   "Pipeline source at /app/pipeline/ (~1400 lines): src/main.rs (harness), src/decoder.rs (decodes stored_int by subtracting 32768 then dividing by 16384 \u2014 CORRECT), src/validator.rs (range check, checksum), src/storage.rs (file I/O), src/config.rs, src/metrics.rs",
+   "The decoder.rs correctly inverts the hidden offset \u2014 so if the solver just passes encoded output through they get correct values; the problem is that values above ~(9999.99 * 16384 + 32768) overflow the u32 storage field in decoder, producing garbled output",
+   "The overflow only manifests for source values above approximately 8191.0 because (8191 * 16384 + 32768) approaches the u32 midpoint \u2014 this is the hidden invariant",
+   "Place sensor_batch_001.bin in /data/ \u2014 10,000 records, ~15% above 8191 to trigger visible violations",
+   "The pipeline harness in main.rs has a placeholder stub `fn normalize(records: &mut Vec<EncodedRecord>) { /* TODO */ }` called but doing nothing",
+   "The validate subcommand in main.rs reports range violations but does NOT check clamp_report.json",
+   "Python helper at /app/gen_batch.py that generates deterministic batches given a seed \u2014 verifier uses this with a different seed",
+   "Cargo.toml sets opt-level=3; pipeline already uses rayon for parallel decode but normalize stub is single-threaded placeholder",
+   "No source for /opt/encode_fixed is anywhere on the filesystem"
+  ],
+  "internal_hint": "The difficulty comes from two interacting sources: (1) the hidden invariant \u2014 the encoder applies offset +32768 to the fixed-point integer, and u32 overflow occurs for values above ~8191.0 causing the decoder to produce wrong results; this is NOT visible by reading decoder.rs (which correctly handles the offset for normal values) but only shows by running the binary on high-magnitude inputs and observing the garbled output pattern. The solver must probe the encoder binary with known inputs, observe the stored bytes, and deduce the encoding formula including the offset. (2) The normalize stage must clamp the fixed-point integer BEFORE storage (not the float value after decode) to prevent overflow \u2014 clamping after decode on a garbled u32 produces wrong clamped values. The performance bar forces the solver to use rayon in the normalize stage rather than a naive serial loop, since the 50k rec/sec bar is tight for a pure-Rust serial implementation on 1 CPU with file I/O included. A solver who clamps the float value after decoding (the naive approach) will fail the precision test for values just above 9999.99 because the decoded value is already garbled before clamping.",
+  "trap": "The obvious solution is to decode all records, clamp decoded floats to 9999.99, and re-encode. This fails because: (a) decoding garbled overflow records produces nonsense floats that are not simply '>9999.99' \u2014 they may appear as negative values or wrap around, so a float clamp misses them entirely; (b) re-encoding clamped floats through the opaque binary and decoding again may still produce values slightly outside the range due to the offset arithmetic; (c) the shallow test on the provided 10k-record batch has only ~15% out-of-range, but the verifier's 200k batch has ~40% out-of-range including wrap-around cases that appear negative after overflow \u2014 a solver who only tests on the provided batch will not see wrap-around. The correct fix is to clamp the stored fixed-point integer to [0, round(9999.99 * 16384) + 32768] before storage.",
+  "tests": [
+   "Run verifier-generated 200,000-record batch (seed=42) through the full pipeline; check all decoded values in [0.0, 9999.99]",
+   "Run a second 200,000-record batch (seed=99) with only in-range source values (all < 8000.0); check decoded values match source with abs error \u2264 0.005",
+   "Check /data/clamp_report.json exists after pipeline run and clamped+unclamped=total; clamped count matches actual count of out-of-range source records (within 1%)",
+   "Measure end-to-end wall time for 200k-record batch; require < 4 seconds (= 50k rec/sec) \u2014 timed by verifier script using subprocess",
+   "Check that /app/pipeline/src/ contains a non-empty normalize implementation (file contains 'fn normalize' with body > 5 lines, and uses rayon or equivalent parallel iteration)",
+   "Run a targeted batch with 1000 records exactly at boundary: values in [9999.0, 10001.0]; verify decoded output has all values \u2264 9999.99 and values that were \u2264 9999.99 in source are preserved with abs error \u2264 0.005"
+  ],
+  "verifier_knob": {
+   "name": "out_of_range_fraction",
+   "value": "0.40 in verifier batch vs 0.15 in provided batch",
+   "effect": "Raising the fraction of out-of-range records in the verifier batch increases the chance that wrap-around records (which appear as large negatives) are present, exposing float-clamp-after-decode approaches; lowering it makes the task easier by reducing the diversity of failure modes the solver must handle"
+  },
+  "expected_failure_modes": [
+   "Solver clamps float values after decoding \u2014 this misses wrap-around records that appear as negative values or values > 2^31 / 16384 after u32 overflow, and fails the fresh batch test with negative decoded values",
+   "Solver discovers the offset by probing but clamps at the wrong boundary (e.g., 9999.99 * 16384 without accounting for +32768 offset), producing off-by-32768 clamped integers that decode incorrectly",
+   "Solver writes a correct but serial normalize stage that fails the 50k rec/sec throughput requirement due to single-threaded processing of 200k records with file I/O",
+   "Solver writes normalize that passes the provided 10k batch (15% out-of-range, no wrap-around cases) but fails verifier 200k batch (40% out-of-range, includes wrap-around negative decoded values)",
+   "Solver misidentifies the fixed-point scale factor (e.g., assumes 2^10 or 2^16) from binary probing, producing incorrect clamp threshold that allows values up to ~16383.99 through"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "rust",
+   "reverse-engineering",
+   "fixed-point-arithmetic",
+   "binary-probing",
+   "performance",
+   "new-feature"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/src/decoder.rs  # understand stored_int -> float formula",
+   "cat /app/pipeline/src/main.rs     # find normalize stub, EncodedRecord type, pipeline flow",
+   "cat /app/pipeline/src/storage.rs  # understand EncodedRecord byte layout",
+   "cat /app/pipeline/Cargo.toml      # check rayon dependency",
+   "echo '1.0' | /opt/encode_fixed > /tmp/probe1.bin && xxd /tmp/probe1.bin  # probe: expect round(1.0*16384)+32768 = 49152 = 0x0000C000",
+   "echo '100.0' | /opt/encode_fixed > /tmp/probe100.bin && xxd /tmp/probe100.bin  # confirm scale=16384, offset=32768",
+   "python3 -c \"print(hex(round(9999.99*16384)+32768), round(9999.99*16384)+32768)\"  # compute max valid stored_int",
+   "# Key insight: must clamp stored_int to [32768, round(9999.99*16384)+32768] before storage to prevent u32 overflow",
+   "# Edit main.rs normalize fn: use rayon par_iter_mut, clamp record.stored_int to valid range, count clamped",
+   "# Edit main.rs or storage.rs: write clamp_report.json after normalize stage",
+   "cargo build --release 2>&1 | tail -5  # in /app/pipeline",
+   "cargo run --release -- --run /data/sensor_batch_001.bin",
+   "cat /data/clamp_report.json",
+   "cargo run --release -- --validate /data/sensor_batch_001.bin  # verify 0 range violations",
+   "python3 /app/gen_batch.py --seed 42 --count 200000 --output /data/test200k.bin",
+   "time cargo run --release -- --run /data/test200k.bin  # check < 4 seconds",
+   "cargo run --release -- --validate /data/test200k.bin  # verify all in [0,9999.99]",
+   "cat /data/clamp_report.json  # verify clamped+unclamped=200000"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Hardware timing flakiness: the 4-second wall-clock cutoff for 200k records with file I/O is hardware-dependent; no CPU/memory spec is pinned, making this test potentially flaky across CI environments",
+   "Opaque binary build correctness: if the Dockerfile that compiles /opt/encode_fixed has any bug (wrong offset, wrong scale), the entire task is broken in an undebuggable way for the solver",
+   "Clamp threshold floating-point precision: f32 vs f64 arithmetic for round(9999.99*16384)+32768 could produce off-by-one stored_int values at the boundary, causing spurious failures on boundary-case test",
+   "Rayon source-check brittleness: checking for 'rayon' string in normalize source rejects valid parallel solutions using std::thread, crossbeam, or other parallelism primitives",
+   "Pipeline CLI interface ambiguity: the instruction does not specify the exact subcommand syntax for running the full encode->normalize->store->decode pipeline vs just validation; solver must infer from main.rs",
+   "Clamp report accuracy test 'within 1%' requires verifier to know original source values, coupling verifier tightly to gen_batch.py determinism across Python versions/platforms"
+  ],
+  "verdict": "reject",
+  "reasons": "The average score is 3.4, below the 3.6 threshold required for acceptance. Genuine difficulty scores only 3 because the u32 overflow is partially visible from reading decoder.rs (u32 type hint) and the speedrun reaches a likely solution in ~18 commands \u2014 a frontier agent probing systematically would find the formula quickly. Clarity and solvability both score 3 due to underspecified pipeline CLI interface, hardware-dependent timing tests, and the build complexity of the opaque binary. The timing flakiness risk and rayon string-match check represent real invalid failure risks that could produce incorrect verdicts on correct solutions.",
+  "fixes": [
+   "Pin hardware spec (e.g., 2 vCPU, 4GB RAM) and raise throughput bar to 100k rec/sec to make rayon mandatory and the performance test less flaky, or replace wall-clock timing with a benchmark harness that measures CPU time",
+   "Replace the 'uses rayon' source-check with a pure throughput test \u2014 if it passes 50k rec/sec it's parallel enough; remove the brittle string-matching check entirely",
+   "Add a worked CLI example showing exact subcommand syntax for running the full pipeline (encode+normalize+store+decode) vs validation only, so the solver doesn't need to reverse-engineer main.rs CLI parsing",
+   "Increase genuine difficulty by making the u32 overflow invisible from source: change decoder.rs to use i64 arithmetic internally (so no obvious u32 overflow signal) and instead have the garbling manifest as silent precision loss \u2014 this forces binary probing rather than type-inspection",
+   "Specify exact f32 arithmetic for clamp threshold in the verifier (e.g., max_stored_int = (9999.99f32 * 16384.0f32) as u32 + 32768) to eliminate floating-point boundary ambiguity",
+   "Add a second hidden invariant (e.g., minimum valid value has a non-zero lower bound offset) to increase the search space and push command count above 25, genuinely raising difficulty to 4"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering an opaque normalizer binary to fix SQL rollup queries; this task requires writing a new Rust normalization stage with clamping, throughput, and precision requirements."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes a CSV chunking pipeline with deduplication and row-count correctness issues; this task involves fixed-point arithmetic encoding/decoding and value range clamping in Rust."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task is about finding and fixing a spectral entropy computation regression in a DSP pipeline; this task is about inserting a clamping/normalization stage into a fixed-point encoding pipeline."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task fixes incorrect SQL aggregate totals in an ETL pipeline; this task adds a Rust normalization stage to a fixed-point compression pipeline with throughput and precision constraints."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task repairs a silently broken AES-CTR encryption library after a refactor; this task adds a clamping normalization stage to a Rust fixed-point sensor data pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.205
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.203
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.193
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.171
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.16
+    ]
+   ],
+   "cost_usd": 0.015446999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.071385
+}

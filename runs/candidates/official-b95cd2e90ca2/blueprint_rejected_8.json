@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "aes-ctr-log-replay-audit",
+  "title": "AES-CTR Log Replay Key Derivation Audit",
+  "scenario": "A database administrator is investigating a post-incident audit failure: the encrypted operation log service (which records all DML events) produces logs that cannot be replayed consistently. The system is a Node.js microservice (~1400 lines across 6 files) that encrypts each log batch with AES-128-CTR, derives per-batch keys from a master secret and batch metadata, and provides a replay/verify daemon that reconstructs plaintexts for forensic review. After a schema-change incident, replay of logs from before the incident silently produces garbled output rather than erroring \u2014 the DBA needs the replay to be bit-exact.",
+  "instruction_draft": "Hey, so we had the schema incident last week and now the replay service is broken \u2014 when I feed it old log batches it either decrypts garbage or occasionally crashes, and I can't tell which batches are affected without running each one. The logs themselves are in /opt/auditlog/batches/ and the service lives in /opt/auditlog/. Can you fix it so that replay of any batch produces the exact same plaintext that was encrypted at write time? The key derivation, counter initialization, and batch-header parsing all have to stay consistent end-to-end across all batches regardless of which node wrote them or when. Don't change the on-disk batch format.",
+  "requirements": [
+   "Replaying any stored batch produces the exact plaintext that was encrypted at write time",
+   "Key derivation is consistent: the same batch metadata always produces the same AES-128-CTR key",
+   "CTR counter initialization is consistent with the value used at encryption time",
+   "Batch-header parsing correctly extracts all fields needed for key derivation on all batches",
+   "The replay service handles batches written by different simulated nodes without silent corruption",
+   "No change to the on-disk batch format is permitted"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20.x via nodesource, installs npm packages (node-forge or native crypto only)",
+   "/opt/auditlog/ contains the service: writer.js (encrypts and writes batches), replay.js (decrypts and verifies), key_derive.js (KDF logic), header.js (batch header encode/decode), metrics.js (Prometheus-style counters), config.js (~80 lines of configuration)",
+   "writer.js: derives a 16-byte AES-128-CTR key via HKDF-SHA256(master_secret, salt=batchId_bytes, info=nodeId+timestamp_floor), initializes CTR with a 16-byte IV where bytes [0:4] are the batch sequence number (big-endian uint32) and bytes [4:16] are zeros \u2014 BUT the IV construction uses a little-endian write for the sequence number, silently wrong",
+   "key_derive.js: HKDF expand step uses output length in bytes but the extract step passes the salt through Buffer.from(salt, 'hex') when the salt is already a raw Buffer, double-hex-encoding it for batches whose batchId was stored as a hex string vs raw bytes (depends on which code path wrote the batch \u2014 old writer vs new writer after the schema change)",
+   "header.js: parses the fixed 64-byte batch header; one field (nodeId) is read as utf8 but written as ascii in the new writer, causing trailing null bytes to be included in the nodeId string fed to HKDF info, changing the derived key for newer batches",
+   "replay.js: calls key_derive.js with arguments in a different order than writer.js (nodeId and timestamp_floor swapped in the info concatenation), so derived key never matches",
+   "/opt/auditlog/batches/ contains 12 pre-generated batch files: 6 written by old writer path (batchId as raw bytes) and 6 by new writer path (batchId as hex string), covering 3 different simulated nodeIds",
+   "metrics.js and config.js are plausible but uninvolved in the bug",
+   "A seed script /opt/auditlog/generate_batches.sh regenerates the batches deterministically from a fixed master secret stored in config.js so the solver can verify round-trips",
+   "The master secret is a fixed 32-byte hex string in config.js",
+   "Tests import key_derive.js, header.js, writer.js logic, and replay.js logic directly and call them with fresh (seeded, deterministic) batch metadata inputs generated at verify time"
+  ],
+  "internal_hint": "There are three independent bugs that must all be fixed for any batch to replay correctly: (1) IV construction in writer.js uses little-endian for the CTR sequence number but replay.js uses big-endian (or vice versa) \u2014 discoverable only by comparing actual CTR behavior on test data, not by reading one file; (2) key_derive.js double-hex-encodes the salt when batchId is already a Buffer, causing different keys for the two writer paths \u2014 discoverable by running both paths and observing that 6 batches decrypt and 6 don't; (3) replay.js swaps nodeId and timestamp_floor in the HKDF info string compared to writer.js \u2014 discoverable by adding instrumentation to compare intermediate KDF inputs. The agent must run the system on real batches to notice that exactly half fail (bug 2), then instrument to find which field differs (bug 3), and only when testing CTR offsets notice the endianness issue (bug 1). All three must be fixed for the fuzz-equivalence tests to pass since tests generate fresh batchIds, nodeIds, and sequence numbers at verify time.",
+  "trap": "A naive agent finds and fixes one or two of the three bugs (most likely the argument-order swap in replay.js which is visible by diffing the two call sites), sees that some batches now decrypt correctly, and stops. The verify-time tests generate batches with odd sequence numbers and hex-string batchIds that exercise the endianness bug and double-encoding bug simultaneously \u2014 batches that happen to have sequence number 0 or matching endianness by accident will pass the sample check but fresh inputs will fail. An agent that only fixes the argument swap will pass ~3/12 sample batches and think it's done.",
+  "tests": [
+   "For N=40 fresh (deterministic, seeded) batch descriptors with varied batchId format (raw vs hex-string), nodeId (ascii-safe strings of lengths 4\u201316), sequence numbers (0, 1, 255, 256, 65535, 2^24-1), and timestamp floors: encrypt a known plaintext using the writer logic, then replay using the replay logic, assert exact byte equality of recovered plaintext",
+   "Key derivation consistency test: for N=30 fresh inputs, call key_derive.js with the same arguments twice and assert identical 16-byte output, and assert that swapping nodeId/timestamp_floor produces a different key",
+   "IV round-trip test: for N=20 fresh sequence numbers including multi-byte values, assert that the IV bytes produced by writer and replay encode the sequence number identically (endianness agreement)",
+   "Header round-trip test: for N=20 fresh nodeId strings (including those with lengths requiring padding), assert that encode then decode returns the identical nodeId with no trailing null bytes",
+   "Cross-node consistency: for 3 fixed nodeIds and 5 sequence numbers each, assert that batches written under different nodeIds all replay correctly (exercises the nodeId utf8/ascii path)"
+  ],
+  "verifier_knob": {
+   "name": "N_fuzz_inputs",
+   "value": "40",
+   "effect": "Increasing N raises the probability that sequence numbers and batchId formats are generated that expose the endianness and double-encoding bugs even if the agent partially fixed them; lowering N to 5 makes it likely that random seed produces only sequence-number-0 cases that pass despite the endianness bug"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the argument-order swap (most visible bug), passes ~half the sample batches, declares done",
+   "Agent fixes the argument swap and the double-hex-encoding but misses the endianness bug because test sequence numbers happen to be small (0 or 1) where endianness doesn't matter for the sample",
+   "Agent notices the endianness issue in isolation but then reintroduces the argument-order bug while refactoring, breaking previously passing tests",
+   "Agent changes the on-disk batch format to avoid the header parsing issue, violating the explicit constraint",
+   "Agent instruments only replay.js without checking whether writer.js and replay.js agree on each KDF input, missing that writer.js is the source of truth and replay.js has the swapped arguments"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "aes-ctr",
+   "key-derivation",
+   "nodejs",
+   "audit-logs",
+   "devops",
+   "incident-response"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/auditlog/config.js",
+   "cat /opt/auditlog/writer.js",
+   "cat /opt/auditlog/replay.js",
+   "cat /opt/auditlog/key_derive.js",
+   "cat /opt/auditlog/header.js",
+   "# Bug 3 spotted: replay.js swaps nodeId/timestamp_floor in info concat vs writer.js",
+   "# Bug 2 spotted: key_derive.js does Buffer.from(salt, 'hex') when salt may already be Buffer",
+   "# Bug 1 spotted: writer.js uses writeUInt32LE, replay.js uses writeUInt32BE (or vice versa) for CTR IV",
+   "# Bug 4 spotted: header.js reads nodeId as utf8 vs ascii causing trailing nulls",
+   "sed -i 's/writeUInt32LE/writeUInt32BE/' /opt/auditlog/writer.js  # fix endianness",
+   "# Edit key_derive.js to check if salt is already a Buffer before hex-decoding",
+   "node -e \"const kd=require('./key_derive.js'); /* test salt handling */\"",
+   "# Edit replay.js to swap nodeId/timestamp_floor back to match writer.js order",
+   "# Edit header.js to trim trailing null bytes from nodeId on decode",
+   "bash /opt/auditlog/generate_batches.sh",
+   "for f in /opt/auditlog/batches/*; do node /opt/auditlog/replay.js $f && echo OK; done",
+   "# All 12 pass; done"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "All three bugs are statically visible by reading 4 files; a skilled agent can find and fix all of them without running any batches, bypassing the intended empirical discovery path described in the hint",
+   "The blueprint's 'trap' (fixing only the argument swap) relies on an agent not reading writer.js carefully, but any agent that reads both files side-by-side will see both the argument swap and the endianness issue simultaneously",
+   "The endianness bug is described as discoverable 'only by comparing actual CTR behavior on test data, not by reading one file' but this is wrong \u2014 reading both writer.js and replay.js makes it immediately visible as a static diff",
+   "Sequence number edge cases (0, 1) where LE==BE may cause an agent to think endianness is fixed after only testing those values, but this is only a trap for agents who don't read the source",
+   "The double-hex-encoding bug in key_derive.js is isolated in one function and straightforwardly visible; it doesn't require running both writer paths",
+   "The Dockerfile uses python:3.13-slim-bookworm with Node.js via nodesource \u2014 if nodesource CDN is unavailable at build time, the container fails to build (internet dependency during build)",
+   "The generate_batches.sh script must be deterministic and pre-seeded; if it has any non-determinism (e.g., timestamps), verify-time tests may not match pre-stored batches",
+   "The instruction says 'Don't change the on-disk batch format' but fixing the header.js ascii/utf8 issue could be interpreted as changing how headers are written vs read, creating ambiguity about which side to fix"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: all three bugs are statically visible by reading the four relevant source files side-by-side, allowing a skilled agent to identify and fix everything in ~17 commands without needing to run any batches empirically. The blueprint's own hint incorrectly states the endianness bug is 'discoverable only by comparing actual CTR behavior on test data' when it is in fact immediately apparent from a static diff of writer.js and replay.js. The intended difficulty (requiring empirical exploration, instrumentation, and cross-component correlation) collapses to a straightforward code-reading exercise.",
+  "fixes": [
+   "Make at least one bug non-statically-discoverable: e.g., move the endianness bug into a compiled native addon or obfuscate the IV construction through an intermediate abstraction so it cannot be spotted by simple file diffing",
+   "Add a fourth bug that only manifests under specific runtime conditions (e.g., a race condition in batch ID generation, or a bug that only triggers when the Node.js process has restarted mid-batch-sequence) to force empirical discovery",
+   "Replace the 'swap two arguments' bug with something requiring dynamic analysis: e.g., the KDF info field is computed correctly in both files but one file reads a config value that was silently changed by the schema migration, so the agent must correlate config state with batch timestamps rather than diffing two call sites",
+   "Make the bug corpus larger and heterogeneous enough that reading source alone is insufficient \u2014 e.g., have the bugs span across 3+ code paths that are activated by runtime feature flags stored in the batch headers, so the agent must run batches to determine which flag values are in play",
+   "If keeping the current bug set, increase difficulty by removing the generate_batches.sh regeneration script so the agent cannot easily verify round-trips and must construct test cases from scratch"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "This task is about log schema validation and throughput performance in a Node.js pipeline, not encryption or key derivation."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing AES-128-CTR encryption/decryption bugs where silent corruption occurs due to broken key derivation or nonce initialization after a refactor, with the same core cryptographic debugging challenge; the main differences are language (Node.js vs C), storage backend (log files vs SQLite), and framing (audit logs vs research reproduction)."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task is about building an HTTP query service over a log aggregation engine, not fixing encryption or key derivation bugs."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "This task involves fixing an HMAC chain verification bug for audit log integrity checking, not AES-CTR key derivation or decryption consistency."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "This task is about fixing incorrect weighted sales aggregation computations in a compiled service, unrelated to encryption or cryptographic key derivation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-94391df591b0",
+     0.126
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.118
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.111
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.095
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.087
+    ]
+   ],
+   "cost_usd": 0.013947000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05523
+}

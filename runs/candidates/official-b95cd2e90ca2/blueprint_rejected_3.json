@@ -1,0 +1,160 @@
+{
+ "blueprint": {
+  "slug": "hmac-log-key-derivation-repair",
+  "title": "HMAC Audit Log Key Derivation Repair",
+  "scenario": "A database administrator is investigating an incident where audit log integrity checks began failing silently after a scheduled key rotation three weeks ago. The system has a Node.js audit log pipeline (~1,200 lines across several components) that derives per-session HMAC keys from a master secret using a KDF, appends cryptographic tags to each log entry, and emits metrics. Since the rotation, the verifier service reports all post-rotation logs as valid, but an offline spot-check script\u2014written by the previous admin and left in /opt/audit/tools/\u2014disagrees with the live verifier on roughly half of recent entries. No reproduction steps were left behind.",
+  "instruction_draft": "Hey, something's off with the audit log HMAC system since we rotated the master key. The live verifier says everything's fine but the offline spot-check tool flags about half the recent entries as corrupt\u2014and I don't trust the live verifier anymore. I need you to figure out what's going wrong, find at least one concrete failing entry in the logs, and fix the HMAC computation so the offline tool and the live verifier agree on fresh entries going forward. The fix needs to be in the signing code itself\u2014the per-session key derivation and the HMAC tag appended to each entry both have to be correct. Don't touch the spot-check tool, that one's the reference.",
+  "requirements": [
+   "Identify at least one log entry where the live verifier and the spot-check tool disagree",
+   "Fix the signing/key-derivation code so that for any new log entry, the HMAC tag produced matches what the spot-check tool would compute",
+   "The per-session key must be derived from the master secret, session ID, and entry sequence number using the same KDF the spot-check tool uses",
+   "The HMAC tag appended to each log entry must be computed over the canonical serialization of the entry fields in the order the spot-check tool expects",
+   "Fresh log entries written after the fix must pass both the live verifier and the spot-check tool"
+  ],
+  "environment": [
+   "Node.js 20 installed; no internet access",
+   "/opt/audit/service/ \u2014 the live audit log pipeline (~900 lines): src/logger.js (entry construction and signing), src/kdf.js (key derivation), src/verifier.js (tag checking), src/metrics.js (Prometheus counters), src/server.js (HTTP endpoints), package.json",
+   "/opt/audit/tools/spot_check.js \u2014 ~180-line reference verifier written by the previous admin; uses its own KDF and HMAC logic directly; treat as ground truth; do not modify",
+   "/var/log/audit/sessions/ \u2014 several hundred real log files produced before and after the key rotation, with embedded HMAC tags",
+   "/etc/audit/master.key \u2014 the current master secret (written after rotation)",
+   "/etc/audit/master.key.prev \u2014 the previous master secret",
+   "Planted bugs: (1) kdf.js derives the per-session key using HMAC-SHA256(master, sessionId) but the spot-check tool uses HMAC-SHA256(master, sessionId || ':' || sequenceNumber.toString(16).padStart(8,'0')); (2) logger.js serializes entry fields as JSON.stringify(entry) but the spot-check tool expects fields concatenated in a fixed order: timestamp + '|' + sessionId + '|' + sequenceNumber + '|' + action + '|' + user + '|' + payload \u2014 so the HMAC input differs; (3) a metrics counter in metrics.js increments on every verify call but uses a stale key reference that doesn't affect correctness but adds noise to logs",
+   "The live verifier was updated at rotation time to match the broken kdf.js, so it agrees with the broken logger \u2014 which is why it reports no errors",
+   "Log entries written before rotation used the old master secret and the old (correct) KDF, so they pass the spot-check tool; entries written after rotation fail",
+   "A /opt/audit/tools/generate_test_entry.js helper script that creates a single entry and prints what both systems compute, to assist investigation",
+   "Dockerfile installs node:20-slim, copies all files, runs npm install, starts the service on port 7744"
+  ],
+  "internal_hint": "The difficulty is not-visible-by-reading: both kdf.js and logger.js look plausible and the live verifier was updated to match them, so reading each file in isolation looks correct. The solver must run the spot-check tool against real log entries to observe divergence, then instrument generate_test_entry.js or add console output to compare intermediate values (the derived key and the HMAC input bytes) between the two systems. Only by diffing the actual byte buffers passed to HMAC in both paths does the solver discover (a) the sequence-number suffix is missing from the KDF input and (b) the serialization order differs. Both bugs must be fixed together\u2014fixing only one causes the KDF to align but the HMAC input to still differ, so the spot-check tool still fails on fresh entries. The cross-component consistency lever fires here: kdf.js and logger.js each have a bug, and fixing just one leaves the other misaligned; the metrics noise in metrics.js is a red herring that wastes time.",
+  "trap": "A solver that fixes only the KDF (the more obvious discrepancy since it involves a clear formula difference) will see many pre-existing log entries start passing and incorrectly conclude the fix is complete. The fuzz-equivalence tests generate fresh entries at verify time with random session IDs, sequence numbers, and payloads, then compare the HMAC tag produced by the fixed logger against the tag produced by spot_check.js running on the same inputs. If the serialization order bug is not also fixed, roughly half the fresh entries (those where JSON.stringify happens to produce a different ordering than the canonical pipe-delimited format, which is always) will fail.",
+  "tests": [
+   "Test 1 \u2014 Spot-check disagreement detection: Run spot_check.js against the post-rotation log files in /var/log/audit/sessions/; assert that at least one entry fails (confirms the solver found the failing case and did not just accept the live verifier's claims)",
+   "Test 2 \u2014 Fresh entry KDF correctness: Generate 200 fresh log entries with random (sessionId, sequenceNumber) pairs drawn at verify time using a seeded PRNG; for each, extract the derived per-session key logged by the fixed service and recompute it using spot_check.js's KDF; assert all 200 match",
+   "Test 3 \u2014 Fresh entry HMAC tag correctness: For the same 200 fresh entries, extract the HMAC tag from the entry as written by the fixed service; recompute the expected tag using spot_check.js's serialization and the correctly derived key; assert all 200 tags match exactly (hex comparison)",
+   "Test 4 \u2014 Cross-component consistency: Call the live service's /verify endpoint on each of the 200 fresh entries after the fix; assert the live verifier and spot_check.js both return valid=true for all 200",
+   "Test 5 \u2014 Pre-rotation entries unaffected: Run spot_check.js against a sample of pre-rotation log entries (which used the old master key); assert they still pass spot_check.js (confirms the fix did not break backward compatibility with old-key entries by touching the wrong layer)",
+   "Test 6 \u2014 No regression on well-formed entries: Feed 50 edge-case entries at verify time (empty payload, max-length user strings, sequence number = 0, sequence number = 0xFFFFFFFF, Unicode in action field) through the fixed service and spot_check.js; assert agreement on all"
+  ],
+  "verifier_knob": {
+   "name": "num_fuzz_entries",
+   "value": "200",
+   "effect": "Lowering to 20 makes shallow fixes that are accidentally correct on small inputs pass; raising to 500+ increases the chance of hitting edge cases in serialization (empty fields, special characters, sequence number boundaries) that expose partial fixes"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the KDF bug (adds sequence number suffix) but misses the serialization-order bug in logger.js; fresh entries still fail because HMAC input bytes differ",
+   "Agent fixes only the serialization-order bug but not the KDF; the derived key is wrong so all HMAC tags still fail",
+   "Agent modifies spot_check.js (the reference tool) to match the broken service instead of fixing the service \u2014 explicitly forbidden but a plausible mistake under time pressure",
+   "Agent verifies by running spot_check.js only against pre-rotation log entries (which pass regardless) and concludes the fix is complete without testing fresh entries",
+   "Agent discovers the metrics.js noise and spends significant time chasing it as the root cause",
+   "Agent hard-codes the expected HMAC for a specific test entry rather than fixing the general computation, which passes manual checks but fails the fuzz-equivalence tests on unseen inputs"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "cryptography",
+   "hmac",
+   "key-derivation",
+   "devops",
+   "nodejs",
+   "audit-logs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/audit/tools/spot_check.js  # note KDF: HMAC-SHA256(master, sessionId+':'+seq.hex8) and serial: ts|sid|seq|action|user|payload",
+   "cat /opt/audit/service/src/kdf.js   # sees HMAC-SHA256(master, sessionId) \u2014 bug 1 immediately visible",
+   "cat /opt/audit/service/src/logger.js  # sees JSON.stringify(entry) \u2014 bug 2 immediately visible",
+   "cat /opt/audit/service/src/verifier.js  # check it calls kdf.js (will need updating too)",
+   "# Edit kdf.js: change deriveKey(master, sessionId) to HMAC-SHA256(master, sessionId+':'+seqNum.toString(16).padStart(8,'0'))",
+   "# Edit logger.js: change JSON.stringify(entry) to timestamp+'|'+sessionId+'|'+seqNum+'|'+action+'|'+user+'|'+payload",
+   "# Edit verifier.js: ensure it calls updated kdf.js with sequenceNumber argument",
+   "npm install && node src/server.js &",
+   "node /opt/audit/tools/generate_test_entry.js  # confirm both systems agree on a fresh entry",
+   "node /opt/audit/tools/spot_check.js /var/log/audit/sessions/<post-rotation-file>  # confirm fresh pass, old pre-rotation still pass"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Test 1 checks that post-rotation entries fail spot_check.js \u2014 this verifies environment setup, not solver work; if log generation had a bug it could cause spurious test failures unrelated to solver actions",
+   "Test 5 checks pre-rotation entries still pass spot_check.js \u2014 these used the old master key (master.key.prev); if spot_check.js always uses /etc/audit/master.key (the new one), pre-rotation entries would have failed even before the fix, making this test meaningless or confusing",
+   "Verifier.js must also be updated (to pass Test 4) but the instruction only says 'fix the signing code itself' and 'don't touch the spot-check tool' \u2014 a solver might not realize verifier.js needs changes too, creating an ambiguous failure",
+   "The blueprint says verifier.js was 'updated at rotation time to match the broken kdf.js' \u2014 if verifier.js directly copies the KDF logic rather than calling kdf.js, fixing kdf.js won't fix the verifier, and the solver must also fix verifier.js; this dependency is not stated in the instruction",
+   "The generate_test_entry.js helper may internally use one of the broken modules, making it misleading during investigation rather than helpful",
+   "Seeded PRNG for fuzz tests: the blueprint says 'seeded PRNG' but doesn't specify the seed or PRNG algorithm \u2014 if this is hardcoded in the test harness but not documented, any environment variance could cause flakiness"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score of 2 disqualifies this task \u2014 both planted bugs are immediately visible by reading the source files (spot_check.js plainly shows the expected formulas; kdf.js and logger.js plainly show the divergent implementations), so a competent agent solves this in ~10 commands without any runtime investigation. The blueprint's own internal hint contradicts itself by claiming bugs are 'not visible by reading' while describing exactly what is written in each file. Additionally, the instruction does not mention that verifier.js must also be fixed to pass Test 4, creating an ambiguity risk for valid failures.",
+  "fixes": [
+   "Obfuscate the bugs: instead of having spot_check.js use a visually distinct formula, make both KDFs use HMAC-SHA256 with nearly identical-looking inputs (e.g., different byte-order of the same fields, or a subtle off-by-one in padding width like padStart(7) vs padStart(8)) so the discrepancy only surfaces at runtime by comparing byte buffers",
+   "Obfuscate the serialization bug: instead of JSON.stringify vs pipe-delimited (obviously different), use two different field-ordering JSON serializations (e.g., alphabetical vs insertion-order) that look similar in source but produce different bytes \u2014 forcing runtime comparison to find the bug",
+   "Add explicit instruction text: state that verifier.js must also be updated to agree with the fixed kdf.js, and add a test that explicitly checks verifier.js was not left in its broken state",
+   "Fix the pre-rotation backward compatibility test (Test 5): clarify how spot_check.js handles the old master key \u2014 does it accept both keys, only the new one, or is there a key-selection mechanism? Without this, Test 5 may be ambiguous or always-pass/always-fail"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "variant",
+     "reason": "Both involve fixing a broken HMAC audit log verifier where a bug causes disagreement between verification methods, but the candidate adds per-session key derivation via KDF and focuses on signing code repair rather than chain verification protocol responses."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference is a TCP service computing HMAC tags over WAL records with canonical binary serialization; the candidate is about repairing KDF-based per-session key derivation and HMAC signing in a Node.js audit log pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "The reference is a CTF credential extraction challenge involving XOR obfuscation in a Go binary; the candidate is a Node.js HMAC key derivation and signing bug repair task."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference involves fixing a log enrichment pipeline with GeoIP enrichment and a Flask API; the candidate is about HMAC key derivation and signing correctness in an audit log system."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference involves building an HTTP query service over a SQLite metrics database with a compiled engine; the candidate is about repairing HMAC signing and KDF logic in a Node.js audit log pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-cff69805912b",
+     0.389
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.157
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.113
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.108
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.103
+    ]
+   ],
+   "cost_usd": 0.015261
+  },
+  "novel": false
+ },
+ "cost_usd": 0.06204900000000001
+}

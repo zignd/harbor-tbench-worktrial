@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "build-artifact-cost-rollup-repair",
+  "title": "Build Artifact Cost Rollup Repair",
+  "scenario": "You are a finance-ops engineer at a mid-sized SaaS company responsible for reconciling monthly cloud build costs. The engineering team runs a home-grown build accounting system (~1,200 lines across several Python and SQL components) that ingests raw artifact logs from the CI/CD system, normalizes storage units, and rolls up costs per team and per project. Last month's report showed several teams with impossibly low totals, and one team's bill was zero despite hundreds of logged artifact uploads.",
+  "instruction_draft": "The build cost accounting system lives at /app/buildcost. Running `python /app/buildcost/main.py --month 2024-09` should write a CSV to /app/output/report_2024-09.csv with one row per (team, project) pair containing: team, project, artifact_count, total_gb, total_cost_usd. The system is broken in at least two ways that interact \u2014 the sample month's numbers look plausible but the totals are wrong. Fix the system so that: (1) every artifact upload contributes to exactly one (team, project) row, (2) total_gb is the sum of artifact sizes after converting all size fields to gigabytes using the unit recorded alongside each size, (3) total_cost_usd equals total_gb multiplied by the per-team storage rate stored in the rates table, and (4) artifact_count and total_gb are never zero for a team-project pair that has uploads. The fix must be entirely within /app/buildcost \u2014 do not modify the SQLite database files or input logs. The repaired pipeline must produce correct results for any month of input data, not just the sample.",
+  "requirements": [
+   "Every artifact upload in the raw logs contributes to exactly one (team, project) row in the output CSV",
+   "total_gb is computed by converting each artifact's size to gigabytes using the unit field (KB, MB, GB, TB) recorded per artifact",
+   "total_cost_usd equals total_gb multiplied by the per-team storage rate from the rates table",
+   "artifact_count and total_gb are never zero for any (team, project) pair that has uploaded artifacts",
+   "The fix must be confined to files under /app/buildcost \u2014 no modification to SQLite DB files or raw input logs",
+   "The pipeline produces correct output for any arbitrary month of input data"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm, installs sqlite3 CLI and python packages: click, pandas",
+   "Directory /app/buildcost/ contains: main.py (orchestrator, ~120 lines), ingest.py (~200 lines, parses raw log JSON and inserts into SQLite), normalize.py (~150 lines, unit conversion), rollup.sql (~80 lines, aggregation query), rates.py (~100 lines, loads per-team rates), schema.sql (~60 lines, defines artifacts and rates tables)",
+   "Bug 1 (data-dependent, not visible by reading): ingest.py inserts artifact sizes into the DB using Python's sqlite3 executemany with a parameter list built from a dict \u2014 but the dict comprehension uses 'size' as key for both the numeric value and the unit string due to a variable shadowing error in a nested loop over parsed JSON fields. The unit column ends up as the stringified size integer for some artifact classes (those parsed in the inner loop), and NULL for others. This only manifests when the JSON log has nested 'metadata' objects (which multi-part artifacts do), so simple artifacts look correct.",
+   "Bug 2 (interacts with Bug 1): normalize.py's unit conversion function treats NULL unit as 'GB' (a silent default), so the NULL-unit artifacts from Bug 1 appear to convert correctly for single-part artifacts. But the rollup.sql GROUP BY uses COALESCE(unit,'GB') too, so totals for teams that only have single-part artifacts appear correct in the sample month \u2014 only teams with multi-part artifacts (which have swapped unit/size) are wrong. The sample month has one team with only single-part artifacts (looks fine) and one team with only multi-part artifacts (wrong but the magnitude isn't obviously impossible).",
+   "rates table has per-team rates in USD/GB, seeded for 4 teams; the artifacts table schema has columns: id, team, project, artifact_name, size_bytes_raw, unit, uploaded_at",
+   "Sample input: /app/data/artifacts_2024-09.json (300 artifact records, mix of single-part and multi-part, two teams look plausible, one team is zero because all its records hit the shadowing bug and produce nonsensical unit values that the conversion then misinterprets as TB-scale numbers which overflow to NULL in SQLite integer arithmetic)",
+   "main.py wires ingest -> normalize -> rollup -> write CSV; output dir /app/output/ is created by main.py",
+   "Plausible but uninvolved code: a retry wrapper in utils.py, a logging config in log_config.py, a separate cost_anomaly.py that flags outliers (not part of the pipeline output)",
+   "Hidden test inputs are generated at verify time: 5 different month JSON files with varying mixes of single-part and multi-part artifacts, including edge cases: a team with only TB-scale artifacts, a team with mixed KB and GB artifacts in the same project, a project with exactly one artifact"
+  ],
+  "internal_hint": "Root cause 1 (requires running the ingester and inspecting the DB): In ingest.py, a loop over JSON fields does `for field, val in record['metadata'].items(): row[field] = val` inside an outer loop that already set `row['size'] = record['size']` and `row['unit'] = record['unit']`. When 'metadata' contains a key 'size' (which multi-part artifacts do, storing a chunk size), it overwrites row['size'] with the chunk size integer, and the original row['unit'] gets overwritten by whatever 'metadata' key follows 'size' in dict iteration order. The fix: use separate namespaces or explicitly extract only known fields from metadata. Root cause 2 (only visible after fixing root cause 1, because fixing root cause 1 makes previously-wrong rows now have correct sizes but they still use the wrong unit due to the COALESCE in rollup.sql): normalize.py correctly converts known units, but rollup.sql does its own COALESCE(unit,'GB') aggregation rather than using the pre-normalized size_gb column that normalize.py writes. So after ingest is fixed, the rollup still uses raw size_raw * a per-unit factor inline, and the inline factor table in rollup.sql has KB=1e-6 instead of 1e-6 (it uses 1/1000/1000 computed as integer division in SQLite, which yields 0 for inputs < 1000000). Fix: use the size_gb column written by normalize.py, or fix the SQLite arithmetic to use 1.0/1000/1000.",
+  "trap": "A solver who fixes only the ingest variable-shadowing bug will see the sample month's output improve (the zero-total team now has values) but the KB-scale artifacts will silently produce zero GB because of SQLite integer division in the rollup SQL. The sample month happens to have no KB-scale artifacts for the repaired team, so the fix looks complete. Hidden test inputs include a team with KB-only artifacts whose total_gb would be zero without the second fix, and a project with mixed KB and GB artifacts where total_gb would be underreported by orders of magnitude.",
+  "tests": [
+   "Run pipeline on the provided sample month 2024-09; verify artifact_count matches ground truth per (team,project), total_gb within 0.1% of expected, total_cost_usd = total_gb * rate within 0.01%",
+   "Verify-time: generate a month with one team having only KB-scale artifacts (e.g., 500 artifacts each 512 KB); check total_gb is approximately 0.244 GB, not 0",
+   "Verify-time: generate a month with mixed KB and GB artifacts in the same project; check total_gb equals sum of correctly converted individual sizes",
+   "Verify-time: generate a month with multi-part artifacts (metadata.size present) for every team; check no team has artifact_count=0 or total_gb=0",
+   "Verify-time: generate a month with TB-scale artifacts for one team; verify total_cost_usd is plausibly large (> 1000 USD) not zero",
+   "Verify-time: generate a month with a project containing exactly one artifact of 1 GB; check that row appears in output with artifact_count=1, total_gb=1.0, total_cost_usd=rate",
+   "Check that no files outside /app/buildcost were modified (stat check on DB files and input logs)"
+  ],
+  "verifier_knob": {
+   "name": "tolerance_pct",
+   "value": "0.1",
+   "effect": "Tightening to 0.01% requires exact arithmetic (no float rounding shortcuts); loosening to 1% allows minor precision bugs to pass. At 0.1%, the SQLite integer division bug (producing exactly 0 for KB artifacts) still fails hard, but minor float precision errors pass."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the ingest variable-shadowing bug, tests on the sample month (which has no KB-only teams after the ingest fix), declares success, and fails hidden KB-scale tests",
+   "Agent spots the COALESCE in rollup.sql but patches it incorrectly (e.g., changes default to 'MB' rather than fixing the integer division), passing sample tests but failing TB-scale hidden tests",
+   "Agent reads rollup.sql and normalize.py and assumes the unit conversion path is correct because both files reference the same column name, missing that rollup.sql bypasses normalize.py's output and recalculates inline with integer division",
+   "Agent fixes ingest.py correctly but does not re-run the pipeline to discover that total_gb is still wrong for KB artifacts \u2014 the two bugs must both be exercised on real data to see both failures"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "build-systems",
+   "finance-ops",
+   "data-pipeline",
+   "sqlite",
+   "unit-conversion"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/buildcost/main.py",
+   "cat /app/buildcost/ingest.py",
+   "cat /app/buildcost/normalize.py",
+   "cat /app/buildcost/rollup.sql",
+   "cat /app/buildcost/rates.py",
+   "cat /app/buildcost/schema.sql",
+   "python /app/buildcost/main.py --month 2024-09",
+   "cat /app/output/report_2024-09.csv",
+   "# Spot variable shadowing in ingest.py metadata loop; fix explicit field extraction",
+   "sed or edit ingest.py to fix metadata key collision",
+   "# While reading rollup.sql, notice 1/1000/1000 integer division for KB; note size_gb column exists",
+   "# Fix rollup.sql to reference size_gb column from normalize.py output instead of inline raw calculation",
+   "python /app/buildcost/main.py --month 2024-09",
+   "cat /app/output/report_2024-09.csv",
+   "# Verify artifact_count, total_gb, total_cost_usd for all teams non-zero and math checks out",
+   "# Confirm no DB files or input logs modified (check mtimes)"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction says 'do not modify the SQLite database files' but the pipeline itself writes to a SQLite DB when run \u2014 the constraint is ambiguous: does it mean the pre-seeded rates DB, or any DB file? If the pipeline recreates the DB each run this is fine, but if it reuses a seeded DB file the constraint is contradictory.",
+   "The location of the SQLite database file is not stated in the solver instruction, only in the environment spec \u2014 solver must infer it from reading main.py or schema.sql, which is fine but could cause confusion if the path is non-obvious.",
+   "Verify-time test inputs are generated dynamically; the blueprint does not specify who generates them or how the verifier knows the ground truth totals \u2014 if the generator has its own bugs (e.g., same KB arithmetic issue), tests could pass a wrong solution or fail a correct one.",
+   "The 'stat check on DB files and input logs' to verify no modification assumes mtime comparison, which could be flaky if the filesystem has low-resolution timestamps or if the pipeline reads (but doesn't write) the input logs and updates atime.",
+   "A skilled agent reading rollup.sql at the start (step 4 of speedrun) will see the integer division bug directly without needing to run anything, reducing genuine difficulty \u2014 both bugs are visible by source inspection alone, which the speedrun guidelines indicate caps genuine_difficulty at 2.",
+   "The tolerance of 0.1% for total_gb may be too tight if the pipeline uses floating-point arithmetic differently (e.g., summing in different order), causing spurious failures on edge cases with many small KB artifacts."
+  ],
+  "verdict": "reject",
+  "reasons": "Both bugs are directly visible by reading the source files (the metadata dict shadowing in ingest.py and the integer division `1/1000/1000` in rollup.sql), so a careful agent can identify and fix both in ~16 commands without needing to run the pipeline to discover the second bug \u2014 this caps genuine_difficulty at 2 per the scoring rubric. Additionally, the verify-time dynamic test generation infrastructure is underspecified (no ground-truth generator described), creating invalid failure risks. The 'do not modify SQLite database files' constraint is ambiguous when the pipeline itself writes to a SQLite database during execution.",
+  "fixes": [
+   "Make Bug 2 invisible to static analysis: instead of a readable integer division error in SQL, hide it as a wrong constant (e.g., KB_FACTOR = 1e-6 but the DB stores sizes as strings with locale commas that parse to 1000x the real value), forcing the agent to actually run the pipeline and inspect intermediate data.",
+   "Specify the verify-time test generator as a committed script in the repo (e.g., /app/testdata/gen_month.py) with a known seed, so ground-truth totals are deterministic and auditable.",
+   "Clarify the 'do not modify SQLite database files' constraint: state explicitly that the rates DB at /app/data/rates.db is the protected file, while the pipeline's working DB at /app/buildcost/work.db is recreated fresh each run and may be written freely.",
+   "To increase genuine_difficulty above 3, add a third subtle interaction: e.g., the rates table join in rollup.sql uses a case-sensitive team name match while ingest.py normalizes team names to lowercase, so one team's rate is NULL and total_cost_usd is NULL rather than zero \u2014 this requires inspecting actual query output, not just reading the SQL."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/migrate-make-to-cmake-build",
+     "verdict": "distinct",
+     "reason": "This task is about migrating a build system from Make to CMake, with no relation to cost accounting, data pipelines, or bug fixing."
+    },
+    {
+     "ref_id": "terminal-bench-pro/setup-mlflow-sqlite-server",
+     "verdict": "distinct",
+     "reason": "This task is about setting up an MLflow tracking server with SQLite backend, unrelated to cost rollup repair or data pipeline debugging."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a broken multi-step data pipeline (ingestion, transformation, aggregation) where records are silently dropped or miscounted, requiring the same core debugging approach of tracing data through pipeline stages to find where rows are lost or miscalculated."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task is about building an HTTP query service on top of a compiled shared library with a specific protocol, not about fixing a data pipeline bug."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a financial reconciliation pipeline where totals are wrong due to incorrect aggregation logic (unit conversion bugs or mismatched offsets), with the same core debugging pattern of tracing how records contribute to rolled-up totals."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/migrate-make-to-cmake-build",
+     0.159
+    ],
+    [
+     "terminal-bench-pro/setup-mlflow-sqlite-server",
+     0.14
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.115
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.11
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.099
+    ]
+   ],
+   "cost_usd": 0.014526
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055191000000000004
+}

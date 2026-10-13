@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "rust-pipeline-encoding-invariant",
+  "title": "Repair a Rust Time-Series Encoding Pipeline",
+  "scenario": "A data engineer has inherited a Rust-based telemetry pipeline that compresses and stores time-series sensor readings into a binary columnar format. The pipeline ships as a compiled binary `/app/pipeline` (no source) plus a Rust crate at `/app/encoder/` that the binary calls via a shared library. The binary reads raw CSV sensor data, invokes the encoder crate to delta-encode and pack values, and writes `.tse` (time-series encoded) files that a downstream reader verifies. The pipeline was working six months ago but now silently produces files that the reader rejects on large inputs, while small smoke tests still pass.",
+  "instruction_draft": "You have inherited a telemetry ingestion pipeline. The binary `/app/pipeline` reads sensor CSVs from `/data/input/`, encodes them, and writes `.tse` files to `/data/output/`. A reader tool at `/app/reader` validates and decodes these files and prints a SHA-256 digest of the reconstructed values per sensor channel.\n\nThe pipeline owner left this terminal output before departing:\n\n```\n$ /app/pipeline /data/input/sample_small.csv\nEncoded 1000 rows -> /data/output/sample_small.tse  [ok]\n$ /app/reader /data/output/sample_small.tse\nChannel 0: digest=a3f1...\nChannel 1: digest=9b2c...\n$ /app/pipeline /data/input/sample_large.csv\nEncoded 50000 rows -> /data/output/sample_large.tse  [ok]\n$ /app/reader /data/output/sample_large.tse\nERROR: block checksum mismatch at block 32, channel 0\n```\n\nYour task: repair the encoder crate at `/app/encoder/` so that:\n\n1. `/app/pipeline` correctly encodes **all** CSV files in `/data/input/` (including those generated at verify time) and the reader reports no errors for any of them.\n2. The reconstructed per-channel SHA-256 digests produced by `/app/reader` exactly match the reference digests in `/data/reference_digests.json` for every file in `/data/input/`.\n3. Encoding throughput for a 100,000-row file must exceed **80,000 rows/second** on a single core (the pipeline reports this metric). A correct but slow implementation will fail.\n4. After your fix, rebuild the shared library and re-link it so the installed `/app/pipeline` binary picks up your changes (a `make` target at `/app/encoder/Makefile` handles this).\n\nDo not modify `/app/pipeline` or `/app/reader`. You may only change source files under `/app/encoder/src/`.",
+  "requirements": [
+   "All `.tse` files produced by `/app/pipeline` on every CSV in `/data/input/` (including verify-time generated ones) are accepted without error by `/app/reader`.",
+   "Per-channel SHA-256 digests from `/app/reader` match entries in `/data/reference_digests.json` for all pre-existing input files.",
+   "Encoding throughput for a 100,000-row single-channel CSV exceeds 80,000 rows/second as reported by `/app/pipeline`.",
+   "Only files under `/app/encoder/src/` are modified; `/app/pipeline` and `/app/reader` are untouched.",
+   "The shared library is rebuilt and re-linked via `make` before the verifier runs."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: rustc 1.78 (pinned via rustup), gcc, make, libssl-dev, python3 (for the verifier script).",
+   "Compiled binary `/app/pipeline` (no source): reads CSV, calls `libencoder.so` via FFI, writes `.tse` files; reports row-count and throughput to stdout.",
+   "Compiled binary `/app/reader` (no source): reads `.tse` files, verifies block checksums, reconstructs original values, prints per-channel SHA-256 digests.",
+   "`/app/encoder/` is a Rust crate (~900 lines across 5 files) that builds `libencoder.so`. It contains a deliberate bug: the delta-encoding zigzag integer packing overflows a u16 accumulator when the block offset counter exceeds 32767 (i.e., after block 32 of a standard 1024-row-per-block layout), silently wrapping and producing a wrong checksum.",
+   "A second hidden invariant planted in the crate: the block header writes a little-endian u32 epoch timestamp using `to_be_bytes()` instead of `to_le_bytes()`, which the reader (compiled to expect little-endian) rejects for any file whose epoch value has a non-zero high byte \u2014 i.e., any real timestamp after year 2000 on large files (small files use epoch=0 in the smoke test path but large ones pass real Unix timestamps > 0x01000000).",
+   "`/app/encoder/Makefile` has targets `build` (cargo build --release) and `install` (copies target/release/libencoder.so to /usr/local/lib/ and runs ldconfig).",
+   "`/data/input/sample_small.csv` \u2014 1000 rows, works fine (epoch=0, no block overflow).",
+   "`/data/input/sample_large.csv` \u2014 50000 rows, epoch=1700000000, triggers both bugs.",
+   "`/data/reference_digests.json` \u2014 precomputed correct digests for sample_small and sample_large (computed against a reference correct implementation the task author runs during Dockerfile build and embeds).",
+   "The performance bug: the current encoder calls `Vec::sort()` on each block's delta list (O(n log n)) unnecessarily before packing \u2014 removing this brings throughput well above 80k rows/s; keeping it fails the performance bar on 100k rows.",
+   "Verifier script `/app/verify.py` (Python, ~80 lines): generates three fresh CSV files with random seeds, runs `/app/pipeline` on each, runs `/app/reader`, checks digests against freshly computed reference (using a bundled reference Python encoder), checks throughput line, checks exit codes."
+  ],
+  "internal_hint": "There are three interacting defects, none visible from a surface read \u2014 they only manifest on real data: (1) zigzag u16 accumulator overflow after block 32 (data-dependent: only triggers at row > 32768), discovered by running the large file and instrumenting block output; (2) endianness bug in epoch timestamp serialisation (`to_be_bytes` vs `to_le_bytes`), discovered by noting the reader error says 'block 32' not 'block 1' and by diffing byte offsets in a hex dump of the .tse header against the block layout documented in the crate's `format.md`; (3) spurious `sort()` call in the delta packer that kills throughput, discovered by profiling or reading the pack loop carefully. The solver must: run the pipeline on the large file, observe the block 32 error, find the accumulator type in the encoder source, discover the endianness mismatch by reading `format.md` (which specifies LE) and comparing to the code, fix both, rebuild, then profile to find the sort call. A solver who only finds one or two bugs will pass the digest check but fail the throughput bar or produce wrong output on fresh inputs with timestamps in a different range.",
+  "trap": "A solver who fixes only the u16 overflow will get correct digests for the provided sample files (because the reference digests were computed post-fix and both bugs matter) but fresh verify-time CSVs with epochs in a range that stresses only the endianness bug will fail. Alternatively, a solver who fixes both correctness bugs but leaves the spurious sort call will fail the 80k rows/s bar. The two difficulty levers interact: you need all three fixes to pass all five state checks.",
+  "tests": [
+   "Run `/app/pipeline` on each of the two pre-existing CSV files; check `/app/reader` exit code is 0 for both.",
+   "Compare `/app/reader` per-channel digests for sample_small and sample_large against `/data/reference_digests.json`; all must match exactly.",
+   "Verifier generates a 100,000-row CSV with epoch=1710000000 and 3 channels; runs pipeline; checks reader exit code is 0 and digests match freshly computed Python reference.",
+   "Verifier generates a 200,000-row CSV with epoch=1750000000 and 1 channel (triggers block > 64, both overflow and endianness); checks reader exit 0 and digest match.",
+   "Verifier generates a 100,000-row single-channel CSV, runs pipeline, parses the throughput line from stdout, asserts throughput > 80000 rows/s."
+  ],
+  "verifier_knob": {
+   "name": "number_of_independent_state_properties_checked",
+   "value": "5",
+   "effect": "Raising to 7 adds checks for a third hidden CSV variant (very large epoch values) and verifies the exact block count in the .tse binary header; lowering to 3 drops the throughput check and the large-epoch variant, making the task easier since fixing only the u16 bug can suffice."
+  },
+  "expected_failure_modes": [
+   "Solver finds and fixes the u16 overflow but misses the endianness bug because the small file smoke test passes and they stop after the first fix.",
+   "Solver fixes both correctness bugs but misses the spurious sort() call, passing digest checks but failing the 80k rows/s throughput bar.",
+   "Solver misreads `format.md` and fixes endianness in the wrong field (e.g., value payload instead of epoch header), passes sample tests but fails fresh inputs with large epochs.",
+   "Solver fixes all three bugs but forgets to run `make install` so the installed pipeline binary still uses the old shared library, causing reader to reject output.",
+   "Solver instruments the pipeline by writing a wrapper script that modifies the CSV before encoding, which the verifier detects by checking `/app/pipeline` is unmodified and runs it directly."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "rust",
+   "binary-reverse-engineering",
+   "hidden-invariant",
+   "performance-threshold",
+   "data-dependent-bug",
+   "columnar-encoding"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls /app/encoder/src/",
+   "cat /app/encoder/src/pack.rs",
+   "cat /app/encoder/src/header.rs",
+   "cat /app/encoder/format.md",
+   "grep -n 'u16\\|accumulator' /app/encoder/src/pack.rs",
+   "grep -n 'to_be_bytes\\|to_le_bytes\\|epoch' /app/encoder/src/header.rs",
+   "sed -i 's/to_be_bytes/to_le_bytes/' /app/encoder/src/header.rs",
+   "grep -n 'sort()' /app/encoder/src/pack.rs",
+   "sed -i 's/offset: u16/offset: u32/' /app/encoder/src/pack.rs",
+   "sed -i '/\\.sort()/d' /app/encoder/src/pack.rs",
+   "cd /app/encoder && make build",
+   "make install",
+   "/app/pipeline /data/input/sample_small.csv",
+   "/app/reader /data/output/sample_small.tse",
+   "/app/pipeline /data/input/sample_large.csv",
+   "/app/reader /data/output/sample_large.tse",
+   "python3 /app/verify.py"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Throughput threshold (80k rows/s) may be flaky depending on container CPU speed, scheduling jitter, or memory bandwidth\u2014a correct fix could fail intermittently on constrained CI hardware.",
+   "The u16 accumulator fix might require changing multiple variable sites or a struct field rather than a single sed substitution; the exact fix surface is unspecified and could cause compile errors if naively applied.",
+   "The Python reference encoder in verify.py must exactly match the Rust reference implementation's encoding decisions (e.g., block size, delta encoding formula); any discrepancy makes fresh-CSV digest checks unpassable regardless of solver correctness.",
+   "make install runs ldconfig which requires root; if the container drops privileges after setup, this silently fails and the pipeline uses the old .so, causing the solver to fail despite correct source fixes.",
+   "All three bugs are statically visible by reading ~900 lines of source\u2014no runtime instrumentation or data-dependent discovery needed\u2014so the 'hidden invariant' difficulty framing is overstated and the task may be easier than intended."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are directly readable in ~900 lines of source code with no runtime analysis required\u2014a systematic agent reading the source files will find all three in under 20 commands, making this closer to a code-reading exercise than a hard debugging task. The performance threshold introduces flakiness risk on variable-speed CI hardware that could cause invalid failures. The average score is (4+4+4+2+4)/5 = 3.6, which barely meets the threshold, but genuine_difficulty at 2 triggers the reject condition per the scoring rules.",
+  "fixes": [
+   "Obfuscate the bugs so they are not statically visible: compile the encoder crate to a .rlib and only ship the object file, or scramble variable names so the overflow and endianness bugs require runtime observation (hex dumps, gdb, strace of the reader rejection) rather than grep on source.",
+   "Add a fourth bug that only manifests via interaction between fixed bugs (e.g., a correct zigzag fix exposes a secondary off-by-one in block boundary detection), raising the minimum command count above 30 and requiring the solver to iterate.",
+   "Make the throughput threshold robust by benchmarking at container build time and setting the threshold to 60% of measured baseline, stored in a file the verifier reads, rather than a hardcoded 80k rows/s that may be flaky across hardware.",
+   "Ensure the Python reference encoder in verify.py is tested against the Rust reference binary during Dockerfile build and the test fails loudly if they disagree, preventing unpassable digest checks."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes a Python chunking/deduplication pipeline bug; the candidate fixes a Rust delta-encoding shared library with a block checksum failure and throughput constraint."
+    },
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "That task designs a DNA storage encoder/decoder from scratch; the candidate repairs an existing Rust time-series binary encoding crate with a specific checksum bug."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task reverse-engineers a binary normalizer and fixes SQL rollup queries; the candidate fixes a Rust shared-library encoder with a block checksum mismatch at scale."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "distinct",
+     "reason": "That task fixes an EMA computation and throughput issue in a metrics pipeline; the candidate fixes a binary columnar format's block checksum corruption in a Rust encoder."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task audits a spectral entropy DSP pipeline for a fast-path mathematical regression; the candidate repairs a Rust delta-encoding crate producing checksum mismatches on large inputs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.25
+    ],
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.23
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.208
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.154
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.142
+    ]
+   ],
+   "cost_usd": 0.015909
+  },
+  "novel": true
+ },
+ "cost_usd": 0.055599
+}

@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "pipeline-codec-invariant-repair",
+  "title": "Inherit a Broken Rust Pipeline Codec",
+  "scenario": "A data engineering team maintains a Rust-based event pipeline. The pipeline ingests timestamped sensor records, compresses them with a custom run-length codec, and writes a compact binary frame to disk. A compiled binary (`/app/bin/frame_tool`) does the authoritative encoding; you inherit the pipeline source but the codec was recently extracted into that opaque binary. Overnight the downstream consumer started silently dropping records \u2014 the binary files it produces appear valid but fail integrity checks on records whose values cross certain thresholds.",
+  "instruction_draft": "```\n$ /app/bin/frame_tool encode /app/data/sample.csv /tmp/out.bin && /app/bin/frame_tool verify /tmp/out.bin\nFRAME OK  records=128  checksum=a3f2c8d1\n$ cargo run --release --manifest-path /app/pipeline/Cargo.toml -- encode /app/data/sample.csv /tmp/pipeline_out.bin && /app/bin/frame_tool verify /tmp/pipeline_out.bin\nFRAME CORRUPT  records=128  checksum mismatch: got=7e910042 want=a3f2c8d1\nERROR: 14 records failed value-range validation\n```\n\nYou are the data engineer who just inherited this pipeline. The Rust source in `/app/pipeline/src/` encodes sensor records into binary frames that the authoritative tool `/app/bin/frame_tool` then verifies. The pipeline's output is currently corrupt.\n\nYour task:\n1. Make `cargo run --release --manifest-path /app/pipeline/Cargo.toml -- encode <input.csv> <output.bin>` produce frames that pass `frame_tool verify` for ANY valid input CSV \u2014 not just the sample.\n2. The pipeline must encode at least **80,000 records per second** on the provided hardware (measured by `frame_tool benchmark /tmp/pipeline_out.bin`). A correct-but-slow solution fails.\n3. Write the integer constant `BLOCK_STRIDE` (the block size the codec uses internally) to `/app/answer/block_stride.txt` as a plain decimal integer.\n\nThe pipeline source is in `/app/pipeline/src/`. Do not modify `/app/bin/frame_tool`.",
+  "requirements": [
+   "cargo run --release in /app/pipeline encodes any valid input CSV into a binary frame that passes frame_tool verify",
+   "frame_tool verify passes for verify-time-generated input CSVs, not only the provided sample",
+   "frame_tool benchmark reports >= 80,000 records/second for the pipeline's output",
+   "/app/answer/block_stride.txt contains the correct decimal integer that is the codec's internal block stride"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install rustup stable, cargo, gcc, python3 toolchain",
+   "Compiled Rust binary /app/bin/frame_tool (built from hidden source during Docker build, stripped, no debug symbols) \u2014 implements authoritative encode, verify, and benchmark subcommands",
+   "frame_tool encode: reads CSV of (timestamp_us: u64, sensor_id: u16, value: f32), writes a binary frame with a per-block run-length + delta encoding, 32-bit CRC32 footer, and a hidden block-stride invariant (BLOCK_STRIDE=192; stride must be exactly 192 or the CRC and value-range checks fail)",
+   "frame_tool verify: checks CRC32, re-decodes each block, validates that every reconstructed f32 value round-trips within 1e-4 of the original; records with value > 32767.0 trigger a special overflow path in the codec that naive re-implementations miss",
+   "frame_tool benchmark: decodes the frame and reports records/sec; a pure-Rust na\u00efve byte-by-byte copy scores ~35k rec/s; correct block-aligned SIMD-friendly encoding reaches 100k+ rec/s",
+   "/app/pipeline/src/ \u2014 roughly 900 lines of Rust across codec.rs, encoder.rs, main.rs, and util.rs; contains a working but wrong codec: it uses BLOCK_STRIDE=64 (wrong) instead of 192, and applies delta encoding before range-clamping instead of after, causing value corruption for values > 32767.0",
+   "/app/data/sample.csv \u2014 128 rows, all sensor values < 1000.0, so the sample never triggers the overflow path and naive fixes appear to pass the sample",
+   "/app/data/large.csv \u2014 500,000 rows including values up to 65000.0 (triggers overflow path); used for benchmark timing",
+   "/app/answer/ \u2014 empty directory for solver output",
+   "Python script /app/gen_csv.py that generates deterministic test CSVs from a seed (used by verifier to create fresh inputs at verify time)",
+   "The hidden BLOCK_STRIDE=192 constant is discoverable by: (a) running frame_tool encode on crafted inputs and binary-diffing outputs to measure block boundaries, or (b) decoding the binary frame structure by hand"
+  ],
+  "internal_hint": "Difficulty comes from two interacting hidden invariants that are only visible at runtime, not by reading the source: (1) the correct BLOCK_STRIDE is 192, discoverable only by probing frame_tool with crafted inputs and measuring where block headers appear in the binary output \u2014 the pipeline source says 64; (2) delta encoding must be applied AFTER range-clamping for values > 32767.0, otherwise the delta overflows i16 and corrupts the reconstruction. The sample CSV never has values > 1000 so both bugs are invisible on the sample. The performance bar rules out a correct-but-naive loop; the solver must structure encoding in 192-record blocks aligned to the codec's internal layout. The solver must: probe frame_tool to discover BLOCK_STRIDE=192 by binary analysis (e.g. encode 1, 192, 193, 384, 385 rows and observe frame size jumps), discover the overflow invariant by encoding rows with value=40000 and running verify, patch both bugs in the Rust source, confirm the benchmark meets 80k rec/s, and write 192 to /app/answer/block_stride.txt.",
+  "trap": "A solver that fixes only the BLOCK_STRIDE (64\u2192192) will pass verify on the sample and on small synthetic inputs, but will fail on verify-time CSVs that include values > 32767.0 because the delta-encoding order bug still corrupts those records. Likewise a solver that fixes only the overflow path but not the stride will produce correct values but wrong CRC. A solver that finds both code bugs but writes BLOCK_STRIDE=64 to the answer file fails the state check. A solver that scores correct but slow (fixing the codec by re-encoding serially without block alignment) fails the performance threshold.",
+  "tests": [
+   "T1 (correctness-sample): cargo run encodes sample.csv; frame_tool verify passes",
+   "T2 (correctness-generated-small): verifier generates a 10,000-row CSV with seed=42 including values up to 60000.0; frame_tool verify must pass",
+   "T3 (correctness-generated-large): verifier generates a 200,000-row CSV with seed=99 including values spanning 0.0\u201365000.0; frame_tool verify must pass",
+   "T4 (correctness-overflow-boundary): verifier generates a CSV where every record has value=32767.5 (exactly on the overflow boundary); frame_tool verify must pass",
+   "T5 (performance): frame_tool benchmark on the 500k-row large.csv output must report >= 80000 rec/s",
+   "T6 (block_stride.txt): /app/answer/block_stride.txt must contain exactly '192' (decimal, single line, no whitespace except optional newline)",
+   "T7 (no frame_tool modification): stat /app/bin/frame_tool mtime must be unchanged from Docker build time"
+  ],
+  "verifier_knob": {
+   "name": "overflow_fraction",
+   "value": "0.30",
+   "effect": "Fraction of records in generated test CSVs whose value exceeds 32767.0. At 0.0 (no overflow values) the overflow bug is invisible and only the stride bug matters; at 0.30 (current) both bugs must be fixed; at 0.60 nearly every record is corrupted making the verify output noisier but not harder to diagnose."
+  },
+  "expected_failure_modes": [
+   "Agent fixes BLOCK_STRIDE in source (64\u2192192) but misses the delta-encoding order bug; passes T1 and T2 if the generated seed happens to avoid overflow, fails T3/T4",
+   "Agent discovers the overflow bug by reading the source and patching it, but guesses BLOCK_STRIDE=64 or another wrong value by inspection rather than probing the binary, writes wrong answer to block_stride.txt, fails T6",
+   "Agent produces correct encoding but uses a naive single-record loop; fails T5 performance threshold even though verify passes",
+   "Agent probes frame_tool correctly and finds BLOCK_STRIDE=192 but patches the pipeline to use a different block-aligned strategy that doesn't match the CRC computation, fails T2/T3",
+   "Agent writes block_stride.txt with value '64' (the wrong value in the source) without probing the binary, fails T6 even if encoding is correct"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "rust",
+   "reverse-engineering",
+   "binary-protocol",
+   "hidden-invariant",
+   "performance-threshold",
+   "data-engineering"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/src/codec.rs  # finds BLOCK_STRIDE=64 and delta-before-clamp bug directly in source",
+   "cat /app/pipeline/src/encoder.rs",
+   "cat /app/pipeline/src/main.rs",
+   "# Both bugs are now visible: wrong stride constant and wrong encoding order",
+   "# Probe frame_tool to confirm true stride (required for block_stride.txt)",
+   "python3 -c \"import csv,sys; w=csv.writer(open('/tmp/191.csv','w')); [w.writerow([i*1000,1,500.0]) for i in range(191)]\"",
+   "python3 -c \"import csv,sys; w=csv.writer(open('/tmp/192.csv','w')); [w.writerow([i*1000,1,500.0]) for i in range(192)]\"",
+   "python3 -c \"import csv,sys; w=csv.writer(open('/tmp/193.csv','w')); [w.writerow([i*1000,1,500.0]) for i in range(193)]\"",
+   "/app/bin/frame_tool encode /tmp/191.csv /tmp/191.bin && /app/bin/frame_tool encode /tmp/192.csv /tmp/192.bin && /app/bin/frame_tool encode /tmp/193.csv /tmp/193.bin",
+   "ls -la /tmp/191.bin /tmp/192.bin /tmp/193.bin  # size jump at 193 confirms stride=192",
+   "sed -i 's/BLOCK_STRIDE.*=.*64/BLOCK_STRIDE: usize = 192/' /app/pipeline/src/codec.rs",
+   "# Edit codec.rs to fix delta order: apply clamp before computing delta",
+   "# (source already tells us where the bug is; edit the ~5 lines around the overflow path)",
+   "nano /app/pipeline/src/codec.rs",
+   "cargo run --release --manifest-path /app/pipeline/Cargo.toml -- encode /app/data/sample.csv /tmp/out.bin",
+   "/app/bin/frame_tool verify /tmp/out.bin",
+   "python3 -c \"import csv; w=csv.writer(open('/tmp/overflow.csv','w')); [w.writerow([i*1000,1,40000.0]) for i in range(200)]\"",
+   "cargo run --release --manifest-path /app/pipeline/Cargo.toml -- encode /tmp/overflow.csv /tmp/ov_out.bin && /app/bin/frame_tool verify /tmp/ov_out.bin",
+   "cargo run --release --manifest-path /app/pipeline/Cargo.toml -- encode /app/data/large.csv /tmp/large_out.bin",
+   "/app/bin/frame_tool benchmark /tmp/large_out.bin",
+   "echo '192' > /app/answer/block_stride.txt"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The source code explicitly contains both bugs (BLOCK_STRIDE=64, delta-before-clamp), so the 'hidden invariants discoverable only at runtime' framing is false \u2014 an agent reading the source finds them immediately without any binary probing, collapsing the intended hard discovery path",
+   "Performance threshold may be hardware-dependent: 'correct block-aligned SIMD-friendly encoding reaches 100k+' but the bar is 80k; on slower CI hardware or with compiler variance a correct solution might flake below 80k rec/s",
+   "The 'delta encoding before range-clamping' bug description in the environment spec is potentially ambiguous \u2014 the exact semantics of 'range-clamping' and whether it means saturation, wrapping, or truncation is not stated in the instruction, so an agent might patch it incorrectly and get a confusing failure",
+   "T6 requires exactly '192' with 'no whitespace except optional newline' but the instruction only says 'plain decimal integer'; an agent writing '192\\n' vs '192' could differ across implementations \u2014 though 'optional newline' covers this",
+   "The sample CSV (128 rows, all < 1000.0) never triggers the overflow path, so T1 alone would pass even with only the stride fix; T2's seed=42 behavior depends on whether the generator produces values >32767.0, which is not guaranteed by description ('including values up to 60000.0' implies yes, but the generator implementation is hidden)"
+  ],
+  "verdict": "reject",
+  "reasons": "The task's core difficulty premise is fatally undermined: the instruction environment explicitly puts both bugs (BLOCK_STRIDE=64 and delta-encoding order) in the readable source code, so a skilled agent finds them by reading ~900 lines rather than through the intended binary-probing discovery. This collapses genuine difficulty to \u22642 (source bugs visible = trivial path). The performance threshold introduces hardware-dependent flakiness risk. The fix is to make the source code compile and run correctly with a different wrong constant (e.g., some plausible value like 256 or 128) and omit the delta-order bug from the source entirely, forcing true binary reverse-engineering.",
+  "fixes": [
+   "Make the pipeline source code appear plausible but NOT reveal the wrong constant by name \u2014 e.g., derive BLOCK_STRIDE from a runtime computation or use an obfuscated constant like 0xC0 (=192 in hex, not obviously 192), so reading the source doesn't immediately give the answer",
+   "Remove or disguise the delta-encoding order bug from the source so it's not findable by grep/read \u2014 instead, have the source call a precompiled .rlib or use a subtle numeric formula that produces wrong results only at the boundary, forcing the agent to probe with crafted inputs",
+   "Document the performance threshold with explicit measurement methodology (which CPU, how measured, variance allowed) to prevent flaky failures on different hardware, or provide a calibration command the agent can run to determine the expected throughput on the current machine"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes a Python CSV chunking pipeline with duplicate/dropped records; the candidate involves reverse-engineering a binary Rust codec's internal block stride and matching its encoding behavior."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both involve fixing a broken Rust codec/pipeline to pass correctness verification and meet a throughput target, with the core challenge being encode/decode correctness and performance \u2014 the candidate adds reverse-engineering an opaque binary's behavior."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task reverse-engineers a black-box normalizer binary for sensor readings and fixes SQL rollup queries; the candidate requires matching a binary frame codec's exact encoding logic and discovering an internal block stride constant."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task implements an HMAC-authenticated TCP audit service with WAL record serialization; the candidate involves reverse-engineering a binary run-length codec to match its frame encoding."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task finds a regression in a spectral entropy DSP pipeline; the candidate involves reverse-engineering a binary Rust codec's block stride and matching its encoding for correctness and throughput."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.21
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.18
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.162
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.131
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.128
+    ]
+   ],
+   "cost_usd": 0.01506
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05971799999999999
+}

@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "udp-rate-limiter-token-bucket",
+  "title": "UDP Rate Limiter Token Bucket Bug",
+  "scenario": "A release engineer is trying to ship a C-based UDP traffic shaper that sits in front of an internal metrics service. The shaper implements per-source token-bucket rate limiting: each source IP gets a bucket that refills at a configured rate, and packets exceeding the quota are dropped. The system has a compiled rate-limiting core (`libratelimit.so`) with no source available, a thin C wrapper (`shaper.c`) that feeds packets in and records admit/drop decisions, and a Git history of ~40 commits showing the wrapper was refactored three weeks ago when multi-source support was added.",
+  "instruction_draft": "The UDP shaper at `/app/shaper/` is failing QA: packet admission counts are wrong when multiple source IPs send traffic in the same time window, but single-source workloads look fine. A recent refactor added per-source bucket tracking. Your job is to find what is broken and fix it so the shaper correctly admits packets up to each source's configured rate and drops all packets that exceed it. The rate-limit contract is: each source IP maintains an independent token bucket with capacity C tokens and a refill rate of R tokens per second; each admitted packet costs one token; the bucket never exceeds C; tokens accumulate continuously based on elapsed time between calls; a packet arriving when the bucket is empty is dropped. The fixed shaper must pass all admission and drop decisions for an adversarial corpus of packet streams including bursty traffic, interleaved multi-source streams, sources with different configured rates, and edge cases around bucket boundaries. Build the fixed shaper binary at `/app/shaper/shaper` so it reads packet records from stdin (one per line: `timestamp_us src_ip length`) and writes `ADMIT` or `DROP` for each.",
+  "requirements": [
+   "The shaper binary at /app/shaper/shaper must exist and be executable",
+   "It reads packet records from stdin, one per line: timestamp_us src_ip length",
+   "For each packet it prints ADMIT or DROP to stdout",
+   "Each source IP maintains an independent token bucket with capacity C and refill rate R",
+   "Tokens accumulate based on elapsed time: delta_tokens = R * elapsed_seconds",
+   "The bucket value is capped at C after each refill",
+   "A packet is admitted if and only if at least one token is available after refill; the token is consumed",
+   "A packet arriving when the bucket is empty after refill is dropped",
+   "Sources with different configured rates are isolated from each other",
+   "The binary must handle interleaved multi-source streams correctly"
+  ],
+  "environment": [
+   "Git repository at /app/shaper/ with ~40 commits; the refactor adding multi-source support is 3 weeks old",
+   "Pre-built opaque shared library /app/shaper/libratelimit.so implementing the token bucket core with no source in the repo; it exports: void* rl_bucket_new(double rate, double capacity); int rl_bucket_check(void* bucket, uint64_t timestamp_us); void rl_bucket_free(void*)",
+   "The library is correct and implements the token bucket contract faithfully for a single bucket",
+   "shaper.c (~350 lines) wraps the library; it uses a hash map to track per-source buckets",
+   "The bug planted in shaper.c: the hash map key is the last octet of the source IP (src_ip & 0xFF) instead of the full 32-bit address, so IPs sharing the same last octet collide and share a bucket \u2014 this is not visible without running multi-source streams where two sources differ only in upper octets",
+   "A second subtler bug: when a new bucket is created for a source, the current timestamp is not passed to rl_bucket_new as the epoch \u2014 instead epoch is hardcoded to 0 \u2014 so the first call computes a massive elapsed time and floods the bucket, masking drops that should occur at burst start for late-joining sources",
+   "Sample test input file /app/shaper/sample.txt with a single-source stream that passes correctly even with the bugs (chosen to not expose either bug)",
+   "A reference config file /app/shaper/shaper.conf with rate=100.0 tokens/sec, capacity=50 tokens",
+   "Makefile in /app/shaper/ that compiles shaper.c against libratelimit.so",
+   "Git log shows the hash-map key change from full IP to last-octet as part of a 'perf: use compact key for bucket lookup' commit 3 weeks ago",
+   "~800 lines total across shaper.c, a small hash map implementation htab.c/htab.h, and a packet parser parse.c"
+  ],
+  "internal_hint": "Two bugs interact. Bug 1 (observe_not_read): the hash key truncation is in a one-liner inside htab_insert/htab_lookup that uses `ip & 0xFF` \u2014 it is syntactically present in source but the wrong behavior only manifests when two sources share the same last octet, which the provided sample.txt never does. Bug 2 (observe_not_read, shallow_check_trap): bucket epoch is hardcoded to 0 at creation time; for a single source starting at t=0 this is fine, but for a source whose first packet arrives at t=500000us the bucket gets credited ~50 tokens it shouldn't have, allowing a burst that should be dropped. A naive fix that only finds Bug 1 passes most corpus cases but fails the late-joining-source edge cases. The reference solution must: (1) change the hash key to the full 32-bit IP; (2) pass the first packet's timestamp as the epoch to rl_bucket_new. The solver must run multi-source test streams to observe the collision behavior, then read git log to find when the key change was introduced, then trace through htab.c to find the truncation. The epoch bug only surfaces when testing streams that start mid-simulation.",
+  "trap": "A solver that only finds and fixes the hash key truncation (Bug 1) will pass all single-source tests, all tests where source IPs differ in the last octet, and the provided sample \u2014 but will fail corpus entries where sources join late (non-zero first timestamp), because the epoch-zero bug floods their initial bucket and admits packets that should be dropped at burst start. The corpus explicitly includes streams where a source's first packet arrives at t=300000us with a configured burst capacity of 10, and the correct behavior is to admit only 10 packets before dropping, but the epoch-zero bug credits ~30 extra tokens.",
+  "tests": [
+   "Single-source stream at configured rate: verify all packets within rate are ADMIT and excess are DROP",
+   "Two sources with the same last IP octet (e.g., 10.0.0.5 and 10.0.1.5) interleaved: each must maintain independent quotas \u2014 failing output has them sharing a bucket",
+   "Late-joining source: first packet at t=500000us, capacity=10, rate=5; verify exactly 10 ADMITs then DROPs (not 35 ADMITs due to epoch-zero credit)",
+   "Burst-then-idle-then-burst: source sends 50 packets instantly (expect 50 ADMITs if capacity=50), then 200ms silence, then 20 more packets (expect 10 ADMITs due to refill at 100/sec)",
+   "Three sources with different configured rates read from shaper.conf overrides: each respects its own rate independently",
+   "Corpus of 200 adversarial streams generated at verify time with random source IPs, rates, capacities, and arrival patterns; correct ADMIT/DROP sequence computed by a reference Python token-bucket implementation; exact match required"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 streams",
+   "effect": "Lowering to 20 streams reduces coverage of late-joining and same-last-octet cases, making partial fixes pass; raising to 500 stresses more IP collision patterns and burst boundary arithmetic"
+  },
+  "expected_failure_modes": [
+   "Agent reads shaper.c, finds the hash key truncation, fixes only that, and submits \u2014 passes ~80% of corpus but fails late-joining cases",
+   "Agent fixes both bugs but implements the epoch fix incorrectly (e.g., subtracts timestamp instead of passing it as epoch), causing off-by-one in token accumulation",
+   "Agent rewrites shaper.c from scratch without using libratelimit.so, implements a slightly different token bucket (e.g., discrete refill intervals instead of continuous), which fails boundary cases in the corpus",
+   "Agent does not discover the epoch-zero bug because the sample.txt and manual tests all start at t=0, and stops after fixing Bug 1",
+   "Agent misidentifies the epoch bug as a floating-point precision issue and adds epsilon guards instead of fixing the root cause"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "networking",
+   "token-bucket",
+   "git-history",
+   "observe-not-read",
+   "multi-source"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/shaper/htab.c htab.h shaper.c parse.c",
+   "git -C /app/shaper log --oneline | head -50",
+   "git -C /app/shaper show <perf-compact-key-commit> # reveals ip & 0xFF",
+   "nm -D /app/shaper/libratelimit.so | grep rl_ # confirm API signatures",
+   "sed -i 's/ip & 0xFF/ip/g' /app/shaper/htab.c  # fix Bug 1",
+   "make -C /app/shaper && printf '0 10.0.0.5 100\\n0 10.0.1.5 100\\n' | ./shaper",
+   "# Observe epoch bug: printf '500000 10.0.0.5 100\\n' x60 | ./shaper shows too many ADMITs",
+   "# Realize rl_bucket_new has no epoch param - API contradiction blocks stated fix",
+   "# Attempt workaround: track first_ts per source, offset timestamps before passing to rl_bucket_check",
+   "# Edit shaper.c to subtract first_packet_timestamp from all timestamps for each source",
+   "make -C /app/shaper",
+   "printf '500000 10.0.0.5 100\\n' | ./shaper  # validate epoch fix",
+   "make -C /app/shaper && run full sample corpus"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "CRITICAL: The stated Bug 2 fix ('pass first packet timestamp as epoch to rl_bucket_new') is impossible with the declared API signature 'void* rl_bucket_new(double rate, double capacity)' which has no epoch parameter. The correct fix must be a workaround (e.g., timestamp offsetting in shaper.c), but the blueprint doesn't describe this, creating an ambiguous pass/fail criterion.",
+   "The 'observe_not_read' tag is misleading: Bug 1 (ip & 0xFF) is directly readable in htab.c source and visible in git diff \u2014 it does not require running the system to observe; a careful source read finds it immediately.",
+   "The corpus is generated at verify time with 'random' streams \u2014 if the reference Python implementation has any floating-point differences from the C token bucket in libratelimit.so (e.g., rounding at bucket cap), 200 streams may produce spurious failures that are not the agent's fault.",
+   "The shaper.conf is described as having a single rate/capacity, but the test 'Three sources with different configured rates read from shaper.conf overrides' implies per-source config overrides \u2014 this feature is not described in the instruction or the environment setup, making it untestable as stated.",
+   "Bug 1 is in htab.c but the blueprint says it's 'a one-liner inside htab_insert/htab_lookup' \u2014 if the fix is in htab.c but the agent fixes it in shaper.c instead (e.g., masking before insert), the behavior is correct but the implementation differs; unclear if verifier cares.",
+   "libratelimit.so is pre-built with no source \u2014 if it has any platform-specific behavior on the test runner (e.g., floating-point environment, endianness, glibc version mismatch), the .so may not load or behave correctly, causing environment-level failures."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint contains a critical internal contradiction: Bug 2's fix requires passing an epoch timestamp to rl_bucket_new, but the declared API has no epoch parameter, making the stated fix impossible and leaving the correct fix undefined. Additionally, the corpus generated at verify time with floating-point token-bucket math creates flaky determinism risks, and the 'observe_not_read' classification is incorrect since both bugs are directly readable in source code. The task fails clarity and solvability minimums due to the API contradiction alone.",
+  "fixes": [
+   "Either add an epoch parameter to rl_bucket_new ('void* rl_bucket_new(double rate, double capacity, uint64_t epoch_us)') or explicitly describe the correct workaround for the epoch bug (e.g., 'in shaper.c, subtract each source's first packet timestamp from all subsequent timestamps before calling rl_bucket_check') so the fix is unambiguous.",
+   "Replace the randomly-generated adversarial corpus with a deterministic, pre-computed corpus stored as fixture files, and use exact integer arithmetic (token counts as integers) in both the reference verifier and the .so to eliminate floating-point divergence failures.",
+   "Remove or redesign the 'three sources with different configured rates from shaper.conf overrides' test \u2014 the instruction and environment setup describe only a single global rate/capacity config, so per-source config is an undescribed feature that cannot be fairly tested.",
+   "Relabel the difficulty tags: Bug 1 is 'read-source' not 'observe_not_read' since it is directly visible in htab.c; only Bug 2 (when correctly described) qualifies as 'shallow_check_trap'."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/freight-dispatch-shift",
+     "verdict": "distinct",
+     "reason": "Freight dispatch scheduling with CLI subcommands is a completely different problem domain from UDP token-bucket rate limiting."
+    },
+    {
+     "ref_id": "terminal-bench/heat-pump-warranty",
+     "verdict": "distinct",
+     "reason": "Insurance claim decision processing is entirely unrelated to network packet rate limiting."
+    },
+    {
+     "ref_id": "terminal-bench/risk-scorer-replay",
+     "verdict": "distinct",
+     "reason": "ML model parity repair is a different problem from implementing a token-bucket rate limiter for UDP traffic."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "Packet codec correctness and performance benchmarking is a different problem from per-source token-bucket rate limiting, despite both involving packets."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "NetFlow v9 aggregation and querying service is a different problem from a token-bucket rate limiter, despite both involving UDP traffic."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/freight-dispatch-shift",
+     0.134
+    ],
+    [
+     "terminal-bench/heat-pump-warranty",
+     0.131
+    ],
+    [
+     "terminal-bench/risk-scorer-replay",
+     0.128
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.117
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.101
+    ]
+   ],
+   "cost_usd": 0.012678
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05692200000000001
+}

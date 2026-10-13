@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "tcp-checksum-offload-edge-cases",
+  "title": "TCP Checksum Engine: Silent Corruption on Edge Flows",
+  "scenario": "A release engineer at a network appliance company is chasing a regression in the in-house packet inspection daemon (`pktd`). The repo contains ~1400 lines of C across five files: the main daemon loop, a packet parser, a TCP checksum computation library (`cksum.c`), a flow tracker, and a test harness. The daemon reads raw packet captures and emits per-flow statistics; it has been shipping for two years. A recent commit extended the checksum library to support TCP-over-IPv6 and pseudo-header variants, but post-ship telemetry on real traffic shows occasional corrupted flow records. The CI sample tests all pass.",
+  "instruction_draft": "You are the release engineer on call. The packet inspection daemon in `/srv/pktd` builds and passes the sample tests in `/srv/pktd/tests/`, but live traffic replay is producing wrong per-flow byte counts and incorrect checksum-valid flags on a subset of flows. Your job is to fix the checksum library and any code that depends on it so that the daemon correctly accepts every well-formed packet and rejects every malformed one \u2014 across all combinations of IPv4/IPv6, standard and jumbo frames, TCP segments with or without options, and payloads whose length is 0, odd, or a multiple of 65535 bytes. The verifier will replay a hidden corpus of raw packet captures (benign and malicious) through the daemon and check that every flow record's `valid_cksum` flag and `payload_bytes` counter match the ground-truth values computed by an independent reference. Every benign packet must be accepted and counted; every packet with a corrupted checksum must be flagged invalid. The daemon must produce its output to stdout as newline-delimited JSON objects, one per flow, with fields `flow_id`, `valid_cksum` (bool), and `payload_bytes` (uint64).",
+  "requirements": [
+   "The daemon binary at `/srv/pktd/pktd` must build from source with `make` in `/srv/pktd/`.",
+   "For every IPv4 TCP packet with a correct checksum the emitted flow record must have `valid_cksum: true`.",
+   "For every IPv6 TCP packet with a correct checksum the emitted flow record must have `valid_cksum: true`.",
+   "Any packet whose TCP checksum is wrong must produce `valid_cksum: false` in the flow record.",
+   "The `payload_bytes` field must equal the exact number of TCP payload bytes (excluding IP and TCP headers and TCP options) across all segments in the flow.",
+   "Packets with TCP data length 0 (pure ACKs, SYNs) must contribute 0 to `payload_bytes`.",
+   "Jumbo frames (IP total length > 65535, using the IPv6 jumbogram hop-by-hop option) must be handled: their payload length must be read from the jumbogram option, not the standard IPv6 payload length field.",
+   "The daemon must accept a pcap file path as its sole argument and print one JSON object per flow to stdout.",
+   "The output must be deterministic: same input produces identical output in any run order."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install gcc, make, libpcap-dev, python3, and scapy (pinned) via apt/pip.",
+   "Git repository at `/srv/pktd/` with ~15 commits of history; the extension commit is the HEAD.",
+   "`/srv/pktd/cksum.c` (~320 lines): implements `tcp4_checksum()` and `tcp6_checksum()`. The IPv6 variant has two bugs introduced in the extension commit: (1) it uses `ntohs(ip6->ip6_plen)` for the pseudo-header length field even for jumbograms (should read the jumbogram hop-by-hop option value), and (2) the one's-complement fold at the end omits a carry fold when the 32-bit accumulator overflows twice (the loop folds once but a second carry can appear after the first fold \u2014 visible only on payloads \u2265 65535 bytes).",
+   "`/srv/pktd/parser.c` (~280 lines): parses Ethernet/IPv4/IPv6/TCP headers; has a subtle bug where TCP options bytes are included in `payload_bytes` because `payload_offset` is computed as `tcp_hdr_start + 20` instead of `tcp_hdr_start + (tcphdr->th_off * 4)`.",
+   "`/srv/pktd/flow.c` (~180 lines): flow table management, correct.",
+   "`/srv/pktd/main.c` (~150 lines): pcap loop, JSON emission, correct.",
+   "`/srv/pktd/harness.c` (~120 lines): sample test harness, tests only short IPv4 flows with no options \u2014 does not exercise IPv6, jumbograms, or TCP options.",
+   "`/srv/pktd/tests/`: four sample pcap files covering simple IPv4 TCP flows; all pass the harness.",
+   "Git log shows the extension commit message: 'Add IPv6 TCP checksum support and jumbogram handling'; diffstat touches only `cksum.c`.",
+   "A reference Python script `/srv/ref/check_flow.py` (using scapy) is planted in the repo at an earlier commit but not at HEAD \u2014 the solver must find it via `git log` or `git show`; it computes ground-truth `valid_cksum` and `payload_bytes` for any pcap.",
+   "The sample pcaps do NOT contain IPv6 traffic, TCP-options traffic, or jumbograms.",
+   "Verifier generates fresh pcaps at test time using scapy: IPv6 flows, flows with TCP timestamp options, a jumbogram flow (simulated via crafted headers), flows with double-carry checksum edge cases, and a set of packets with deliberately wrong checksums."
+  ],
+  "internal_hint": "Difficulty sources: (1) observe_not_read \u2014 the parser bug (`th_off` vs hardcoded 20) only fires on packets with TCP options, which are absent from sample tests; the double-carry fold bug only fires on payloads \u2265 65535 bytes; the jumbogram length bug only fires on jumbogram-flagged packets. All three bugs are invisible by reading the relevant file in isolation because each code path looks locally plausible. The solver must run the daemon against crafted traffic (or the reference script) to observe wrong counts. (2) shallow_check_trap \u2014 fixing only the IPv6 checksum (the obvious regression from `git log`) leaves the `th_off` parser bug and the double-carry bug intact; the hidden corpus includes IPv4 flows with TCP options, which fail on `payload_bytes`, so a partial fix still fails. Resolution path: (a) read git log, find the extension commit; (b) compare HEAD `cksum.c` to parent to spot the pseudo-header length and fold bugs; (c) run daemon on sample pcaps \u2014 they all pass, confirming the sample tests are insufficient; (d) craft or find a pcap with TCP options and observe wrong `payload_bytes`, tracing it to `parser.c`; (e) craft a large IPv6 payload to trigger the double-carry; (f) fix all three: use `tcphdr->th_off * 4` in parser.c, read jumbogram hop-by-hop option in cksum.c, add second carry fold in cksum.c.",
+  "trap": "A solver that reads the extension commit diff, spots the pseudo-header length bug, fixes it, re-runs the sample tests (all pass), and submits \u2014 fails because (a) the double-carry fold is still broken for large payloads and (b) the `th_off` parser bug silently inflates `payload_bytes` for any flow with TCP options. Both failures are invisible on the provided samples. A solver that also finds and fixes the double-carry but misses the parser bug still fails on the hidden corpus's TCP-options flows.",
+  "tests": [
+   "Build test: `make -C /srv/pktd` exits 0 and produces the `pktd` binary.",
+   "IPv4 basic: verifier generates 50 random valid IPv4 TCP flows (no options, lengths 1\u20131400 bytes); daemon output `valid_cksum` must be true and `payload_bytes` must match scapy ground truth for all.",
+   "IPv4 corrupted: verifier generates 30 IPv4 TCP packets with bit-flipped checksums; daemon must emit `valid_cksum: false` for all.",
+   "IPv4 TCP options: verifier generates 40 flows where segments carry TCP timestamp options (10 bytes); daemon `payload_bytes` must exclude option bytes \u2014 i.e., match `len(tcp.payload)` from scapy.",
+   "IPv6 valid: verifier generates 40 valid IPv6 TCP flows; daemon `valid_cksum` must be true for all.",
+   "IPv6 corrupted: verifier generates 25 IPv6 TCP packets with corrupted checksums; daemon must emit `valid_cksum: false` for all.",
+   "Double-carry edge: verifier crafts two IPv6 TCP segments whose combined payload checksum accumulator requires two carry folds (payload crafted so intermediate sum == 0xFFFFFFFF after first fold then gains another carry); daemon must emit `valid_cksum: true`.",
+   "Jumbogram: verifier crafts an IPv6 packet with a hop-by-hop jumbogram option setting payload length to 70000; daemon must read the jumbogram length and emit correct `payload_bytes` and `valid_cksum: true`.",
+   "Zero-length payload: verifier generates 20 pure ACK segments; daemon `payload_bytes` must be 0 for each.",
+   "Mixed corpus: verifier replays a 200-packet mixed pcap (IPv4+IPv6, with/without options, with/without errors); daemon JSON output is compared element-wise to scapy reference; all fields must match exactly."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 packets in the mixed corpus, 40\u201350 per category",
+   "effect": "Increasing corpus size and adding more TCP-option variants, jumbogram sizes, and checksum near-miss values raises coverage of tricky cases; decreasing it allows a partial fix to squeak through."
+  },
+  "expected_failure_modes": [
+   "Agent finds and fixes the IPv6 pseudo-header length bug from the git diff but does not discover the double-carry fold bug because it requires a payload \u2265 65535 bytes that the sample tests never produce.",
+   "Agent fixes the checksum bugs but never investigates `parser.c` because the sample tests have no TCP options; `payload_bytes` is wrong on the hidden corpus.",
+   "Agent fixes all three bugs but introduces a byte-order error in the jumbogram option length read (big-endian vs host-endian), causing jumbogram flows to get wrong lengths.",
+   "Agent instruments the daemon but only tests against the provided sample pcaps, declares success, and misses all three hidden failure modes.",
+   "Agent finds the reference script in git history but misreads its checksum logic and copies its approach incorrectly, fixing only one of the two checksum bugs."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "networking",
+   "c",
+   "checksums",
+   "git-history",
+   "observe-not-read",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /srv/pktd && git log --oneline  # find extension commit SHA",
+   "git diff HEAD~1 HEAD -- cksum.c  # read the IPv6 extension diff to identify bugs",
+   "cat parser.c  # find tcp_hdr_start + 20 bug",
+   "# Fix 1: edit cksum.c - replace ntohs(ip6->ip6_plen) with jumbogram hop-by-hop option read for pseudo-header length",
+   "# Fix 2: edit cksum.c - add second carry fold after first: sum += (sum >> 16); sum &= 0xffff;",
+   "# Fix 3: edit parser.c - change tcp_hdr_start + 20 to tcp_hdr_start + (tcphdr->th_off * 4)",
+   "make -C /srv/pktd  # build and confirm 0 exit",
+   "./pktd tests/sample1.pcap  # sanity check sample tests still pass",
+   "# Submit"
+  ],
+  "speedrun_commands": 9,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The Environment section of the blueprint explicitly describes all three bugs with file locations and fix directions \u2014 a strong agent reading the full instruction can skip all exploration and fix directly, collapsing genuine difficulty.",
+   "Jumbogram simulation requires crafting packets with payload > 65535 bytes; at 2GB RAM this is feasible but the verifier's scapy-based pcap generation for jumbograms (which aren't standard pcap-compatible) needs careful implementation to avoid flakiness.",
+   "The double-carry edge case verifier packet must be crafted so the checksum accumulator hits exactly 0xFFFFFFFF after the first fold \u2014 this is a precise constraint that could be brittle if the verifier's scapy script has any off-by-one in payload crafting.",
+   "JSON output ordering: the instruction says 'deterministic' but does not specify flow ordering (e.g., by flow_id, by first-packet arrival order); verifier comparison could fail on valid implementations that sort differently.",
+   "The reference script hidden in git history is a red herring if the agent already knows the bugs from the instruction \u2014 its presence adds noise without contributing to difficulty.",
+   "libpcap on linux may not support reading crafted jumbogram pcap files written by scapy without special handling, potentially causing the daemon to silently skip jumbogram packets rather than mis-parse them."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint's Environment section explicitly describes all three bugs (jumbogram pseudo-header length, double-carry fold, th_off parser offset) with file locations and enough detail that a strong agent can fix them in ~9 commands without any exploration, making the 'observe_not_read' and 'shallow_check_trap' difficulty levers ineffective. The speedrun confirms genuine_difficulty scores 2, which is below the minimum threshold of 3. Additionally, the jumbogram verifier implementation carries meaningful flakiness risk since real jumbograms exceed standard pcap limits and the double-carry edge case requires precise payload crafting.",
+  "fixes": [
+   "Remove bug descriptions from the Environment section visible to the solver \u2014 keep only the file names, line counts, and the general statement that 'the extension commit introduced regressions'; move all bug specifics exclusively to the Internal Hint.",
+   "Replace the explicit 'Resolution path' in the blueprint with a vaguer statement that multiple independent bugs exist across multiple files, forcing the agent to discover them through execution rather than reading.",
+   "Specify flow output ordering explicitly (e.g., ascending flow_id) to eliminate ambiguity in verifier comparison.",
+   "Validate that the verifier can reliably generate and replay jumbogram pcaps in the container environment before accepting the blueprint, or replace jumbograms with a simpler large-payload IPv6 flow (e.g., 66000-byte TCP segment using TCP segmentation) that standard pcap handles without special cases.",
+   "Add a fourth hidden bug in flow.c or main.c (e.g., a flow eviction race or JSON field name typo triggered only on certain flow counts) to further deter partial-fix submissions, and ensure the sample tests genuinely cannot surface any of the bugs."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Both involve network flow processing but the candidate focuses on TCP checksum validation and payload byte counting in a C daemon, while this reference involves NetFlow v9 aggregation with template handling in a different language/architecture."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "The reference is a Rust packet codec performance/correctness problem, while the candidate is a C TCP checksum engine with IPv4/IPv6/jumbo frame edge cases."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference involves HMAC-SHA256 computation over WAL records in a TCP audit service, while the candidate involves TCP checksum validation and flow byte counting across IP protocol variants."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "The reference is about AES-CTR encryption bugs in a refactored library, while the candidate is about TCP checksum computation bugs with IPv6/jumbo frame support."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "The reference involves NetFlow v9 ASN attribution and template state management in Python, while the candidate involves TCP checksum validation and payload counting in a C daemon across IP protocol variants."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-0cd67d8adf4d",
+     0.226
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.16
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.148
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.097
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.093
+    ]
+   ],
+   "cost_usd": 0.014982
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056718000000000005
+}

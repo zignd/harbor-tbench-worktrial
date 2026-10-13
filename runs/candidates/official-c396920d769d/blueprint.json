@@ -1,0 +1,65 @@
+{
+ "slug": "rust-numeric-accumulator-invariant",
+ "title": "Fixed-Point Pipeline Accumulator Repair",
+ "scenario": "A data engineering team runs a time-series aggregation service that ingests raw sensor readings and computes fixed-point statistical summaries. The production binary (compiled from a now-lost branch) produces correct outputs; the source tree a new engineer inherited was 'synced' from a different branch and has diverged in its accumulator math. The binary ships as a compiled artifact in the Docker image at /app/bin/accumulator_ref; the source lives at /app/src/ (~1,400 lines across several modules). The pipeline writes summary records to /app/db/results.db (SQLite) and must process 500,000 records in under 4 seconds on a single core.",
+ "instruction_draft": "You have inherited a Rust sensor-aggregation pipeline at /app/src/. The pipeline reads batched sensor records from /app/data/input.bin, accumulates fixed-point statistics, and writes rows to /app/db/results.db.\n\nWhen you run the current source build against the provided sample batch, the output rows in results.db differ from those produced by the reference binary /app/bin/accumulator_ref on the same input. Fix the pipeline source so that:\n\n1. For every input batch (including the sample and batches generated at verification time), the pipeline writes rows to results.db that are byte-for-byte identical to those the reference binary produces.\n2. The pipeline processes 500,000 sensor records in under 4 seconds on a single CPU core.\n3. The file /app/db/results.db exists and contains exactly one row per input batch, with columns: batch_id (integer), sample_count (integer), fixed_mean (integer, Q16.16 fixed-point), fixed_variance (integer, Q16.16 fixed-point), checksum (integer).\n4. The fixed_mean and fixed_variance values must be computed using the same accumulation order and rounding convention as the reference binary\u2014these are not visible in the source and must be inferred by probing the reference binary.\n\nDo not modify /app/bin/accumulator_ref. Do not alter the database schema. The verifier will generate fresh batches and compare your pipeline's output against the reference binary's output on those same batches.",
+ "requirements": [
+  "results.db exists with schema: batch_id INTEGER, sample_count INTEGER, fixed_mean INTEGER, fixed_variance INTEGER, checksum INTEGER",
+  "For every input batch, fixed_mean matches the reference binary's output exactly (Q16.16 rounding)",
+  "For every input batch, fixed_variance matches the reference binary's output exactly (Q16.16 rounding)",
+  "For every input batch, checksum matches the reference binary's output exactly",
+  "Pipeline processes 500,000 records in under 4 seconds on a single CPU core",
+  "Exactly one row per batch in results.db"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm base with rustc/cargo (stable, pinned), sqlite3, python3 installed via apt",
+  "Compiled reference binary at /app/bin/accumulator_ref (ELF x86-64, stripped, no source). Accepts: accumulator_ref <input.bin> <output.db>. Reads batched records in a documented binary format, writes SQLite rows.",
+  "/app/data/input.bin: sample batch of 10,000 records in the documented format (batch_id=1)",
+  "/app/data/generate_batch.py: deterministic batch generator (seeded) that produces input.bin files for arbitrary record counts and batch IDs \u2014 solver can use this to probe the reference binary",
+  "/app/src/: ~1,400 lines of Rust across: main.rs, accumulator.rs, codec.rs, db.rs, stats.rs. The source compiles and runs but produces wrong fixed_mean and fixed_variance.",
+  "The source bug: accumulator.rs uses Welford online variance with Q16.16 arithmetic, but applies the final division BEFORE the Q16.16 shift instead of after, causing systematic drift. Additionally, the rounding mode is floor instead of the reference binary's round-half-up (banker's rounding for the mean).",
+  "The bug is NOT visible by reading the source alone: the formula looks plausible (Welford is correct in floating-point, wrong only in fixed-point ordering) and both division and shift appear in adjacent lines. The divergence only manifests on multi-record batches and grows with variance in the data.",
+  "The performance bug: accumulator.rs processes records one at a time in a Vec push loop instead of chunked SIMD-friendly processing; a simple chunk-based rewrite suffices to hit 4s threshold.",
+  "Hidden invariant: the reference binary uses round-half-up for fixed_mean but truncation for fixed_variance. This asymmetry is not documented anywhere and must be discovered by probing with carefully chosen inputs (e.g., batches where the exact midpoint between two Q16.16 values is hit).",
+  "checksum: reference binary computes a CRC32 of the raw i32 sample values in little-endian order using the standard IEEE polynomial \u2014 this IS documented in /app/docs/format.md",
+  "/app/docs/format.md: documents the binary record format (4-byte little-endian i32 per sample, preceded by 8-byte batch header) and checksum algorithm, but NOT the fixed-point rounding conventions",
+  "/app/run_pipeline.sh: convenience script that builds and runs the Rust pipeline on /app/data/input.bin writing to /app/db/results.db",
+  "Dockerfile pins: rustc 1.78, sqlite3 3.45, python3.13"
+ ],
+ "internal_hint": "Difficulty comes from two sources: (1) The fixed-point rounding invariant is data-dependent and cannot be discovered by reading source\u2014it requires probing the reference binary with crafted inputs. The source has a plausible-looking Welford formula, but the Q16.16 shift order is wrong (divides before shifting). The rounding asymmetry (round-half-up for mean, truncate for variance) is a hidden behavioral invariant that only surfaces on specific inputs. A skilled engineer: (a) runs the sample through both binaries and compares outputs, (b) generates minimal batches (1 record, 2 records, 3 records) to isolate mean vs. variance divergence, (c) crafts inputs near Q16.16 midpoints to detect rounding convention, (d) fixes the accumulator.rs shift-before-divide order, (e) applies correct rounding per type. (2) The performance issue requires profiling to find the tight loop and restructuring to chunked processing.",
+ "trap": "A naive agent will: (1) read accumulator.rs, spot that Welford looks 'basically right', maybe fix the shift order, but miss the rounding asymmetry between mean and variance\u2014so fixed_mean matches but fixed_variance still diverges on verification batches with non-trivial variance. (2) Test only on the sample batch, which may not hit the rounding midpoint case. (3) Fix correctness but not performance, or optimize performance but introduce a subtle reordering that changes accumulation results. The hidden invariant (round-half-up for mean, truncate for variance) is the primary trap\u2014it only surfaces on inputs the sample doesn't exhibit.",
+ "tests": [
+  "Verifier generates 5 fresh batches (seeded, deterministic) with sizes 1000, 10000, 50000, 100000, 500000, each with different batch_ids, and runs both the fixed pipeline and the reference binary",
+  "For each fresh batch: fixed_mean must match reference binary output exactly (INTEGER equality in SQLite)",
+  "For each fresh batch: fixed_variance must match reference binary output exactly (INTEGER equality in SQLite)",
+  "For each fresh batch: checksum must match reference binary output exactly",
+  "Performance test: 500,000-record batch must complete in under 4 seconds (measured by verifier with `time`)",
+  "Schema check: results.db has exactly the required columns with correct types",
+  "Rounding probe: verifier generates a batch specifically crafted so that the true mean lands at a Q16.16 half-step boundary (0.5 in the fractional part), checking that fixed_mean rounds up rather than down",
+  "Variance rounding probe: verifier generates a batch where true variance lands at a Q16.16 half-step, checking that fixed_variance truncates (matches reference binary's truncation behavior)"
+ ],
+ "verifier_knob": {
+  "name": "number_of_verification_batches",
+  "value": "5 fresh batches including rounding-probe inputs",
+  "effect": "Increasing to 10+ batches with more adversarial rounding cases makes the hidden invariant harder to fully nail; decreasing to 2 batches without rounding probes makes correctness easier to achieve by coincidence"
+ },
+ "expected_failure_modes": [
+  "Agent fixes shift-before-divide order but misses the rounding asymmetry (mean rounds up, variance truncates), causing variance mismatches on verification batches",
+  "Agent correctly identifies rounding for mean but applies same rule to variance, failing variance rounding probe",
+  "Agent fixes correctness but the performance test fails because chunked processing was not implemented",
+  "Agent tests only on sample batch (10,000 records), which doesn't hit rounding midpoint cases, and declares success prematurely",
+  "Agent probes reference binary with small batches to find mean rounding but doesn't probe variance separately, assuming both use same rounding",
+  "Agent makes chunked processing optimization that changes accumulation order, causing floating-point-style drift in integer accumulation path"
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "debugging",
+ "tags": [
+  "rust",
+  "fixed-point-arithmetic",
+  "reverse-engineering",
+  "binary-probing",
+  "performance",
+  "data-pipeline"
+ ]
+}

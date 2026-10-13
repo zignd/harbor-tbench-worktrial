@@ -301,7 +301,12 @@ def gate_static(task_dir: Path, tag: str) -> tuple[list[str], bool, bool]:
 
 def gate_functional(task_dir: Path, name: str) -> tuple[list[str], dict]:
     oracle, oracle_x = run_with_retries(
-        task_dir, "oracle", f"{name}-oracle", attempts=ORACLE_RUNS, concurrent=ORACLE_RUNS
+        # One at a time: three at once held three Docker networks per gate.
+        task_dir,
+        "oracle",
+        f"{name}-oracle",
+        attempts=ORACLE_RUNS,
+        concurrent=1,
     )
     nop, nop_x = run_with_retries(task_dir, "nop", f"{name}-nop")
     result = {

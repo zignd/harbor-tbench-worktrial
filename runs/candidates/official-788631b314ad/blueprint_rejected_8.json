@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "subnet-allocator-silent-corruption",
+  "title": "IP Subnet Allocator Silent Corruption",
+  "scenario": "A release engineer is preparing a v2.1 tag for an internal network provisioning service written in C. The service manages a pool of IPv4 subnets and exposes a daemon that allocates and releases subnet ranges on request over a Unix socket. The git repository has about 18 months of history: the allocator was originally written for a /24-only world, then extended in two successive commits to support variable-length prefix allocations (/20 through /28). Integration tests were added at the same time but only exercise the single-prefix-length case. CI passed but production operators have been filing subtle tickets: allocations sometimes overlap, and the overlap only appears when a mix of prefix lengths is allocated and partially freed in a realistic workload order.",
+  "instruction_draft": "The subnet allocator daemon in this repository is silently issuing overlapping subnet allocations when a mix of prefix lengths (/20 through /28) are allocated and partially released in workload order. No overlap occurs in the single-length unit tests that ship with the repo. Your job is to locate every correctness defect in the allocator so that: (1) no two simultaneously active leases share any IP address; (2) a released subnet is fully reclaimable and can be re-issued as part of a larger or different-prefix lease later; (3) the aggregate space accounted for by all active leases never exceeds the configured pool size; (4) the daemon survives at least 50,000 alloc/free cycles on a mixed-length workload without assertion failure or memory corruption detected by AddressSanitizer. Build the daemon with `make` from the repo root; it must accept the existing wire protocol. Do not change the wire protocol or the public API header.",
+  "requirements": [
+   "No two simultaneously active leases share any IP address",
+   "A released subnet is fully reclaimable and re-issuable at a different prefix length",
+   "Aggregate active lease space never exceeds configured pool size",
+   "Daemon survives 50,000 mixed-prefix alloc/free cycles under AddressSanitizer without error",
+   "Build succeeds with `make` from repo root",
+   "Wire protocol and public API header are unchanged"
+  ],
+  "environment": [
+   "Git repository with ~1,800 lines across: src/allocator.c (~600 lines, core bitmap+free-list logic), src/daemon.c (~350 lines, Unix socket handler), src/proto.c (~180 lines, request/response codec), include/alloc.h (public API, must not change), tests/unit_test.c (~300 lines, single-prefix-length tests only), Makefile",
+   "Three planted defects, none visible by static reading alone:",
+   "DEFECT 1 (data-dependent, observe_not_read): The buddy-merge function recomputes a block's natural alignment using the block's current prefix length, but after a /28 is freed into a hole left by a previously freed /24, the buddy index arithmetic uses a stale prefix stored in the block header rather than the merged block's new prefix \u2014 this only triggers when the free-list has a specific size-ordering that arises after at least ~200 mixed frees, so the allocator appears correct on small tests",
+   "DEFECT 2 (shallow_check_trap): The bitmap range-claim function uses a 32-bit shift `1u << prefix` to build a mask for prefix lengths >= 20, but for /20 the shift produces 0x100000 which fits in 32 bits \u2014 it appears to work on samples \u2014 however for the pool base address computation the same mask is used as a divisor in a host-count calculation that silently truncates on /20 boundaries, causing the first /20 allocation to claim 64K addresses but mark only 32K as used in the bitmap, so a second concurrent /20 allocation overlaps the top half",
+   "DEFECT 3 (long-horizon): The free-list reinsert path for split blocks (when a large block is split to satisfy a smaller request) pushes both halves to the tail of the free-list; the allocator then searches from head and skips alignment checks, so a block at a misaligned offset can be issued, which only becomes a network overlap after the list has been reordered by several free-merge events \u2014 invisible until ~500 cycles",
+   "Seed commit log includes a message 'extend allocator to variable prefix lengths' that introduced defects 1 and 2, and a later 'fix split-block reinsert order' that introduced defect 3 (it fixed something else but introduced the ordering bug)",
+   "Unit tests in tests/unit_test.c exercise only /24 allocations and pass cleanly",
+   "A helper binary `tools/workload_gen` (pre-compiled, no source) generates deterministic mixed-prefix workload traces as binary files for use with the daemon",
+   "Makefile targets: `make` (build daemon), `make test` (unit tests), `make asan` (build with -fsanitize=address,undefined)"
+  ],
+  "internal_hint": "Difficulty comes from three interacting defects that only manifest under mixed-prefix, multi-cycle workloads: (1) the buddy-merge prefix stale-read (find by running workload_gen traces and observing assertion failures in allocator_validate() after ~300 cycles, then adding instrumentation to the merge path); (2) the 32-bit shift mask truncation for /20 which the unit tests never hit because they only test /24 (find by constructing a two-concurrent-/20 scenario or by noticing the pool-accounting invariant breaks at cycle ~50); (3) the free-list tail-insert misalignment which needs ~500 cycles of reordering before a misaligned block surfaces (find by enabling the internal assert on issued block alignment and running the full 50k workload). The solver must run the daemon against workload traces, observe failures, add instrumentation or insert asserts, attribute each failure to a specific code site, and patch. No single defect is findable by reading source; each requires running real data.",
+  "trap": "A solver that fixes only the 32-bit shift (defect 2, the most obvious arithmetic issue) will pass the small provided test suite and even a moderate 5,000-cycle run, because defect 1 needs ~200 cycles of mixed frees and defect 3 needs ~500 cycles of list churn. The verifier runs 50,000 cycles and checks the no-overlap invariant on every allocation response, so all three defects must be fixed. A solver that adds the ASAN build but only verifies against the unit tests will also miss all three.",
+  "tests": [
+   "Build test: `make asan` succeeds and produces a daemon binary",
+   "Unit regression: `make test` still passes (no API change)",
+   "Overlap test: verifier allocates 200 /28s, frees alternating half, allocates 100 /27s, checks every pair of active leases for IP overlap \u2014 must find zero overlaps",
+   "Pool accounting test: verifier runs 1,000 alloc/free cycles with random prefix mix /20-/28, asserts sum of active lease sizes never exceeds pool size at any point",
+   "Reclaimability test: allocate entire pool in /28s, free all, allocate entire pool as a single /20 \u2014 must succeed without error",
+   "Endurance test: verifier replays a seeded 50,000-cycle mixed-prefix workload against the ASAN-instrumented daemon and checks for zero ASAN errors and zero overlap violations throughout",
+   "Misalignment test: verifier checks that every issued subnet base address is a natural multiple of its prefix size (e.g., /27 base is divisible by 32)",
+   "Buddy-merge test: allocate two adjacent /27s carved from a /26, free both in reverse order, then allocate the /26 \u2014 must return same base address, proving full merge"
+  ],
+  "verifier_knob": {
+   "name": "endurance_cycles",
+   "value": "50000",
+   "effect": "Lowering to 5000 lets a one-defect fix pass (defect 2 alone is enough to clear short runs); raising to 100000 forces all three defects to be fixed and exposes any latent list-ordering issues a solver may have introduced"
+  },
+  "expected_failure_modes": [
+   "Agent fixes the visible 32-bit shift and stops, believing the small test suite passing means correctness \u2014 fails the 50k endurance test on defects 1 and 3",
+   "Agent adds instrumentation but only runs a few hundred cycles, misses defect 3 which needs ~500 cycles of list churn to surface",
+   "Agent rewrites the buddy allocator from scratch but introduces a new alignment bug in the split path, fails the misalignment test",
+   "Agent patches the merge path (defect 1) using the wrong prefix source (uses request prefix instead of merged block prefix), appears to fix the assertion but still produces overlaps on specific free orderings",
+   "Agent builds without ASAN and misses a use-after-free in the free-list reinsertion that the endurance test catches only under ASAN"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "networking",
+   "allocator",
+   "git-history",
+   "observe-not-read",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat include/alloc.h src/allocator.c src/daemon.c src/proto.c",
+   "cat tests/unit_test.c Makefile",
+   "git log --oneline",
+   "git show <commit-hash-extend-variable-prefix>",
+   "git show <commit-hash-fix-split-block>",
+   "# In allocator.c: grep for '1u << prefix' \u2014 spot defect 2 immediately",
+   "# In buddy-merge function: identify that block->prefix (header field) is used after merge instead of computed new_prefix \u2014 defect 1",
+   "# In free-list reinsert: confirm split halves pushed to tail without alignment validation \u2014 defect 3",
+   "# Fix defect 2: change '1u << prefix' mask to use uint64_t or correct bit width",
+   "# Fix defect 1: in merge path, replace block->prefix with locally computed merged_prefix",
+   "# Fix defect 3: in alloc path, add alignment assert/check before issuing block from free-list",
+   "make asan",
+   "make test",
+   "tools/workload_gen --seed 42 --cycles 50000 > /tmp/trace.bin",
+   "./daemon_asan --trace /tmp/trace.bin",
+   "# Verify zero ASAN errors and zero overlap violations"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Pre-compiled tools/workload_gen binary with no source: platform mismatch (darwin vs linux container), missing shared libraries, or changed ABI could make it non-functional with no fallback, blocking verification entirely",
+   "Defects described precisely enough in blueprint that skilled agent finds all three by static reading in one pass, undermining the observe_not_read premise and the shallow_check_trap \u2014 the task's own difficulty lever is neutralized",
+   "ASAN + 50,000 cycle endurance test on 1 CPU / 2GB RAM may be flaky on timing-sensitive or resource-constrained CI environments; partial ASAN output truncation could cause false negatives",
+   "The buddy-merge defect (stale prefix in block header) is described so specifically that an agent reading the hint-adjacent blueprint description knows exactly which variable to look at, making it a guided fix rather than a discovery",
+   "Wire protocol 'unchanged' requirement has no specified baseline hash or test \u2014 an agent could accidentally change a padding byte and not know it failed until the verifier runs, with no actionable error"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three defects are locatable by careful static reading of ~600 lines of C source \u2014 the 'observe_not_read' tag is contradicted by the blueprint's own precise descriptions, and the classic '1u << prefix' 32-bit shift bug is immediately visible to any experienced C programmer without running the code. The pre-compiled workload_gen binary with no source is a serious environmental risk that could make the task unsolvable on platform mismatch. The average score of 3.4 falls below the required 3.6 threshold, and the genuine_difficulty score of 2 is disqualifying per the scoring rubric.",
+  "fixes": [
+   "Make defects truly require dynamic observation: replace the '1u << prefix' arithmetic defect with a race condition in the daemon's socket handler that only triggers under concurrent alloc/free requests, or a hash-collision in the lease lookup table that surfaces only after specific allocation sequences \u2014 these cannot be found by reading the single-threaded allocator.c",
+   "Replace or open-source tools/workload_gen so the solver can build it from source, ensuring cross-platform compatibility and removing the binary dependency risk; alternatively embed the workload generation logic directly into the verifier",
+   "Deepen the shallow_check_trap by making defect 2 appear to produce correct results for all prefix lengths in isolation, only failing when the pool base address wraps in a way that requires running the daemon against a specific address-space configuration that the unit tests don't use \u2014 not just a wider-type fix"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/retro-console-soc",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a retro gaming console SoC in Verilog; the candidate is about finding and fixing a subnet allocator bug in C."
+    },
+    {
+     "ref_id": "terminal-bench-pro/recover-git-reflog-commits",
+     "verdict": "distinct",
+     "reason": "That task is about recovering lost Git commits via reflog; the candidate is about debugging silent correctness defects in a C network subnet allocator daemon."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a Rust packet-codec service for correctness and performance; the candidate involves finding overlapping-allocation bugs in a C IPv4 subnet allocator."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a SQLite database with a compiled engine; the candidate is about locating correctness defects in a C subnet allocation daemon."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a NetFlow v9 aggregation service returning empty/incorrect data; the candidate is about fixing overlapping-allocation bugs in a C IPv4 subnet allocator."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/retro-console-soc",
+     0.1
+    ],
+    [
+     "terminal-bench-pro/recover-git-reflog-commits",
+     0.085
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.081
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.063
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.058
+    ]
+   ],
+   "cost_usd": 0.014535
+  },
+  "novel": true
+ },
+ "cost_usd": 0.054255000000000005
+}

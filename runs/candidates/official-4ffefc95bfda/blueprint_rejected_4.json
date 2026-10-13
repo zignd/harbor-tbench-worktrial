@@ -1,0 +1,160 @@
+{
+ "blueprint": {
+  "slug": "ledger-reconcile-sql-engine",
+  "title": "Invoice Ledger Reconciliation Engine",
+  "scenario": "A finance-ops team maintains a small in-house Python+SQLite codebase (`/app/reconciler/`) that reconciles vendor invoices against purchase orders. The system ingests raw CSV drops, stages them in SQLite, runs a multi-step SQL reconciliation pipeline, and writes a final `reconciled.db` with match rates reported per vendor. A recent audit flagged that the reported match rates are wrong on several vendor accounts, and a compliance deadline requires the engine to achieve \u2265 95 % accuracy (correct match/no-match classification) across all vendor\u00d7month cells on a hidden validation set.",
+  "instruction_draft": "You are a finance-ops engineer at a mid-size firm. The reconciliation engine at `/app/reconciler/` ingests invoice and purchase-order CSV files, runs a multi-step SQL pipeline, and writes match decisions to `reconciled.db`. Recent spot-checks show the engine is misclassifying invoices on several vendor accounts. Your job is to find and fix every defect so that the engine correctly classifies each invoice-to-PO pair.\n\nThe rules are: an invoice matches a PO if and only if (a) the `vendor_id` values are identical, (b) the invoice `amount` falls within \u00b10.01 of the PO `amount` after applying any open credit memos for that vendor, and (c) the invoice `currency` matches the PO `currency`. Each invoice matches at most one PO (earliest issued PO wins on ties). Unmatched invoices must be recorded as unmatched; double-counting a PO against two invoices is an error. Run `/app/reconciler/run.sh` to execute the pipeline. The classification accuracy on the hidden validation set must be \u2265 95 %.",
+  "requirements": [
+   "Invoice matches PO iff vendor_id is identical, currency is identical, and invoice amount equals PO amount within \u00b10.01 after subtracting open credit memos for that vendor.",
+   "Each invoice matches at most one PO; ties broken by earliest PO issue date.",
+   "Each PO is consumed by at most one invoice (no double-counting).",
+   "Unmatched invoices are recorded as unmatched (not silently dropped).",
+   "Running `/app/reconciler/run.sh` produces `reconciled.db` with a `matches` table and a `summary` table.",
+   "Classification accuracy on the hidden validation set must be \u2265 95 %."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3 CLI, python3-pandas, python3-pytest; no internet at solve time.",
+   "Directory `/app/reconciler/` (~1200 lines total) containing: `run.sh`, `ingest.py` (CSV\u2192SQLite staging), `pipeline.sql` (multi-step reconciliation), `report.py` (writes summary), `utils.py` (helper functions), `schema.sql` (table definitions).",
+   "Sample data in `/app/data/sample/`: `invoices.csv`, `purchase_orders.csv`, `credit_memos.csv` covering 3 vendors and ~60 rows; `expected_sample.csv` with ground-truth match decisions for those rows.",
+   "Bug 1 (data-dependent, not visible by reading): `pipeline.sql` applies credit memos by summing ALL credit memos for a vendor regardless of currency. When a vendor has memos in both USD and EUR, the deduction is wrong for one currency. This only manifests when multi-currency credit memos exist for the same vendor \u2014 the sample data has only single-currency vendors, so the bug is invisible until the hidden set is run.",
+   "Bug 2 (interacting): The tie-breaking ORDER BY in the SQL that selects earliest-PO uses `issue_date` TEXT comparison (lexicographic) rather than date-cast, so ISO dates sort correctly but dates written as M/D/YYYY (which appear only in the hidden set's PO file) sort wrong, causing wrong PO assignment. When Bug 1 is present, some of these wrong assignments accidentally produce the right amount match (because the amount is the same across tied POs), masking Bug 2 until Bug 1 is fixed and the net amounts diverge.",
+   "The `ingest.py` normalises date formats to ISO before inserting \u2014 but only for invoices, not purchase_orders, so PO dates remain as-ingested.",
+   "Roughly 400 lines of plausible but uninvolved code: `report.py` generates per-vendor breakdown charts as CSV, `utils.py` has currency-conversion stubs (not called in the pipeline), a `tests/` folder with unit tests for ingest only.",
+   "Hidden validation set (generated at verify time): 8 vendors, ~400 invoice-PO pairs, including multi-currency credit memo cases and M/D/YYYY-dated POs with genuine ties."
+  ],
+  "internal_hint": "Two interacting bugs, neither visible by static reading alone.\n\nBug 1 (credit memo currency bug): In `pipeline.sql`, the CTE that computes `net_po_amount` does `SUM(cm.amount)` over all credit memos for a vendor without filtering on currency. A vendor with both a $200 USD credit memo and a \u20ac150 EUR credit memo gets a combined $350 deduction applied to both the USD and EUR POs, corrupting both. This only appears with multi-currency vendors, absent from the sample. Fix: add `AND cm.currency = po.currency` to the credit memo join.\n\nBug 2 (date sort bug): The tie-breaking `ORDER BY po.issue_date ASC` operates on raw text. `ingest.py` normalises invoice dates to YYYY-MM-DD but not PO dates, so M/D/YYYY PO dates (e.g. '3/5/2024') sort lexicographically wrong. Fix: cast in the ORDER BY: `ORDER BY date(po.issue_date) ASC`, or normalise PO dates in `ingest.py`.\n\nInteraction: When Bug 1 inflates/deflates net amounts, the wrong PO is selected for some invoices anyway, and the amount mismatch from Bug 2's wrong-PO selection happens to cancel the amount mismatch from Bug 1 for a subset of cases. Fixing Bug 1 first causes accuracy to drop slightly on those cases (making Bug 2 more visible), then fixing Bug 2 brings total accuracy above 95 %.\n\nA solver must: (1) run the pipeline on the sample and compare to expected output (close but not exact), (2) instrument the SQL to expose credit memo aggregation by currency, (3) notice the date format issue by querying the staging table, (4) patch both bugs in `pipeline.sql` (and/or `ingest.py`), (5) re-run and verify.",
+  "trap": "A solver who fixes only the credit memo currency filter will reach ~88 % accuracy on the hidden set because M/D/YYYY tie-breaking errors on the hidden PO data remain. The sample data has no ties among POs of the same vendor+currency, so the date bug produces no error on the sample \u2014 the solver sees 100 % on the sample after fixing Bug 1 and stops. The hidden tests expose both bugs independently and in combination.",
+  "tests": [
+   "Run `/app/reconciler/run.sh`; check exit code is 0 and `reconciled.db` exists with tables `matches` and `summary`.",
+   "Query `matches` against hidden ground truth (400 rows, generated at verify time with multi-currency credit memos and M/D/YYYY PO dates and genuine PO ties); compute precision, recall, and accuracy of match/no-match decisions; require accuracy \u2265 0.95.",
+   "Specifically check: for vendor 'V_MULTI_CCY' (USD+EUR credit memos), all USD-currency invoices have credit memos deducted only in USD and all EUR-currency invoices only in EUR.",
+   "Specifically check: for vendor 'V_TIE' (two POs same amount, same vendor, same currency, dates '3/5/2024' and '11/2/2023' in M/D/YYYY), the invoice is matched to the chronologically earlier PO (11/2/2023 = Nov 2, 2023).",
+   "Check that no PO `po_id` appears more than once in the `matches` table (no double-counting).",
+   "Check that every invoice in the input appears exactly once in `matches` (none silently dropped)."
+  ],
+  "verifier_knob": {
+   "name": "accuracy_threshold",
+   "value": "0.95",
+   "effect": "Raising to 0.97 requires the solver to also handle a third edge case (partial credit memos that sum to exactly 0.01 boundary); lowering to 0.85 makes fixing Bug 1 alone sufficient to pass."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the credit memo currency filter (Bug 1), sees 100% on sample data, and submits \u2014 fails hidden tests at ~88% due to date tie-breaking errors.",
+   "Solver notices the date format issue and fixes `ingest.py` for invoices (already done) but misses that PO dates are not normalised \u2014 date bug persists.",
+   "Solver rewrites the credit memo logic correctly for the sample but uses a different aggregation approach that still ignores currency for edge cases (e.g. NULL currency rows).",
+   "Solver fixes both bugs in isolation but introduces a regression: the match-at-most-one-PO constraint is broken when rewriting the tie-breaking subquery, causing double-counting on POs with multiple competing invoices.",
+   "Solver explores `utils.py` and `report.py` (the uninvolved ~400 lines) and spends time chasing currency-conversion stubs that are never called, running out of time before finding the real SQL bugs."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "finance",
+   "debugging",
+   "reconciliation",
+   "edge-cases",
+   "two-interacting-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/reconciler/pipeline.sql",
+   "cat /app/reconciler/ingest.py",
+   "grep -n 'issue_date\\|ORDER BY\\|credit_memo\\|currency' /app/reconciler/pipeline.sql",
+   "# Notice: credit memo join lacks AND cm.currency = po.currency",
+   "# Notice: ingest.py normalises invoice dates but not PO dates",
+   "# Notice: ORDER BY po.issue_date ASC is raw text comparison",
+   "/app/reconciler/run.sh",
+   "diff <(sqlite3 reconciled.db 'SELECT invoice_id,po_id,matched FROM matches ORDER BY invoice_id') /app/data/sample/expected_sample.csv",
+   "# Fix Bug 1: add AND cm.currency = po.currency to credit memo CTE in pipeline.sql",
+   "# Fix Bug 2: change ORDER BY po.issue_date ASC to ORDER BY date(po.issue_date) ASC",
+   "sed -i 's/AND cm.vendor_id = po.vendor_id/AND cm.vendor_id = po.vendor_id AND cm.currency = po.currency/' /app/reconciler/pipeline.sql",
+   "sed -i 's/ORDER BY po.issue_date ASC/ORDER BY date(po.issue_date) ASC/' /app/reconciler/pipeline.sql",
+   "/app/reconciler/run.sh",
+   "sqlite3 reconciled.db 'SELECT COUNT(*) FROM matches'",
+   "sqlite3 reconciled.db 'SELECT po_id, COUNT(*) FROM matches GROUP BY po_id HAVING COUNT(*) > 1'"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Bug 2 is described as 'not visible by static reading alone' but the asymmetry in ingest.py (normalises invoice dates but not PO dates) combined with the text ORDER BY in pipeline.sql is discoverable purely by reading the source \u2014 making the 'trap' weaker than advertised.",
+   "The hidden validation set is generated at verify time with specific vendor IDs (V_MULTI_CCY, V_TIE) \u2014 if the sample data doesn't include these vendor IDs, a solver who inspects the staging DB to check their fix might notice a perfect sample score and assume correctness; this is intentional but the stop-early trap only works if the solver doesn't read ingest.py carefully.",
+   "The interaction described ('fixing Bug 1 causes accuracy to drop slightly') could confuse a solver who runs intermediate checks and concludes their Bug 1 fix broke something, leading them to revert it \u2014 this is a valid difficulty lever but could feel like a flaky environment.",
+   "The sed-based fixes shown in speedrun may not match exact SQL syntax in the actual generated files; small whitespace or quoting differences could require manual editing, adding uncertainty to build reproducibility.",
+   "The \u00b10.01 tolerance rule combined with floating-point SQLite arithmetic may produce borderline cases where ROUND() or CAST() differences affect match classification in ways not covered by the stated rules."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies acceptance: both bugs are discoverable by static reading of the two key files (pipeline.sql and ingest.py), and a skilled agent reading the code systematically would find and fix both in ~15 commands without needing the sample data to expose them. The blueprint explicitly states the interaction requires dynamic testing to expose, but the asymmetric date normalisation in ingest.py is a visible static signal. The task is otherwise well-constructed \u2014 clear rules, realistic scenario, strong verifier \u2014 but the core difficulty claim (bugs invisible without dynamic inputs) does not hold for a careful reader.",
+  "fixes": [
+   "Make Bug 2 truly invisible statically: instead of the asymmetry being in ingest.py (which is readable), embed the date normalisation inside the SQL pipeline itself using a CTE that appears to normalise dates but has an off-by-one or wrong strftime format that only fails on M/D/YYYY \u2014 so reading ingest.py gives no clue.",
+   "Add a third, genuine interaction: make the credit memo CTE also used by the tie-breaking subquery so that fixing Bug 1 alone changes which POs are candidates for tie-breaking in a non-obvious way, requiring dynamic inspection of intermediate query results rather than static reading.",
+   "Strengthen the trap by ensuring sample data has at least one M/D/YYYY PO date that happens to sort correctly lexicographically (e.g., '9/1/2024' vs '2024-09-01') \u2014 giving false confidence that date handling is fine \u2014 rather than simply having no such dates at all."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/normalize-invoice-pdfs-to-csv",
+     "verdict": "distinct",
+     "reason": "That task extracts and normalizes invoice data from PDFs into CSV; the candidate task debugs a multi-step SQL reconciliation pipeline to correctly match invoices against POs using business rules."
+    },
+    {
+     "ref_id": "terminal-bench/medical-claims-processing",
+     "verdict": "distinct",
+     "reason": "That task reviews medical claims and fixes a CRP flagging engine; the candidate task fixes a financial invoice-to-PO matching pipeline with specific reconciliation rules."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/financial-document-processor",
+     "verdict": "distinct",
+     "reason": "That task classifies and extracts data from mixed document files; the candidate task debugs SQL reconciliation logic for matching invoices to purchase orders."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding and fixing defects in a data pipeline that produces incorrect output, with correctness validated against a hidden test set, though the candidate uses SQL/SQLite reconciliation rules while this reference fixes a CSV chunking pipeline."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task fixes a SQL query to produce correct window function results; the candidate task fixes an entire multi-step reconciliation pipeline with business matching rules across invoices, POs, and credit memos."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/normalize-invoice-pdfs-to-csv",
+     0.359
+    ],
+    [
+     "terminal-bench/medical-claims-processing",
+     0.18
+    ],
+    [
+     "terminal-bench-2-1/financial-document-processor",
+     0.16
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.084
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.084
+    ]
+   ],
+   "cost_usd": 0.013998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.052179
+}

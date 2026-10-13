@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "release-build-sql-rollup-repair",
+  "title": "Rolling Release Metrics Rollup Repair",
+  "scenario": "A release engineering team runs nightly build-health dashboards from a SQLite database populated by a Bash ETL pipeline. The pipeline reads raw per-build event rows, applies a two-stage SQL rollup (hourly \u2192 daily), and writes summary rows that CI alerting queries against. After last week's schema migration, the rollup output is silently wrong: alert thresholds are never crossed even when builds are clearly failing. The environment is a ~1,200-line system with a pipeline script, a set of SQL view/query files, seed data, and a compiled C helper binary (no source) that pre-aggregates certain time-window columns before SQLite sees them.",
+  "instruction_draft": "Your nightly release-metrics pipeline lives under /opt/metrics/. After last week's schema migration the summary table written by bin/run_pipeline.sh no longer triggers alerts correctly: the daily failure rate reported for any build series is always far below the true value, and the window-weighted mean duration is systematically inflated. Both values feed the same alerting query, so the dashboards appear healthy when they should not.\n\nFix the pipeline so that: (1) each row in summary.daily correctly reports the failure rate as failed_builds / total_builds for that date+series, where a build is failed if its exit_code column is non-zero; (2) the window-weighted mean duration in summary.daily equals the arithmetic mean of duration_sec across all builds in that date+series (the helper binary's pre-aggregated column must be used only as a raw input, not as a weight); and (3) both of the above hold for every combination of date and series present in the events table, including series that have zero failures and series whose builds span midnight boundaries. Do not alter the alerting query or the schema of summary.daily; only the pipeline logic and SQL may change.",
+  "requirements": [
+   "failure_rate in summary.daily equals failed_builds / total_builds, where a build is failed iff exit_code != 0",
+   "window_mean_duration in summary.daily equals the arithmetic mean of duration_sec for each (date, series) group",
+   "the helper binary's pre-aggregated column is used only as a raw input; it must not be used as a divisor or weight for duration averaging",
+   "results are correct for series with zero failures (failure_rate = 0.0)",
+   "results are correct for builds whose timestamps span midnight (the build belongs to the date of its start_time)",
+   "the schema of summary.daily and the alerting query are not modified"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install sqlite3, bash, bc",
+   "/opt/metrics/bin/run_pipeline.sh: the main ETL driver; calls ingest, the C helper binary, then SQL rollup scripts",
+   "/opt/metrics/sql/hourly_rollup.sql: first-stage aggregation from events \u2192 summary.hourly; contains bug #1: uses exit_code = 0 as the failure flag (inverted logic), so failed_builds counts successes",
+   "/opt/metrics/sql/daily_rollup.sql: second-stage aggregation from summary.hourly \u2192 summary.daily; contains bug #2: divides SUM(window_duration_sec) by SUM(pre_agg_count) instead of SUM(total_builds), inflating mean duration whenever the C helper's pre_agg_count differs from total_builds (which it does for midnight-spanning builds)",
+   "/opt/metrics/bin/preaggregate: compiled C binary (no source); reads events.db, writes a pre_agg_events table with columns (series, hour_bucket, pre_agg_count, window_duration_sec); pre_agg_count excludes builds that start in one hour and end in the next, so it is always <= total_builds",
+   "/opt/metrics/lib/ingest.sh: loads raw JSON build logs into events table (series TEXT, start_time INTEGER unix epoch, duration_sec REAL, exit_code INTEGER); correct and not involved",
+   "/opt/metrics/data/sample_builds.json: 30-row sample with visible failures and successes for 3 series on 2 dates; smoke-test input",
+   "/opt/metrics/alerting_query.sql: read-only reference; queries summary.daily; must not be changed",
+   "SQLite database at /opt/metrics/data/metrics.db created by the pipeline",
+   "approximately 400 additional lines of plausible but uninvolved shell utility functions in /opt/metrics/lib/util.sh and /opt/metrics/lib/schema.sh",
+   "seed script populates sample_builds.json with enough rows that both bugs produce plausible-looking (but wrong) numbers on the sample"
+  ],
+  "internal_hint": "Two interacting causes: (1) hourly_rollup.sql counts failed_builds as COUNT(*) WHERE exit_code = 0 (inverted flag \u2014 successes are counted as failures); this means failure_rate is inverted but looks plausible on balanced samples. (2) daily_rollup.sql computes window_mean_duration = SUM(window_duration_sec) / SUM(pre_agg_count) rather than SUM(window_duration_sec) / SUM(total_builds); because the C binary's pre_agg_count excludes midnight-spanning builds, this divisor is too small and the mean is inflated. The interaction: if the solver only fixes the exit_code inversion, failure rates still look wrong on the hidden corpus because duration is also broken (and vice versa). Neither bug is obvious from reading the sample output because: the sample has equal pass/fail counts (so inverted failure_rate \u2248 true failure_rate) and no midnight-spanning builds (so pre_agg_count = total_builds and the duration bug cancels). The solver must run the pipeline on adversarial data (unbalanced series, midnight-spanning builds) to observe both defects, then trace them to the two SQL files. The C binary is a distraction/red herring for duration \u2014 solvers who suspect the binary must instrument to discover pre_agg_count differs from total_builds only for midnight-spanning events.",
+  "trap": "The sample data is balanced (equal pass/fail) and has no builds crossing midnight. A solver who fixes only the exit_code inversion will pass the sample check (failure_rate now matches) but the hidden corpus includes series with 0%, 100%, and arbitrary failure rates plus midnight-spanning builds, exposing both that the exit_code fix was incomplete on some edge cases AND that window_mean_duration is still wrong. A solver who spots the duration bug but uses a naive SUM(duration_sec)/COUNT(*) without going through the hourly rollup correctly will fail series where hourly boundaries split builds differently. The shallow check trap is specifically that the provided sample makes both bugs invisible without active experimentation.",
+  "tests": [
+   "Load a generated corpus of 500 builds across 10 series and 5 dates including: series with 0% failure rate, series with 100% failure rate, builds with start_time in one calendar day and start_time+duration crossing midnight; run the pipeline; verify failure_rate = (count of rows with exit_code != 0) / total for every (date, series) pair within 0.001 tolerance",
+   "For each (date, series) pair in the generated corpus, verify window_mean_duration equals the arithmetic mean of duration_sec for that group within 0.01 tolerance",
+   "Verify the schema of summary.daily is unchanged (same column names and types as defined in schema.sh)",
+   "Verify alerting_query.sql is bit-for-bit identical to the original",
+   "Run the pipeline on a corpus where pre_agg_count deliberately differs from total_builds by 30% (many midnight-spanning builds); verify window_mean_duration is still correct",
+   "Verify that a series with exactly 1 failed build out of 1 total produces failure_rate = 1.0",
+   "Verify that a series with 0 failed builds out of N total produces failure_rate = 0.0"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "500 builds, 10 series, 5 dates",
+   "effect": "Raising corpus size increases coverage of edge cases (more midnight-spanning builds, more extreme failure rates, more series with single builds); lowering it makes it easier to pass by luck or partial fix"
+  },
+  "expected_failure_modes": [
+   "Agent reads hourly_rollup.sql, spots the exit_code inversion, fixes it, runs the sample, sees failure_rate look correct, and stops \u2014 missing the duration bug entirely because the sample has no midnight-spanning builds",
+   "Agent suspects the C binary is the source of the duration error and spends time trying to reverse-engineer or replace it, never finding the actual divisor error in daily_rollup.sql",
+   "Agent fixes both bugs but uses SUM(duration_sec)/COUNT(*) at the daily level rather than correctly aggregating through the hourly stage, causing failures on series split across multiple hours",
+   "Agent verifies only against the sample data and does not construct adversarial test cases to expose the midnight-spanning build scenario",
+   "Agent fixes the exit_code logic but inverts it again (uses exit_code != 0 correctly in one place but leaves a secondary COUNT that double-counts)"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "sqlite",
+   "bash",
+   "algorithmic",
+   "two-interacting-bugs",
+   "shallow-check-trap"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/metrics/sql/hourly_rollup.sql  # spot exit_code = 0 inversion bug",
+   "cat /opt/metrics/sql/daily_rollup.sql  # spot SUM(pre_agg_count) divisor bug",
+   "cat /opt/metrics/lib/schema.sh  # confirm summary.daily column names",
+   "cat /opt/metrics/bin/run_pipeline.sh  # confirm pipeline flow",
+   "sed -i 's/exit_code = 0/exit_code != 0/g' /opt/metrics/sql/hourly_rollup.sql",
+   "sed -i 's/SUM(pre_agg_count)/SUM(total_builds)/g' /opt/metrics/sql/daily_rollup.sql",
+   "bash /opt/metrics/bin/run_pipeline.sh",
+   "sqlite3 /opt/metrics/data/metrics.db \"SELECT * FROM summary_daily LIMIT 20;\"",
+   "# Optionally verify: construct small adversarial JSON with midnight-spanning builds, re-run"
+  ],
+  "speedrun_commands": 9,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The compiled C binary with no source is a significant build risk: if the binary has hardcoded paths, architecture assumptions (x86 vs arm64), or glibc version dependencies that differ from the Dockerfile base, it will fail to run in the container and make the task unsolvable rather than hard.",
+   "The 'trap' relies on agents not reading source code, but a strong agent will read the SQL files directly and find both bugs in under 10 commands, making the shallow-check-trap ineffective as a difficulty lever.",
+   "The task description in the blueprint explicitly names which file contains which bug (hourly_rollup.sql has exit_code inversion, daily_rollup.sql has pre_agg_count divisor error), meaning the instruction itself leaks the solution structure even if not revealed to the solver \u2014 a careful agent reading the environment description would infer this.",
+   "The 'arithmetic mean through the hourly stage' requirement is subtly ambiguous: the instruction says window_mean_duration equals arithmetic mean of duration_sec, but the 'expected failure mode' mentions agents who use SUM(duration_sec)/COUNT(*) at daily level fail \u2014 this implies the correct path must go through the hourly aggregation, but this constraint is not stated in the instruction to the solver.",
+   "The midnight-spanning build attribution rule ('belongs to the date of its start_time') may conflict with how the C binary buckets by hour \u2014 if the binary places a midnight-spanning build in two hour buckets, the hourly rollup logic must deduplicate correctly, but this interaction is not clearly specified.",
+   "Flakiness risk: 500-build corpus with floating-point arithmetic and 0.001/0.01 tolerances could produce borderline failures depending on SQLite's floating-point behavior (REAL vs INTEGER division)."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: both bugs are directly visible by reading two small SQL files, and a strong agent can find and fix them in ~9 commands without any adversarial experimentation, making the 'shallow-check-trap' and 'two-interacting-causes' difficulty levers ineffective against source-reading strategies. Additionally, the compiled C binary with no source introduces an unreliable build dependency that could make the task unsolvable due to architecture or ABI mismatches in the container. The instruction also leaves ambiguous whether the correct duration aggregation must flow through the hourly stage or can be computed directly at the daily level.",
+  "fixes": [
+   "Hide the bugs deeper: instead of obvious SQL logic errors, encode the failure_rate inversion as a schema migration that renamed a column (e.g., 'success_count' renamed to 'failed_count' without updating the SQL), requiring the agent to trace data lineage across multiple files rather than finding a single wrong literal.",
+   "Replace the compiled C binary with a Python or shell script that has its own subtle bug (e.g., off-by-one in midnight boundary detection) to make the pre_agg_count discrepancy something the agent must discover empirically rather than read from a description.",
+   "Make the bugs interact more: e.g., the exit_code inversion feeds into the duration calculation through a conditional weight, so fixing one bug without the other produces wrong duration values \u2014 forcing the agent to test both fixes together rather than independently.",
+   "Remove or heavily obfuscate the per-file bug attribution from the blueprint's environment description, and add several plausible-looking but innocent files to increase the search space.",
+   "Add a third subtle bug (e.g., timezone offset applied twice for UTC conversion) that only manifests on certain date combinations, requiring the agent to construct truly adversarial test cases rather than just reading source."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both involve repairing a multi-stage SQLite ETL pipeline with a compiled binary black-box helper and SQL rollup queries, differing mainly in the specific metrics (failure rate/duration vs. sensor normalization/energy) and bug nature."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about query optimization for performance while preserving semantics, not about debugging incorrect aggregation logic in a pipeline."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both are SQLite ETL pipeline repair tasks requiring fixing incorrect aggregation logic (sum/count vs. failure_rate/mean_duration) for grouped summaries, with the same general debugging approach."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-processing logic causing duplicate/missing rows in a CSV pipeline, not about fixing SQL aggregation formulas in a metrics rollup system."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task involves auditing a DSP/spectral-entropy computation pipeline for a mathematical regression in a fast-path implementation, a fundamentally different domain and problem type."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.168
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.15
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.147
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.139
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.114
+    ]
+   ],
+   "cost_usd": 0.014772
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051633000000000005
+}

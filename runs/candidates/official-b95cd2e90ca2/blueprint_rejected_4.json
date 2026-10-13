@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "hmac-log-key-derivation-repair",
+  "title": "HMAC Audit Log Key Derivation Repair",
+  "scenario": "A database administrator is responding to a security incident where the audit log verification service started failing integrity checks after a key rotation last week. The environment contains a Node.js audit log pipeline (~1,200 lines across several modules) that ingests structured JSON log events, derives per-session HMAC keys using a custom KDF, signs each log entry, and exposes a verification endpoint. Logs from the incident period are present, plus a metrics dashboard showing which log sessions verify successfully and which fail.",
+  "instruction_draft": "Hey, since the key rotation last week our log verification service has been rejecting legit audit entries \u2014 not all of them, just some sessions. The dashboard at /app/metrics/verification_stats.json shows the failure pattern. The pipeline is in /app/src/ and the logs are under /app/logs/. I need the verifier (src/verifier.js) to correctly validate every entry in every log file under logs/ \u2014 and I mean correctly, not by weakening the checks. The HMAC over each entry must chain properly: each entry's expected MAC should be reproducible given the session key and the prior entry's MAC as the chaining input. Make sure your fix works for sessions with any number of entries, any session ID length, and any mix of event types. Don't change the log files or the test harness at /app/tests/.",
+  "requirements": [
+   "The verifier must correctly validate all existing log entries under /app/logs/ without weakening integrity checks",
+   "Each log entry's HMAC must be reproducible: computed from the session key, the prior entry's MAC as chaining input, and the current entry's canonical JSON payload",
+   "The session key derivation must handle session IDs of any byte length correctly",
+   "The chaining must be consistent: the first entry uses a defined IV (discoverable from the codebase), and each subsequent entry uses the previous entry's MAC",
+   "The fix must not alter log files or the test harness at /app/tests/"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20 via apt, plus npm packages: express, better-sqlite3, jest",
+   "/app/src/kdf.js: exports deriveSessionKey(masterKey, sessionId) using HKDF-SHA256 \u2014 contains a bug where sessionId is truncated to 16 bytes before being used as the HKDF info field, silently dropping the rest",
+   "/app/src/hmac_chain.js: exports computeEntryMAC(sessionKey, prevMAC, entryPayload) \u2014 contains a second bug where entryPayload is serialized with Object.keys sorted lexicographically but one branch (for 'error' event type) accidentally uses insertion order, breaking reproducibility for error events",
+   "/app/src/verifier.js: reads log files, calls kdf.js and hmac_chain.js to recompute MACs and compare; currently fails because of both upstream bugs propagating inconsistently",
+   "/app/src/logger.js: the write path that originally produced the logs; uses the same kdf.js and hmac_chain.js (so logs were written with the buggy code \u2014 but the old master key produced session IDs all \u226416 bytes, so truncation didn't matter then)",
+   "/app/src/server.js: Express HTTP server exposing /verify/:sessionId and /metrics endpoints (~200 lines of plausible but uninvolved route handling)",
+   "/app/src/db.js: SQLite session registry mapping session IDs to metadata (~150 lines, not involved in the bug)",
+   "/app/config/keys.json: contains current masterKey (post-rotation, base64) and previousMasterKey; post-rotation session IDs are longer (32 hex chars vs old 8 hex chars), triggering the truncation bug",
+   "/app/logs/: 12 log files, mix of short-session-ID (old, verify fine) and long-session-ID (new, fail); each file is newline-delimited JSON, ~20-80 entries; several files contain 'error' event type entries",
+   "/app/metrics/verification_stats.json: pre-generated dashboard showing per-file pass/fail counts so the solver can see the pattern without running the service first",
+   "/app/tests/verifier.test.js: Jest test suite that generates fresh session IDs (8, 16, 24, 32, 48 byte lengths) and event type mixes at test time, writes synthetic log chains using a reference implementation embedded in the test, then calls the solver's verifier.js to validate them \u2014 the reference implementation in the test file is correct",
+   "/app/tests/reference_kdf.js: correct HKDF implementation used only by the test suite's reference; solver must not touch it",
+   "All npm dependencies pre-installed; jest configured in package.json"
+  ],
+  "internal_hint": "There are two interacting bugs, neither visible by reading any single file in isolation \u2014 they only manifest together on the post-rotation data. Bug 1 (kdf.js): sessionId.slice(0, 16) is applied before passing to the HKDF info field, so any session ID longer than 16 bytes gets silently aliased with another \u2014 this explains the per-file pattern in the metrics. Bug 2 (hmac_chain.js): the canonical JSON serialization uses JSON.stringify(Object.keys(payload).sort().reduce(...)) for most events but a special case for type==='error' uses JSON.stringify(payload) directly (insertion-order keys), making error-event MACs non-reproducible when the logger and verifier happen to construct the object in different orders. The solver must: (1) examine the metrics dashboard to see only long-session-ID files fail, (2) correlate with key rotation and session ID length change in config, (3) find the truncation in kdf.js by running the verifier on a synthetic long session, (4) separately notice that even after fixing kdf.js, files with error events still fail, (5) locate the branch in hmac_chain.js, and (6) fix both. A solver who fixes only one bug will pass about half the generated test cases.",
+  "trap": "A solver who fixes only the KDF truncation bug will pass all non-error-event test cases and all short-session-ID log files, making it look correct on a shallow check. The hidden tests always generate at least one error-type event per session and always use session IDs longer than 16 bytes, so both bugs must be fixed. The verify-time test also generates sessions with IDs of 48 bytes to ensure the truncation is really gone, not just accidentally masked.",
+  "tests": [
+   "For each of N generated session IDs (lengths 8, 16, 24, 32, 48 bytes), generate a synthetic log chain of 10-30 entries with a mix of event types including at least one 'error' event, write it using the reference implementation, run the solver's verifier.js against it, assert all entries valid",
+   "Run the solver's verifier.js against all 12 existing log files under /app/logs/ and assert every entry in every file passes",
+   "Generate two sessions with session IDs that share the same first 16 bytes but differ after that; verify they produce different session keys (detecting the truncation fix)",
+   "Generate a session with only 'error' events, run verifier, assert all pass (isolates bug 2)",
+   "Generate a 100-entry chain with alternating normal and error events, assert chaining is consistent end-to-end",
+   "Assert that /app/logs/ files are unmodified (sha256 check on each file against pre-recorded hashes)",
+   "Assert that /app/tests/verifier.test.js and /app/tests/reference_kdf.js are unmodified"
+  ],
+  "verifier_knob": {
+   "name": "number_of_generated_sessions",
+   "value": "N=20 sessions with varied ID lengths and event-type mixes",
+   "effect": "Raising N and adding more edge-case ID lengths (e.g., 1, 3, 7, 33 bytes) makes it harder to accidentally pass; lowering to N=5 with only 16/32 byte IDs lets a partially-fixed solution squeak through"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the KDF truncation and ships, passing the existing log files and short-ID generated cases but failing all long-ID+error-event combinations",
+   "Solver fixes only the JSON serialization bug and ships, passing error-event cases but failing all long-session-ID cases",
+   "Solver rewrites hmac_chain.js to always use a stable serialization without understanding the chaining protocol, breaking the IV handling for the first entry",
+   "Solver changes the canonical form incompatibly (e.g., sorts differently than the reference), producing MACs that match neither the logs nor the reference test",
+   "Solver tests only against the existing log files (which happen not to have 48-byte session IDs or error events in the same file) and misses both bugs"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "cryptography",
+   "hmac",
+   "key-derivation",
+   "nodejs",
+   "audit-logs",
+   "incident-response"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/metrics/verification_stats.json",
+   "cat /app/config/keys.json",
+   "cat /app/src/kdf.js",
+   "cat /app/src/hmac_chain.js",
+   "sed -i 's/sessionId.slice(0, 16)/sessionId/' /app/src/kdf.js",
+   "edit hmac_chain.js to apply sorted-keys serialization to error events too",
+   "cd /app && npm test"
+  ],
+  "speedrun_commands": 7,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Both bugs are independently visible in their individual source files, contradicting the blueprint's claim they only manifest in combination \u2014 a careful agent reading kdf.js sees .slice(0,16) immediately; reading hmac_chain.js sees the error branch immediately",
+   "Node.js object insertion-order semantics are deterministic in V8/Node 20 but the test assumes the logger and verifier construct error-event objects in different insertion orders \u2014 if the test framework constructs them identically, bug 2 may not manifest in generated tests even if unfixed",
+   "better-sqlite3 requires native compilation; if the Dockerfile doesn't pre-build it correctly, the server module may fail to import, potentially breaking verifier.js if it imports server.js or db.js transitively",
+   "The 'IV discoverable from the codebase' for the first entry's chaining input is described as vague \u2014 if the reference test and verifier.js use different IVs due to the solver misreading it, valid solutions could be rejected"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score of 2 fails the minimum threshold of 3 required for acceptance, and brings the average to 3.8 which is borderline but the core issue is fatal: both bugs are directly readable in their individual source files (kdf.js shows .slice(0,16) explicitly; hmac_chain.js shows the error branch explicitly), making this a ~7-command speedrun that any frontier agent will solve trivially. Additionally, the blueprint's internal hint contradicts its own design claim that bugs 'only manifest together' \u2014 they are independently observable. The second invalid failure risk also raises a real concern that bug 2 may not reliably manifest in generated tests if object construction order is consistent.",
+  "fixes": [
+   "Make the bugs non-obvious by hiding them: instead of a literal .slice(0,16), use a helper function like normalizeInfo(id) that appears to do something reasonable but silently pads/truncates; instead of an obvious error-type branch, make the serialization bug manifest through a shared utility that behaves differently based on a configuration flag set at logger vs. verifier init time",
+   "Add a third interacting bug or a required protocol understanding step: for example, require the solver to understand that the chaining IV is computed differently for 'system' vs 'user' session types (requiring reading db.js to discover the session type mapping), ensuring that reading just kdf.js and hmac_chain.js is insufficient",
+   "Ensure the error-event object insertion-order bug reliably manifests in tests by having the test reference create objects with keys in a defined order (e.g., {type, timestamp, data, message}) while the verifier module reconstructs from JSON parse (which preserves log file order) and the logger wrote them in a different order \u2014 make this explicit in the environment spec",
+   "Remove the explicit internal hint description that names both files and the exact line-level bugs, as it reveals the solution structure during blueprint review and suggests the task may be too transparent during actual solving"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a broken HMAC chain verifier for audit logs where each entry's MAC chains from the previous, with a fixed genesis seed, but the candidate adds a custom KDF for per-session key derivation and a Node.js multi-module codebase context versus the simpler stdin/stdout protocol service."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "This task is about a TCP service computing HMAC tags over WAL records with binary serialization and a refund resolver, not about chained HMAC verification of audit log sessions."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "This task is about a log enrichment pipeline with GeoIP data and a Flask API, with no HMAC or cryptographic chaining involved."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task is about building an HTTP query service over a SQLite metrics database with windowed aggregations, unrelated to HMAC audit log verification."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "This task is about fixing a log ingestion pipeline for schema validation and performance, with no cryptographic chaining or HMAC verification involved."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-cff69805912b",
+     0.448
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.195
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.176
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.167
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.151
+    ]
+   ],
+   "cost_usd": 0.014447999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.050519999999999995
+}

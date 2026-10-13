@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "rolling-window-quantile-sql-engine",
+  "title": "Rolling Quantile SQL Engine",
+  "scenario": "A release engineer is trying to ship a build of an internal analytics platform. The platform includes a SQLite-backed query engine (~1,200 lines across several modules) that computes rolling window quantiles over time-series event data. The CI pipeline has been failing since a recent refactor: the `qengine` CLI produces wrong quantile values on certain inputs, and the regression test suite catches only about half the failures. The repo contains a pre-compiled C extension (`libqcore.so`) that implements the inner sort-and-select kernel, plus Python glue code, a SQL query planner, and a bash driver script that orchestrates everything.",
+  "instruction_draft": "The `qengine` build at `/app` is broken: the rolling quantile results it emits are silently wrong on some inputs. Your job is to identify what is wrong and fix it so that `qengine` produces correct P50, P90, and P99 rolling-window quantile values for every combination of window size, stride, and data distribution that the acceptance harness generates.\n\nCorrectness is defined precisely: for each window, the Pq quantile is the value at zero-indexed position `floor(q * N)` in the sorted window, where N is the number of observations in the window and q is the quantile fraction (0.50, 0.90, 0.99). Windows that contain fewer than two observations must be skipped and produce no output row. The driver `run_qengine.sh` must accept arguments `<sqlite_db> <table> <ts_col> <val_col> <window_size> <stride> <quantile>` and write one result row per qualifying window to stdout as `<window_start_ts>,<quantile_value>`. Fix the system so that all results are correct across the full acceptance corpus.",
+  "requirements": [
+   "The quantile definition used is: position = floor(q * N) in the 0-indexed sorted window.",
+   "Windows with fewer than 2 observations are skipped and produce no output row.",
+   "run_qengine.sh accepts positional arguments: <sqlite_db> <table> <ts_col> <val_col> <window_size> <stride> <quantile>.",
+   "Each output row is formatted as <window_start_ts>,<quantile_value> with one row per qualifying window.",
+   "Results must be correct for P50, P90, and P99 across arbitrary window sizes, strides, and data distributions.",
+   "Results must be correct when windows partially overlap and when data is not uniformly spaced in time.",
+   "Results must be correct for integer and floating-point value columns.",
+   "The fix must not change the CLI interface or output format."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get installs: sqlite3, gcc, python3-dev; pip installs: nothing extra.",
+   "/app/run_qengine.sh \u2014 the bash driver script; currently passes wrong arguments to the Python planner in a subtle order transposition for stride vs window_size.",
+   "/app/qengine/ \u2014 Python package (~600 lines): planner.py (builds the SQL windowing query), executor.py (calls libqcore), formatter.py (formats output rows).",
+   "/app/qengine/planner.py \u2014 contains a second bug: the WHERE clause that filters windows with fewer than 2 observations uses `< 1` instead of `< 2`, letting single-observation windows through; single-obs windows are safe samples but N=1 corner cases break the quantile formula.",
+   "/app/libqcore.so \u2014 pre-compiled C shared library (no source provided); correctly implements floor(q*N) selection when called with the right (sorted_values, N, q) signature. Its behavior is only observable by running it.",
+   "/app/qengine/executor.py \u2014 calls libqcore with correct ctypes signature when given correct inputs; no bug here.",
+   "/app/qengine/formatter.py \u2014 correct, no bugs here.",
+   "/app/tests/sample_cases/ \u2014 three small SQLite databases with canned expected outputs covering only uniform-stride, integer-value cases; all pass even with the two bugs because the sample stride==window_size (so transposition is invisible) and no single-observation windows appear.",
+   "/app/tests/run_tests.sh \u2014 bash script that runs sample cases and diffs against expected; passes with the two bugs in place.",
+   "/app/README.md \u2014 documents the CLI interface and quantile definition precisely.",
+   "The two bugs interact: fixing only the stride/window_size transposition in run_qengine.sh causes the planner's < 1 filter to suddenly expose single-observation window rows that poison the quantile output; fixing only the filter in planner.py makes some hidden corpus cases fail because stride != window_size generates wrong window boundaries. A full fix requires both changes."
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the bugs are not visible by static reading alone \u2014 both require running the engine on data where stride != window_size OR where single-observation windows appear, which the sample corpus never exercises; (2) the two bugs interact: fixing the run_qengine.sh argument transposition unmasks the planner.py filter bug, making a half-fix look worse than the original on new data, which may confuse the solver into reverting.\n\nRoot cause A (run_qengine.sh): the script passes $5 (window_size) and $6 (stride) swapped to the Python planner, e.g., `python -m qengine.planner $db $table $ts $val $stride $window_size $q`. When stride==window_size (all sample cases) this is invisible. The solver must notice by running on a corpus case where stride != window_size.\n\nRoot cause B (planner.py): the HAVING clause reads `HAVING COUNT(*) > 1` but was incorrectly changed during refactor to `HAVING COUNT(*) >= 1` (i.e., `< 2` check is `COUNT(*) < 2` to skip, equivalently allow only COUNT >= 2). Actually planted as: the SQL uses `HAVING COUNT(*) >= 1` when it should be `HAVING COUNT(*) >= 2`. Single-observation windows reach libqcore with N=1, and floor(0.99 * 1) = 0, which is technically valid, but the spec says skip them \u2014 so the output has extra rows that break the diff.\n\nThe solver must: (1) observe failures on stride != window_size inputs, (2) trace the argument path from run_qengine.sh through to planner.py, (3) fix the transposition, (4) then observe new failures on P99 with small windows, (5) find the HAVING clause and fix the threshold from >=1 to >=2.",
+  "trap": "The sample test suite passes with both bugs present because all sample databases use stride == window_size (making the transposition invisible) and all windows have >= 3 observations (making the COUNT filter irrelevant). A solver that fixes only the argument transposition will pass the sample tests but fail hidden corpus cases that have single-observation windows. A solver that fixes only the HAVING clause will still fail hidden corpus cases where stride != window_size. The shallow-check trap is that `bash /app/tests/run_tests.sh` reports all green after either single fix.",
+  "tests": [
+   "Generate 20 SQLite databases at verify time with randomized: (a) non-uniform timestamp spacing, (b) stride values that differ from window_size (e.g., stride=3, window=7), (c) datasets where some windows have exactly 1 observation. For each, compute ground-truth quantiles using a reference Python implementation. Run run_qengine.sh and compare output rows and values exactly.",
+   "Test P50, P90, and P99 on the same databases to ensure the fix works for all three quantile fractions, not just P50.",
+   "Test with float-valued columns (not just integers) to verify libqcore receives correct data.",
+   "Verify that no output row appears for windows with exactly 1 observation (skip rule).",
+   "Verify that window_start_ts in each output row correctly reflects the window boundary under the given stride, not the window_size.",
+   "Regression test: run the original sample cases and confirm they still pass after the fix."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "20 databases, each with 50-500 rows, stride in {1,2,3,5,7,10}, window in {5,10,15,20}",
+   "effect": "Raising the number of databases and widening the stride/window parameter space increases coverage of corner cases; lowering it makes the shallow fix more likely to accidentally pass."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the HAVING clause (planner.py) because it is readable code, misses the argument transposition in run_qengine.sh which requires running the system.",
+   "Agent fixes only the run_qengine.sh transposition, runs sample tests, sees green, and stops \u2014 missing the HAVING clause bug that is now unmasked on hidden corpus.",
+   "Agent rewrites the quantile logic from scratch using SQLite window functions, getting the formula slightly wrong (off-by-one on floor vs ceil, or incorrect handling of the boundary row).",
+   "Agent correctly identifies both bugs but introduces a new error in the quantile position formula (e.g., uses ceil instead of floor, or 1-indexed instead of 0-indexed position).",
+   "Agent cannot determine libqcore's calling convention without source, guesses wrong ctypes types, and produces corrupted output for float columns."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "sqlite",
+   "algorithmic",
+   "two-interacting-bugs",
+   "black-box-binary",
+   "rolling-window"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/run_qengine.sh",
+   "cat /app/qengine/planner.py",
+   "cat /app/qengine/executor.py",
+   "cat /app/README.md",
+   "# Bug 1 visible: run_qengine.sh passes $6 (stride) before $5 (window_size) to planner",
+   "# Bug 2 visible: planner.py has HAVING COUNT(*) >= 1, should be >= 2",
+   "sed -i 's/python -m qengine.planner .* $6 $5/fix transposition/' /app/run_qengine.sh",
+   "sed -i 's/HAVING COUNT(\\*) >= 1/HAVING COUNT(*) >= 2/' /app/qengine/planner.py",
+   "bash /app/tests/run_tests.sh",
+   "python3 -c \"import sqlite3; c=sqlite3.connect('/tmp/t.db'); c.execute('CREATE TABLE e(ts INT,v REAL)'); c.executemany('INSERT INTO e VALUES(?,?)',[(i,i*1.1) for i in range(50)]); c.commit()\"",
+   "bash /app/run_qengine.sh /tmp/t.db e ts v 7 3 0.9",
+   "python3 -I -c \"# reference impl: verify output matches floor(0.9*N) logic\"",
+   "echo 'Both bugs fixed and verified'"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The libqcore.so binary may have platform/architecture issues in the Docker container that aren't anticipated \u2014 if it segfaults or links incorrectly, the task becomes unsolvable for reasons unrelated to the bugs.",
+   "The claim that bugs are 'not visible by static reading alone' is false \u2014 both bugs are directly readable in source files, making the genuine difficulty assessment in the blueprint inaccurate and potentially causing the task to be too easy for frontier agents.",
+   "The HAVING clause bug description is internally inconsistent: the blueprint says '< 2 check is COUNT(*) < 2 to skip' but then says 'planted as HAVING COUNT(*) >= 1 when it should be HAVING COUNT(*) >= 2' \u2014 the exact text in planner.py matters for sed-based fixes and should be specified precisely.",
+   "If the acceptance harness's reference implementation uses a different tie-breaking or rounding rule for floor(q*N) at edge cases (e.g., q=0.99, N=100 gives position 99, which is the last element), float precision in comparisons could cause spurious failures.",
+   "The pre-compiled libqcore.so has no source provided \u2014 if it contains a bug (e.g., for float columns), the agent cannot fix it, making some test cases permanently unsolvable, which would be an invalid failure."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold (score 2/5) because both bugs are directly visible by reading the source files in the first 2-3 commands \u2014 the blueprint's own claim that they 'require running the engine' is false for a competent agent who reads all files simultaneously. The speedrun reaches a complete solution in ~13 commands, well under the 20-command ceiling for a score above 2. Additionally, the libqcore.so black-box with no source creates an invalid failure risk if it has platform issues or undocumented behavior for float columns.",
+  "fixes": [
+   "Make at least one bug non-visible by static reading: e.g., put the argument transposition inside a compiled helper binary, or encode the wrong HAVING threshold as a configuration value loaded at runtime from a file that requires understanding the data flow to locate.",
+   "Add a third bug that requires dynamic analysis to find \u2014 for example, an off-by-one in the window boundary calculation that only manifests when timestamps are non-integer or when the stride doesn't evenly divide the time range, forcing the agent to actually run the engine and inspect intermediate SQL queries.",
+   "Replace the sample test corpus with one that exercises stride != window_size, so the agent cannot rely on 'sample tests pass = done' and must explicitly verify the hidden corpus requirements, raising the cost of the shallow-check trap.",
+   "Clarify the exact planted text of the HAVING clause bug to eliminate ambiguity for sed-based fixes, and specify the libqcore.so calling convention failure modes explicitly so the black-box risk is contained."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "Both involve fixing a broken analytics pipeline with a hidden regression, but the core problem differs: spectral entropy via STFT vs. rolling window quantile computation over SQL data."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a correct PostgreSQL query for performance; this task is about finding and fixing correctness bugs in a rolling quantile engine."
+    },
+    {
+     "ref_id": "terminal-bench/embedding-drift-monitor",
+     "verdict": "distinct",
+     "reason": "That task fixes statistical drift detection tests (KS, PSI, MMD); this task fixes rolling window quantile computation in a SQLite-backed CLI engine."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes a CSV chunking/deduplication pipeline with row-count and header bugs; this task fixes quantile math in a time-series rolling window SQL engine."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task reverse-engineers a black-box binary normalizer and fixes downstream SQL rollups; this task fixes rolling quantile logic in a known Python/SQL/C system."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e7c8c1f5f126",
+     0.136
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.118
+    ],
+    [
+     "terminal-bench/embedding-drift-monitor",
+     0.097
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.087
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.084
+    ]
+   ],
+   "cost_usd": 0.014265
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05466
+}

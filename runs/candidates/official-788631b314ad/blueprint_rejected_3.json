@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "tcp-checksum-relay-filter",
+  "title": "TCP Relay Checksum Filter",
+  "scenario": "A release engineer has a small C TCP relay/proxy service that was extended six weeks ago to add packet-level filtering: only forwarded packets whose TCP pseudo-header checksum falls within an allowed range get passed to clients; the rest are silently dropped. The feature shipped but the CI canary has been failing sporadically on real traffic replays since the merge. The repository has full git history, a replay harness, and ~1200 lines of C across five source files. The binary ships without sanitizer flags so the bug does not crash \u2014 it silently corrupts the checksum arithmetic on certain packet classes.",
+  "instruction_draft": "The relay service in /srv/relay is a TCP packet inspector that reads pcap-style frame records from stdin and writes allowed frames to stdout, one frame per line encoded as a hex string. Six weeks ago a checksum-range filter was added: only frames whose TCP pseudo-header checksum (computed over the IPv4 pseudo-header plus TCP header plus payload, RFC 793 \u00a73.1) lands in the inclusive range [low, high] from the config file /srv/relay/filter.conf are forwarded; all others must be silently dropped. Running the replay harness (`make replay` in /srv/relay) against the bundled sample traffic shows occasional mismatches, but the mismatches are data-dependent and the provided sample does not expose the full pattern.\n\nYour job as the release engineer is to find and fix the checksum filter so that it correctly classifies every frame: no allowed frame is dropped, no denied frame is forwarded. The fix must be in C source under /srv/relay/src/. After `make` the binary must be at /srv/relay/build/relay. The verifier will feed a hidden corpus of pcap frame records (some benign, some crafted to stress boundary conditions) through the binary and compare its output to a reference implementation; every misclassified frame is a failure.",
+  "requirements": [
+   "The binary /srv/relay/build/relay must compile with `make` in /srv/relay with no errors.",
+   "For each input frame whose TCP pseudo-header checksum (RFC 793, IPv4 pseudo-header: src IP, dst IP, zero, protocol=6, TCP length) falls within [low, high] inclusive as specified in /srv/relay/filter.conf, the binary must write the frame's hex-encoded bytes to stdout followed by a newline.",
+   "For each input frame whose checksum falls outside [low, high], the binary must produce no output for that frame.",
+   "The checksum computation must handle odd-length TCP segments (padding the trailing byte with zero before summing), the one's-complement fold of the 32-bit accumulator, and the final one's-complement of the 16-bit sum, per RFC 793.",
+   "The checksum must be computed over the IPv4 pseudo-header (source address, destination address, zero byte, protocol byte 0x06, TCP segment length as 16-bit big-endian) concatenated with the TCP header and payload.",
+   "The binary must correctly handle frames where the checksum equals exactly low or exactly high (inclusive boundary).",
+   "The binary must correctly handle frames with a computed checksum of 0xFFFF (the RFC 793 special case where -0 must be transmitted as 0xFFFF)."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, libpcap-dev, python3, and xxd.",
+   "/srv/relay/ is a git repository with ~15 commits of history. The final commit adds the checksum-range filter feature.",
+   "/srv/relay/src/ contains: main.c (frame I/O loop, ~200 lines), filter.c (the checksum filter, ~180 lines, contains the bugs), proto.c (IP/TCP struct parsing, ~150 lines), replay.c (test harness driver, ~100 lines), util.c (hex encode/decode helpers, ~120 lines). Total ~750 lines of real, plausible relay code.",
+   "/srv/relay/Makefile builds all sources into /srv/relay/build/relay.",
+   "/srv/relay/filter.conf contains two lines: 'low 0x1000' and 'high 0x8FFF' (the allowed checksum range).",
+   "/srv/relay/samples/ contains 12 pcap-frame hex records used by `make replay`; 10 pass, 2 are dropped. The sample does NOT include frames with odd-length payloads, boundary-exact checksums, or the 0xFFFF special case.",
+   "filter.c has THREE interacting bugs planted: (1) the pseudo-header TCP-length field is computed as total IP length minus IP header length (correct) but then byte-swapped to little-endian before being fed to the checksum accumulator \u2014 it should stay big-endian; (2) odd-length payloads are padded but the padding byte is set to 0x80 instead of 0x00; (3) the final one's-complement negation uses ~sum & 0xFFFF but the comparison against [low, high] is done BEFORE the final complement (i.e., the raw accumulated sum is compared, not the checksum). Each bug is invisible when reading the file casually because the surrounding code looks plausible; they only manifest on specific packet content.",
+   "The git log shows the filter was added in a single commit six weeks ago with a message 'feat: add checksum-range filter'. The diff is readable but the three bugs are spread across three non-adjacent hunks.",
+   "A reference Python script /srv/relay/tools/ref_checksum.py (never called by the binary) correctly implements the RFC 793 checksum for developer reference \u2014 the solver may discover it while exploring.",
+   "The replay harness (make replay) runs the binary against /srv/relay/samples/ and reports PASS/FAIL per frame but does not explain why a frame fails."
+  ],
+  "internal_hint": "Difficulty sources: (1) observe_not_read \u2014 all three bugs produce correct results on the provided samples because the samples use even-length payloads, no boundary checksums, and no 0xFFFF values; running the binary on real crafted inputs is the only way to observe failures. (2) substantial_construction \u2014 the solver must understand RFC 793 checksum semantics deeply enough to identify that byte-order, padding value, and pre-vs-post-complement comparison are all wrong. Resolution path: (a) run `make replay` to confirm sporadic failures, (b) examine git log/diff to locate filter.c as the new code, (c) read filter.c and spot that the comparison logic looks suspicious, (d) instrument with test frames that have odd payloads or boundary checksums to observe wrong output, (e) find /srv/relay/tools/ref_checksum.py and use it to generate reference answers, (f) fix all three bugs: htons\u2192correct big-endian for pseudo-header length, padding byte 0x80\u21920x00, move comparison to after final one's-complement. A solver who fixes only one or two bugs passes the provided samples but fails the hidden corpus.",
+  "trap": "A naive solver reads filter.c, spots that the byte-swap on the TCP length looks wrong (bug 1), fixes it, runs `make replay`, sees all 12 samples pass, and submits. The hidden corpus then fails on: odd-length payloads (bug 2 still active \u2014 wrong padding byte shifts the checksum), frames with checksums near 0xFFFF (bug 3 still active \u2014 comparison done on pre-complement value inverts near-boundary decisions), and frames whose checksum equals exactly low or high (also bug 3). The shallow check trap is real: the provided sample uses only even-length payloads and no near-boundary checksums.",
+  "tests": [
+   "Compile test: `make` in /srv/relay exits 0 and produces /srv/relay/build/relay.",
+   "Provided-sample test: feed each of the 12 hex records from /srv/relay/samples/ to the binary; verify exactly the 10 expected records appear in stdout and the 2 denied records do not.",
+   "Odd-length payload test (hidden): generate 50 frames with TCP payloads of odd byte length (1, 3, 7, 15, 31 bytes) with known checksums; verify the binary accepts those in range and drops those out of range.",
+   "Boundary-exact test (hidden): generate frames whose RFC 793 checksum equals exactly low (0x1000) and exactly high (0x8FFF); verify both are forwarded.",
+   "Pre-boundary test (hidden): generate frames with checksum 0x0FFF (one below low) and 0x9000 (one above high); verify both are dropped.",
+   "0xFFFF special case test (hidden): generate a frame whose RFC 793 checksum computes to 0xFFFF; if 0xFFFF is within [low, high] (it is not in the default config), it must be forwarded; since 0xFFFF > 0x8FFF it must be dropped \u2014 verify it is dropped.",
+   "Pseudo-header byte-order test (hidden): generate 30 frames with source/destination IPs chosen so that the TCP length field endianness matters for the checksum boundary; verify correct classification.",
+   "Large corpus adversarial test (hidden, 200 frames): a mix of crafted frames designed to stress all three bug sites simultaneously; the binary's stdout must exactly match a reference Python implementation's output."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 adversarial frames",
+   "effect": "Raising the count and diversity of hidden frames (more odd-length payloads, more boundary-exact checksums, more endianness-sensitive IPs) increases the chance that a partial fix is caught; lowering to ~30 frames makes it easier for a two-bug fix to slip through."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only bug 1 (byte-swap), sees all 12 samples pass, submits \u2014 fails on odd-length and boundary hidden cases.",
+   "Agent fixes bugs 1 and 2 but misses that the comparison is done before the final one's-complement (bug 3) \u2014 passes odd-length cases but fails boundary-exact and near-boundary hidden frames.",
+   "Agent rewrites the checksum function from scratch but gets the pseudo-header TCP-length field wrong (uses total IP length instead of TCP segment length) \u2014 produces wrong checksums for all frames with IP options, though the samples have none.",
+   "Agent fixes all three bugs but introduces an off-by-one in the one's-complement fold (misses folding the carry from the 32\u219216 reduction twice) \u2014 fails on frames whose 32-bit accumulator carry is non-zero after first fold.",
+   "Agent does not notice the pre-vs-post-complement comparison bug because the code reads plausible and the sample passes \u2014 the most common failure mode."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "networking",
+   "checksum",
+   "rfc793",
+   "git-history",
+   "observe-not-read"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /srv/relay && git log --oneline",
+   "git show HEAD -- src/filter.c  (see the full diff of the filter addition)",
+   "cat src/filter.c  (~180 lines, read carefully)",
+   "cat tools/ref_checksum.py  (reference implementation for comparison)",
+   "# Identify bug 1: tcp_len byte-swapped to little-endian before accumulation",
+   "# Identify bug 2: odd-length padding byte is 0x80 instead of 0x00",
+   "# Identify bug 3: [low,high] comparison done on raw accumulator, not after ~sum & 0xFFFF",
+   "sed -i 's/<byteswap_expression>/<correct_expression>/' src/filter.c  (fix bug 1)",
+   "sed -i 's/0x80/0x00/' src/filter.c  (fix bug 2)",
+   "# Edit bug 3: move checksum = ~sum & 0xFFFF before the if (checksum >= low && checksum <= high) comparison",
+   "nano/vim src/filter.c  (fix bug 3 in context)",
+   "make",
+   "make replay  (all 12 samples pass)",
+   "# Submit"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'observe_not_read' tag is misleading: all three bugs are visible by reading ~180 lines of filter.c plus the reference Python script, so the task doesn't actually require runtime observation to solve \u2014 it just requires not stopping early.",
+   "The shallow-check trap (fixing only bug 1 and stopping) depends on agent behavior, not task design; a methodical agent reviewing the full file escapes the trap purely by reading.",
+   "The boundary test for 0xFFFF: the config has high=0x8FFF so 0xFFFF must be dropped \u2014 this is stated clearly and the reference implementation handles it, so no ambiguity, but worth confirming the hidden corpus frame is constructed with a checksum that actually equals 0xFFFF after correct RFC 793 computation (requires careful crafting).",
+   "Odd-length payload crafting: the hidden test must ensure that frames with odd-length TCP payloads have IPs/ports/data chosen so the correct checksum lands within or outside [0x1000, 0x8FFF] as intended \u2014 any error in corpus generation invalidates those test cases.",
+   "The blueprint says 'observe-not-read' is a difficulty tag but the environment includes ref_checksum.py and a 180-line filter.c with syntactically detectable bugs \u2014 a strong code-reading agent bypasses the intended difficulty path entirely."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are statically visible in a single ~180-line source file, and the reference Python implementation is provided in the same repo \u2014 a thorough agent reading the source and ref implementation can fix all three bugs in ~14 commands without any runtime experimentation. The 'observe_not_read' difficulty lever does not hold: the bugs are syntactically identifiable (a byte-swap call, a literal 0x80 constant, and comparison ordering), so the task reduces to a careful code review, not an observability challenge. The shallow-check trap relies on an agent stopping prematurely after fixing one bug, which is not a robust difficulty mechanism against strong agents trained to be thorough. To be accepted, the bugs should be restructured so they cannot be identified by reading source alone (e.g., require runtime corpus observation, obfuscated arithmetic, or the bug lives in generated/compiled code).",
+  "fixes": [
+   "Replace the static source-readable bugs with a bug that requires runtime observation: e.g., a checksum that's conditionally wrong only when a specific IP address octet pattern triggers a branch that was never covered in code review \u2014 something that looks correct syntactically but is wrong semantically under non-obvious conditions.",
+   "Remove the ref_checksum.py file from the environment or at minimum don't mention it in the instruction \u2014 its presence lets the agent immediately validate their understanding of the RFC without any exploration.",
+   "Make the bugs span multiple files (not just filter.c) and require the agent to discover which file contains the bug through runtime corpus analysis rather than git history that directly names 'feat: add checksum-range filter' pointing to filter.c \u2014 or add red-herring bugs in other files to force runtime disambiguation.",
+   "Add a runtime-only failure mode: e.g., the bug manifests only when the binary is run with a specific environment variable or config value that differs from what git diff shows, forcing the agent to actually run the binary with crafted inputs rather than just reading source.",
+   "If retaining the current structure, at minimum remove the 'six weeks ago a checksum-range filter was added' hint from the instruction so the agent cannot immediately jump to the newest commit, forcing broader exploration of the ~15-commit history."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/cell-lineage-reconstruction",
+     "verdict": "distinct",
+     "reason": "Completely different domain \u2014 cell tracking in video vs. TCP checksum filtering in C."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about a frame codec decode/encode service with a custom wire format; the candidate is about RFC 793 TCP pseudo-header checksum arithmetic \u2014 different core problem despite both involving binary frame processing."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task centers on HMAC-SHA256 computation over WAL records and database lookups, not TCP checksum filtering."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves NetFlow v9 aggregation and flow data correctness in Rust, entirely different from C-based TCP pseudo-header checksum filtering."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about AES-128-CTR nonce derivation bugs in a C encryption library, not TCP checksum arithmetic."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/cell-lineage-reconstruction",
+     0.168
+    ],
+    [
+     "ours/official-aac910462208",
+     0.165
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.152
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.123
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.071
+    ]
+   ],
+   "cost_usd": 0.014915999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.053154
+}

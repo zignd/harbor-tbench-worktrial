@@ -4,6 +4,15 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 23:38 -03:00 · Docker ran out of networks; two tuner bugs behind a stuck spec fix
+- **Docker network pools exhausted.** `8a6e`'s spec-fix authoring failed with "all predefined address pools have been fully subnetted". Every Harbor run creates a Docker network, and Docker's default pools allow ~31 in total, shared with the other projects on this machine (textus runners, CI runners). We were at ~20 of ours: ~10 authoring runs, gates (oracle ×3 each), quality checks, red-team and Opus trials. My process kills had also leaked 9 networks (pruned).
+  - **Fix: a machine-wide cap.** `run_job` now holds `concurrent` of `ENV_SLOTS` (14) environment slots while it runs. Opus trials are exempt: they keep their own `OPUS_CONCURRENCY` slots (5), so we peak at ~19 networks of ours. Oracle runs in a gate go one at a time (three at once held three networks per gate).
+  - **Not done:** raising Docker's address pools. That needs a Docker restart, which would kill every container on the machine, including other projects'. The cap applies to processes started from now on. Running ones keep the old behaviour until they restart.
+- **Tuner bug 1 (mine):** the new spec-fix branch skipped the snapshot copy and plan write that every round needs, so it crashed in `render_metatask`. The crash was in a worker thread, so the other work in the batch continued. Fixed, with a regression test.
+- **Tuner bug 2 (mine):** `tune_candidates.py` kept its own verdict filter without `invalid`, so run from the command line it skipped `8a6e` silently. The filter lives only in `tune_one` now.
+- **Infra failures aren't tuning results.** An authoring run that never started (Docker, proxy) was recorded as a finished "gates_failed" round with a final record, so it would never be retried. It now logs a `tune` event with `result: infra`, writes no final record, and `_resume_rounds` ignores such rounds. `8a6e`'s failed round is archived under `abandoned_tune_r1/infra_failed_r1/`, and its spec fix is running.
+- 129 tests pass.
+
 ### 23:30 -03:00 · Testing our own gates for over-strictness
 - **Status:** 4 tasks calibrated, 0 learnable (3 too easy, 1 invalid and being spec-fixed). Three of the four passed every gate, so the gates didn't block them; the generator was the problem. But our newer gates have only ever been checked in one direction:
   - the difficulty review accepted **11 of 135** blueprint drafts and has never seen a task known to be learnable, so it may reject exactly the middle we need;

@@ -20,12 +20,12 @@ COPY app/config /app/config
 COPY app/docs /app/docs
 COPY app/logs /app/logs
 
-# Compile traffic-sampler binary and remove source
-COPY app/src/traffic_sampler.c /tmp/traffic_sampler.c
+# Compile traffic-sampler binary from build context (source not exposed in image)
+COPY build/traffic_sampler.c /tmp/traffic_sampler.c
 RUN mkdir -p /app/bin && \
     gcc -O2 -o /app/bin/traffic-sampler /tmp/traffic_sampler.c -lm && \
     chmod +x /app/bin/traffic-sampler && \
-    rm /tmp/traffic_sampler.c
+    rm -f /tmp/traffic_sampler.c
 
 # Create logs directory with proper permissions
 RUN mkdir -p /app/logs && chmod 755 /app/logs

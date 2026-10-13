@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from analysis import tuner
 from analysis.llm import Reply
@@ -86,3 +87,50 @@ def test_invalid_calibration_gets_a_spec_fix_plan_from_the_judged_failures():
     assert plan["kind"] == "fix_spec" and plan["change"].count("tied rows") == 1  # deduplicated
     text = tuner.directive(plan)
     assert "Spec fix" in text and "every solution the instruction allows passes" in text
+
+
+def test_spec_fix_round_snapshots_the_package_and_saves_its_plan(tmp_path, monkeypatch):
+    import shutil
+
+    from analysis.ledger import Ledger
+
+    fixture = Path(__file__).parent / "fixtures" / "harbor_jobs" / "p0-metatask-sonnet"
+    task = next(fixture.glob("*/artifacts/app/output"))
+    cand_dir = tmp_path / "official-x"
+    shutil.copytree(task, cand_dir / "task")
+    spec = {"domain": "d", "skill_type": "s", "capabilities": ["a", "b"], "pillar": "p",
+            "persona": "x", "language": "any", "fixture": "f", "verifier": "service_probe",
+            "levers": ["hidden_invariant", "edge_case_inputs"], "style": "minimal"}  # fmt: skip
+    bp = json.loads((Path(__file__).parent / "fixtures" / "blueprint_ledger.json").read_text())
+    (cand_dir / "spec.json").write_text(json.dumps(spec))
+    (cand_dir / "blueprint.json").write_text(json.dumps(bp))
+    (cand_dir / "calibration.json").write_text(json.dumps({"verdict": "invalid", "outcomes": ["invalid"],
+        "trials": [{"outcome": "invalid", "failure": {"valid": False, "mode": "test_overreach",
+        "requirement": "tie order", "explanation": "unstated"}}]}))  # fmt: skip
+    from generator import pipeline
+
+    monkeypatch.setattr(pipeline, "CANDIDATES_DIR", tmp_path)  # Candidate.dir resolves here
+    seen = {}
+
+    def fake_retune(cand, ledger, rnd, plan, previous):
+        seen["previous_exists"] = previous.exists()
+        seen["plan"] = plan
+        return ["stop here"]  # gates fail: ends the round without a calibration
+
+    monkeypatch.setattr(tuner, "_retune", fake_retune)
+    tuner.tune_candidate(cand_dir, Ledger(tmp_path / "l.jsonl"), max_rounds=1)
+    assert seen["previous_exists"] and seen["plan"]["kind"] == "fix_spec"
+    assert (cand_dir / "tune_plan_r1.json").exists()
+
+
+def test_an_infra_failed_authoring_is_not_a_tuning_round(tmp_path):
+    from analysis.ledger import Event, Ledger
+
+    ledger = Ledger(tmp_path / "l.jsonl")
+    ledger.append(Event("tune", "c", {"round": 1, "plan": {}, "gate_problems": ["authoring failed"],
+                                      "result": "gates_failed"}))  # fmt: skip
+    assert tuner._resume_rounds("c", ledger) == ([], None)  # redone, not counted
+    ledger.append(Event("tune", "c", {"round": 1, "plan": {}, "gate_problems": ["oracle 0/3"],
+                                      "result": "gates_failed"}))  # fmt: skip
+    rounds, cal = tuner._resume_rounds("c", ledger)
+    assert [r["round"] for r in rounds] == [1] and cal["verdict"] == "gates_failed"

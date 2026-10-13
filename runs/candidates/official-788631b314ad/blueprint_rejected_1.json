@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "tcp-checksum-repair-git",
+  "title": "TCP Checksum Validator Repair",
+  "scenario": "A release engineer is blocked: the nightly integration suite for a lightweight TCP packet inspection library (`libpktcheck`) is failing on the CI corpus but local unit tests still pass. The repository has 18 months of history, roughly 1,400 lines of C across six source files, plus a Python harness that generates test vectors and validates output. The library exposes a single public entry point that classifies raw Ethernet frames as VALID, CORRUPT, or FRAGMENT and writes per-packet verdicts to a results file.",
+  "instruction_draft": "The CI pipeline for `libpktcheck` at `/repo` is broken: the validator produces wrong verdicts on a hidden corpus of raw Ethernet frames even though the bundled sample inputs pass. Your job is to ship a correct build.\n\nThe library reads a binary capture file (a sequence of length-prefixed raw Ethernet frames) and writes one verdict per packet \u2014 VALID, CORRUPT, or FRAGMENT \u2014 to an output file. A VALID packet must satisfy all of: (1) the IPv4 header checksum is correct, (2) the TCP checksum (computed over the TCP pseudo-header derived from the IPv4 source and destination addresses, protocol field, TCP segment length, and the full TCP header plus payload) is correct, and (3) the TCP segment is not fragmented (IPv4 MF flag clear and fragment offset zero). A CORRUPT verdict means any checksum fails on a complete (non-fragmented) packet. A FRAGMENT verdict means the IPv4 fragment offset is non-zero or the MF flag is set, regardless of checksum validity.\n\nBuild the library with `make -C /repo` and run it as `/repo/build/pktcheck <input.bin> <output.txt>`. After your fix, the binary must produce correct verdicts on every packet in the hidden corpus. The verifier will run `make -C /repo` fresh, so only committed source changes count.",
+  "requirements": [
+   "IPv4 header checksum is validated correctly for all packets",
+   "TCP checksum is computed over the correct pseudo-header: IPv4 src addr, dst addr, zero byte, protocol (6), TCP segment length (header + payload), then the full TCP header and payload",
+   "TCP segment length used in the pseudo-header equals the IPv4 total length minus the IPv4 header length (not a hardcoded constant and not the Ethernet frame length)",
+   "A packet is FRAGMENT if IPv4 MF flag is set OR fragment offset field is non-zero (offset is in the low 13 bits of the flags+fragment-offset field, in units of 8 bytes)",
+   "A packet is CORRUPT if it is not FRAGMENT and any checksum (IP or TCP) is incorrect",
+   "A packet is VALID only if it is not FRAGMENT and both checksums are correct",
+   "Fragment packets are never classified as CORRUPT even if checksums are wrong",
+   "The binary must be built by `make -C /repo` without errors and accept the calling convention <input.bin> <output.txt>"
+  ],
+  "environment": [
+   "Git repository at /repo with ~18 months of history (~30 commits) and ~1400 lines of C across: src/pktcheck.c (main entry, frame dispatch), src/ipv4.c (IP header parse + checksum), src/tcp.c (TCP classification, WRONG pseudo-header construction), src/checksum.c (one's complement sum), src/capture.c (frame reader), include/*.h, Makefile",
+   "The planted bug is in src/tcp.c: the pseudo-header uses a HARDCODED constant 20 for TCP segment length instead of computing it from the IPv4 total-length minus IP header length; this is introduced in commit ~8 months ago in a 'performance refactor' that also changed the fragment detection to only check the MF flag (ignoring non-zero fragment offset) \u2014 two bugs introduced in the same refactor commit",
+   "The hardcoded-20 bug makes all TCP checksums wrong for packets with payload > 0 bytes, but the bundled sample inputs happen to be 20-byte TCP headers with empty payloads, so samples pass",
+   "The fragment-offset bug means packets with offset>0 but MF=0 (last fragment) are misclassified as VALID or CORRUPT instead of FRAGMENT",
+   "A Python script /repo/tools/gen_corpus.py generates test vectors; a small sample corpus /repo/test/sample.bin and /repo/test/sample_expected.txt are provided (all packets have zero-length TCP payload, masking both bugs)",
+   "The git log shows the refactor commit with message 'optimize TCP pseudo-header construction for fixed-size headers' \u2014 discoverable by running the code on varied input, not by reading the function in isolation since the constant 20 looks plausible for a minimal TCP header",
+   "Dockerfile installs: build-essential, git, python3, libpcap-dev (unused but realistic), make; FROM python:3.13-slim-bookworm",
+   "The verifier generates fresh captures with: variable-length TCP payloads (64, 128, 512 bytes), trailing fragments (offset>0 MF=0), and middle fragments (offset>0 MF=1), then runs the built binary and diffs verdicts"
+  ],
+  "internal_hint": "Difficulty comes from 'observe_not_read': both bugs are invisible by reading tcp.c in isolation because hardcoded 20 is correct for the degenerate case (empty payload) that all sample packets exercise, and the fragment-offset-only check looks complete unless you know the MF flag interpretation. The engineer must run the binary on crafted packets with non-empty payloads and with last-fragment packets to observe wrong verdicts, then bisect git history to find the refactor commit that introduced both bugs simultaneously. Fix 1: replace the hardcoded 20 in the pseudo-header length field with (ntohs(ip->tot_len) - ip_hdr_len) where ip_hdr_len = (ip->ihl & 0xF) * 4. Fix 2: in the fragment check, treat a packet as FRAGMENT if (ntohs(ip->frag_off) & 0x3FFF) != 0, i.e., check both the fragment-offset bits (0x1FFF) and the MF flag (0x2000) together. The shallow-check trap is that the provided samples have empty payloads and no last-fragment packets, so fixing only the more obvious fragment-offset bug (or only the pseudo-header bug) passes samples but not the hidden corpus.",
+  "trap": "A solver that fixes only the fragment-offset bug (because it is easier to spot from the MF-only check) will pass all sample tests but fail hidden corpus packets with non-empty TCP payloads because the pseudo-header still uses 20. Conversely, fixing only the pseudo-header bug passes payload tests but fails last-fragment classification. A solver that tries to verify shallowly by re-running the sample corpus and seeing PASS will stop early and submit an incomplete fix. Both bugs must be fixed; neither is visible without running the binary on non-trivial traffic.",
+  "tests": [
+   "Verifier builds /repo with `make -C /repo` and asserts exit code 0",
+   "Verifier generates a capture with 50 TCP packets each carrying exactly 128-byte payloads and known-correct checksums; expects all VALID verdicts (catches the pseudo-header bug)",
+   "Verifier generates 20 packets with deliberately corrupted TCP checksums and non-empty payloads; expects all CORRUPT verdicts",
+   "Verifier generates 10 packets that are last-fragments (fragment offset=200, MF=0) with correct-looking IP+TCP; expects all FRAGMENT verdicts (catches the MF-only check bug)",
+   "Verifier generates 10 packets that are middle-fragments (MF=1, offset=8); expects FRAGMENT verdicts",
+   "Verifier generates a mixed capture of 120 packets (valid, corrupt, fragment in random order) and diffs output verdict-for-verdict against reference implementation",
+   "Verifier confirms the binary accepts the two-argument calling convention and writes exactly one newline-terminated verdict per packet"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "120 packets across 7 categories",
+   "effect": "Increasing to 500+ packets with more payload-size variety and edge cases (zero-length TCP, jumbo frames, non-zero IHL options) raises difficulty; reducing to 30 packets with only two categories lowers difficulty and makes partial fixes viable"
+  },
+  "expected_failure_modes": [
+   "Agent reads tcp.c, sees the TCP pseudo-header construction, and thinks it looks correct without running a payload-bearing packet through it; submits unchanged or with only comment edits",
+   "Agent fixes the fragment-offset bug after git-bisecting but misses the pseudo-header bug because sample verification still passes; submits incomplete fix",
+   "Agent rewrites tcp.c from scratch but introduces an endianness error in the pseudo-header length computation (using host byte order for a field that should be network byte order), which passes on a little-endian host but fails a different endianness check in the verifier",
+   "Agent fixes both bugs but introduces a compilation error in the Makefile dependencies, causing `make -C /repo` to fail during verification",
+   "Agent doesn't commit the changes (edits files but doesn't `git add && git commit`), so the verifier's fresh `make` builds the original broken binary"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "networking",
+   "tcp",
+   "checksum",
+   "git-history",
+   "observe-not-read"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /repo/src/tcp.c",
+   "cat /repo/src/ipv4.c",
+   "git -C /repo log --oneline",
+   "git -C /repo show <refactor-commit-hash>",
+   "make -C /repo",
+   "python3 /repo/tools/gen_corpus.py --payload 128 -o /tmp/test_payload.bin --expected /tmp/expected.txt",
+   "/repo/build/pktcheck /tmp/test_payload.bin /tmp/out.txt",
+   "diff /tmp/expected.txt /tmp/out.txt",
+   "# Observe CORRUPT instead of VALID for payload packets; confirm MF-only fragment check visible in step 1",
+   "sed -i 's/hardcoded_20_expression/ntohs(ip->tot_len) - ((ip->ihl & 0xF) * 4)/' /repo/src/tcp.c",
+   "sed -i 's/MF_flag_only_check/(ntohs(ip->frag_off) \\& 0x3FFF) != 0/' /repo/src/tcp.c",
+   "make -C /repo",
+   "/repo/build/pktcheck /tmp/test_payload.bin /tmp/out2.txt",
+   "diff /tmp/expected.txt /tmp/out2.txt",
+   "git -C /repo add src/tcp.c",
+   "git -C /repo commit -m 'fix TCP pseudo-header length and fragment offset detection'"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The MF-only fragment check bug is directly visible by reading src/tcp.c \u2014 any agent that reads the source will spot 'check MF flag but not offset bits', undermining the observe_not_read lever and making the task source-readable, not observation-required",
+   "If gen_corpus.py does not expose CLI flags for payload length, the agent cannot easily craft diagnostic captures without reverse-engineering the tool first, creating an unspecified dependency",
+   "The endianness trap (using host byte order instead of ntohs) is environment-dependent: it silently passes on little-endian x86 Docker hosts but fails a verifier running different byte-order tests \u2014 ambiguous whether this is a genuine skill check or environment fussiness",
+   "The git-commit requirement is a silent failure mode: agents that correctly fix the code but forget to commit will fail verification with no diagnostic feedback, which tests workflow hygiene rather than networking/C knowledge",
+   "gen_corpus.py interface is unspecified in the blueprint \u2014 if the agent cannot generate non-trivial captures easily, the observe_not_read path is blocked and the agent must rely on source reading alone (which reveals one bug directly)"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because the fragment-offset bug (MF-only check without offset bits) is directly visible by reading src/tcp.c, meaning a strong agent can find and fix both bugs in ~15 commands without any observation-required steps, breaking the core observe_not_read difficulty claim. The average score is (4+4+5+2+5)/5 = 4.0, which meets the threshold, but genuine_difficulty is below the required minimum of 3. The task is otherwise well-constructed \u2014 clear, realistic, and verifiable \u2014 but the fundamental difficulty premise is undermined by one bug being source-readable.",
+  "fixes": [
+   "Make the fragment-check bug also invisible by source inspection: instead of MF-only, use a more subtle bug like checking `(frag_off & 0x1FFF) != 0` (correct offset bits) but using the wrong byte order (host instead of network), so both bugs require running the binary to observe \u2014 reading the code would show 'correct' logic that just has an endianness error",
+   "Remove or obfuscate the fragment detection source so the agent cannot read it directly; for example, inline it into a macro defined in a header that requires following multiple include chains, raising the cost of source inspection",
+   "Add a third subtle bug (e.g., off-by-one in frame length parsing in capture.c) that only manifests with specific frame sizes in the hidden corpus, increasing the search space and requiring the agent to run more diagnostic tests rather than fixate on tcp.c",
+   "Make the sample corpus include some non-empty-payload packets (but specifically 20-byte payloads only) so the hardcoded-20 still passes samples \u2014 this maintains the shallow-check trap while forcing more careful observation to find the edge",
+   "Specify the gen_corpus.py interface explicitly in the environment description so the agent's path to crafting diagnostic captures is unambiguous and the observe_not_read path is well-defined"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet codec for correctness and performance benchmarks, not about repairing C-based TCP/IP checksum validation logic."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decrypt-and-restore-backup-fragments",
+     "verdict": "distinct",
+     "reason": "That task involves decrypting and reassembling encrypted backup fragments, not debugging TCP checksum computation in a C library."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about building a TCP audit service with HMAC-SHA256 computation over WAL records, not repairing IPv4/TCP checksum validation and packet classification logic."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a NetFlow v9 aggregation service in Rust, not repairing TCP checksum and fragmentation classification in a C library."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a frame encode/decode service with a custom binary wire format, not about IPv4/TCP checksum validation and fragment detection in raw Ethernet frames."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ae2e414b859f",
+     0.191
+    ],
+    [
+     "terminal-bench-pro/decrypt-and-restore-backup-fragments",
+     0.169
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.145
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.113
+    ],
+    [
+     "ours/official-aac910462208",
+     0.096
+    ]
+   ],
+   "cost_usd": 0.01458
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05882999999999999
+}

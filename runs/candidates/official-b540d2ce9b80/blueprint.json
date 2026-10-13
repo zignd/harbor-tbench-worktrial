@@ -1,0 +1,63 @@
+{
+ "slug": "webpack-native-addon-feature-flags",
+ "title": "Native Addon Feature Flag Migration",
+ "scenario": "A platform engineering team is migrating a JavaScript build system to support a new compiled native addon that gates webpack optimization passes behind a set of feature flags. The addon binary is pre-compiled in the Docker image at /opt/native/optimizer.node. Its API is undocumented \u2014 the team only has the old webpack.config.js that called a Python preprocessor, and the new addon that is supposed to replace it. The migration requires translating the old preprocessor's configuration semantics into the addon's flag system, which can only be discovered by running it.",
+ "instruction_draft": "Hey, we're migrating our webpack build to use the new optimizer addon at /opt/native/optimizer.node instead of the old Python preprocessor. The addon takes a config object and returns transformed module descriptors \u2014 I need you to wire it up in webpack.config.js so the build pipeline produces correct output bundles.\n\nThe deal is: the old preprocessor in scripts/preprocess.py defines which modules get which optimization passes (dead code elimination, const folding, scope hoisting). The new addon should produce identical pass assignments for each module, but it uses a totally different flag system that you'll need to figure out. When the build finishes, /dist/manifest.json must list every entry module with its assigned optimization passes matching what the old preprocessor would have produced. The addon must be configured so that running `node scripts/verify_build.js` exits 0 \u2014 it replays the preprocessor on a fresh set of module descriptors generated at verify time and checks that the addon matches.",
+ "requirements": [
+  "webpack.config.js must use the optimizer addon at /opt/native/optimizer.node (not the Python preprocessor) to assign optimization passes to modules",
+  "The addon must be correctly configured so its pass assignments match the Python preprocessor semantics for all module types",
+  "The build must produce /dist/manifest.json listing each entry module with its assigned optimization passes",
+  "Running node scripts/verify_build.js must exit 0, meaning the addon's output matches the preprocessor on fresh verify-time module descriptors",
+  "All three optimization passes (dead_code_elimination, const_folding, scope_hoisting) must be correctly gated per module type according to the original preprocessor rules"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm with nodejs 20, npm, and webpack 5 installed via apt/npm",
+  "Pre-compiled opaque native addon at /opt/native/optimizer.node (Node.js N-API addon, no source)",
+  "The addon exports a single function: configure(configObj) returning an Optimizer instance, and instance.process(moduleDescriptor) returning {passes: [...]}",
+  "The addon's config keys are undocumented and non-obvious: the addon uses 'elimination_gate', 'folding_threshold', 'hoist_namespace' rather than the preprocessor's human-readable names",
+  "The addon has subtle data-dependent behavior: folding_threshold is a numeric boundary (not boolean), and modules whose 'complexity_score' field is exactly at the boundary are assigned differently than those above/below \u2014 this only shows when running real module descriptors with edge-case scores",
+  "scripts/preprocess.py: 200-line Python script that reads module descriptors (JSON with fields: id, type, complexity_score, has_side_effects) and outputs pass assignments. Rules: dead_code_elimination for type in ['util','lib'] AND NOT has_side_effects; const_folding when complexity_score < 40; scope_hoisting when type == 'lib' OR (type == 'util' AND complexity_score < 20)",
+  "The existing webpack.config.js calls subprocess to run preprocess.py but this is broken in the new environment (Python subprocess path issues planted)",
+  "scripts/verify_build.js: generates 50 fresh module descriptors at verify time (using a seeded RNG based on today's date), runs both the preprocessor reference and the configured addon, asserts exact pass-set equality for each module",
+  "src/ directory with 8 JavaScript entry modules that reference each other",
+  "package.json with webpack, webpack-cli as devDependencies",
+  "A working dist/ placeholder with an outdated manifest.json to make it look like the build ran",
+  "scripts/probe_addon.js: a helper script the solver can run to experiment with the addon API (intentionally left in the environment as a realistic artifact)",
+  "The addon binary is built in the Dockerfile using a C++ source that is NOT included \u2014 only the .node artifact is copied into /opt/native/"
+ ],
+ "internal_hint": "The resolution path requires three phases: (1) Discover the addon's config schema by experiment \u2014 run probe_addon.js or write a small script to call configure() with various keys and call process() on test descriptors, observing what passes come back. The addon accepts 'elimination_gate' (boolean), 'folding_threshold' (number), and 'hoist_namespace' (string, one of 'lib', 'lib+util'). (2) Characterize the boundary behavior \u2014 the folding_threshold boundary is EXCLUSIVE on the lower side, meaning complexity_score < threshold (not <=). A naive reading of the Python code (< 40) maps correctly to the addon's exclusive boundary, BUT the addon treats the threshold as applying to complexity_score < threshold where threshold=40 gives the same result. The real trap is scope_hoisting: the preprocessor uses type=='lib' OR (type=='util' AND complexity_score < 20), but the addon's 'hoist_namespace' flag only controls WHICH namespaces are hoisted \u2014 'lib' hoists only lib types, 'lib+util' hoists lib AND util types but WITHOUT the complexity_score sub-condition, so a separate complexity gate must be applied by wrapping the addon call. The solver must discover that hoist_namespace='lib+util' over-hoists util modules with complexity_score >= 20, and compensate by post-processing the addon result for those cases. (3) Wire into webpack.config.js as a custom plugin that calls the addon synchronously during the compilation's optimizeModules hook, then writes manifest.json.",
+ "trap": "The naive solution configures the addon with hoist_namespace='lib+util' and calls it directly, which correctly handles lib-type modules and util-type modules with low complexity scores, but INCORRECTLY assigns scope_hoisting to util modules with complexity_score >= 20. This error is invisible in the provided src/ modules (which happen to all have complexity_score < 20 or are type 'lib') but appears in the verify-time generated descriptors which include util modules with complexity_score in the 20-60 range. The verify script exits non-zero with a diff showing false scope_hoisting assignments. A frontier agent that only tests against the provided modules and doesn't study the preprocessor's scope_hoisting rule carefully will ship this bug.",
+ "tests": [
+  "webpack build completes without error and /dist/manifest.json exists and is valid JSON",
+  "manifest.json contains an entry for each of the 8 src/ entry modules",
+  "node scripts/verify_build.js exits 0 \u2014 this generates 50 fresh descriptors including util modules with complexity_score in {0,5,15,19,20,25,35,45,55} and type in {util, lib, app, vendor}, and checks addon output matches preprocessor for each",
+  "At least one verify-time descriptor is a util module with complexity_score == 20 (boundary case) \u2014 must NOT have scope_hoisting",
+  "At least one verify-time descriptor is a util module with complexity_score == 19 \u2014 must have scope_hoisting",
+  "At least one verify-time descriptor is a lib module with complexity_score == 50 \u2014 must have scope_hoisting and NOT const_folding",
+  "webpack.config.js does not invoke the Python preprocessor subprocess (checked by confirming no child_process.execSync/exec call to preprocess.py)",
+  "The optimizer.node addon is loaded via require('/opt/native/optimizer.node') in the webpack config or a module it loads"
+ ],
+ "verifier_knob": {
+  "name": "boundary_cases_in_verify_set",
+  "value": "8 distinct boundary-region descriptors out of 50",
+  "effect": "Increasing the number of boundary-case descriptors (complexity_score at 19, 20, 39, 40 for various types) makes shallow pass-through implementations fail more loudly; decreasing to 0 boundary cases allows an over-hoisting solution to pass accidentally"
+ },
+ "expected_failure_modes": [
+  "Agent discovers the addon API via probe but misses the scope_hoisting sub-condition on complexity_score, ships hoist_namespace='lib+util' without post-processing, passes local tests but fails verify-time util modules with complexity_score >= 20",
+  "Agent tries to keep the Python preprocessor subprocess in the build pipeline (just fixing the path) rather than migrating to the addon, causing the webpack.config.js check to fail",
+  "Agent discovers folding_threshold and elimination_gate correctly but guesses hoist_namespace semantics from the name without experimentally probing it with util modules at complexity boundary, leading to wrong scope_hoisting on edge cases",
+  "Agent wires the addon into a wrong webpack lifecycle hook (e.g., afterEmit instead of optimizeModules), causing manifest.json to not reflect actual optimization decisions",
+  "Agent correctly characterizes the addon behavior for the 8 provided src/ modules (all passing) but does not test the edge-case complexity_score range, so doesn't notice the util>=20 scope_hoisting bug before submitting"
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "build-and-packaging",
+ "tags": [
+  "webpack",
+  "native-addon",
+  "feature-flags",
+  "opaque-binary",
+  "configuration",
+  "javascript"
+ ]
+}

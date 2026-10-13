@@ -12,7 +12,7 @@ Fix the orchestrator so that all of the following hold when the service is resta
 
 4. POST /api/rollback immediately sets phase to 'rolledback' regardless of current health.
 
-5. The rollback-decider module at /app/src/rollback-decider.js must be fully implemented: it currently returns {decision:'promote'} unconditionally.
+5. The rollback-decider module at /app/src/rollback-decider.js must be fully implemented and make correct promote/rollback decisions based on the health window state.
 
 6. POST /api/telemetry accepts { statusCode, latencyMs, weight } records, routes them through the sampler pipeline, and updates the health window. The error rate calculation must correctly reflect the original request outcome, using the weight field from each record for weighted averaging.
 

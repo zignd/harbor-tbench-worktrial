@@ -51,6 +51,7 @@ test: ## Run unit tests
 
 lint: ## Lint pipeline code (AfterQuery's validator/validate.py excluded)
 	@uv run --quiet ruff check . --exclude validator/validate.py
+	@bash scripts/check_repo_hygiene.sh
 
 calibrate: ## Calibrate every gated candidate in one wave (wider than per-batch; uses OPUS_CONCURRENCY)
 	@$(UV_RUN) python -m scripts.calibrate_candidates

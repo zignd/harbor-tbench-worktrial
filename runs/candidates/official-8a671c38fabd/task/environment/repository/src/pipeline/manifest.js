@@ -1,0 +1,2 @@
+function assertManifest(m){if(!m||m.version!==3||!Array.isArray(m.entries)||typeof m.root!=='string'||!Array.isArray(m.signatures))throw Error('invalid manifest');for(let i=0;i<m.entries.length;i++){const e=m.entries[i];if(e.index!==i||typeof e.keyId!=='string'||typeof e.nonce!=='string'||typeof e.ciphertext!=='string'||typeof e.tag!=='string')throw Error('invalid entry')}return true}
+module.exports={assertManifest};

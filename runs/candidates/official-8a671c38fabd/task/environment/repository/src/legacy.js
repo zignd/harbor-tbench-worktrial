@@ -1,0 +1,1 @@
+module.exports={sealBatch:(events,rotations)=>({version:2,entries:events.map((e,index)=>({index,keyId:rotations[0].id,nonce:'',ciphertext:Buffer.from(JSON.stringify(e)).toString('base64'),tag:''})),root:'',signatures:[]})};

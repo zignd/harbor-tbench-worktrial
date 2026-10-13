@@ -1,0 +1,1 @@
+const {sealBatch}=require('../src');const r=[{id:'p',effectiveAt:0,key:'AAECAwQFBgcICQoLDA0ODw'}];if(sealBatch([{timestamp:1,payload:'ok'}],r).version!==3)process.exit(1);console.log('integration ok');

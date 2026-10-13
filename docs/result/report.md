@@ -198,13 +198,86 @@ The final per-task verdict, package hashes and check results are in `docs/result
 ## 9. Stretch goals
 
 ### 9.1 A — Cost-efficient evaluation
-Exact curtailment is implemented and shown to be lossless vs running all five trials (all 2^5 sequences in `analysis/curtailment.py`). The report's simulation table gives saved trials by true pass probability (≈12–23% for p∈[0.2,0.8]); the 0/3 early-reject alternative saves more (~25–40%) at the cost of recall. **Caveat:** the dollar figure mixes exact-curtailment savings with early stops on invalid tasks; the trial-count saving is the trustworthy number. Blueprint-time predicted pass rate did **not** track observed outcomes (correlation ≈ −0.29 over 9 earlier tasks), so it is not used as a pre-filter.
+
+Exact sequential curtailment stops a task as soon as the five-run verdict cannot change; the verdict is
+identical to running all five. Measured from the ledger (`evidence/stretchA-curtailment.json`):
+
+| Scope | Tasks calibrated | Trials run | Naive 5× each | Trials saved | Calibration spend | Naive cost | Saved |
+|---|---|---|---|---|---|---|---|
+| Luna → GPT-5.4-mini (this run) | 31 | 114 | 155 | **41 (26.5%)** | $10.51 | $14.28 | **$3.78** |
+| historical pairs | 34 | 143 | 170 | 27 (15.9%) | $105.81 | $125.79 | $19.98 |
+| all pairs | 65 | 257 | 325 | 68 (20.9%) | $116.31 | $147.09 | $30.78 |
+
+**Savings are reported separately by mechanism, because conflating them overstates the result.**
+
+- *Exact curtailment* genuinely avoids trials: 26.5% of trials and the same
+  proportion of dollars on this run's pair. The dollar figure is an estimate at constant per-trial cost
+  ($0.0921 mean) — per-trial cost varies with trace length, so it is not a billing fact.
+- *Early stops on invalid or hacked runs* save **nothing**: the trial was paid for and its result cannot be
+  used, so the run must be repeated. The ledger records 62 such error events
+  ($0). They are excluded from the savings above, and they are exactly why the audited
+  approval needed a replacement trial.
+- The optional 0/3 aggressive early reject trades recall for more savings and was **not** used for shipping.
+
+**Predictor limitation.** The blueprint's self-predicted pass rate did not track observed outcomes
+(correlation ≈ −0.29 over 9 earlier tasks), so it is not used as a pre-filter. Learning to predict
+learnability without rollouts is an open problem in the literature this work follows.
 
 ### 9.2 B — Difficulty tuning
-`analysis/tuner.py` + `scripts/tune_candidates.py` implement knob → lever → regenerate with logged mutations. Ten tuning records exist. **No tuning experiment is demonstrated to have moved a task into the band** (the tuner runs ended `gates_failed`). This is a measured negative result: tuning is implemented and exercised, but successful difficulty adjustment is not shown.
+
+`analysis/tuner.py` and `scripts/tune_candidates.py` implement knob → lever → regenerate with logged
+mutations. Audited across **13 tuning experiments** with recorded before/after package hashes
+(`evidence/stretchB-tuning.json`):
+
+| Metric | Value |
+|---|---|
+| Experiments with a hash-bound before/after | 13 |
+| Rounds executed | 1–3 per experiment |
+| Experiments whose calibration reached **learnable** | **0** |
+| Total tuner spend | $0.07 |
+
+**Successful difficulty adjustment is not demonstrated.** The tuner's own runs ended in `gated` or
+`calibrated` states outside the band; the mutations either failed their gates or left the band
+unchanged. This is a measured negative result, recorded as *not demonstrated* rather than achieved,
+and it is consistent with the bimodality in §7.2: the levers available without introducing an invalid
+failure mode move a task to one end or the other rather than onto the 1–3/5 plateau.
 
 ### 9.3 C — Diversity
 `analysis/diversity.py` reports per-axis coverage and balance exp(H)/N, instruction uniqueness (TF-IDF cosine, Vendi) and novelty against the reference sets. Rejects per layer are recorded. **Caveat:** the automatic novelty check ran only against TB 2.1 + `examples/`, not the full published corpus; this is disclosed and is not full public-task decontamination.
+
+### 9.4 D — Human-likeness and rubric comparison
+
+**Rubric comparison (same rubric, model and settings, all re-run this session).** The 16-criterion
+rubric in `generator/quality_rubric.toml` was applied to all six human-written `examples/` and to our
+four audited generated packages (`evidence/rubric-comparison.json`):
+
+| Set | Packages | Pass the rubric | Mean blocking findings |
+|---|---|---|---|
+| Human-written `examples/` | 6 | **0 (0%)** | **2.17** |
+| Generated (audited) | 4 | **3 (75%)** | **0.25** |
+
+This is **not** evidence that our tasks are better than the reference tasks. It is evidence that the
+rubric has been optimized against: the generator's repair loop consumes exactly these findings, so
+the scores are Goodharted for the generated set. The honest reading is that **the rubric measures
+"what this generator was taught to fix"** — primarily test↔instruction coverage and offline
+verification — and not general task quality. It is still useful as an internal gate, and it did catch
+three real defects (a wall-clock failure mode, network-dependent verification, thin coverage), but it
+must not be quoted as evidence that generated tasks exceed published ones. No cached historical score
+is mixed into this table; every entry was re-run in this session.
+
+**Stylometrics.** Generated instructions are longer (≈330 vs 183 words), code-span-heavy (≈34 vs 1.2)
+and use no bullets where the examples average 10.2 — the "verbose, over-structured" tells the
+guideline literature warns about (`evidence/stylometrics.json`).
+
+**Blinded discrimination experiment.** 24 example×generated pairs, identities shuffled with recorded
+seed 20261013, judged by `openai/gpt-5.6-luna`: **accuracy 0.375, 95% Wilson CI [0.212, 0.573]**
+(`evidence/blind.json`). The interval contains 0.5, so the judge cannot distinguish the two sets at
+this sample size; the point estimate is *below* chance, which is not evidence of human-likeness either.
+Caveats reported rather than buried: the pairs are not independent, the judge assessed its own model's
+family, temperature-0 reruns were **not** deterministic (the first, interrupted run disagreed with the
+seeded rerun on 1 of the first 12 pairs), and the generated packages were pre-audit versions. **Near-chance
+discrimination is not proof of indistinguishability**, and this experiment does not show the pipeline
+produces human-like instructions.
 
 ### 9.4 D — Human-likeness
 Stylometrics (`analysis/human_likeness.py`) show generated instructions are longer (≈330 vs 183 words) and code-span-heavy (≈34 vs 1.2) with no bullets vs 10.2 in examples — the "verbose, over-structured" tells the guideline paper warns about. A seeded blinded experiment over 24 example×generated pairs (model `openai/gpt-5.6-luna`, seed 20261013) gave **accuracy 0.375, 95% Wilson CI [0.212, 0.573]** — indistinguishable from chance at this sample size, but below 50% and not evidence of proven human-likeness. Caveats: repeated pairs are not independent, the model judged its own family's output, temperature-0 reruns were not deterministic, and the packages were pre-audit versions. Evidence: `docs/result/evidence/blind.json`, `stylometrics.json`.

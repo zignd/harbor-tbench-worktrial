@@ -221,7 +221,7 @@ spec (inverse-frequency over a 10-axis taxonomy)
 
 - `runs/ledger.jsonl`: every stage of every candidate (cost, time, result, inputs hash).
 - `runs/candidates/<id>/`: spec, blueprint, gate decisions, the authored task, calibration with per-trial judge labels.
-- `output/`: shipped (learnable) tasks. `make test` / `make lint` / `make plan` for checks and checklist progress.
+- `output/`: the audited task packages. **One is approved** (`optimize-policy-decision-audit`, 3/5 against GPT-5.4-mini); the other four pass every gate but miss the 1-3/5 band and carry `approved: false` with their measured reason. Start at `output/README.md` and `docs/result/report.md`. `make test` / `make lint` / `make plan` for checks and checklist progress.
 
 ### Exploratory study: who writes the task, who solves it
 

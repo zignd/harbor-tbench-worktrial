@@ -1,6 +1,6 @@
 # Result deliverables
 
-**Audited revision:** the commit that adds this file. Run `git log -1 --format=%H` to confirm; the same hash is recorded in `docs/result/verification.json` under `revision`.
+**Audited revision:** `8ab58b49dde02f44effea464d34ded4199e84749` (recorded in `docs/result/verification.json` under `revision`; the manifest is regenerated one commit after the code it describes).
 
 Two documents plus machine-readable evidence:
 
@@ -8,6 +8,7 @@ Two documents plus machine-readable evidence:
 - **`presentation.pptx`** — a concise 10–12 slide interview deck with presenter notes.
 - **`presentation.html`** — the same deck as an offline HTML file (open in a browser; `←`/`→` to navigate). No server or network needed.
 - **`verification.json`** — the machine-readable audit manifest (approved tasks, hashes, checks, spend snapshots). `overall_status` is `passed` only when every check actually passes.
+- **`../output/`** — five audited task packages; **one is approved** (`optimize-policy-decision-audit`, 3/5, pooled 0.70 over two independent batches), each carrying its own `calibration.json` and `verification.json`.
 - **`evidence/`** — frozen raw evidence: inventories, spend snapshots, quality checks, the blinded experiment, stylometrics and historical candidate data.
 
 ## Rebuild the deck

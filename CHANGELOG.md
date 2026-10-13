@@ -4,7 +4,7 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
-### 23:27 -03:00 · Authoring summarizes only near the context limit
+### 23:22 -03:00 · Authoring summarizes only near the context limit
 - `METATASK_SUMMARIZE_THRESHOLD` 140k → 20k free tokens. At 140k, terminus-2 summarized an authoring run once its history passed ~60k tokens. That was a cost lever (Phase 0's 104k-token history cost $2.75), but each summarization is a multi-minute pause of several long calls that drops detail mid-build: 4 of 6 builds were paused in it at once. Throughput now matters more than cost, so it only fires near the real 200k limit. Opus calibration never set this and keeps terminus-2's defaults.
 - Applies to authoring processes started from now on. Running batches keep the old value until they restart, and they aren't restarted just for this, since that would lose in-flight authoring.
 

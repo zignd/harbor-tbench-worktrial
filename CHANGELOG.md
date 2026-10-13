@@ -4,7 +4,7 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
-### 22:24 -03:00 · Malformed model JSON no longer sinks a candidate
+### 22:15 -03:00 · Malformed model JSON no longer sinks a candidate
 - **7 candidates of the 12-wide batch crashed** with `JSONDecodeError` within minutes. Under parallel load, Sonnet's blueprint and review replies sometimes held two JSON objects ("Extra data") or trailing commas. The parser took one greedy `{...}` span and parsed it strictly, so one bad draft out of four parallel ones crashed the whole candidate (~$0.6-0.8 of drafts each).
 - **`extract_json`** now scans for the first `{` that starts a decodable object (prose before it or a second object after it don't matter) and retries each position with trailing commas removed. This applies to every judge and reviewer, since they all share the parser. Tested on prose + trailing commas, two fenced blocks, and a non-JSON brace before the real object.
 - **A draft whose reply still can't be parsed twice** becomes a skipped draft (logged as an `error` event), not a crashed candidate.

@@ -129,6 +129,7 @@ def main() -> int:
             "evidence": "docs/result/evidence/reconciliation-final.json",
         },
     }
+    approved_names = {t.name for t in approved}
     quarantined = []
     for slug, ev in (
         ("repair-reproducible-release-packager", "packager-final-calibration.json"),
@@ -199,7 +200,12 @@ def main() -> int:
             "verification record, and approved_tasks stays empty because "
             "none lands in the 1-3/5 band."
         ),
-        "quarantined_candidates": quarantined,
+        "quarantined_candidates": [q for q in quarantined if q["task"] not in approved_names],
+        "quarantined_note": (
+            "First-pass measurements for packages that are NOT approved. A package that "
+            "was later approved (e.g. after a second independent calibration batch) is "
+            "deliberately absent here so it cannot appear both approved and rejected."
+        ),
         "quarantine_note": (
             "Quality-clean, gate-clean packages that failed the learnable band. "
             "They are preserved under runs/audit-20261013/ and are not shipped; "

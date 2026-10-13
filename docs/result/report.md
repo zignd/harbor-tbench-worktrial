@@ -181,7 +181,10 @@ Two mechanisms explain the shape:
    something the solver cannot approach (0/5). The historical Sonnet→Opus pairing failed the same
    way for the opposite reason (8 too easy, 0 in band).
 
-The final per-task verdict, package hashes and check results are in `docs/result/verification.json`. If neither lands 1–3 with valid failures after repair, **no task is approved** and this document states that plainly rather than shipping a weak task.
+The final per-task verdict, package hashes and check results are in `docs/result/verification.json`.
+One package did land in the 1–3 band with valid failures under a pre-registered rule and is approved
+(§7); the other four are published unapproved with their measured reason rather than shipped, and no
+advisory override was used to promote any of them.
 
 ---
 

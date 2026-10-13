@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:05 -03:00 · Self-audit caught two contradictions in my own artefacts
+- **Report contradicted itself:** a sentence left over from an earlier draft still said "If neither lands 1-3 with valid failures after repair, **no task is approved**" — while the same document reported one approved task two sections earlier. Rewritten to state the actual outcome.
+- **`verification.json` listed one task as both approved and rejected:** `quarantined_candidates` still carried `optimize-policy-decision-audit` with the first-pass reason "too easy" (batch 1 = 4/5), which directly contradicts its approval on batch 2. Approved tasks are now excluded from that block, with a note explaining why, so a package can never appear as both.
+- Grepped every deliverable for stale "output/ is empty" / "three tasks shipped" / `overall_status: failed` claims. The only surviving mention is the intentional `SUPERSEDED BY THE AUDIT` note in `docs/findings.md`, which is correct.
+- Decks regenerated and re-validated against the corrected manifest.
+
 ### 20:55 -03:00 · Spend reconciliation: the dominant cause is cache accounting, quantified
 - The key read **$209.17 at 15:20 on 2026-10-13**, i.e. it *does* cover the historical Sonnet/Opus era; it is not a later-created credential. Raw ledger total $545.64 vs key $219.70, a $325.94 over-count.
 - The retained per-job token data lets the cause be computed instead of guessed. That era had a **48.1% cache-hit rate** (80.3M of 167.0M input tokens were cache reads). The same tokens cost **$617.45** if cached input is billed at the full prompt rate, **$380.61** cache-aware, and **$451.76** as reported by Harbor/LiteLLM — so **cache accounting explains a $236.84 swing** and LiteLLM applied only partial cache accounting.

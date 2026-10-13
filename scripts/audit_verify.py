@@ -46,7 +46,9 @@ def main() -> int:
             "calibration": {k: c.get(k) for k in ("verdict", "outcomes", "legit_passes", "n_trials", "models")},
             "checks": v.get("checks", {}),
         })
-    revision = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=ROOT).stdout.strip()
+    rev = subprocess.run(["git", "rev-parse", "HEAD"], check=False,
+                        capture_output=True, text=True, cwd=ROOT)
+    revision = rev.stdout.strip()
     checks_ok = bool(tasks) and all(all(v for v in t["checks"].values()) for t in tasks)
     tests_ok = _passed("tests-final.log")
     requirements = {

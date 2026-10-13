@@ -285,7 +285,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 109 / 109 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 110 / 110 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -397,7 +397,7 @@ Part 3: pipeline metrics
 
 Stretch A: cost-efficient evaluation
 - [x] Curtailment savings: trials run vs naive 5× per task, in $ and %. Done in `evidence/stretchA-curtailment.json`: on this run's pair, 31 tasks used 114 trials against a naive 155 — **26.5% of trials and ~$3.78 saved**; 20.9% / $30.78 across all pairs. The dollar figure is stated as an estimate at constant per-trial cost, and **early stops on invalid or hacked runs are reported separately and explicitly save nothing** (the trial was paid for and must be repeated), so curtailment savings are not overstated.
-~~- [ ] Simulation over the observed per-task p: expected savings and the effect of the optional aggressive 0/3 early reject (reported only, not used for shipping).~~ skipped: the report already shows the measured curtailment saving; the simulation was optional and time went to shipping.
+- [x] Simulation over the observed per-task p: expected savings and the effect of the optional aggressive 0/3 early reject (reported only, not used for shipping). **Previously annotated as skipped; now done** (`evidence/stretchA-simulation.json`, report §9.1): P(in band) peaks at 0.83 around p≈0.35; exact curtailment saves 17-23% of trials in the band-relevant region, matching the 26.5% measured; the aggressive 0/3 rule saves a further 18-37% but **discards 7-28% of learnable tasks**, so it is reported and deliberately not used for shipping.
 - [x] Predicted-vs-observed pass rate: correlation of Sonnet's blueprint-time prediction with the Opus outcome, and whether it would work as a pre-filter.
 
 Stretch D: human-likeness

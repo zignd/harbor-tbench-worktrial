@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:35 -03:00 · The one stretch-A item still marked skipped is now done
+- The plan's simulation over the observed per-task pass rate was struck through as skipped, but the goal's stretch-A description explicitly asks for it. Rather than leave a gap hidden behind a strike-through, I produced it (`evidence/stretchA-simulation.json`, report §9.1) and un-struck the item with a note that it was previously skipped.
+- Three results worth stating: **P(in band) peaks at 0.83 around p≈0.35**, giving a concrete difficulty target; **exact curtailment saves 17-23% of trials in the band-relevant region**, which brackets the 26.5% actually measured over 31 tasks (the figure runs high because a pool of very easy and very hard tasks curtails less); and the **aggressive 0/3 early reject would save a further 18-37% but discards 7-28% of genuinely learnable tasks**, which is exactly why shipping uses five full judged attempts.
+- Plan 110/110. The other struck-through item (the optional cheap-solver transfer check) remains correctly marked skipped.
+
 ### 21:20 -03:00 · Deck/report numbers now machine-checked against evidence
 - Mechanically cross-checked every figure in the deck and report against `verification.json` and the raw evidence files. **One real drift found:** the deck's spend was hardcoded at $219.64 while the audited key reading was $219.6975. Fixed structurally — `deck_data.json` now derives spend (and the ledger figure) from the manifest and `reconciliation.json`, so it cannot drift again.
 - Added `scripts/audit_deck_consistency.py` (14 checks: approved-task agreement, band/trial counts, spend, blind result, curtailment and tuning figures, rubric figures, HTML listing the approved task, zero external resources, and that the manifest does **not** claim spend reconciliation was met) and wired it into `make lint`, so drift now fails the build instead of waiting to be noticed.

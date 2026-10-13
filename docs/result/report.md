@@ -223,6 +223,36 @@ identical to running all five. Measured from the ledger (`evidence/stretchA-curt
   approval needed a replacement trial.
 - The optional 0/3 aggressive early reject trades recall for more savings and was **not** used for shipping.
 
+**Simulation over the true pass rate** (`analysis/curtailment.py`, evidence
+`stretchA-simulation.json`). This was previously annotated as skipped; it is reported here because it
+explains the measured figure above:
+
+| true p | P(in band) | E[trials], exact curtailment | saved | E[trials], aggressive 0/3 | saved | learnable tasks kept |
+|---|---|---|---|---|---|---|
+| 0.05 | 0.226 | 4.68 | 6% | 3.01 | 40% | 63% |
+| 0.1 | 0.409 | 4.42 | 12% | 3.03 | 39% | 66% |
+| 0.2 | 0.666 | 4.05 | 19% | 3.13 | 37% | 72% |
+| 0.35 | 0.830 | 3.85 | 23% | 3.39 | 32% | 81% |
+| 0.5 | 0.781 | 3.94 | 21% | 3.75 | 25% | 88% |
+| 0.65 | 0.566 | 4.16 | 17% | 4.10 | 18% | 93% |
+| 0.8 | 0.262 | 4.32 | 14% | 4.31 | 14% | 97% |
+| 0.9 | 0.081 | 4.26 | 15% | 4.26 | 15% | 99% |
+
+Three things fall out of this:
+
+1. **The measured 26.5% is consistent with the model.** Exact curtailment saves 17–23% of trials in the
+   region where a task is actually likely to land in band (p = 0.2–0.65). Our measured 26.5% across 31
+   tasks sits at the optimistic end of that band, which is what a pool with many *very* easy and
+   *very* hard tasks would produce (at p ≤ 0.1 the saving falls to 6–12%, because a too-hard task runs
+   all five trials before the verdict is certain).
+2. **The band is easiest to hit around p ≈ 0.35**, where P(in band) = 0.83. That is a concrete,
+   actionable target for difficulty design, and it is consistent with the bimodality actually observed
+   (§7.2): the pipeline lands at the extremes and rarely near 0.35.
+3. **The aggressive 0/3 early reject is not free.** It would save a further 18–37% of trials, but it
+   **discards 7–28% of genuinely learnable tasks** (recall falls to 72% at p = 0.2). It is therefore
+   reported and deliberately **not** used for shipping — which is why the audited approval rests on
+   five full judged attempts rather than a curtailed record.
+
 **Predictor limitation.** The blueprint's self-predicted pass rate did not track observed outcomes
 (correlation ≈ −0.29 over 9 earlier tasks), so it is not used as a pre-filter. Learning to predict
 learnability without rollouts is an open problem in the literature this work follows.

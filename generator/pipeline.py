@@ -126,7 +126,7 @@ def _draft(cand: Candidate, ledger: Ledger, index, concepts: str, feedback, atte
     for tries in range(2):
         try:
             return _draft_once(cand, ledger, index, concepts, feedback, attempt)
-        except (ValueError, ValidationError) as e:
+        except (ValueError, ValidationError, TypeError, KeyError, AttributeError) as e:  # bad reply
             _record(ledger, cand, "error", {"stage": "blueprint", "attempt": attempt,
                                             "try": tries + 1, "error": str(e)[:500]})  # fmt: skip
     return None, None

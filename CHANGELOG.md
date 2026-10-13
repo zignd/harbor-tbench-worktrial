@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 01:43 -03:00 · The reasoning behind the study: who writes the task, who solves it
+- **Where we are:** 9 tasks calibrated against Opus 4.8, 0 in the 1-3 band (8 too easy at 4/4 or 5/5, 1 invalid). Three kinds of tuning (more bugs, lever/knob mutations, and a rework with 8 independent hidden-input requirements for `31ca`, 4/4 for $1.92) never moved a pass rate.
+- **Solver pilot (exploratory, partial):** `qwen/qwen3.7-max` solved the same packages 5/5 on the three pairs finished so far (ledger-reconcile, `2f50`, `31ca`), at $0.32-$0.61 per 5 trials. So the tasks are easy for any current strong model, not just for Opus. The pilot script keeps nothing out of the ledger (`pilot_trial` events) and writes `runs/pilot/pilot_models.json`; it is not part of the pipeline.
+- **The explanation we are testing:** the trial pairs a weaker author with a stronger solver, a student writing problems for a professor. The harness (reviews, levers, tuners) can steer what the author tries but not lift what it can write. `docs/findings.md` records the reasoning, the evidence, a 2 x 2 design (weak/strong author x weak/strong solver, same harness) and hypotheses, with a diagram for the presentation.
+- **Proposed pair (same family, so the gap is size and training, not style):** `deepseek/deepseek-v4.1-flash` ($0.30/$1.20 per million tokens) and `deepseek/deepseek-v4-pro` ($0.96/$1.91). Estimated cost ~$25 for ~12 paired tasks, cap $40. The study is added to `docs/plan.md` as a new section (58/91 items); nothing in it is shipped or counted in the funnel.
+
 ### 00:34 -03:00 · Stopped to be credit-cautious again; breadth mutation (code only)
 - **Everything running was stopped** (batches, tuners, snapshot calibrations, watchers, trial containers), and spend discipline is back. `make usage` on the key: **$131.68 used, $367.46 remaining**.
 - **Why:** for a few hours the pipeline ran with parallelism set as if credits didn't matter. Priced at OpenRouter list rates, that pace was **$150-200 per hour** (ledger, hours 02-03 UTC), which would use up the budget left within ~90 minutes. Defaults are back to cost-conscious: `OPUS_CONCURRENCY` 3, exact-curtailment calibration waves (`CALIBRATION_EAGER` off), `CALIBRATE_FIRST` off (no Opus trial before the cheap gates pass), 2 parallel blueprint drafts instead of 4, authoring summarization at 140k again, authoring cap 100 turns. All remain environment-overridable.

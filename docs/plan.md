@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 57 / 83 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 58 / 91 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -415,6 +415,18 @@ Deliverables
 - [x] `README.md` usage section: setup (`uv sync`, `.env`), `make` targets, running a batch, reading the report. Done: "Running this implementation" (setup, `make` targets, parallel/auto-calibrating batches, report).
 - [ ] Final cleanup: remove dead code, check secrets aren't anywhere in history, all commits pushed.
 - [ ] Final `make usage` recorded in `CHANGELOG.md` (total spend and remaining credit).
+
+### Study: who writes the task, who solves it
+
+After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for stronger and for cheaper models alike), we test the reason instead of tuning around it: a weaker author for a stronger solver is a student writing problems for a professor. Reasoning, design and hypotheses are in `docs/findings.md`. **Exploratory: nothing here is shipped or counted in the funnel.**
+- [x] `docs/findings.md`: the thesis, the evidence so far, the 2 x 2 design (weak/strong author x weak/strong solver), metrics, hypotheses and threats to validity.
+- [ ] 💲 Finish the solver pilot (`scripts/pilot_models.py`: `qwen/qwen3.7-max` and `z-ai/glm-5.1` on the 5 too-easy packages, ~$3) and keep its table as evidence.
+- [ ] Pick the model pair and check the gap: `deepseek/deepseek-v4.1-flash` (weak) and `deepseek/deepseek-v4-pro` (strong), both solving a common reference set, to confirm their pass rates differ.
+- [ ] Study mode: author model and solver model chosen per role, runs and ledger events tagged `study`, outputs under `runs/study/`, never shipped (`assert_official_models` still guards shipping).
+- [ ] `scripts/study.py`: draw ~12 specs once; each author writes its own task from the same spec; free gates only (structure, lint, leak scan, build, oracle 3/3, nop 0); every valid task is solved 5 times by each solver; failures judged by one fixed judge.
+- [ ] 💲 Run the study under a spend cap (est. $25, cap $40) and record the per-cell results.
+- [ ] `analysis/study.py`: per-cell in-band share, too easy/hard/invalid shares, pass-rate distribution, task validity rate and cost; a report section and a presentation Q&A entry.
+- [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).
 
 ## Key tradeoffs (to document in the CHANGELOG)
 

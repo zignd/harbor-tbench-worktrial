@@ -91,29 +91,13 @@ Whatever the outcome, the study gives a measured answer rather than a claim.
 
 ## 6. Measured outcome: luna author, gpt-5.4-mini solver (the shipped run)
 
-Full report: `reports/summary.md`; shipped task: `output/repair-log-replay-sql`. Novelty reference for this run is TB 2.1 plus `examples/` only (`NOVELTY_SETS=terminal-bench-2-1`).
+Full report: `reports/summary.md`; shipped tasks: `output/`. Novelty reference for this run is TB 2.1 plus `examples/` only (`NOVELTY_SETS=terminal-bench-2-1`).
 
-- **Models:** `openai/gpt-5.6-luna` authors and judges; `openai/gpt-5.4-mini` (about 60% on TB 2) calibrates. The band is relative to mini.
-- **Three tasks shipped (firsts for the trial):** `repair-log-replay-sql` (1 of 3), `optimize-policy-decision-audit` (3 of 5), `repair-attributed-funnel-service` (3 of 5); all valid failures, each re-verified with `scripts/validate.sh`, an independent oracle 3/3 and nop.
-- **First shipped (originally):** `repair-log-replay-sql` landed at 1 pass / 2 valid fails of 3 judged runs (exact curtailment stopped there). It passes `scripts/validate.sh`, an independent oracle 3/3 and nop. Its README records the one caveat: `harbor check` flagged `behavior_in_tests` (tests cover the core but not every documented boundary).
-- **The distribution is bimodal for this pairing**, not centred on the band: across 11 calibrated candidates the verdicts were too_easy 1 (4/4), too_hard 4 (0/5), learnable 1, invalid 5 (mostly `test_overreach`, an unstated requirement in the tests). A weaker solver did **not** simply shift tasks into the band; it added both passes and hard failures, and the invalid failures came from the instruction not stating everything the tests check.
-- **Comparison:** Sonnet 4.6 -> Opus 4.8 also produced 0 of 9 in the band; luna -> luna produced 0 shipped of ~8 (4 at 0/5, 1 at 4/4). luna -> mini produced 1 shipped, so the same-brand weaker solver helped at the margin, but the first-order problem is task construction, not the pairing.
-- **Cost and time:** about $7 of model spend for this run's 20 candidates (authoring, quality checks, red-team, 67 calibration trials), the rest of the key's spend being earlier runs. Wall clock was the binding constraint: each candidate takes 20-60 minutes because the quality gate sends packages through ~6 minute repair rounds and every repair re-calibrates.
-
-## 6. Measured outcome (Gemini pair, 8 specs)
-
-Full write-up: `docs/study-report.md`; deck: `docs/study-deck.pptx`; data: `runs/study/results.json`. The pair actually used is `google/gemini-2.5-flash-lite` (weak) and `google/gemini-3-flash-preview` (strong) (DeepSeek flash was too slow: 3-6 min per authoring step; partial data in `runs/study-deepseek-partial/`).
-
-| Author -> solver | Valid tasks | In band | Too easy | Too hard | Invalid | Mean pass rate |
-|---|---|---|---|---|---|---|
-| weak -> weak | 0/7 | 0 | 0 | 0 | 0 | n/a |
-| weak -> strong | 0/7 | 0 | 0 | 0 | 0 | n/a |
-| strong -> weak | 4/8 | 0 | 0 | 0 | 4 | 0.00 |
-| strong -> strong | 4/8 | 0 | 1 | 1 | 2 | 0.45 |
-
-- **The thesis was not tested:** the weak author never produced a valid package (0/7), so the trial's own setup (weak author -> strong solver) has no data. The hypotheses H1-H3 above stay hypotheses.
-- **What we did see:** author strength decided whether a task existed (0/7 vs 4/8 passing the free gates) before it decided difficulty; the strong author's 4 valid tasks gave strong-solver passes of 4, 0, 5, 0 (none in the band); the solvers differ (5/5 vs 0/5, 4/5 vs 0/5 on pilot packages).
-- **Spend:** $16.38 in the study ledger (key delta about $33.6 including the pilot's tail and unpriced calls); cap $40.
+- **Models:** `openai/gpt-5.6-luna` authors, reviews, judges and red-teams; `openai/gpt-5.4-mini` (about 60% on TB 2) calibrates. The band is relative to mini.
+- **Three tasks shipped, the trial's first:** `repair-log-replay-sql` (1 pass / 2 valid fails of 3), `optimize-policy-decision-audit` (3/5), `repair-attributed-funnel-service` (3/5). Every one re-verified with `scripts/validate.sh`, an independent `harbor run` oracle 3/3 and nop 0. (The live ledger shows 2 learnable because the still-running batch re-authored the first task's source candidate after it shipped; the third task's calibration record is in its output README.)
+- **Funnel for this model label (22 candidates):** 21 blueprint-accepted, 21 authored, 20 structurally valid, 21 functionally correct, 4 quality-ok, 19 novel, 17 red-team clean, 13 calibrated, 2 learnable in the live ledger (3 shipped in total). Model cost ≈ $10.4 and ≈ 604 stage-minutes.
+- **The distribution is bimodal, not centred on the band:** of 13 calibrated, learnable 2, too_easy 1 (4/4), too_hard 6 (0/5), invalid 4 (mostly `test_overreach`, a test checking behavior the instruction never states). A weaker solver added both passes and hard failures; it did not simply move tasks into the band, and a quarter of the calibrated tasks were invalid for instruction/test misalignment.
+- **Comparison:** Sonnet 4.6 -> Opus 4.8 gave 0 of 9; luna -> luna gave 0 shipped of ~8 (4 at 0/5, 1 at 4/4). luna -> mini gave 3 shipped. The same-brand weaker solver helped at the margin, but the first-order limit is task construction and the quality/repair loop, not the pairing.
 
 ## 7. Threats to validity, as measured
 

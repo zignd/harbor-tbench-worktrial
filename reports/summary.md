@@ -150,4 +150,4 @@ Exact curtailment is lossless; the 0/3 early reject loses learnable tasks at low
 | repair-log-replay-sql | generated | 14/16 | 1 |
 
 Mean stylometrics, examples: {'instruction_words': 183.0, 'instruction_sentences': 12.3, 'instruction_bullets': 10.2, 'instruction_headers': 0.0, 'instruction_emphasis': 0.0, 'instruction_code_spans': 1.2, 'test_functions': 3.0, 'dockerfile_lines': 9.8, 'solution_lines': 69.3, 'environment_files': 1.8}
-Mean stylometrics, shipped: {'instruction_words': 337.3, 'instruction_sentences': 17.0, 'instruction_bullets': 0.0, 'instruction_headers': 0.0, 'instruction_emphasis': 0.0, 'instruction_code_spans': 35.7, 'test_functions': 4.0, 'dockerfile_lines': 7.3, 'solution_lines': 54.0, 'environment_files': 59.7}
+Mean stylometrics, shipped: {'instruction_words': 337.3, 'instruction_sentences': 17.0, 'instruction_bullets': 0.0, 'instruction_headers': 0.0, 'instruction_emphasis': 0.0, 'instruction_code_spans': 35.7, 'test_functions': 4.0, 'dockerfile_lines': 7.3, 'solution_lines': 54.0, 'environment_files': 10.3}

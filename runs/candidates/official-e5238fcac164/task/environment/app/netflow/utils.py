@@ -1,163 +1,145 @@
 """
-utils.py - Logging helpers and miscellaneous utilities for the NetFlow
-settlement service.
+Utility functions: logging, checksum helpers, and byte-order conversions
+used across the NetFlow settlement service.
 """
 
 import logging
-import os
-import socket
 import struct
-from typing import Optional
+import socket
+import hashlib
+from typing import Union
+
+_log_initialized = False
 
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
-
-def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
-    """Return a module-level logger with a consistent format.
-
-    Loggers are cached by the standard logging machinery, so calling this
-    multiple times with the same name returns the same instance.
-    """
-    logger = logging.getLogger(f'netflow.{name}')
-    if not logger.handlers:
+def get_logger(name: str) -> logging.Logger:
+    """Return a consistently configured logger for the given name."""
+    global _log_initialized
+    logger = logging.getLogger(name)
+    if not _log_initialized:
         handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                '%(asctime)s %(levelname)-8s %(name)s: %(message)s',
-                datefmt='%Y-%m-%dT%H:%M:%S',
-            )
+        formatter = logging.Formatter(
+            '%(asctime)s %(levelname)-8s %(name)s: %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S',
         )
-        logger.addHandler(handler)
-    logger.setLevel(level)
+        handler.setFormatter(formatter)
+        logging.getLogger().addHandler(handler)
+        logging.getLogger().setLevel(logging.WARNING)
+        _log_initialized = True
     return logger
 
 
-# ---------------------------------------------------------------------------
-# IP address helpers
-# ---------------------------------------------------------------------------
-
-def ip_to_int(ip_str: str) -> int:
-    """Convert a dotted-decimal IPv4 string to a 32-bit integer."""
-    try:
-        packed = socket.inet_aton(ip_str)
-        return struct.unpack('!I', packed)[0]
-    except (socket.error, struct.error) as exc:
-        raise ValueError(f'Invalid IPv4 address: {ip_str!r}') from exc
+def unpack_uint8(data: bytes, offset: int) -> int:
+    """Unpack a single unsigned byte at *offset*."""
+    return struct.unpack_from('!B', data, offset)[0]
 
 
-def int_to_ip(value: int) -> str:
-    """Convert a 32-bit integer to a dotted-decimal IPv4 string."""
-    try:
-        return socket.inet_ntoa(struct.pack('!I', value & 0xFFFFFFFF))
-    except (socket.error, struct.error) as exc:
-        raise ValueError(f'Cannot convert {value!r} to IP') from exc
-
-
-def parse_cidr(cidr: str):
-    """Parse a CIDR notation string into (network_int, prefix_len).
-
-    Example::
-
-        parse_cidr('10.0.0.0/8')  # -> (167772160, 8)
-
-    Raises ValueError on malformed input.
-    """
-    if '/' not in cidr:
-        raise ValueError(f'Not a CIDR notation: {cidr!r}')
-    prefix, length_str = cidr.rsplit('/', 1)
-    try:
-        prefix_len = int(length_str)
-    except ValueError as exc:
-        raise ValueError(f'Invalid prefix length in {cidr!r}') from exc
-    if not 0 <= prefix_len <= 32:
-        raise ValueError(f'Prefix length out of range in {cidr!r}')
-    network_int = ip_to_int(prefix)
-    # Mask off host bits so callers can rely on the network address
-    if prefix_len < 32:
-        mask = (0xFFFFFFFF << (32 - prefix_len)) & 0xFFFFFFFF
-        network_int = network_int & mask
-    return network_int, prefix_len
-
-
-# ---------------------------------------------------------------------------
-# Struct helpers
-# ---------------------------------------------------------------------------
-
-def read_uint8(data: bytes, offset: int) -> int:
-    """Read one unsigned byte at *offset*."""
-    return data[offset]
-
-
-def read_uint16_be(data: bytes, offset: int) -> int:
-    """Read a big-endian unsigned 16-bit integer at *offset*."""
+def unpack_uint16(data: bytes, offset: int) -> int:
+    """Unpack a big-endian unsigned 16-bit integer at *offset*."""
     return struct.unpack_from('!H', data, offset)[0]
 
 
-def read_uint32_be(data: bytes, offset: int) -> int:
-    """Read a big-endian unsigned 32-bit integer at *offset*."""
+def unpack_uint32(data: bytes, offset: int) -> int:
+    """Unpack a big-endian unsigned 32-bit integer at *offset*."""
     return struct.unpack_from('!I', data, offset)[0]
 
 
-def bytes_to_uint(data: bytes, big_endian: bool = True) -> int:
-    """Interpret an arbitrary-length byte string as an unsigned integer."""
-    if not data:
-        return 0
-    order = 'big' if big_endian else 'little'
-    return int.from_bytes(data, byteorder=order)
+def unpack_ipv4(data: bytes, offset: int) -> str:
+    """Unpack a 4-byte IPv4 address at *offset* and return dotted-decimal."""
+    raw = struct.unpack_from('!4B', data, offset)
+    return '.'.join(str(b) for b in raw)
 
 
-# ---------------------------------------------------------------------------
-# File helpers
-# ---------------------------------------------------------------------------
+def pack_uint8(value: int) -> bytes:
+    return struct.pack('!B', value & 0xFF)
 
-def read_binary_file(path: str) -> bytes:
-    """Read an entire binary file and return its contents.
 
-    Raises FileNotFoundError if the file does not exist, OSError on other
-    I/O errors.
+def pack_uint16(value: int) -> bytes:
+    return struct.pack('!H', value & 0xFFFF)
+
+
+def pack_uint32(value: int) -> bytes:
+    return struct.pack('!I', value & 0xFFFFFFFF)
+
+
+def pack_ipv4(addr: str) -> bytes:
+    """Pack a dotted-decimal IPv4 address string into 4 bytes."""
+    return socket.inet_aton(addr)
+
+
+def ip_to_int(addr: str) -> int:
+    """Convert a dotted-decimal IPv4 address to an integer."""
+    parts = addr.split('.')
+    result = 0
+    for p in parts:
+        result = (result << 8) | int(p)
+    return result
+
+
+def int_to_ip(value: int) -> str:
+    """Convert a 32-bit integer to a dotted-decimal IPv4 address string."""
+    return '.'.join(str((value >> (8 * i)) & 0xFF) for i in (3, 2, 1, 0))
+
+
+def internet_checksum(data: bytes) -> int:
     """
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f'No such file: {path!r}')
-    with open(path, 'rb') as fh:
-        return fh.read()
-
-
-def safe_filename(name: str) -> str:
-    """Strip directory components and return only the base filename."""
-    return os.path.basename(name)
-
-
-# ---------------------------------------------------------------------------
-# Checksum / integrity
-# ---------------------------------------------------------------------------
-
-def simple_checksum(data: bytes) -> int:
-    """Compute a simple additive checksum over *data* (32-bit wrap).
-
-    This is not a cryptographic hash; it is used only for quick sanity
-    checks on decoded record counts.
+    Compute the Internet checksum (RFC 1071) over *data*.
+    Returns the one's complement of the one's complement sum.
     """
+    if len(data) % 2 != 0:
+        data += b'\x00'
     total = 0
-    for byte in data:
-        total = (total + byte) & 0xFFFFFFFF
-    return total
+    for i in range(0, len(data), 2):
+        word = (data[i] << 8) + data[i + 1]
+        total += word
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return ~total & 0xFFFF
 
 
-def verify_record_count(records, declared_count: int, source: str = '') -> bool:
-    """Log a warning if the number of decoded records differs from *declared_count*.
+def validate_checksum(data: bytes, expected: int) -> bool:
+    """Return True if the Internet checksum of *data* matches *expected*."""
+    return internet_checksum(data) == expected
 
-    Returns True when counts match, False otherwise.
-    """
-    logger = get_logger('utils')
-    actual = len(records)
-    if actual != declared_count:
-        logger.warning(
-            '%sDeclared %d records but decoded %d',
-            f'{source}: ' if source else '',
-            declared_count,
-            actual,
-        )
-        return False
-    return True
+
+def file_digest(path: str, algorithm: str = 'sha256') -> str:
+    """Compute the hex digest of a file using the given hash algorithm."""
+    h = hashlib.new(algorithm)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def pretty_bytes(n: int) -> str:
+    """Format a byte count as a human-readable string."""
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(n) < 1024:
+            return f'{n:.1f} {unit}'
+        n /= 1024
+    return f'{n:.1f} PB'
+
+
+class RingBuffer:
+    """Fixed-size circular buffer used for sliding-window diagnostics."""
+
+    def __init__(self, capacity: int):
+        self._buf = [None] * capacity
+        self._capacity = capacity
+        self._head = 0
+        self._size = 0
+
+    def push(self, item) -> None:
+        self._buf[self._head % self._capacity] = item
+        self._head += 1
+        if self._size < self._capacity:
+            self._size += 1
+
+    def items(self) -> list:
+        if self._size < self._capacity:
+            return list(self._buf[: self._size])
+        start = self._head % self._capacity
+        return self._buf[start:] + self._buf[:start]
+
+    def __len__(self) -> int:
+        return self._size

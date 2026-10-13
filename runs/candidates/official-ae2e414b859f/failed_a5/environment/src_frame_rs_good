@@ -1,0 +1,100 @@
+//! Frame delimiter logic for the packet-codec wire format.
+//! Frames wrap encoded packets with a 4-byte little-endian length prefix.
+
+use std::io;
+use crate::codec::Packet;
+
+/// Write a framed packet to a buffer.
+/// The frame format is: [length: u32 LE][encoded packet bytes]
+pub fn write_frame(pkt: &Packet, buf: &mut Vec<u8>) {
+    let start = buf.len();
+    // Reserve space for the length prefix
+    buf.extend_from_slice(&[0u8; 4]);
+    pkt.encode(buf);
+    let payload_len = (buf.len() - start - 4) as u32;
+    let len_bytes = payload_len.to_le_bytes();
+    buf[start..start + 4].copy_from_slice(&len_bytes);
+}
+
+/// Read a framed packet from a byte slice.
+/// Returns the decoded packet and total bytes consumed (including the 4-byte prefix).
+pub fn read_frame(buf: &[u8]) -> io::Result<(Packet, usize)> {
+    if buf.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "frame too short"));
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if buf.len() < 4 + len {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("frame body truncated: need {}, have {}", 4 + len, buf.len()),
+        ));
+    }
+    // Decode the packet from the frame body
+    let frame_body = &buf[4..4 + len];
+    let (pkt, _) = Packet::decode(frame_body)?;
+    Ok((pkt, 4 + len))
+}
+
+/// Write multiple packets as a sequence of frames.
+pub fn write_frames(pkts: &[Packet], buf: &mut Vec<u8>) {
+    for pkt in pkts {
+        write_frame(pkt, buf);
+    }
+}
+
+/// Read all framed packets from a buffer.
+pub fn read_frames(mut buf: &[u8]) -> io::Result<Vec<Packet>> {
+    let mut packets = Vec::new();
+    while !buf.is_empty() {
+        let (pkt, consumed) = read_frame(buf)?;
+        packets.push(pkt);
+        buf = &buf[consumed..];
+    }
+    Ok(packets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_roundtrip_basic() {
+        let pkt = Packet::new(0x01, vec![1u8, 2, 3, 4, 5]);
+        let mut buf = Vec::new();
+        write_frame(&pkt, &mut buf);
+        let (decoded, _) = read_frame(&buf).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn frame_roundtrip_empty_payload() {
+        let pkt = Packet::new(0x02, vec![]);
+        let mut buf = Vec::new();
+        write_frame(&pkt, &mut buf);
+        let (decoded, _) = read_frame(&buf).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn frame_roundtrip_128_bytes() {
+        let payload = vec![0x55u8; 128];
+        let pkt = Packet::new(0x03, payload);
+        let mut buf = Vec::new();
+        write_frame(&pkt, &mut buf);
+        let (decoded, _) = read_frame(&buf).unwrap();
+        assert_eq!(pkt, decoded);
+    }
+
+    #[test]
+    fn multi_frame_roundtrip() {
+        let pkts = vec![
+            Packet::new(0x01, vec![10u8; 20]),
+            Packet::new(0x02, vec![20u8; 30]),
+            Packet::new(0x03, vec![30u8; 40]),
+        ];
+        let mut buf = Vec::new();
+        write_frames(&pkts, &mut buf);
+        let decoded = read_frames(&buf).unwrap();
+        assert_eq!(pkts, decoded);
+    }
+}

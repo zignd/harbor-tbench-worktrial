@@ -187,6 +187,7 @@ def test_clean_package_runs_quality_alongside_novelty_and_redteam(env, monkeypat
         monkeypatch, ([], True, True), ([], {"oracle": [], "nop": [], "excluded": 0}), QUALITY_FAIL
     )
     monkeypatch.setattr(pipeline.novelty, "gate_index", lambda d, exclude="": None)
+    monkeypatch.setattr(pipeline, "stage_difficulty", lambda cand, ledger, h: [])
     monkeypatch.setattr(pipeline.novelty, "lexical_flags", lambda text, index: [])
     monkeypatch.setattr(
         pipeline.novelty, "judge_same_task",
@@ -245,3 +246,28 @@ def test_parallel_drafts_keep_an_accepted_one_and_record_the_rest(tmp_path, monk
     assert pipeline.stage_blueprint(cand, ledger)
     assert len(list(cand.dir.glob("blueprint_rejected_*.json"))) == 3
     assert len(ledger.events(stage="blueprint_gate")) == 4
+
+
+def test_a_too_easy_built_package_goes_back_to_repair_without_a_red_team(env, monkeypatch):
+    _, ledger = env
+    calls = _gate_env(monkeypatch, ([], True, True), ([], {"oracle": [], "nop": [], "excluded": 0}),
+                      {"ok": True, "outcomes": {}, "blocking_failures": [], "advice": [],
+                       "cost_usd": 0.0})  # fmt: skip
+    monkeypatch.setattr(pipeline.novelty, "gate_index", lambda d, exclude="": None)
+    monkeypatch.setattr(pipeline.novelty, "lexical_flags", lambda text, index: [])
+    monkeypatch.setattr(
+        pipeline.novelty, "judge_same_task",
+        lambda text, index: {"novel": True, "verdicts": [], "nearest": [], "cost_usd": 0.0},
+    )  # fmt: skip
+    monkeypatch.setattr(pipeline, "review_package", lambda task_dir, intended: {
+        "accepted": False, "difficulty": 2, "speedrun_commands": 6, "cost_usd": 0.05,
+        "promised_difficulty_present": False, "reasons": "bugs sit in one readable file",
+        "fixes": ["ship the component as a binary"]})  # fmt: skip
+    cand = pipeline.Candidate(sample_specs(1, seed=16)[0])
+    cand.blueprint = BLUEPRINT
+    shutil.copytree(TASK, cand.task_dir)
+    problems = pipeline.stage_gates(cand, ledger, 1)
+    assert len(problems) == 1 and problems[0].startswith("difficulty:")
+    assert "missing from the environment" in problems[0] and "ship the component" in problems[0]
+    assert "redteam" not in calls  # no red-team spend on a package that goes back to repair
+    assert ledger.events(stage="gate_difficulty")[0].result["speedrun_commands"] == 6

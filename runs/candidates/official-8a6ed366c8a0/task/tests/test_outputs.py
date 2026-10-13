@@ -166,7 +166,7 @@ def test_top_paths_sorted_descending():
 def test_top_paths_matches_db():
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT path, COUNT(*) as cnt FROM events GROUP BY path ORDER BY cnt DESC LIMIT 10")
+    cur.execute("SELECT path, COUNT(*) as cnt FROM events GROUP BY path ORDER BY cnt DESC, path ASC LIMIT 10")
     db_rows = [(row[0], row[1]) for row in cur.fetchall()]
     conn.close()
     resp = api_get("/api/top_paths")

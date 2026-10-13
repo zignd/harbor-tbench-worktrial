@@ -1,82 +1,92 @@
-#!/usr/bin/env python3
 """
-settle.py - NetFlow Settlement Aggregator CLI.
+NetFlow v9 settlement entry point.
 
-Discovers NetFlow v9 binary files in the given data directory, decodes
-flow records, attributes byte counts to counterparties via an IP-to-ASN
-mapping table, and writes a per-counterparty settlement CSV.
+Usage:
+    python /app/settle.py <data_directory>
 
-Usage::
+Discovers all *.bin files in <data_directory> (sorted by filename),
+parsing NetFlow v9 records, maps each source IP to a counterparty ASN
+using /app/data/asn_map.csv, and writes per-ASN byte totals to
+settlement.csv in the current working directory.
 
-    python settle.py /app/data/
-    python settle.py /app/data/ --output /tmp/settlement.csv
-
-The output CSV has columns ``asn`` and ``bytes``.  Only ASNs with at
-least one attributed byte appear in the output; ASNs with zero traffic
-are omitted.
+Output columns: asn, total_bytes
 """
 
-import argparse
-import os
 import sys
+import os
+import csv
+import logging
 
-# Ensure the package root is on sys.path when run directly.
+# Ensure /app is on the path so 'netflow' package is importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from netflow.aggregator import run
+from netflow.aggregator import FlowAggregator
 from netflow.utils import get_logger
 
-logger = get_logger('settle')
+log = get_logger('settle')
+
+OUTPUT_FILE = 'settlement.csv'
+ASN_MAP_RELATIVE = 'asn_map.csv'
 
 
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(
-        description='Aggregate NetFlow v9 records into per-counterparty byte totals.',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+def find_asn_map(data_dir: str) -> str:
+    """Locate asn_map.csv: look in data_dir, then /app/data/."""
+    candidates = [
+        os.path.join(data_dir, ASN_MAP_RELATIVE),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     'data', ASN_MAP_RELATIVE),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    raise FileNotFoundError(
+        f'asn_map.csv not found; tried: {candidates}'
     )
-    p.add_argument(
-        'data_dir',
-        help='Directory containing *.bin NetFlow capture files and asn_map.csv',
-    )
-    p.add_argument(
-        '--output',
-        default='settlement.csv',
-        metavar='PATH',
-        help='Output CSV path (default: %(default)s)',
-    )
-    p.add_argument(
-        '--log-level',
-        default='WARNING',
-        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-        help='Logging verbosity (default: %(default)s)',
-    )
-    return p.parse_args(argv)
+
+
+def write_settlement(totals: dict, output_path: str) -> None:
+    """Write per-ASN byte totals to a CSV file."""
+    with open(output_path, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['asn', 'total_bytes'])
+        for asn in sorted(totals.keys()):
+            writer.writerow([asn, totals[asn]])
+    log.info('Wrote %d ASN rows to %s', len(totals), output_path)
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    if argv is None:
+        argv = sys.argv[1:]
 
-    import logging
-    logging.getLogger('netflow').setLevel(getattr(logging, args.log_level))
+    if len(argv) != 1:
+        print(f'Usage: python {sys.argv[0]} <data_directory>', file=sys.stderr)
+        sys.exit(1)
 
-    data_dir = os.path.abspath(args.data_dir)
+    data_dir = os.path.abspath(argv[0])
     if not os.path.isdir(data_dir):
-        logger.error('Data directory does not exist: %s', data_dir)
+        print(f'Error: {data_dir!r} is not a directory', file=sys.stderr)
         sys.exit(1)
 
-    asn_map_path = os.path.join(data_dir, 'asn_map.csv')
-    if not os.path.isfile(asn_map_path):
-        logger.error('ASN map not found: %s', asn_map_path)
+    try:
+        asn_map_path = find_asn_map(data_dir)
+    except FileNotFoundError as exc:
+        print(f'Error: {exc}', file=sys.stderr)
         sys.exit(1)
 
-    output_path = args.output
-    output_dir = os.path.dirname(os.path.abspath(output_path))
-    if not os.path.isdir(output_dir):
-        logger.error('Output directory does not exist: %s', output_dir)
-        sys.exit(1)
+    aggregator = FlowAggregator(asn_csv_path=asn_map_path)
+    totals = aggregator.process_directory(data_dir)
 
-    run(data_dir, output_path)
-    logger.info('Settlement written to %s', output_path)
+    if not totals:
+        print('Warning: no byte totals produced; check input files.',
+              file=sys.stderr)
+
+    write_settlement(totals, OUTPUT_FILE)
+
+    stats = aggregator.stats()
+    print(f'Processed {stats.files_processed} file(s), '
+          f'{stats.records_decoded} record(s), '
+          f'{len(totals)} ASN(s). '
+          f'Output: {OUTPUT_FILE}')
 
 
 if __name__ == '__main__':

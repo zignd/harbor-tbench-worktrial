@@ -1,168 +1,158 @@
 """
-asn_lookup.py - CIDR-prefix longest-match trie for IP-to-ASN resolution.
-
-The trie is built once from a CSV file containing (cidr, asn) rows and then
-queried for each flow record's source IP address.  Longest-prefix match
-semantics are implemented so that a /24 entry shadows a less-specific /16
-for addresses that fall in both ranges.
-
-CSV format expected::
-
-    cidr,asn
-    10.0.0.0/8,AS64512
-    192.168.1.0/24,AS64514
-    ...
-
-Addresses that do not match any prefix are returned as None; callers
-typically attribute those bytes to an "unknown" bucket and exclude them
-from settlement totals.
+CIDR-prefix trie for mapping source IPv4 addresses to ASN counterparty IDs.
+Loads from a CSV with columns: prefix, asn
+Example: 10.0.0.0/8, AS64501
 """
 
 import csv
-import socket
 import struct
-from typing import Dict, List, Optional, Tuple
+import socket
+from typing import Optional, List, Tuple
+from .utils import get_logger
 
-from netflow.utils import get_logger, ip_to_int, parse_cidr
-
-logger = get_logger('asn_lookup')
+log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Trie node
-# ---------------------------------------------------------------------------
+def _parse_cidr(cidr: str) -> Tuple[int, int]:
+    """
+    Parse a CIDR notation string into (network_int, mask_int).
+    Returns (network, mask) both as 32-bit unsigned integers.
+    """
+    cidr = cidr.strip()
+    if '/' in cidr:
+        addr_str, prefix_len_str = cidr.split('/', 1)
+        prefix_len = int(prefix_len_str)
+    else:
+        addr_str = cidr
+        prefix_len = 32
+    packed = socket.inet_aton(addr_str.strip())
+    addr_int = struct.unpack('!I', packed)[0]
+    if prefix_len == 0:
+        mask = 0
+    else:
+        mask = ((1 << 32) - 1) ^ ((1 << (32 - prefix_len)) - 1)
+    network = addr_int & mask
+    return network, mask
+
+
+def _ip_to_int(addr: str) -> int:
+    packed = socket.inet_aton(addr.strip())
+    return struct.unpack('!I', packed)[0]
+
 
 class _TrieNode:
-    """A single node in the binary trie."""
-
-    __slots__ = ('children', 'asn')
+    """Binary trie node for longest-prefix matching."""
+    __slots__ = ('children', 'asn', 'prefix_len')
 
     def __init__(self):
-        self.children: List[Optional['_TrieNode']] = [None, None]
+        self.children = [None, None]
         self.asn: Optional[str] = None
+        self.prefix_len: int = -1
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
+class ASNLookup:
+    """
+    Longest-prefix-match lookup table mapping IPv4 CIDR blocks to ASN IDs.
 
-class AsnLookup:
-    """Longest-prefix-match trie keyed by IPv4 CIDR prefixes.
-
-    Usage::
-
-        lut = AsnLookup()
-        lut.load_csv('/app/data/asn_map.csv')
-        asn = lut.lookup('10.1.5.5')   # -> 'AS64512'
-
+    Usage:
+        trie = ASNLookup('/app/data/asn_map.csv')
+        asn = trie.lookup('203.0.113.5')  # returns e.g. 'AS64502' or None
     """
 
-    def __init__(self):
+    def __init__(self, csv_path: str):
         self._root = _TrieNode()
-        self._prefix_count = 0
+        self._entries: List[Tuple[str, int, str]] = []  # (prefix_str, prefix_len, asn)
+        self._load(csv_path)
 
-    # ------------------------------------------------------------------
-    # Building the trie
-    # ------------------------------------------------------------------
+    def _load(self, csv_path: str) -> None:
+        loaded = 0
+        with open(csv_path, newline='') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                prefix = row['prefix'].strip()
+                asn = row['asn'].strip()
+                try:
+                    network, mask = _parse_cidr(prefix)
+                    prefix_len = bin(mask).count('1')
+                    self._insert(network, prefix_len, asn)
+                    self._entries.append((prefix, prefix_len, asn))
+                    loaded += 1
+                except Exception as exc:
+                    log.warning('Skipping bad prefix %r: %s', prefix, exc)
+        log.info('ASNLookup: loaded %d prefixes from %s', loaded, csv_path)
 
-    def insert(self, cidr: str, asn: str) -> None:
-        """Insert one CIDR prefix -> ASN mapping into the trie."""
-        network_int, prefix_len = parse_cidr(cidr)
+    def _insert(self, network: int, prefix_len: int, asn: str) -> None:
         node = self._root
         for bit_pos in range(31, 31 - prefix_len, -1):
-            bit = (network_int >> bit_pos) & 1
+            bit = (network >> bit_pos) & 1
             if node.children[bit] is None:
                 node.children[bit] = _TrieNode()
             node = node.children[bit]
-        # Always overwrite so that the last-loaded entry wins when two
-        # entries have identical prefix lengths for the same network.
+        # Always overwrite so the last-loaded entry for a prefix wins.
         node.asn = asn
-        self._prefix_count += 1
+        node.prefix_len = prefix_len
 
-    def load_csv(self, path: str) -> int:
-        """Load CIDR-to-ASN mappings from a CSV file.
-
-        The CSV must have columns ``cidr`` and ``asn`` (case-insensitive
-        header).  Returns the number of prefixes loaded.
-
-        Raises FileNotFoundError if the file cannot be opened.
+    def lookup(self, addr: str) -> Optional[str]:
         """
-        loaded = 0
-        with open(path, newline='') as fh:
-            reader = csv.DictReader(fh)
-            for lineno, row in enumerate(reader, start=2):
-                try:
-                    cidr = row['cidr'].strip()
-                    asn = row['asn'].strip()
-                    if not cidr or not asn:
-                        logger.warning('Line %d: empty cidr or asn, skipping', lineno)
-                        continue
-                    self.insert(cidr, asn)
-                    loaded += 1
-                except (KeyError, ValueError) as exc:
-                    logger.warning('Line %d: skipping bad entry: %s', lineno, exc)
-        logger.info('Loaded %d CIDR prefixes from %s', loaded, path)
-        return loaded
-
-    # ------------------------------------------------------------------
-    # Querying
-    # ------------------------------------------------------------------
-
-    def lookup(self, ip_str: str) -> Optional[str]:
-        """Return the ASN for *ip_str* using longest-prefix match.
-
-        Returns None if no prefix matches.
+        Return the ASN for the longest matching prefix, or None if no match.
         """
         try:
-            ip_int = ip_to_int(ip_str)
-        except ValueError:
-            logger.debug('Cannot parse IP %r, returning None', ip_str)
+            addr_int = _ip_to_int(addr)
+        except Exception:
+            log.debug('ASNLookup.lookup: invalid address %r', addr)
             return None
-        return self._lookup_int(ip_int)
 
-    def lookup_packed(self, packed_ip: bytes) -> Optional[str]:
-        """Look up a 4-byte big-endian packed IPv4 address.
-
-        Convenience wrapper used by the parser when it has already unpacked
-        the raw bytes from the flow record.
-        """
-        if len(packed_ip) != 4:
-            return None
-        ip_int = struct.unpack('!I', packed_ip)[0]
-        return self._lookup_int(ip_int)
-
-    def _lookup_int(self, ip_int: int) -> Optional[str]:
-        """Internal integer-keyed lookup."""
         node = self._root
         best_asn: Optional[str] = None
+
         for bit_pos in range(31, -1, -1):
-            bit = (ip_int >> bit_pos) & 1
-            node = node.children[bit]
-            if node is None:
-                break
             if node.asn is not None:
                 best_asn = node.asn
+            bit = (addr_int >> bit_pos) & 1
+            child = node.children[bit]
+            if child is None:
+                break
+            node = child
+
+        # Check the last node reached
+        if node.asn is not None:
+            best_asn = node.asn
+
         return best_asn
 
-    # ------------------------------------------------------------------
-    # Introspection helpers
-    # ------------------------------------------------------------------
-
-    @property
-    def prefix_count(self) -> int:
-        """Number of CIDR prefixes currently loaded."""
-        return self._prefix_count
-
     def all_asns(self) -> List[str]:
-        """Return a sorted list of all distinct ASN values in the trie."""
-        asns: List[str] = []
-        self._collect_asns(self._root, asns)
-        return sorted(set(asns))
+        """Return a sorted list of all distinct ASN IDs in the table."""
+        seen = set()
+        for _, _, asn in self._entries:
+            seen.add(asn)
+        return sorted(seen)
 
-    def _collect_asns(self, node: Optional[_TrieNode], out: List[str]) -> None:
-        if node is None:
-            return
-        if node.asn is not None:
-            out.append(node.asn)
-        self._collect_asns(node.children[0], out)
-        self._collect_asns(node.children[1], out)
+    def entry_count(self) -> int:
+        """Return the number of CIDR entries loaded."""
+        return len(self._entries)
+
+    def __repr__(self) -> str:
+        return f'ASNLookup({len(self._entries)} prefixes)'
+
+
+class CachingASNLookup(ASNLookup):
+    """
+    ASNLookup with a simple LRU-ish cache for hot paths where the same
+    source IP appears in many consecutive flow records.
+    """
+
+    def __init__(self, csv_path: str, cache_size: int = 4096):
+        super().__init__(csv_path)
+        self._cache: dict = {}
+        self._cache_size = cache_size
+
+    def lookup(self, addr: str) -> Optional[str]:
+        result = self._cache.get(addr)
+        if result is not None:
+            return result
+        result = super().lookup(addr)
+        if len(self._cache) >= self._cache_size:
+            # Evict an arbitrary entry to bound memory
+            self._cache.pop(next(iter(self._cache)))
+        self._cache[addr] = result
+        return result

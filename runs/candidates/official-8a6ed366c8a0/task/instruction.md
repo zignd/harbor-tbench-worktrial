@@ -6,7 +6,7 @@ Two problems need to be fixed:
 
 1. GET /api/stats returns per-country request counts that do not match the actual country distribution in the traffic log. After you run /app/tools/replay_traffic.sh, the counts returned by GET /api/stats must exactly match the ground-truth per-country counts computed by /app/tools/compute_stats.py from /app/data/access.log. Every log line, regardless of HTTP status code, must result in a row in the events table.
 
-2. GET /api/top_paths does not exist. It must return a JSON array of exactly the top 10 requested URL paths and their counts, sorted descending by count. Each element must have the keys "path" and "count".
+2. GET /api/top_paths does not exist. It must return a JSON array of exactly the top 10 requested URL paths and their counts, sorted descending by count, with ties broken alphabetically by path (A before Z). Each element must have the keys "path" and "count".
 
 Both endpoints must return valid JSON with Content-Type application/json.
 

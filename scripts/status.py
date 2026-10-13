@@ -87,8 +87,8 @@ def _live_authoring(cand_id: str) -> tuple[str, str] | None:
     return None
 
 
-def candidate_rows() -> tuple[str, list[str]]:
-    """One line per candidate that isn't held: status, phase, attempt, last activity, verdict."""
+def candidate_records() -> tuple[dict[str, int], int, list[dict]]:
+    """(status counts, shipped count, one record per candidate incl. held)."""
     from generator.pipeline import CANDIDATES_DIR
 
     last: dict[str, dict] = {}
@@ -98,7 +98,8 @@ def candidate_rows() -> tuple[str, list[str]]:
         task = e["task"].rsplit("-t", 1)[0] if "-t" in e["task"][-3:] else e["task"]
         last[task] = e
     now = datetime.now(UTC)
-    counts, rows = {}, []
+    counts: dict[str, int] = {}
+    records = []
     for d in sorted(CANDIDATES_DIR.glob("official-*")):
         status = (
             json.loads((d / "status.json").read_text())["status"]
@@ -106,8 +107,6 @@ def candidate_rows() -> tuple[str, list[str]]:
             else "new"
         )
         counts[status] = counts.get(status, 0) + 1
-        if status == "held":
-            continue
         e = last.get(d.name)
         attempt = (e or {}).get("result", {}).get("attempt", "")
         age = ""
@@ -130,13 +129,38 @@ def candidate_rows() -> tuple[str, list[str]]:
             if (d / "blueprint.json").exists()
             else "-"
         )
-        line = f"{d.name[-12:]}  {slug[:30]:30}  {status:9}  {phase:22} a{attempt!s:3} {age:8} {verdict}"
-        rows.append((status != "building", line))
+        records.append(
+            {
+                "id": d.name,
+                "path": d,
+                "slug": slug,
+                "status": status,
+                "phase": phase,
+                "attempt": str(attempt),
+                "age": age,
+                "verdict": verdict,
+            }
+        )
     shipped = (
         sum(1 for p in Path("output").iterdir() if (p / "task.toml").exists())
         if Path("output").exists()
         else 0
     )
+    return counts, shipped, records
+
+
+def candidate_rows() -> tuple[str, list[str]]:
+    """One line per candidate that isn't held: status, phase, attempt, last activity, verdict."""
+    counts, shipped, records = candidate_records()
+    rows = []
+    for r in records:
+        if r["status"] == "held":
+            continue
+        line = (
+            f"{r['id'][-12:]}  {r['slug'][:30]:30}  {r['status']:9}  {r['phase']:22} "
+            f"a{r['attempt']:3} {r['age']:8} {r['verdict']}"
+        )
+        rows.append((r["status"] != "building", line))
     summary = (
         ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
         + f"  | shipped (learnable) {shipped}"
@@ -168,82 +192,12 @@ def main() -> int:
     return 0
 
 
-HIGHLIGHT_SEC = 3.0  # how long a changed line stays highlighted
-
-
-def watch(every: int) -> int:
-    """Curses viewer: scroll with arrows/PgUp/PgDn/Home/End, q quits; changed lines are highlighted."""
-    import contextlib
-    import curses
-    import io
-    import threading
-    import time
-
-    state = {"lines": [], "changed": {}, "updated": 0.0, "busy": False}
-
-    def refresh_loop() -> None:
-        while True:
-            state["busy"] = True
-            buf = io.StringIO()
-            try:
-                with contextlib.redirect_stdout(buf):
-                    main()
-            except Exception as exc:  # noqa: BLE001  keep the viewer alive on transient errors
-                buf.write(f"error: {exc}\n")
-            lines = buf.getvalue().splitlines()
-            now = time.time()
-            if state["lines"]:
-                old = set(state["lines"])
-                for ln in lines:
-                    if ln not in old:
-                        state["changed"][ln] = now
-            state["lines"], state["updated"], state["busy"] = lines, now, False
-            time.sleep(every)
-
-    def ui(scr: curses.window) -> None:
-        curses.curs_set(0)
-        curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-        scr.timeout(200)
-        top = 0
-        threading.Thread(target=refresh_loop, daemon=True).start()
-        while True:
-            h, w = scr.getmaxyx()
-            lines = state["lines"]
-            page = max(h - 1, 1)
-            top = max(0, min(top, len(lines) - page))
-            scr.erase()
-            now = time.time()
-            for row, ln in enumerate(lines[top : top + page]):
-                hot = now - state["changed"].get(ln, 0) < HIGHLIGHT_SEC
-                scr.addnstr(row, 0, ln, w - 1, curses.color_pair(1) if hot else 0)
-            end = min(top + page, len(lines))
-            foot = f" {top + 1}-{end}/{len(lines)}  ↑↓ PgUp/PgDn Home/End scroll · q quit"
-            foot += "  · refreshing…" if state["busy"] else ""
-            scr.addnstr(h - 1, 0, foot, w - 1, curses.A_REVERSE)
-            scr.refresh()
-            key = scr.getch()
-            if key in (ord("q"), 27):
-                return
-            top += {
-                curses.KEY_UP: -1, ord("k"): -1, curses.KEY_DOWN: 1, ord("j"): 1,
-                curses.KEY_PPAGE: -page, curses.KEY_NPAGE: page,
-                curses.KEY_HOME: -10**9, ord("g"): -10**9,
-                curses.KEY_END: 10**9, ord("G"): 10**9,
-            }.get(key, 0)  # fmt: skip
-
-    try:
-        curses.wrapper(ui)
-    except KeyboardInterrupt:
-        pass
-    return 0
-
-
 if __name__ == "__main__":
     import sys
 
-    if "--watch" in sys.argv:  # scrollable TUI, refreshed every N seconds (default 30)
+    if "--watch" in sys.argv:  # interactive TUI, refreshed every N seconds (default 30)
+        from scripts.watch_tui import run
+
         args = sys.argv[sys.argv.index("--watch") + 1 :]
-        every = int(args[0]) if args and args[0].isdigit() else 30
-        raise SystemExit(watch(every))
+        raise SystemExit(run(int(args[0]) if args and args[0].isdigit() else 30))
     raise SystemExit(main())

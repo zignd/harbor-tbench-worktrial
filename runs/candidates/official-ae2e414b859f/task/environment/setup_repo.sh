@@ -6,7 +6,7 @@ rm -rf "$REPO"
 mkdir -p "$REPO"
 cd "$REPO"
 
-git init
+git init -b main
 git config user.email "platform@example.com"
 git config user.name "Platform Team"
 

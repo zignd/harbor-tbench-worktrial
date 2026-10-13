@@ -1,0 +1,141 @@
+//! Fuzz-equivalence test: encode then decode must return the original packet.
+//! Set FUZZ_SEED env var to control the PRNG seed.
+//! Set FUZZ_N env var to control number of packets (default 2000).
+
+use packet_codec::codec::Packet;
+use packet_codec::frame::{write_frame, read_frame};
+
+/// A minimal xorshift64 PRNG for reproducible sequences.
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        Xorshift64 { state: if seed == 0 { 0xdeadbeefcafebabe } else { seed } }
+    }
+
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    fn next_usize(&mut self, lo: usize, hi: usize) -> usize {
+        lo + (self.next() as usize % (hi - lo + 1))
+    }
+
+    fn fill_bytes(&mut self, buf: &mut Vec<u8>, n: usize) {
+        buf.clear();
+        for _ in 0..n {
+            buf.push((self.next() & 0xFF) as u8);
+        }
+    }
+}
+
+fn get_seed() -> u64 {
+    std::env::var("FUZZ_SEED")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0x1234567890abcdef)
+}
+
+fn get_n() -> usize {
+    std::env::var("FUZZ_N")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(2000)
+}
+
+#[test]
+fn fuzz_codec_roundtrip() {
+    let seed = get_seed();
+    let n = get_n();
+    let mut rng = Xorshift64::new(seed);
+    let mut payload_buf = Vec::new();
+
+    // Power-of-two lengths to stress the frame boundary conditions
+    let pow2_lengths: Vec<usize> = (0..=10).map(|i| 1usize << i).collect(); // 1,2,4,...,1024
+
+    let mut lengths_to_test: Vec<usize> = Vec::new();
+
+    // First: 50 packets of each power-of-two length
+    for &len in &pow2_lengths {
+        for _ in 0..50 {
+            lengths_to_test.push(len);
+        }
+    }
+
+    // Then: random lengths for the remainder
+    let remaining = if n > lengths_to_test.len() { n - lengths_to_test.len() } else { 0 };
+    for _ in 0..remaining {
+        let len = rng.next_usize(1, 1024);
+        lengths_to_test.push(len);
+    }
+
+    for (i, &payload_len) in lengths_to_test.iter().enumerate() {
+        rng.fill_bytes(&mut payload_buf, payload_len);
+        let tag = (rng.next() & 0xFF) as u8;
+        let original = Packet::new(tag, payload_buf.clone());
+
+        // Test direct codec roundtrip
+        let mut encoded = Vec::new();
+        original.encode(&mut encoded);
+        let (decoded, consumed) = Packet::decode(&encoded)
+            .unwrap_or_else(|e| panic!("packet {} (len={}) codec decode failed: {}", i, payload_len, e));
+        assert_eq!(consumed, encoded.len(),
+            "packet {} (len={}) consumed {} but encoded len is {}", i, payload_len, consumed, encoded.len());
+        assert_eq!(original, decoded,
+            "packet {} (len={}) codec roundtrip mismatch", i, payload_len);
+
+        // Test frame roundtrip
+        let mut framed = Vec::new();
+        write_frame(&original, &mut framed);
+        let (frame_decoded, frame_consumed) = read_frame(&framed)
+            .unwrap_or_else(|e| panic!("packet {} (len={}) frame decode failed: {}", i, payload_len, e));
+        assert_eq!(frame_consumed, framed.len(),
+            "packet {} (len={}) frame consumed {} but framed len is {}", i, payload_len, frame_consumed, framed.len());
+        assert_eq!(original, frame_decoded,
+            "packet {} (len={}) frame roundtrip mismatch", i, payload_len);
+    }
+}
+
+#[test]
+fn fuzz_127_byte_payload() {
+    // Regression: 127-byte payload must roundtrip correctly via both codec and frame.
+    let payload = (0u8..127).collect::<Vec<u8>>();
+    let pkt = Packet::new(0x42, payload);
+    let mut encoded = Vec::new();
+    pkt.encode(&mut encoded);
+    let (decoded, _) = Packet::decode(&encoded).unwrap();
+    assert_eq!(pkt, decoded, "127-byte codec roundtrip failed");
+
+    let mut framed = Vec::new();
+    write_frame(&pkt, &mut framed);
+    let (frame_decoded, _) = read_frame(&framed).unwrap();
+    assert_eq!(pkt, frame_decoded, "127-byte frame roundtrip failed");
+}
+
+#[test]
+fn fuzz_power_of_two_coverage() {
+    // Explicitly test every power-of-two payload length from 1 to 1024.
+    let seed = get_seed();
+    let mut rng = Xorshift64::new(seed ^ 0xfeedface);
+    let mut payload_buf = Vec::new();
+
+    for exp in 0..=10u32 {
+        let len = 1usize << exp;
+        rng.fill_bytes(&mut payload_buf, len);
+        let pkt = Packet::new(0x07, payload_buf.clone());
+
+        let mut framed = Vec::new();
+        write_frame(&pkt, &mut framed);
+        let (decoded, consumed) = read_frame(&framed)
+            .unwrap_or_else(|e| panic!("power-of-two len={} frame decode failed: {}", len, e));
+        assert_eq!(pkt, decoded, "power-of-two len={} mismatch", len);
+        assert_eq!(consumed, framed.len(), "power-of-two len={} consumed mismatch", len);
+    }
+}

@@ -1,169 +1,159 @@
 """
-aggregator.py - Per-ASN byte-count accumulator for NetFlow settlement.
+Per-ASN byte-count aggregator for NetFlow v9 settlement.
 
-The Aggregator orchestrates file discovery, parsing, IP-to-ASN resolution,
-and CSV output.  It is the primary entry point used by settle.py.
-
-Typical usage::
-
-    agg = Aggregator('/app/data/asn_map.csv')
-    agg.process_directory('/app/data')
-    agg.write_csv('settlement.csv')
+Receives FlowRecord objects from the parser and accumulates the IN_BYTES
+field into per-counterparty totals keyed by ASN ID.  The ASN for each
+record is resolved by looking up the source IP in the ASN mapping table.
 """
 
-import csv
 import os
+import csv
 from typing import Dict, List, Optional
+from .parser import NetFlowV9Parser
+from .asn_lookup import CachingASNLookup
+from .utils import get_logger, pretty_bytes
 
-from netflow.asn_lookup import AsnLookup
-from netflow.parser import Parser
-from netflow.utils import get_logger
+log = get_logger(__name__)
 
-logger = get_logger('aggregator')
+UNKNOWN_ASN = 'UNKNOWN'
 
 
-class Aggregator:
-    """Accumulates per-ASN IN_BYTES totals from NetFlow v9 binary files.
+class AggregationStats:
+    """Counters collected during a single aggregation run."""
 
-    The class loads the ASN mapping table once at construction time and
-    then processes one or more directories of binary capture files.
-    Results are accumulated across successive calls to
-    :meth:`process_directory` until :meth:`reset` is called.
+    def __init__(self):
+        self.files_processed: int = 0
+        self.records_decoded: int = 0
+        self.records_skipped_no_ip: int = 0
+        self.records_skipped_no_bytes: int = 0
+        self.records_skipped_no_asn: int = 0
+        self.total_bytes_attributed: int = 0
+
+    def __repr__(self) -> str:
+        return (
+            f'AggregationStats(files={self.files_processed}, '
+            f'records={self.records_decoded}, '
+            f'bytes={pretty_bytes(self.total_bytes_attributed)})'
+        )
+
+
+class FlowAggregator:
+    """
+    Aggregates NetFlow v9 records from multiple binary files into
+    per-ASN byte totals.
+
+    Usage:
+        agg = FlowAggregator(asn_csv_path='/app/data/asn_map.csv')
+        totals = agg.process_directory('/app/data/')
+        # totals -> {'AS64501': 1234567, 'AS64502': 987654, ...}
     """
 
-    def __init__(self, asn_map_path: str):
-        self._lut = AsnLookup()
-        self._lut.load_csv(asn_map_path)
+    def __init__(self, asn_csv_path: str):
+        self._asn_lookup = CachingASNLookup(asn_csv_path)
         self._totals: Dict[str, int] = {}
-        self._files_processed = 0
-        self._records_attributed = 0
-        self._records_unmatched = 0
+        self._stats = AggregationStats()
 
     # ------------------------------------------------------------------
-    # Processing
+    # Public API
     # ------------------------------------------------------------------
 
-    def process_directory(self, data_dir: str) -> Dict[str, int]:
-        """Discover and parse all *.bin files in *data_dir*.
-
-        Files are processed in sorted filename order so that template
-        definitions exported in earlier files (by name) are available
-        when parsing later files.
-
-        Returns the cumulative per-ASN byte totals after this call.
+    def process_directory(self, directory: str) -> Dict[str, int]:
+        """
+        Discover all *.bin files in *directory*, sort them by filename,
+        and process each in order.  Returns the accumulated per-ASN
+        byte totals as a dict mapping ASN ID -> total bytes.
         """
         bin_files = sorted(
-            f for f in os.listdir(data_dir) if f.endswith('.bin')
+            f for f in os.listdir(directory) if f.endswith('.bin')
         )
         if not bin_files:
-            logger.warning('No .bin files found in %s', data_dir)
-            return dict(self._totals)
+            log.warning('No .bin files found in %s', directory)
+            return {}
 
-        logger.info('Processing %d files from %s', len(bin_files), data_dir)
+        log.info('Processing %d file(s) from %s', len(bin_files), directory)
 
         for filename in bin_files:
-            filepath = os.path.join(data_dir, filename)
-            logger.info('Parsing %s', filepath)
-
-            # Create a fresh parser for each file so that processing
-            # remains isolated between capture files.
-            parser = Parser()
-
-            try:
-                records = parser.parse_file(filepath)
-            except OSError as exc:
-                logger.error('Failed to read %s: %s', filepath, exc)
-                continue
-
-            self._attribute_records(records, filename)
-            self._files_processed += 1
-            logger.info(
-                '%s: %d records, %d attributed',
-                filename, len(records),
-                sum(1 for r in records
-                    if r.get('IPV4_SRC_ADDR_STR') and
-                    self._lut.lookup(r.get('IPV4_SRC_ADDR_STR', '')) is not None)
-            )
+            filepath = os.path.join(directory, filename)
+            self._process_file(filepath)
 
         return dict(self._totals)
 
-    def _attribute_records(self, records, source: str) -> None:
-        """Attribute IN_BYTES from each record to the matching ASN."""
-        for rec in records:
-            src_ip = rec.fields.get('IPV4_SRC_ADDR_STR')
-            if not src_ip:
-                self._records_unmatched += 1
-                continue
-
-            asn = self._lut.lookup(src_ip)
-            if asn is None:
-                self._records_unmatched += 1
-                logger.debug('No ASN for src_ip=%s in %s', src_ip, source)
-                continue
-
-            in_bytes = rec.get('IN_BYTES', 0)
-            self._totals[asn] = self._totals.get(asn, 0) + in_bytes
-            self._records_attributed += 1
-
-    # ------------------------------------------------------------------
-    # Output
-    # ------------------------------------------------------------------
-
-    def get_totals(self) -> Dict[str, int]:
-        """Return a copy of the current per-ASN byte totals."""
-        return dict(self._totals)
-
-    def write_csv(self, output_path: str) -> None:
-        """Write per-ASN totals to a CSV file at *output_path*.
-
-        The output has two columns: ``asn`` and ``bytes``.  Rows are
-        sorted by ASN for deterministic output.
+    def process_files(self, filepaths: List[str]) -> Dict[str, int]:
         """
-        rows = sorted(self._totals.items())
-        with open(output_path, 'w', newline='') as fh:
-            writer = csv.writer(fh)
-            writer.writerow(['asn', 'bytes'])
-            for asn, total in rows:
-                writer.writerow([asn, total])
-        logger.info('Wrote %d ASN rows to %s', len(rows), output_path)
+        Process an explicit ordered list of binary file paths.
+        Returns accumulated per-ASN byte totals.
+        """
+        for filepath in filepaths:
+            self._process_file(filepath)
+        return dict(self._totals)
+
+    def totals(self) -> Dict[str, int]:
+        """Return current per-ASN byte totals without processing new files."""
+        return dict(self._totals)
+
+    def stats(self) -> AggregationStats:
+        """Return aggregation statistics."""
+        return self._stats
 
     def reset(self) -> None:
-        """Clear accumulated totals and counters (keeps the ASN table)."""
-        self._totals = {}
-        self._files_processed = 0
-        self._records_attributed = 0
-        self._records_unmatched = 0
+        """Clear accumulated totals and statistics."""
+        self._totals.clear()
+        self._stats = AggregationStats()
 
     # ------------------------------------------------------------------
-    # Diagnostic helpers
+    # Internal helpers
     # ------------------------------------------------------------------
 
-    @property
-    def files_processed(self) -> int:
-        return self._files_processed
+    def _process_file(self, filepath: str) -> None:
+        """
+        Parse one binary capture file and accumulate its flow bytes into
+        the per-ASN totals.
+        """
+        log.info('Processing file: %s', filepath)
+        # Create a fresh parser for each file so memory stays bounded.
+        parser = NetFlowV9Parser()
 
-    @property
-    def records_attributed(self) -> int:
-        return self._records_attributed
+        try:
+            with open(filepath, 'rb') as f:
+                data = f.read()
+        except OSError as exc:
+            log.error('Cannot read %s: %s', filepath, exc)
+            return
 
-    @property
-    def records_unmatched(self) -> int:
-        return self._records_unmatched
+        records = 0
+        for record in parser.parse_file(data):
+            records += 1
+            self._attribute_record(record)
 
+        self._stats.files_processed += 1
+        self._stats.records_decoded += records
+        log.info('  %s: decoded %d records', filepath, records)
 
-def run(data_dir: str, output_path: str) -> None:
-    """Convenience function used by settle.py.
+    def _attribute_record(self, record) -> None:
+        """
+        Resolve the ASN for a FlowRecord's source IP and add its byte count
+        to the corresponding per-ASN total.
+        """
+        if record.src_ip is None:
+            self._stats.records_skipped_no_ip += 1
+            return
+        if record.in_bytes is None:
+            self._stats.records_skipped_no_bytes += 1
+            return
 
-    Locates the ASN map inside *data_dir*, runs the aggregator, and
-    writes the settlement CSV to *output_path*.
-    """
-    asn_map = os.path.join(data_dir, 'asn_map.csv')
-    agg = Aggregator(asn_map)
-    agg.process_directory(data_dir)
-    agg.write_csv(output_path)
-    logger.info(
-        'Settlement complete: %d ASNs, %d attributed records, %d unmatched',
-        len(agg.get_totals()),
-        agg.records_attributed,
-        agg.records_unmatched,
-    )
+        asn = self._asn_lookup.lookup(record.src_ip)
+        if asn is None:
+            self._stats.records_skipped_no_asn += 1
+            log.debug('No ASN for src_ip %s; skipping record', record.src_ip)
+            return
+
+        self._totals[asn] = self._totals.get(asn, 0) + record.in_bytes
+        self._stats.total_bytes_attributed += record.in_bytes
+
+    def _format_totals_report(self) -> str:
+        """Return a human-readable summary of per-ASN totals."""
+        lines = ['Per-ASN Byte Totals:']
+        for asn in sorted(self._totals):
+            lines.append(f'  {asn}: {pretty_bytes(self._totals[asn])} '
+                         f'({self._totals[asn]:,} bytes)')
+        return '\n'.join(lines)

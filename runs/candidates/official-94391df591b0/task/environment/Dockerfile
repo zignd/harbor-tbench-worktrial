@@ -20,7 +20,7 @@ COPY app/ /app/
 
 # Install Node dependencies (pre-baked into image; no internet at solve time)
 WORKDIR /app
-RUN npm install --omit=dev
+RUN npm ci --omit=dev
 
 # Ensure output directory is writable
 RUN mkdir -p /app/output && chmod 777 /app/output

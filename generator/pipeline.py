@@ -46,6 +46,8 @@ from generator.config import (
     RUN_MODE,
     RUNS_DIR,
 )
+from generator.package_review import feedback as package_feedback
+from generator.package_review import review_package
 from generator.spec import TaskSpec
 from validator import leak_scan, novelty
 from validator.lint import errors as lint_errors
@@ -406,7 +408,34 @@ def _novelty_then_redteam(cand: Candidate, ledger: Ledger, attempt: int, h: str)
                 f"({lexical or (judged and judged['verdicts'])})"
             )
         ]
+    too_easy = stage_difficulty(cand, ledger, h)
+    if too_easy:
+        return too_easy  # no red-team spend on a package that goes back to repair anyway
     return stage_redteam(cand, ledger, attempt, h)
+
+
+def stage_difficulty(cand: Candidate, ledger: Ledger, h: str) -> list[str]:
+    """Speedrun review of the built package: a ~20-command task goes back to repair."""
+    budget.check(0.2)
+    t0 = time.monotonic()
+    bp = cand.blueprint
+    intended = f"{bp.internal_hint} Trap: {bp.trap} Levers: {', '.join(cand.spec.levers)}."
+    review = review_package(cand.task_dir, intended)
+    _record(
+        ledger,
+        cand,
+        "gate_difficulty",
+        {
+            "accepted": review["accepted"],
+            "difficulty": review.get("difficulty"),
+            "speedrun_commands": review.get("speedrun_commands"),
+            "promised_present": review.get("promised_difficulty_present"),
+        },
+        review["cost_usd"],
+        t0,
+        h,
+    )
+    return [] if review["accepted"] else [package_feedback(review, intended)]
 
 
 def stage_redteam(cand: Candidate, ledger: Ledger, attempt: int, h: str = "") -> list[str]:

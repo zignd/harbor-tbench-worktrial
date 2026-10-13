@@ -1,340 +1,323 @@
 """
-parser.py - NetFlow v9 binary packet parser.
+NetFlow v9 binary packet parser.
 
-Handles template FlowSets, data FlowSets, and Options Template FlowSets
-following RFC 3954.  The parser maintains an internal template cache that
-maps template IDs to their field definitions so that subsequent data
-FlowSets can be decoded.
-
-Typical usage::
-
-    parser = Parser()
-    records = parser.parse_file('/app/data/flows_001.bin')
-    for rec in records:
-        src_ip = rec.get('IPV4_SRC_ADDR')
-        in_bytes = rec.get('IN_BYTES', 0)
-
-The parser is intentionally stateful so that template definitions seen in
-one file are available when parsing subsequent files passed to the same
-instance.  The caller controls whether to share or reset the parser between
-files.
+Parses packet headers, template flowsets, and data flowsets according to
+RFC 3954. Maintains a template cache so that data flowsets can be decoded
+after the corresponding template flowset has been received.
 """
 
-import socket
 import struct
-from dataclasses import dataclass, field
-from typing import Dict, Iterator, List, Optional, Tuple
-
-from netflow import schema
-from netflow.utils import (
-    get_logger,
-    int_to_ip,
-    read_binary_file,
-    bytes_to_uint,
+from typing import Dict, List, Optional, Tuple, Iterator
+from .schema import (
+    TEMPLATE_FLOWSET_ID, OPTIONS_FLOWSET_ID, DATA_FLOWSET_ID_MIN,
+    PACKET_HEADER_SIZE, FLOWSET_HEADER_SIZE,
+    TEMPLATE_RECORD_HEADER_SIZE, TEMPLATE_FIELD_SIZE,
+    IN_BYTES, IPV4_SRC_ADDR,
 )
+from .utils import get_logger, unpack_uint16, unpack_uint32, unpack_ipv4
 
-logger = get_logger('parser')
-
-# NetFlow v9 packet header is always 20 bytes.
-_HEADER_LEN = 20
-# Each flowset starts with a 4-byte preamble (flowset_id + length).
-_FLOWSET_HDR_LEN = 4
+log = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
+class TemplateField:
+    """A single field definition within a NetFlow v9 template record."""
+    __slots__ = ('field_type', 'field_length')
 
-@dataclass
-class FieldDef:
-    """A single field definition within a template."""
-    type_id: int     # RFC 3954 field type identifier
-    length: int      # field width in bytes
+    def __init__(self, field_type: int, field_length: int):
+        self.field_type = field_type
+        self.field_length = field_length
 
-    @property
-    def name(self) -> str:
-        """Human-readable field name, or 'FIELD_<n>' for unknown types."""
-        return schema.FIELD_NAMES.get(self.type_id, f'FIELD_{self.type_id}')
+    def __repr__(self) -> str:
+        return f'TemplateField(type={self.field_type}, len={self.field_length})'
 
 
-@dataclass
 class Template:
-    """A decoded NetFlow v9 template (template FlowSet entry)."""
-    template_id: int
-    fields: List[FieldDef] = field(default_factory=list)
+    """
+    A parsed NetFlow v9 template record.
 
-    @property
-    def record_length(self) -> int:
-        """Total byte width of one data record using this template."""
-        return sum(f.length for f in self.fields)
+    Attributes:
+        template_id: The numeric ID of this template (>= 256).
+        fields: Ordered list of TemplateField objects.
+        record_length: Total byte length of one data record using this template.
+    """
+
+    def __init__(self, template_id: int, fields: List[TemplateField]):
+        self.template_id = template_id
+        self.fields = fields
+        self.record_length = sum(f.field_length for f in fields)
+
+    def field_offset(self, target_type: int) -> Optional[Tuple[int, int]]:
+        """
+        Return (byte_offset, byte_length) for the first field with the given
+        field type, or None if the template does not contain that field.
+        """
+        offset = 0
+        for field in self.fields:
+            if field.field_type == target_type:
+                return offset, field.field_length
+            offset += field.field_length
+        return None
+
+    def __repr__(self) -> str:
+        return (f'Template(id={self.template_id}, '
+                f'fields={len(self.fields)}, '
+                f'record_len={self.record_length})')
 
 
-@dataclass
 class FlowRecord:
-    """A single decoded flow record."""
-    template_id: int
-    fields: Dict[str, int]   # field_name -> integer value
+    """
+    A single decoded data flow record extracted from a data flowset.
 
-    def get(self, field_name: str, default: int = 0) -> int:
-        """Return the value of *field_name*, or *default* if absent."""
-        return self.fields.get(field_name, default)
+    Attributes:
+        template_id: ID of the template used to decode this record.
+        src_ip: Source IPv4 address string (dotted-decimal), or None.
+        in_bytes: Byte count for this flow, or None if field absent.
+        raw: Raw bytes of this record.
+    """
+    __slots__ = ('template_id', 'src_ip', 'in_bytes', 'raw')
+
+    def __init__(self, template_id: int, src_ip: Optional[str],
+                 in_bytes: Optional[int], raw: bytes):
+        self.template_id = template_id
+        self.src_ip = src_ip
+        self.in_bytes = in_bytes
+        self.raw = raw
+
+    def __repr__(self) -> str:
+        return (f'FlowRecord(tmpl={self.template_id}, '
+                f'src={self.src_ip}, bytes={self.in_bytes})')
 
 
-# ---------------------------------------------------------------------------
-# Parser
-# ---------------------------------------------------------------------------
+class PacketHeader:
+    """Parsed NetFlow v9 packet header."""
+    __slots__ = ('version', 'count', 'sys_uptime', 'unix_secs',
+                 'sequence', 'source_id')
 
-class Parser:
-    """Stateful NetFlow v9 binary parser.
+    def __init__(self, version, count, sys_uptime, unix_secs, sequence, source_id):
+        self.version = version
+        self.count = count
+        self.sys_uptime = sys_uptime
+        self.unix_secs = unix_secs
+        self.sequence = sequence
+        self.source_id = source_id
 
-    The parser accumulates template definitions across successive calls to
-    :meth:`parse_file` or :meth:`parse_bytes`.  Reset the instance (or
-    create a new one) to start fresh.
+    def __repr__(self) -> str:
+        return (f'PacketHeader(ver={self.version}, count={self.count}, '
+                f'seq={self.sequence})')
+
+
+class NetFlowV9Parser:
+    """
+    Stateful NetFlow v9 parser.
+
+    Maintains a template cache across calls to parse_packet() so that
+    data flowsets received after their template definitions are decodable.
+    A single instance should be reused across all packets in a logical
+    export stream.
     """
 
     def __init__(self):
-        # template_id -> Template
+        # Maps template_id -> Template
         self.templates: Dict[int, Template] = {}
-        self._packets_seen = 0
-        self._records_decoded = 0
+        self._packets_parsed = 0
+        self._records_emitted = 0
         self._templates_seen = 0
+        self._unknown_template_ids = set()
 
     # ------------------------------------------------------------------
-    # Public interface
+    # Public API
     # ------------------------------------------------------------------
 
-    def parse_file(self, path: str) -> List[FlowRecord]:
-        """Parse all NetFlow v9 packets from the binary file at *path*.
-
-        Returns a list of :class:`FlowRecord` objects decoded from data
-        FlowSets in the file.  Template FlowSets are consumed and used to
-        update the internal cache but do not produce FlowRecord objects.
+    def parse_file(self, data: bytes) -> Iterator[FlowRecord]:
         """
-        data = read_binary_file(path)
-        logger.debug('Parsing %s (%d bytes)', path, len(data))
-        return self.parse_bytes(data, source=path)
+        Parse all NetFlow v9 packets contained in *data* (a raw binary blob
+        as typically stored in a capture file) and yield FlowRecord objects.
 
-    def parse_bytes(self, data: bytes, source: str = '<bytes>') -> List[FlowRecord]:
-        """Parse all NetFlow v9 packets from *data*.
-
-        A single file may contain multiple back-to-back NetFlow v9 packets;
-        this method consumes all of them.
+        Packets are assumed to be concatenated without any framing headers.
+        Each packet boundary is found by summing flowset lengths (each
+        flowset header carries its own byte length).
         """
-        records: List[FlowRecord] = []
         offset = 0
-        total = len(data)
-        while offset < total:
-            if offset + _HEADER_LEN > total:
-                logger.debug('%s: %d trailing bytes, stopping', source, total - offset)
+        while offset < len(data):
+            if offset + PACKET_HEADER_SIZE > len(data):
+                log.debug('Truncated packet header at offset %d', offset)
                 break
-            pkt_records, consumed = self._parse_packet(data, offset, source)
-            if consumed <= 0:
-                logger.warning('%s: zero-length packet at offset %d, stopping', source, offset)
+            version = unpack_uint16(data, offset)
+            count = unpack_uint16(data, offset + 2)
+            sys_uptime = unpack_uint32(data, offset + 4)
+            unix_secs = unpack_uint32(data, offset + 8)
+            sequence = unpack_uint32(data, offset + 12)
+            source_id = unpack_uint32(data, offset + 16)
+
+            if version != 9:
+                log.warning('Non-v9 packet (version=%d) at offset %d; stopping',
+                            version, offset)
                 break
-            records.extend(pkt_records)
-            offset += consumed
-            self._packets_seen += 1
-        logger.debug('%s: decoded %d records from %d packets', source, len(records), self._packets_seen)
-        return records
 
-    # ------------------------------------------------------------------
-    # Packet-level parsing
-    # ------------------------------------------------------------------
+            header = PacketHeader(version, count, sys_uptime, unix_secs,
+                                  sequence, source_id)
+            fs_offset = offset + PACKET_HEADER_SIZE
 
-    def _parse_packet(self, data: bytes, base: int, source: str) -> Tuple[List[FlowRecord], int]:
-        """Parse one NetFlow v9 packet starting at *base*.
+            # Walk flowsets to find where this packet ends
+            pkt_end, records = self._walk_flowsets(data, fs_offset,
+                                                    len(data), header)
+            yield from records
+            self._packets_parsed += 1
+            offset = pkt_end
 
-        Returns (records, bytes_consumed).
+    def parse_packet(self, data: bytes) -> Iterator[FlowRecord]:
         """
-        if base + _HEADER_LEN > len(data):
-            return [], 0
+        Parse a single NetFlow v9 UDP packet and yield FlowRecord objects.
+        """
+        if len(data) < PACKET_HEADER_SIZE:
+            log.debug('Packet too short: %d bytes', len(data))
+            return
+        version = unpack_uint16(data, 0)
+        count = unpack_uint16(data, 2)
+        if version != 9:
+            return
+        sys_uptime = unpack_uint32(data, 4)
+        unix_secs = unpack_uint32(data, 8)
+        sequence = unpack_uint32(data, 12)
+        source_id = unpack_uint32(data, 16)
+        header = PacketHeader(version, count, sys_uptime, unix_secs,
+                              sequence, source_id)
+        _, records = self._walk_flowsets(data, PACKET_HEADER_SIZE,
+                                         len(data), header)
+        yield from records
+        self._packets_parsed += 1
 
-        version, count, uptime, unix_secs, seq_num, source_id = struct.unpack_from(
-            '!HHIIII', data, base
-        )
-        if version != schema.NETFLOW_V9_VERSION:
-            logger.warning(
-                '%s: unexpected version %d at offset %d (expected 9)',
-                source, version, base
-            )
-            return [], _HEADER_LEN
+    def template_count(self) -> int:
+        """Return the number of distinct templates currently cached."""
+        return len(self.templates)
 
-        logger.debug(
-            '%s: packet seq=%d count=%d uptime=%d src_id=%d',
-            source, seq_num, count, uptime, source_id
-        )
+    def stats(self) -> dict:
+        """Return a snapshot of parser statistics."""
+        return {
+            'packets_parsed': self._packets_parsed,
+            'records_emitted': self._records_emitted,
+            'templates_cached': len(self.templates),
+            'templates_seen': self._templates_seen,
+            'unknown_template_ids': len(self._unknown_template_ids),
+        }
 
-        offset = base + _HEADER_LEN
-        end = len(data)
-        records: List[FlowRecord] = []
-        flowsets_parsed = 0
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
-        # We iterate until we have parsed `count` FlowSets or run out of
-        # data.  RFC 3954 counts FlowSets, not individual records.
-        while flowsets_parsed < count and offset + _FLOWSET_HDR_LEN <= end:
-            flowset_id, flowset_len = struct.unpack_from('!HH', data, offset)
-            if flowset_len < _FLOWSET_HDR_LEN:
-                logger.warning(
-                    '%s: flowset at offset %d has invalid length %d, stopping packet',
-                    source, offset, flowset_len
-                )
+    def _walk_flowsets(self, data: bytes, offset: int, limit: int,
+                       header: PacketHeader) -> Tuple[int, list]:
+        """
+        Walk flowsets starting at *offset*, processing at most
+        header.count flowsets or until *limit* is reached.
+        Returns (new_offset, list_of_flow_records).
+        """
+        records = []
+        flowsets_remaining = header.count
+        while flowsets_remaining > 0 and offset + FLOWSET_HEADER_SIZE <= limit:
+            if offset + 4 > len(data):
                 break
-            flowset_end = offset + flowset_len
-            if flowset_end > end:
-                logger.warning(
-                    '%s: flowset at offset %d extends beyond data (%d > %d)',
-                    source, offset, flowset_end, end
-                )
+            flowset_id = unpack_uint16(data, offset)
+            flowset_length = unpack_uint16(data, offset + 2)
+            if flowset_length < 4:
+                log.debug('Invalid flowset length %d at offset %d',
+                          flowset_length, offset)
                 break
+            flowset_data_start = offset + 4
+            flowset_end = offset + flowset_length
+            if flowset_end > len(data):
+                flowset_end = len(data)
 
-            if flowset_id == schema.FLOWSET_ID_TEMPLATE:
-                self._parse_template_flowset(data, offset + _FLOWSET_HDR_LEN, flowset_end, source)
-            elif flowset_id == schema.FLOWSET_ID_OPTIONS:
-                # Options Template FlowSets are not used for settlement;
-                # we skip them but still advance the offset.
-                logger.debug('%s: skipping Options Template FlowSet at offset %d', source, offset)
-            elif flowset_id >= schema.FLOWSET_ID_DATA_MIN:
-                recs = self._parse_data_flowset(data, offset + _FLOWSET_HDR_LEN, flowset_end, flowset_id, source)
-                records.extend(recs)
+            if flowset_id == TEMPLATE_FLOWSET_ID:
+                self._process_template_flowset(
+                    data, flowset_data_start, flowset_end)
+            elif flowset_id == OPTIONS_FLOWSET_ID:
+                pass  # Options templates not used in settlement
+            elif flowset_id >= DATA_FLOWSET_ID_MIN:
+                for rec in self._process_data_flowset(
+                        data, flowset_data_start, flowset_end, flowset_id):
+                    records.append(rec)
             else:
-                logger.warning('%s: unknown flowset_id %d at offset %d', source, flowset_id, offset)
+                log.debug('Unknown flowset_id %d at offset %d',
+                          flowset_id, offset)
 
             offset = flowset_end
-            flowsets_parsed += 1
+            flowsets_remaining -= 1
 
-        bytes_consumed = offset - base
-        return records, bytes_consumed
+        return offset, records
 
-    # ------------------------------------------------------------------
-    # Template FlowSet parsing
-    # ------------------------------------------------------------------
+    def _process_template_flowset(self, data: bytes,
+                                  offset: int, end: int) -> None:
+        """Parse all template records within a template flowset."""
+        while offset + TEMPLATE_RECORD_HEADER_SIZE <= end:
+            template_id = unpack_uint16(data, offset)
+            field_count = unpack_uint16(data, offset + 2)
+            offset += TEMPLATE_RECORD_HEADER_SIZE
 
-    def _parse_template_flowset(self, data: bytes, start: int, end: int, source: str) -> None:
-        """Parse a Template FlowSet body and update the template cache."""
-        offset = start
-        while offset + 4 <= end:
-            template_id, field_count = struct.unpack_from('!HH', data, offset)
-            offset += 4
-
-            if template_id == 0:
-                # Padding — skip.
+            if template_id == 0 or field_count == 0:
                 break
 
-            fields: List[FieldDef] = []
-            for _ in range(field_count):
-                if offset + 4 > end:
-                    logger.warning(
-                        '%s: template %d field definition truncated at offset %d',
-                        source, template_id, offset
-                    )
-                    break
-                field_type, field_len = struct.unpack_from('!HH', data, offset)
-                offset += 4
-                fields.append(FieldDef(type_id=field_type, length=field_len))
-
-            if len(fields) != field_count:
-                logger.warning(
-                    '%s: template %d: expected %d fields, got %d',
-                    source, template_id, field_count, len(fields)
-                )
-                continue
-
-            # Only cache this template if we haven't seen it before.
-            # Re-exported templates with the same ID are ignored.
-            if template_id in self.templates:
-                continue
-
-            tpl = Template(template_id=template_id, fields=fields)
-            self.templates[template_id] = tpl
             self._templates_seen += 1
-            logger.debug(
-                '%s: cached template %d with %d fields (%d bytes/record)',
-                source, template_id, len(fields), tpl.record_length
-            )
+            fields_end = offset + field_count * TEMPLATE_FIELD_SIZE
+            if fields_end > end:
+                log.debug('Template %d: field data truncated', template_id)
+                break
 
-    # ------------------------------------------------------------------
-    # Data FlowSet parsing
-    # ------------------------------------------------------------------
+            # If we have already seen this template ID, skip it so we do
+            # not overwrite the cached layout with a re-exported copy.
+            if template_id in self.templates:
+                offset = fields_end
+                continue
 
-    def _parse_data_flowset(self, data: bytes, start: int, end: int,
-                             template_id: int, source: str) -> List[FlowRecord]:
-        """Decode all flow records from a data FlowSet body.
+            fields: List[TemplateField] = []
+            for _ in range(field_count):
+                ftype = unpack_uint16(data, offset)
+                flen = unpack_uint16(data, offset + 2)
+                fields.append(TemplateField(ftype, flen))
+                offset += TEMPLATE_FIELD_SIZE
 
-        Returns a (possibly empty) list of :class:`FlowRecord` objects.
-        If the template for *template_id* is not in the cache the FlowSet
-        is silently skipped — this can happen when packets arrive out of
-        order relative to the template export.
-        """
-        tpl = self.templates.get(template_id)
-        if tpl is None:
-            logger.debug(
-                '%s: no template for flowset id %d, skipping %d bytes',
-                source, template_id, end - start
-            )
-            return []
+            tmpl = Template(template_id, fields)
+            self.templates[template_id] = tmpl
+            log.debug('Cached template %d: %d fields, %d bytes/record',
+                      template_id, len(fields), tmpl.record_length)
 
-        rec_len = tpl.record_length
+    def _process_data_flowset(self, data: bytes, offset: int, end: int,
+                              flowset_id: int) -> Iterator[FlowRecord]:
+        """Decode all flow records within a data flowset."""
+        template = self.templates.get(flowset_id)
+        if template is None:
+            if flowset_id not in self._unknown_template_ids:
+                log.debug('No template for flowset_id %d; skipping', flowset_id)
+                self._unknown_template_ids.add(flowset_id)
+            return
+
+        rec_len = template.record_length
         if rec_len == 0:
-            logger.warning('%s: template %d has zero-length records', source, template_id)
-            return []
+            return
 
-        records: List[FlowRecord] = []
-        offset = start
+        src_info = template.field_offset(IPV4_SRC_ADDR)
+        bytes_info = template.field_offset(IN_BYTES)
+
         while offset + rec_len <= end:
-            rec_fields: Dict[str, int] = {}
-            field_offset = offset
-            for fdef in tpl.fields:
-                raw = data[field_offset: field_offset + fdef.length]
-                value = bytes_to_uint(raw, big_endian=True)
-                # For IPv4 addresses store both the integer and the
-                # dotted-decimal string so callers can use either form.
-                if fdef.type_id == schema.IPV4_SRC_ADDR and fdef.length == 4:
-                    rec_fields['IPV4_SRC_ADDR'] = value
-                    rec_fields['IPV4_SRC_ADDR_STR'] = int_to_ip(value)
-                elif fdef.type_id == schema.IPV4_DST_ADDR and fdef.length == 4:
-                    rec_fields['IPV4_DST_ADDR'] = value
-                    rec_fields['IPV4_DST_ADDR_STR'] = int_to_ip(value)
-                else:
-                    name = fdef.name
-                    rec_fields[name] = value
-                field_offset += fdef.length
+            raw = data[offset: offset + rec_len]
 
-            records.append(FlowRecord(template_id=template_id, fields=rec_fields))
+            src_ip: Optional[str] = None
+            if src_info is not None:
+                src_off, src_len = src_info
+                if src_len == 4:
+                    src_ip = unpack_ipv4(raw, src_off)
+
+            in_bytes: Optional[int] = None
+            if bytes_info is not None:
+                b_off, b_len = bytes_info
+                if b_len == 4:
+                    in_bytes = unpack_uint32(raw, b_off)
+                elif b_len == 2:
+                    in_bytes = unpack_uint16(raw, b_off)
+                elif b_len == 1:
+                    in_bytes = raw[b_off]
+
+            record = FlowRecord(flowset_id, src_ip, in_bytes, raw)
+            self._records_emitted += 1
+            yield record
             offset += rec_len
-            self._records_decoded += 1
-
-        # Any remaining bytes are padding to align the FlowSet to a 4-byte
-        # boundary; they are skipped.
-        return records
-
-    # ------------------------------------------------------------------
-    # Diagnostic helpers
-    # ------------------------------------------------------------------
-
-    @property
-    def packets_seen(self) -> int:
-        return self._packets_seen
-
-    @property
-    def records_decoded(self) -> int:
-        return self._records_decoded
-
-    @property
-    def templates_seen(self) -> int:
-        return self._templates_seen
-
-    def reset_stats(self) -> None:
-        """Reset packet/record counters without clearing the template cache."""
-        self._packets_seen = 0
-        self._records_decoded = 0
-        self._templates_seen = 0
-
-    def dump_templates(self) -> str:
-        """Return a human-readable summary of cached templates."""
-        lines = [f'Templates cached: {len(self.templates)}']
-        for tid, tpl in sorted(self.templates.items()):
-            field_summary = ', '.join(
-                f'{f.name}({f.length}B)' for f in tpl.fields
-            )
-            lines.append(f'  Template {tid}: {field_summary}')
-        return '\n'.join(lines)

@@ -132,10 +132,10 @@ notes(s, "These rules are enforced in code and unit-tested after the audit.");
 // 9 stretch
 s = lightTitle("Stretch goals");
 const rows = [
-  ["A cost-efficient eval", "curtailment lossless; ~12-23% trials saved; dollar figure caveated"],
-  ["B difficulty tuning", "implemented and exercised; no in-band movement demonstrated"],
-  ["C diversity", "coverage + novelty reported on the TB 2.1 pool"],
-  ["D human-likeness", `blind accuracy ${D.blind.accuracy.toFixed(2)} (95% CI ${D.blind.wilson[0].toFixed(2)}-${D.blind.wilson[1].toFixed(2)})`],
+  ["A cost-efficient eval", "26.5% of trials (~$3.79) saved vs naive 5x; invalid-run early stops credited with nothing"],
+  ["B difficulty tuning", "13 hash-bound tuning experiments; 0 moved into the band — not demonstrated"],
+  ["C diversity", "coverage, duplication and novelty provenance reported on the TB 2.1 pool (89 tasks)"],
+  ["D human-likeness", `blind accuracy ${D.blind.accuracy.toFixed(2)} (95% CI ${D.blind.wilson[0].toFixed(2)}-${D.blind.wilson[1].toFixed(2)}); rubric overfits our generator (examples 0/6 vs generated 3/4)`],
 ];
 s.addTable([[{ text: "Goal", options: { bold: true } }, { text: "Result", options: { bold: true } }]]
   .concat(rows.map(r => [{ text: r[0] }, { text: r[1] }])),

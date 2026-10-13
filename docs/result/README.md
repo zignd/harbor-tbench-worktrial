@@ -1,6 +1,6 @@
 # Result deliverables
 
-**Audited revision:** `8ab58b49dde02f44effea464d34ded4199e84749` (recorded in `docs/result/verification.json` under `revision`; the manifest is regenerated one commit after the code it describes).
+**Audited revision:** `01ab5a79439622ee1123e61aa049bed06015df04` (recorded in `docs/result/verification.json` under `revision`; the manifest is regenerated one commit after the code it describes).
 
 Two documents plus machine-readable evidence:
 

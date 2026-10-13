@@ -2,7 +2,7 @@
 
 ## Context
 
-AfterQuery's work trial (`harbor-tbench-worktrial/README.md`) asks for a pipeline that **authors Terminal-Bench-style Harbor tasks with `claude-sonnet-4.6`** and **keeps only "learnable" ones**: 1-3 of 5 runs pass with `terminus-2` + `claude-opus-4.8`. Graded in this order:
+AfterQuery's work trial (`harbor-tbench-worktrial/README.md`) asks for a pipeline that **authors Terminal-Bench-style Harbor tasks (default `claude-sonnet-4.6`)** and **keeps only "learnable" ones**: 1-3 of 5 runs pass with `terminus-2` + the calibration model (default `claude-opus-4.8`). Graded in this order:
 1. Fraction of tasks in band, with *valid* failure reasons.
 2. Pipeline design.
 3. How we know tasks are good.
@@ -11,7 +11,8 @@ AfterQuery's work trial (`harbor-tbench-worktrial/README.md`) asks for a pipelin
 
 Hard limits:
 - $500 of API credit.
-- Only those two models.
+- Models are **open** (README/AGENTS.md updated): any tool-calling model may author, judge or calibrate, preferably one with a published Terminal-Bench score. Defaults stay Sonnet 4.6 (author) and Opus 4.8 (calibration), and every result records its models.
+- Spend ceiling set by the user: **$400 of the $500 key** in total.
 - Novel tasks only (no public repos or examples).
 - `[agent].timeout_sec = 3600`.
 - Timeouts and running out of turns are not valid failures.
@@ -282,7 +283,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 65 / 92 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 65 / 100 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -430,6 +431,20 @@ After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for 
 - [x] Research-paper-format report `docs/study-report.md` (abstract, intro, method, results, discussion, threats to validity, conclusion), presentation deck `docs/study-deck.pptx` (or a Marp/HTML deck if pptx is not practical), and updated `docs/architecture.md`, `README.md` and `CHANGELOG.md`.
 - [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).
 
+### Hypothesis track: strong author, strong calibration model (ships to `output/`)
+
+**Hypothesis (not yet tested):** the Sonnet 4.6 -> Opus 4.8 pairing gave 0 of 9 in band because the author is weaker than the solver. If a strong author writes for a similarly strong solver, more tasks should land in the 1-3/5 band. The earlier study could not test it (the weak author produced no valid tasks), so this track tests the strong -> strong side directly **through the real pipeline**, so its tasks can ship: the strong solver is declared the calibration model, the band is relative to it, and every record states the models. Fallback if it fails: keep Sonnet -> Opus and the difficulty-by-construction levers below.
+
+Proposed pair (chosen by Terminal-Bench score, tool calls supported): author `google/gemini-3.7-flash` (~86% on TB 2.1, $0.75/$3.75), calibration solver `google/gemini-3.8-flash` (~89%, $0.75/$3.75), judge and red-team Sonnet 4.6 (fixed). Probe on 2026-10-13: `gemini-3.7-flash` passed a terminus-2 trial in 21 turns ($0.17, 510 s). Budget: shares the $400 account ceiling; stop and re-plan if cost per learnable task exceeds ~$40.
+- [ ] Model plumbing: `GENERATOR_MODEL` / `EVAL_MODEL` reach blueprint, authoring, judges, red-team and calibration; `config.assert_official_models()` accepts the configured pair (still refuses dev mode); ledger events, calibration records, shipped-task READMEs and `reports/summary.md` state the models. Unit-tested.
+- [ ] 💲 Probe the calibration solver `gemini-3.8-flash` through terminus-2 (one trial), and re-check the author pair on one blueprint + authoring round. Record speed and cost.
+- [ ] Difficulty-by-construction levers (verify-time generated inputs, long-horizon or multi-stage work, a trap where a shallow self-check passes but hidden property tests fail) added to the spec/blueprint/tuner guidance. Unit-tested.
+- [ ] 💲 Pilot: 3 candidates through the full pipeline (gates, quality, red-team, calibration) with the pair. Record the funnel, time and cost per task. **Go/no-go:** above ~$40 per learnable task, fix generation first.
+- [ ] 💲 Batch of 10+ candidates with the pair; exact curtailment, every trial judged. Learnable tasks ship to `output/<task>/` with the models in their README.
+- [ ] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation, novelty check.
+- [ ] 💲 Weak-author control under a 20-minute authoring budget per task (`google/gemini-3.5-flash-lite`, ~54%), same specs, same gates, for comparison; exploratory, never shipped (builds on `scripts/study.py`).
+- [ ] Outcome recorded in `docs/findings.md` and `reports/summary.md`: the in-band share of strong -> strong tasks against the 0/9 of Sonnet -> Opus, stated plainly whether the hypothesis held, with small-N caveats and the models on every number.
+
 ## Key tradeoffs (to document in the CHANGELOG)
 
 - **Authoring harness.** The Harbor meta-task reuses terminus-2, logging and cost tracking, and matches how AfterQuery reviewers run tasks. The cost is no Docker inside the synthesis container, so real builds and oracle runs happen in the host gates and feed back through repair rounds. The fallback is the custom `docker exec` loop.
@@ -439,7 +454,7 @@ After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for 
 - **Calibration rule.** Exact curtailment is lossless versus 5 full runs. An optional aggressive early-reject after 0/3 is reported only as a measured tradeoff, not used for shipping.
 - **"Don't cheat" line.** Not in instructions by default (it shifts pass rates). Defense comes from the leak scan, red-team and pass audit.
 - **Writing styles.** Meta-Task varies instruction styles for diversity, but the guideline paper favors terse instructions. We restrict to terse-compatible styles and let human-likeness scores decide.
-- **Models.** Sonnet is used for authoring, blueprinting, judging and red-teaming, and Opus only for calibration. Using Sonnet as a judge or hacker is the only interpretation of the model rule we rely on, and it's noted explicitly.
+- **Models.** The model rule is open (README/AGENTS.md). Defaults: Sonnet for authoring, blueprinting, judging and red-teaming, Opus for calibration. The hypothesis track uses a strong Gemini author and a strong Gemini calibration solver, with one fixed judge, and labels every result with its models.
 
 ## Verification
 

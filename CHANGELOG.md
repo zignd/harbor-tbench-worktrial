@@ -4,6 +4,10 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 08:46 -03:00 · Plan: strong-author, strong-solver hypothesis track
+- **What:** `docs/plan.md` gains a "Hypothesis track" section (8 items, progress 65/100) and the model rule is updated to match the open README/AGENTS.md. Hypothesis: Sonnet -> Opus gave 0 of 9 in band because the author is weaker than the solver; a strong author (`gemini-3.7-flash`) with a strong calibration solver (`gemini-3.8-flash`) run through the real pipeline might land more tasks in band, and could ship to `output/` with the models stated.
+- **Why this way:** the earlier study could not test strong -> strong through shipping gates, and tasks outside the pipeline can't be output. The track needs model plumbing (`GENERATOR_MODEL` / `EVAL_MODEL`, a relaxed `assert_official_models`), difficulty-by-construction levers, a 3-candidate pilot with a ~$40-per-learnable go/no-go, a 10+ batch, and a 20-minute weak-author control. Stated as a hypothesis, with Sonnet -> Opus as the fallback. No code changed.
+
 ### 08:36 -03:00 · Model constraint opened in README.md and AGENTS.md
 - **What:** the rule that only Sonnet 4.6 (authoring) and Opus 4.8 (calibration) may be used is removed from `README.md` and `AGENTS.md` (the user's decision). Any tool-calling model may author, judge, red-team or calibrate; defaults stay Sonnet 4.6 and Opus 4.8. The band is now defined relative to the calibration model.
 - **Guardrails kept:** every result must record which models produced it, one fixed calibration model and judge per batch, no mixing of models inside one funnel without labels, prefer models with a published Terminal-Bench score, no embedding models in the novelty path, dev mode still never ships.

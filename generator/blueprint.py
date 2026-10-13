@@ -13,8 +13,10 @@ from analysis.llm import chat, extract_json
 from generator.spec import LEVERS, VERIFIERS, TaskSpec
 from validator import novelty
 
-# Calibration showed "genuine_difficulty" scored 4-5 on tasks Opus solved 4/4: a 3 is not enough.
-MIN_DIFFICULTY = 4
+# 4 accepted only 11 of 135 drafts and the review has never been shown a learnable task, so
+# it may reject exactly the middle we need. 3 aims for the middle; the speedrun cap (<= ~20
+# commands -> at most 2) still rejects the "bug visible by reading" shape that went 4/4.
+MIN_DIFFICULTY = 3
 
 SYSTEM = (
     "You design tasks for Terminal-Bench, a benchmark of hard, realistic command-line work. "
@@ -189,8 +191,7 @@ Return only JSON: {{"speedrun": ["command or step", "..."], "speedrun_commands":
 "scores": {{"clarity": n, "solvability": n, "verifiability": n,
 "genuine_difficulty": n, "realism": n}}, "invalid_failure_risks": ["..."],
 "verdict": "accept|reject", "reasons": "2-3 sentences", "fixes": ["concrete improvements"]}}
-Accept only if every score is at least 3, genuine_difficulty is at least 4, and the average is at
-least 3.6."""
+Accept only if every score is at least 3 and the average is at least 3.6."""
 
 
 RETRY_SECTION = """

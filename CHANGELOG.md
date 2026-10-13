@@ -4,6 +4,17 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 23:30 -03:00 · Testing our own gates for over-strictness
+- **Status:** 4 tasks calibrated, 0 learnable (3 too easy, 1 invalid and being spec-fixed). Three of the four passed every gate, so the gates didn't block them; the generator was the problem. But our newer gates have only ever been checked in one direction:
+  - the difficulty review accepted **11 of 135** blueprint drafts and has never seen a task known to be learnable, so it may reject exactly the middle we need;
+  - the quality rubric blocks 5 of AfterQuery's own 6 example tasks.
+- **Changes:**
+  1. **The review is tested directly.** The 6 candidates the review called too easy after they were built (`3bbd`, `ae2e`, `e5238`, `aa07`, `aac9`, `9439`) were resumed through their gates into calibration. `1091` (also review-rejected) is already heading there, and `0cd6` (errored on the since-fixed leak-scan timeout) is retried. If any lands in the band, the review is too strict, and that task ships. `48eb` stays stopped (a variant of one of our own tasks).
+  2. **The review aims for the middle:** `MIN_DIFFICULTY` 4 → 3. The speedrun cap (≤ ~20 commands → difficulty at most 2) still rejects the "bug visible by reading" shape that went 4/4, 4/5 and 5/5. A new 6-candidate batch (seed 6) runs under it.
+  3. **Quality gate:** `structured_data_schema` and `file_reference_mentioned` are now advisory. Blocking criteria are the ones tied to an invalid failure or a hackable task: instruction/test alignment, determinism, anti-cheating, tests/solution in the image, hardcoded solution, valid failure modes.
+- The stretch goals don't block shipping. Diversity and human-likeness only feed the report, and the tuner and red-team sit in the shipping path to move tasks into the band, not to stop them.
+- 127 tests pass. Running batches keep their old gate settings until they restart, and the newly launched ones use the new ones.
+
 ### 23:22 -03:00 · Authoring summarizes only near the context limit
 - `METATASK_SUMMARIZE_THRESHOLD` 140k → 20k free tokens. At 140k, terminus-2 summarized an authoring run once its history passed ~60k tokens. That was a cost lever (Phase 0's 104k-token history cost $2.75), but each summarization is a multi-minute pause of several long calls that drops detail mid-build: 4 of 6 builds were paused in it at once. Throughput now matters more than cost, so it only fires near the real 200k limit. Opus calibration never set this and keeps terminus-2's defaults.
 - Applies to authoring processes started from now on. Running batches keep the old value until they restart, and they aren't restarted just for this, since that would lose in-flight authoring.

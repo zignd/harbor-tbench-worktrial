@@ -15,14 +15,16 @@ from generator.config import JOBS_DIR, MODEL
 
 RUBRIC = Path(__file__).resolve().parents[1] / "generator" / "quality_rubric.toml"
 
+# Only criteria tied to an invalid failure or a hackable task block a candidate:
+# instruction/test alignment, determinism, anti-cheating and valid failure modes. Format
+# criteria (structured_data_schema, file_reference_mentioned) are advisory: the full rubric
+# blocks 5 of AfterQuery's own 6 example tasks, so it rejects tasks a human reviewer accepts.
 BLOCKING = {
     "behavior_in_task_description",
     "behavior_in_tests",
     "anti_cheating_measures",
-    "structured_data_schema",
     "tests_or_solution_in_image",
     "hardcoded_solution",
-    "file_reference_mentioned",
     "deterministic_tests",
     "valid_failure_modes",
 }

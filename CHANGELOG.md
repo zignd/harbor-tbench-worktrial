@@ -4,6 +4,9 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 05:50 -03:00 · Late reruns stopped at the deadline
+- Fixed the gap cap bug (it now uses the study cap) and reran the gap: one more job finished (strong 5/5 on `31ca`; 6 of 10 jobs in all). A late 3-repair rerun of the weak author's 7 specs (started 05:27) had no result by 05:47, so it was stopped by explicit pid and its containers removed; the weak outcomes in `results.json` stay the 1-repair ones, flagged. Decision made on the user's behalf to keep the 06:00 deadline over a longer wait. Key spend at that point: about $174.5 of $500.
+
 ### 05:34 -03:00 · Study results, report and deck (exploratory)
 - **Result:** with the Gemini pair (flash-lite weak, 3-flash strong), 8 specs, the weak author produced **0 of 7 valid tasks** (spec 02 unfinished), the strong author **4 of 8**. So the trial's pairing (weak author -> strong solver) could not be tested. Among the 4 valid strong-author tasks the strong solver scored 4/5, 0/5, 5/5, 0/5 and the weak solver 0/5 on all (turn-cap failures voided its verdicts). **No cell had a task in the 1-3/5 band.** Gap check (5 of 10 jobs): strong 5/5 and 4/5 where weak scored 0/5 (the other jobs were stopped by a spend-guard bug: the gap's own $8 cap was compared with total study spend; fixed, not rerun).
 - **Answer to the thesis: not tested, not supported.** Author strength decided whether a task existed before it decided difficulty. Details, threats and the per-task table are in `docs/study-report.md`; deck `docs/study-deck.pptx` (rendered and checked with LibreOffice); figure `docs/figures/study-2x2.png`; findings, architecture (section 12 and a Q&A entry), README and plan updated.

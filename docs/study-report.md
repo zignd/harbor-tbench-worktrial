@@ -38,10 +38,10 @@ The design follows the task-synthesis literature in `docs/research/`: blueprints
 |---|---|---|---|
 | ledger-reconcile | 4/4 | 0/5 (3 invalid) | 5/5 |
 | `2f50` | 4/5 | 0/5 (1 invalid) | 4/5 |
-| `31ca` | 4/4 | 2/5 (1 invalid) | not run |
+| `31ca` | 4/4 | 2/5 (1 invalid) | 5/5 |
 | `b540`, `3bbd` | 5/5 | not run | not run |
 
-Only 5 of 10 gap jobs ran: the gap command used a spend guard meant for the whole study and stopped after about $8 (a bug, fixed in the code but not rerun for lack of time). Where both ran, strong beat weak clearly. In the DeepSeek attempt, flash had solved the same packages 5/5, 5/5 and 2/5, so Gemini flash-lite is a much weaker solver than DeepSeek flash.
+Only 6 of 10 gap jobs ran: the gap command used an $8 guard compared with the whole study's spend and stopped early (a bug, fixed afterwards; a rerun finished one more job before the deadline). Where both ran, strong beat weak clearly. In the DeepSeek attempt, flash had solved the same packages 5/5, 5/5 and 2/5, so Gemini flash-lite is a much weaker solver than DeepSeek flash.
 
 ### 4.2 Author validity
 
@@ -84,7 +84,7 @@ Ledger-recorded study spend: $16.38 (blueprints $0.57, authoring $7.54, solving 
 
 - **Small N.** 8 specs, 4 valid strong-author tasks, 0 valid weak-author tasks.
 - **One model family**, and the model labels weak and strong are ours; the gap check ran on only 3 of 5 packages.
-- **Mixed repair policy:** some tasks got 1 repair and some 3 (flagged in `results.json`); the weak author may be penalised or helped by that, and 1 weak spec (02) was unfinished at the deadline and is excluded.
+- **Late weak-author rerun (3 repairs, started at 05:27) did not finish before the 06:00 deadline and was stopped; the weak outcomes shown are the 1-repair ones.** **Mixed repair policy:** some tasks got 1 repair and some 3 (flagged in `results.json`); the weak author may be penalised or helped by that, and 1 weak spec (02) was unfinished at the deadline and is excluded.
 - **A gate crash in the first version of the study code** hit one weak package without an `instruction.md`; it was recorded as invalid (as it is).
 - **Solver turn caps.** At `max_turns=100` the weak solver's failures are largely invalid by our own rule, which empties its cells' band shares.
 - **Judge bias.** One Sonnet 4.6 judge classified all failures, and we did not run a pass audit on study passes (cheap, but skipped for time).

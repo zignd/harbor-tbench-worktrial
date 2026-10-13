@@ -325,7 +325,7 @@ def cmd_gap(ledger: Ledger) -> None:
         task_dir = Path(RUNS_DIR) / "candidates" / f"official-{c}" / sub
         try:
             r = solve(task_dir, s, f"study-gap-{s}-{c}", ledger, f"study-gap-{c}",
-                      cap=GAP_CAP_USD, judge=False)  # fmt: skip
+                      cap=CAP_USD, judge=False)  # fmt: skip
         except CapReached as e:
             print(f"gap {s} {c}: skipped, {e}", flush=True)
             return

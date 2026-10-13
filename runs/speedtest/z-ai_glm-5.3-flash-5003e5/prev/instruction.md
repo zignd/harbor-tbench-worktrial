@@ -1,0 +1,5 @@
+Please reproduce and repair the log-metricd benchmark in /opt/log-metricd. The daemon must be built and deployed as the systemd unit log-metricd, remain active across systemctl restart log-metricd, and listen on 0.0.0.0:9090. GET /healthz must return 200 with the documented health response.
+
+The service must expose the documented JSON protocol at POST /v1/streams/register, POST /v1/ingest, and POST /v1/query. A valid registration transaction must admit every requested stream while keeping the sum of allocated buckets at or below the requested budget, and ingestion must retain every latency sample within that stream's configured [x_min, x_max]. Quantile estimates for every q in (0, 1) must satisfy the relative error bound for the configured maximum error, whose default is 0.01. Empty sketches must return finite values and boundary or exact power values must not cause indexing errors or NaN estimates.
+
+The deployed service must also sustain at least 8,000 ingestion events per second while query workers are concurrent, with p99 /v1/query response latency below 35 milliseconds. You can inspect the sample run with /opt/bench/run_sample.sh.

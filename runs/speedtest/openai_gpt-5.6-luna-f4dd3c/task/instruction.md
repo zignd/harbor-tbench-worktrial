@@ -1,0 +1,7 @@
+Our overnight quantitative batch runs for portfolio risk simulations are failing to reconcile into the central SQLite database, blocking the morning risk sign-off. The deployment runner at /opt/quant-reconcile/deploy.sh aborts during staging verification, leaving /var/lib/quant-reconcile/reconcile.db unusable and /usr/local/bin/quant-reconcile-service undeployed.
+
+Resolve the deployment and ingestion pipeline so that /opt/quant-reconcile/deploy.sh exits 0 and installs an executable /usr/local/bin/quant-reconcile-service. /etc/quant-reconcile/reconcile.env must configure SQLite with WAL journaling, a busy timeout of at least 5000 milliseconds, and synchronous=NORMAL.
+
+/var/lib/quant-reconcile/reconcile.db must exist and pass PRAGMA integrity_check. Running the service with --batch-dir on previously unseen binary simulation spools must process every spool successfully while preserving IEEE-754 records. Every batch must be represented in batch_reconcile with its identifier, worker node, record count, mean_drift, var_surface, and MATCHED or DISCREPANCY status. Trades whose absolute drift exceeds MAX_DRIFT or whose variance exceeds VAR_LIMIT in reconcile.env must be identified using accurate floating-point comparisons and inserted into anomaly_records with their trade IDs and reasons.
+
+worker_audit must contain accurate per-node batch counts, record counts, and input spool checksums. Processing must be safe under concurrent SQLite use and must not leave orphaned shared-memory or SQLite WAL files.

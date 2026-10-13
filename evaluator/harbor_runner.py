@@ -86,10 +86,10 @@ class TrialResult:
             return "infra"
         if self.reward is None:
             return "infra"
-        if self.reward >= 1.0:
-            return "pass"
         if self.max_turns and self.n_episodes and self.n_episodes >= self.max_turns:
             return "invalid"  # ran out of turns: never a valid failure
+        if self.reward >= 1.0:
+            return "pass"
         return "fail"
 
     @property

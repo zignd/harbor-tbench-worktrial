@@ -190,7 +190,8 @@ def analyze_failure(task_dir: Path, trial_dir: Path, trajectory_path: Path, chat
     mode = verdict.get("mode", "")
     valid = bool(verdict.get("valid")) and mode in VALID_MODES
     quote = (verdict.get("instruction_quote") or "").strip()
-    if valid and not quote:
+    instruction = (Path(task_dir) / "instruction.md").read_text()
+    if valid and (not quote or quote not in instruction):
         # Enforced here, not left to the model: a failure on a requirement the instruction
         # never states is the task's fault (8a6e: 5/5 "valid" failures on unstated tie order).
         valid, mode = False, "test_overreach"

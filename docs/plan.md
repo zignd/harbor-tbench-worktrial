@@ -285,7 +285,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 88 / 113 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 89 / 113 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -457,7 +457,7 @@ Budget: this run was capped at $150 on top of ~$176 already spent, inside the $4
 
 **Order:** freeze evidence → verify shipping → fix reporting/accounting → complete measured stretch evaluations → consolidate report/deck → clean-clone handoff. This is a plan, not authorization to start paid jobs now. Use `make usage` before/after paid steps, respect the $400 account ceiling and $75 reserve, estimate new verification costs before running, and ask for approval where AGENTS.md requires it. Do not silently relax quality gates or hide contrary results to reach completion.
 
-- [ ] Inventory every current `output/` directory, including later background outputs, and classify it as pending audit, approved or withdrawn. Recover the exact calibration package/version and map its source candidate, model label, settings and content hash. Preserve original evidence before any edits; never infer approval from a directory name or an earlier goal verdict.
+- [x] Inventory every current `output/` directory, including later background outputs: four previous outputs archived unchanged under `runs/audit-20261013/original-output/` and placed under `pending/`. Timestamped inventory/hashes and starting spend in `docs/result/evidence/`. Original source mappings require the exact-record audit below; no previous approval is assumed.
 - [ ] Persist `output/<task>/calibration.json` and a verification record with trial outcomes, audit/judge labels, verbatim instruction quotes, dates, source evidence paths and package hashes. Check quoted requirements actually occur in the instruction and manually inspect each claimed valid failure and honest pass. Add regression tests preventing shipping a different hash/model or a task with invalid/hacked runs.
 - [ ] Resolve blocking quality findings for every shipped task: test↔instruction coverage both ways, deterministic verification, leakage/reward hacking, novelty and canary placement. Audit answer-bearing alternate implementations in environments. A `behavior_in_tests` advisory override is not evidence that a coverage gap is harmless. If a package changes, rerun the affected gates and recalibrate the new hash; if it cannot qualify, preserve its history but remove it from the approved set and report the reason.
 - [ ] Restore generated Git-history fixtures reproducibly in the actual shipped package (e.g. a bundled history restored during Docker build), not only the candidate archive. Test checkout contents/history from committed files; never rely on local `.git/`, host files, pre-existing images or mutable unpinned dependencies. Revalidate after the packaging fix because previous verification predates removal of an embedded `.git/`.

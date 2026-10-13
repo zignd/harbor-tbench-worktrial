@@ -1,0 +1,3 @@
+Exports are read-only from the caller's perspective. The command accepts an existing SQLite path and an integer half-open event window. JSON Lines is used so exports can be streamed and resumed by sequence. The tenant name is resolved at export time. Null values in the three policy-result fields mean that no applicable policy revision existed for that request.
+
+For incident analysis, preserve the database and the exact command window. The schema migration files are append-only. Indexes created by the exporter are ordinary SQLite indexes and may be removed by a maintenance job and regenerated on the next export.

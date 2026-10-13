@@ -41,7 +41,7 @@ def test_audit_pass_maps_labels():
 
 def test_failure_judge_requires_a_known_valid_mode():
     ok = {"valid": True, "mode": "weak_verification", "explanation": "x",
-          "instruction_quote": "Fix the repository so all commits are kept."}  # fmt: skip
+          "instruction_quote": "Please help me find them and merge them into master."}  # fmt: skip
     assert judge.analyze_failure(TASK, OPUS_TRIAL, TRAJ, chat_fn=lambda *a, **k: _reply(ok))[
         "valid"
     ]
@@ -50,6 +50,17 @@ def test_failure_judge_requires_a_known_valid_mode():
         TASK, OPUS_TRIAL, TRAJ, chat_fn=lambda *a, **k: _reply(invalid_mode)
     )
     assert result["valid"] is False  # an invalid mode can't be a valid failure
+
+
+def test_invented_instruction_quote_is_not_a_valid_failure():
+    reply = {
+        "valid": True,
+        "mode": "weak_verification",
+        "instruction_quote": "Invented requirement.",
+    }
+    assert not judge.analyze_failure(TASK, OPUS_TRIAL, TRAJ, chat_fn=lambda *a, **k: _reply(reply))[
+        "valid"
+    ]
 
 
 def test_judge_trial_maps_harbor_outcomes(monkeypatch):

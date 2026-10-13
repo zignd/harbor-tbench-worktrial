@@ -45,7 +45,8 @@ def test_opus_trial_fields():
 
 def test_metatask_trial_has_artifacts():
     t = _only("p0-metatask-sonnet")
-    assert t.outcome == "pass"
+    assert t.outcome == "invalid"  # recorded run exhausted its turn cap despite verifier reward 1
+    assert t.reward == 1
     assert (t.artifacts_dir / "app" / "output" / "task.toml").exists()
 
 

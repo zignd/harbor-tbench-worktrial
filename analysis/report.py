@@ -15,7 +15,8 @@ from pathlib import Path
 from analysis.curtailment import table as curtailment_table
 from analysis.diversity import coverage, difficulty_spread, novelty_report, uniqueness
 from analysis.human_likeness import stylometrics
-from analysis.ledger import Ledger
+from analysis.ledger import Ledger, hash_dir
+from analysis.package_evidence import approval_errors
 from evaluator.calibrate import LEGIT_PASS, N_RUNS
 from generator.config import (
     EXAMPLES_DIR,
@@ -69,8 +70,19 @@ def funnel(rows: list[dict], events) -> dict:
 
     def passed(stage: str, key: str, ok) -> int:
         return sum(
-            any(e.stage == stage and ok(e.result.get(key)) for e in by_task[r["id"]]) for r in rows
+            any(
+                e.stage == stage
+                and e.inputs_hash == hashes[r["id"]]
+                and bool(e.inputs_hash)
+                and ok(e.result.get(key))
+                for e in by_task[r["id"]]
+            )
+            for r in rows
         )
+
+    hashes = {
+        r["id"]: hash_dir(r["dir"] / "task") if (r["dir"] / "task").exists() else "" for r in rows
+    }
 
     return {
         "candidates": len(rows),
@@ -87,6 +99,23 @@ def funnel(rows: list[dict], events) -> dict:
             bool(r["calibration"] and r["calibration"]["verdict"] == "learnable") for r in rows
         ),
     }
+
+
+def approved_outputs(root: Path, models: str) -> list[Path]:
+    """Only immutable, exact-version approvals count as shipped; a directory is not approval."""
+    out = []
+    for p in sorted(root.iterdir()) if root.exists() else []:
+        record = _load(p / "calibration.json")
+        verification = _load(p / "verification.json")
+        if not record or not verification or not (p / "task.toml").exists():
+            continue
+        if (
+            not approval_errors(p, record, models)
+            and verification.get("status") == "passed"
+            and verification.get("package_hash") == record.get("package_hash")
+        ):
+            out.append(p)
+    return out
 
 
 def cost_and_time(events) -> dict:
@@ -206,10 +235,22 @@ def build() -> dict:
     events = [e for e in ledger.events() if e.mode == "official" and e.models == MODEL_LABEL]
     rows = candidates()
     specs = [TaskSpec(**r["spec"]) for r in rows if r["spec"]]
-    shipped = sorted(p for p in Path(OUTPUT_DIR).iterdir() if (p / "task.toml").exists())
+    shipped = approved_outputs(Path(OUTPUT_DIR), MODEL_LABEL)
     examples = sorted(p for p in Path(EXAMPLES_DIR).iterdir() if p.is_dir())
     report = {
         "funnel": funnel(rows, events),
+        "approved_shipped": len(shipped),
+        "approved_packages": [
+            {"task": p.name, "calibration": _load(p / "calibration.json")} for p in shipped
+        ],
+        "generation_counts": {
+            "fresh_candidates": sum(
+                not (_load(r["dir"] / "models.json") or {}).get("reused_from") for r in rows
+            ),
+            "reused_candidates": sum(
+                bool((_load(r["dir"] / "models.json") or {}).get("reused_from")) for r in rows
+            ),
+        },
         "cost_and_time": cost_and_time(events),
         "total_usd": round(sum(e.cost_usd for e in events), 2),
         "total_minutes": round(sum(e.seconds for e in events) / 60, 1),
@@ -281,7 +322,14 @@ def to_markdown(rep: dict) -> str:
             "are excluded."
         ),
         "",
-        "## Funnel (README Part 3)",
+        "## Current-package stage counts (README Part 3)",
+        "",
+        (
+            "Gate successes refer to the current package hash, not earlier successful revisions. "
+            "These are stage counts, not a strictly sequential funnel: eager calibration and gate "
+            "parallelism can change stage order."
+        ),
+        f"Approved shipped packages: **{rep['approved_shipped']}**; generation origins: {rep['generation_counts']}.",
         "",
         "| Stage | Count |",
         "|---|---|",
@@ -316,7 +364,7 @@ def to_markdown(rep: dict) -> str:
     c = rep["calibration"]
     lines += [
         "",
-        "## Calibration (terminus-2 + claude-opus-4.8)",
+        f"## Calibration (terminus-2 + {rep['models'].split('|')[-1]})",
         "",
         f"Pass-count distribution: {c['histogram']}",
         (

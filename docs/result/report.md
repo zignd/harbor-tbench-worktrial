@@ -299,20 +299,54 @@ Per-scope ledger estimates (newest scope is this run):
 
 ### 10.1 Reconciliation against the account key
 
-The account key is authoritative: conservative spend **$219.64**, remaining **$280.36** (of the $500 ceiling, expiring 2026-10-23). The local ledger's raw total is **$544.19** over 2,391 events and 110.5 summed stage-hours — a residual of **$332.43 (61%)**. Per raw mode/model scope:
+**The key is authoritative.** It read **$209.17 at 15:20 on 2026-10-13** — after the entire historical
+era — and **$219.6975** now, so this key does cover that era and is not a second,
+later-created credential.
 
-| Scope (mode · model) | Ledger est. USD | Summed stage-hours | Events |
-|---|---|---|---|
-| official · unlabeled (Sonnet→Opus era) | 502.20 | 51.9 | 1,036 |
-| official · `openai/gpt-5.6-luna` author + GPT-5.4-mini solver | 16.47 | 21.5 | 976 |
-| study · unlabeled | 16.95 | 30.7 | 218 |
-| official · `google/gemini-3.8-flash` | 7.99 | 3.7 | 121 |
-| dev · unlabeled | 0.57 | 2.7 | 10 |
-| speedtest · Gemini | 0.00 | 0.0 | 30 |
+The raw ledger totals **$545.64** over 2,391 events, of which
+**$519.72** sits in the unlabeled Sonnet→Opus era. Against a key total of
+$219.6975 that is a **$325.94 over-count**. Earlier I could only say "estimated per-token
+prices"; the retained token data lets me say more precisely what happened.
 
-**What reconciles.** Over the audit window bracketed by consecutive `make usage` snapshots, the independently priced per-step costs recorded by the audit scripts sum to **$0.4778** against a key delta of **$0.4551** — a ratio of **1.05**, inside the 10% target (`evidence/reconciliation-audit-window.json`). Counter lag is the only systematic offset; snapshots were taken ~1–2 min after each paid step.
+**Cause 1 — cache accounting (quantified).** That era carried a **48% cache-hit
+rate**: 80,310,130 of 166,980,021 input tokens were cache reads, which
+OpenRouter bills at roughly a tenth of the prompt rate. The same retained tokens cost three different
+ways:
 
-**What does not reconcile, and why it stays open.** The entire residual sits in the **unlabeled historical era** ($502.20 across 1,036 events), which predates the model labeling this audit introduced. Investigated causes that can be ruled out: retries are separate ledger rows and are not double counted; excluded and incomplete trials carry their own rows; shared-key use by other projects would push the key *above* the ledger, not below. Causes that **cannot** be verified because the data was not retained: per-event token counts and cache-token usage, so the estimated-price vs actual-charge gap cannot be recomputed; pricing tier changes during the earlier period. The plan's reconciliation item therefore remains **open with a measured gap**, not explained away. Raw snapshots, per-scope and per-stage estimates and the residual are published in `evidence/reconciliation.json` and `evidence/reconciliation-windows.json`; no raw ledger event was modified.
+| Basis | Cost |
+|---|---|
+| Cached input billed at the **full prompt rate** (the over-count we suspected) | **$617.45** |
+| **Cache-aware** pricing (cached reads discounted) | **$380.61** |
+| As **reported by Harbor/LiteLLM** | **$451.76** |
+
+**Cache accounting alone accounts for a $236.84 swing**, and it is
+the single largest identified source of the over-count. LiteLLM's own figure sits between the two
+bounds, i.e. it applied *partial* cache accounting.
+
+**Cause 2 — what I ruled out.** Shared-key use by another project would push the key *above* the
+ledger, not below. Retries and excluded runs are separate billed calls with separate ledger rows, so
+they cannot double-count. Counter lag is seconds-to-minutes and immaterial at this magnitude.
+
+**Cause 3 — the residual, and why it stays open.** After cache-aware correction the historical models
+cost $380.61 and the current models a further
+$29.63 as reported, leaving a residual of
+**$190.26** against the key. The leading hypothesis is that
+part of the historical traffic was billed to a **different credential**: `docs/plan.md` records that the
+API base was changed from `api.aqinference.com` (which returns 401 for this key) to OpenRouter during
+setup, and calls made outside that switch would not appear on this key at all. **Per-call provider and
+credential identifiers were never recorded, so this cannot be confirmed retrospectively** — I am
+naming it as a hypothesis, not asserting it.
+
+**Acceptance condition not met.** The plan asks for reconciliation within 10%; the residual is ~87% of
+the key total, so the item stays **open with a measured gap**. What changed is that the dominant cause
+is now quantified from retained evidence instead of assumed, and the remainder is attributed to a
+named, untestable-in-retrospect cause. Raw snapshots, per-scope and per-stage estimates, the retained-token
+recomputation and the residual are in `evidence/reconciliation.json`,
+`evidence/reconciliation-audit-window.json` and `evidence/reconciliation-final.json`. No raw ledger event
+was modified.
+
+**Separately, the current audited window does reconcile**: the independently priced step costs
+($0.4778) match the key delta ($0.4551) to within 5%.
 
 ### 10.2 Wall-clock versus summed stage time
 

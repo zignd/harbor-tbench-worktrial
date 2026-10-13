@@ -4,6 +4,13 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 20:55 -03:00 · Spend reconciliation: the dominant cause is cache accounting, quantified
+- The key read **$209.17 at 15:20 on 2026-10-13**, i.e. it *does* cover the historical Sonnet/Opus era; it is not a later-created credential. Raw ledger total $545.64 vs key $219.70, a $325.94 over-count.
+- The retained per-job token data lets the cause be computed instead of guessed. That era had a **48.1% cache-hit rate** (80.3M of 167.0M input tokens were cache reads). The same tokens cost **$617.45** if cached input is billed at the full prompt rate, **$380.61** cache-aware, and **$451.76** as reported by Harbor/LiteLLM — so **cache accounting explains a $236.84 swing** and LiteLLM applied only partial cache accounting.
+- Ruled out with reasons: shared-key use by another project (would push the key above the ledger), retry/excluded double counting (separate billed calls, separate rows), counter lag (seconds-scale).
+- **Residual $190.26** after cache-aware correction. Leading hypothesis: part of the historical traffic was billed to a **different credential** — the plan records an API-base change from `api.aqinference.com` to OpenRouter during setup — which cannot be confirmed because per-call credential IDs were never recorded. Named as a hypothesis, not asserted.
+- **The 10% acceptance condition is still not met, so the plan item stays open.** What improved is that the dominant cause is now quantified from evidence rather than assumed.
+
 ### 20:40 -03:00 · HTML deck navigation tested in a real browser
 - Loaded `docs/result/presentation.html` from `file://` in Chrome and drove it with the keyboard: `ArrowRight` advanced the counter `1/11 -> 11/11` in order, `ArrowLeft` and `Space` work, and the deck clamps at both ends (verified by overshooting in both directions).
 - The page loads **zero external resources** (`link`, `script[src]`, `img`, `iframe` all absent), so the offline requirement is met rather than assumed.

@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:00 -03:00 · Fresh-clone verification re-run at the current revision
+- The fresh-clone check had last run at `9d0ece3`; **16 commits have landed since**. `git diff` shows `output/` itself was untouched, but "untouched" is an inference, not a verification, so I re-ran the check rather than relying on it.
+- Cloned `8cdd2f1` into a temporary directory and, from the clone alone: all five published packages pass `scripts/validate.sh`, **oracle 3/3** and **nop 0**. No `.env`, no embedded `.git`, no pre-existing images; credentials come from the process environment.
+- Report and plan now quote the audited revision rather than a hard-coded one that would go stale on the next commit.
+
 ### 22:45 -03:00 · Documented commands are now checked, not just written
 - I had just expanded the report's reproduction section - which is itself an instance of the failure this audit keeps finding: writing a claim without running it. So the claim is now machine-checked.
 - `scripts/audit_deck_consistency.py` (already in `make lint`) gained a 15th check: **every module and script named in the report's reproduction section must exist**. It catches documenting a command that does not exist or was renamed.

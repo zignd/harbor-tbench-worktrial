@@ -87,98 +87,108 @@ def build() -> dict:
 
 def slides(d: dict) -> list[str]:
     m, b, bl = d["models"], d["batch"], d["blind"]
-    st = d["stylometrics"]
     approved = d["approved_tasks"]
-    ap = (
-        f"<p><span class='tag'>approved</span> {html.escape(', '.join(t['task'] for t in approved))}</p>"
-        if approved
-        else (
-            "<p class='warn'>No task approved: none lands in the 1-3/5 band.</p>"
-            "<p>Five audited packages sit in <code>output/</code>, each with its calibration and "
-            "verification record:</p><ul>"
-            + "".join(
-                f"<li>{html.escape(x['task'])} &mdash; <b>{html.escape(str(x['verdict']))}</b></li>"
-                for x in d["output_packages"]
-            )
-            + "</ul>"
+    name = html.escape(approved[0]["task"]) if approved else ""
+    acc = f"{bl['accuracy']:.2f}"
+    ci = f"{bl['wilson'][0]:.2f}-{bl['wilson'][1]:.2f}"
+    mx = max(b["learnable"], b["too_easy"], b["too_hard"], b["invalid"], 1)
+    bars = [
+        ("Learnable", b["learnable"], "var(--acc)"),
+        ("Too easy", b["too_easy"], "var(--warn)"),
+        ("Too hard", b["too_hard"], "var(--bad)"),
+        ("Invalid", b["invalid"], "#7a8b99"),
+    ]
+    bar_html = "".join(
+        f"<div class='barrow'><span>{lab}</span>"
+        f"<i style='width:{int(80 * n / mx)}%;background:{col}'></i><b>{n}</b></div>"
+        for lab, n, col in bars
+    )
+    band = "".join(
+        f"<div class='band {cls}'><em>{n}</em><small>{lab}</small></div>"
+        for n, lab, cls in (
+            ("0", "too hard", "bad"),
+            ("1", "learnable", "ok"),
+            ("2", "learnable", "ok"),
+            ("3", "learnable", "ok"),
+            ("4", "too easy", "warn"),
+            ("5", "too easy", "warn"),
         )
     )
-    problem = (
-        "<h2>The problem</h2><p>A task is useful only in the learnable band: run 5x with a solver, "
-        "exactly 1-3 pass, and failures must be the model's fault, not the task's.</p>"
-        "<p class='mut'>Sonnet to Opus produced 0 of 9 in band; we rebuilt the pipeline and opened "
-        "the model choice.</p>"
-    )
-    pipeline = (
-        "<h2>Pipeline</h2><p>spec &rarr; blueprint &rarr; rubric + novelty gate &rarr; in-container "
-        "authoring meta-task &rarr; structure/lint/leak &rarr; oracle 3/3 + nop &rarr; "
-        "<code>harbor check</code> quality &rarr; novelty re-check &rarr; red-team &rarr; calibration "
-        "(5x, exact curtailment) &rarr; ship in band.</p>"
-    )
-    difficulty = (
-        "<h2>Difficulty by construction</h2><p>An author as strong as the solver cannot out-think it, "
-        "so difficulty is built in: hidden-seed verify-time inputs, dependent multi-stage work, "
-        "shallow-self-check traps, long-horizon inputs. Every tested requirement is stated.</p>"
-    )
-    audit = (
-        "<h2>The audit that changed the story</h2><p class='bad'>Four previously 'shipped' tasks were "
-        "rejected: no immutable calibration inside the package, one shipped on a single judged pass, "
-        "stale READMEs, and the report's counts disagreeing.</p>"
-        "<p>They are archived unchanged, not deleted.</p>"
-    )
-    verify = (
-        "<h2>Verification discipline</h2><p>Approval = a content-hash-bound calibration record + "
-        "verification record inside the package. A directory is not approval. Verification runs "
-        "offline at build time; independent oracle 3/3 and nop re-run; reports use only the declared "
-        f"model pair.</p>{ap}"
-    )
-    limits = (
-        "<h2>Limitations and next steps</h2><ul><li>Small N; bimodal difficulty</li>"
-        "<li>Self-judging bias; author also judges</li>"
-        "<li>Reduced novelty scope (TB 2.1 + examples)</li><li>Turn-cap passes are invalid by rule</li>"
-        "</ul><p>Next: more specs, stronger traps, a wider solver gap, and a full 5-run re-audit.</p>"
+    pipe1 = "spec → blueprint → author → lint / leak → <b>oracle 3/3 + nop</b>"
+    pipe2 = "quality → novelty → red-team → <b>calibrate 5×</b> → ship in band"
+    trials = "".join(
+        f"<div class='trial {('ok' if o == 'pass' else 'bad')}'>{'PASS' if o == 'pass' else 'FAIL'}"
+        f"<small>#{i}</small></div>"
+        for i, o in enumerate(["pass", "pass", "pass", "fail", "fail"], 1)
     )
     return [
         (
-            f"<h1>{html.escape(d['title'])}</h1><p class='mut'>{html.escape(d['subtitle'])}</p>"
-            f"<p class='mut'>Models: {html.escape(m['author'])} author, {html.escape(m['solver'])} solver</p>"
-        ),
-        problem,
-        (
-            "<h2>Models and scope</h2><div class='grid'>"
-            f"<div class='card'>Author / reviewer / judge / red-team<b>{html.escape(m['author'])}</b></div>"
-            f"<div class='card'>Calibration solver<b>{html.escape(m['solver'])}</b></div>"
-            f"<div class='card'>Novelty pool<b>{html.escape(m['novelty'])}</b></div></div>"
-        ),
-        pipeline,
-        difficulty,
-        (
-            "<h2>Candidate batch</h2><div class='grid'>"
-            f"<div class='card'>Records<b>{b['records']}</b></div>"
-            f"<div class='card'>Fresh / reused<b>{b['fresh']} / {b['reused']}</b></div>"
-            f"<div class='card'>Learnable<b>{b['learnable']}</b></div>"
-            f"<div class='card'>Too hard / too easy<b>{b['too_hard']} / {b['too_easy']}</b></div>"
-            f"<div class='card'>Invalid<b>{b['invalid']}</b></div></div>"
-            "<p class='mut'>Bimodal, as Tmax predicts without continuous difficulty control.</p>"
-        ),
-        audit,
-        verify,
-        (
-            "<h2>Stretch goals</h2><p><b>A</b> curtailment lossless, ~12-23% trials saved (dollar "
-            "figure caveated). <b>B</b> tuning implemented, <span class='warn'>no in-band movement "
-            "demonstrated</span>. <b>C</b> coverage + novelty reported on the TB 2.1 pool. "
-            f"<b>D</b> blind accuracy {bl['accuracy']:.2f} "
-            f"(95% CI {bl['wilson'][0]:.2f}-{bl['wilson'][1]:.2f}); examples {st['examples_words']:.0f} "
-            f"words vs generated {st['generated_words']:.0f}.</p>"
+            f"<div class='hero'><h1>{html.escape(d['title'])}</h1>"
+            f"<p>{html.escape(d['subtitle'])}</p>"
+            f"<p class='mut'>{html.escape(m['author'])} · {html.escape(m['solver'])}</p></div>"
         ),
         (
-            "<h2>Cost and time</h2><div class='grid'>"
-            f"<div class='card'>Key spend<b>${d['spend']['conservative']:.2f}</b></div>"
-            f"<div class='card'>Remaining<b>${d['spend']['remaining']:.2f}</b></div>"
-            f"<div class='card'>Luna/mini ledger<b>${d['spend']['this_run_ledger']:.2f}</b></div></div>"
-            "<p class='mut'>Ledger over-counts across scopes; the key is authoritative, reconciliation open.</p>"
+            "<h2>A task is useful only in the 1-3 of 5 band</h2>"
+            f"<div class='bandrow'>{band}</div>"
+            "<p>Failures must be the model's fault — not a flaky environment or a hidden timeout.</p>"
+            "<p class='mut'>Sonnet → Opus: 0 of 9 in band. We rebuilt the pipeline.</p>"
         ),
-        limits,
+        (
+            "<h2>Cheap gates first. Calibration is the difficulty signal.</h2>"
+            f"<p class='pipe'>{pipe1}</p><p class='pipe'>{pipe2}</p>"
+            "<p class='mut'>A directory in output/ is not approval — only a hash-bound record is.</p>"
+        ),
+        (
+            "<h2>One fixed pair. The band is relative to the solver.</h2><div class='grid3'>"
+            f"<div class='card'><small>Author</small><b>gpt-5.6-luna</b><p>writes, reviews, judges, red-teams</p></div>"
+            f"<div class='card'><small>Solver</small><b>gpt-5.4-mini</b><p>terminus-2 · 5 attempts · 100-turn cap</p></div>"
+            f"<div class='card'><small>Novelty</small><b>TB 2.1</b><p>{html.escape(m['novelty'])}</p></div></div>"
+        ),
+        (
+            "<h2>The pool is bimodal. Most tasks miss the band.</h2>"
+            f"<div class='bars'>{bar_html}</div>"
+            f"<p class='mut'>{b['records']} records · {b['fresh']}/{b['reused']} fresh/reused · "
+            "<b>1 approved after audit</b></p>"
+        ),
+        (
+            "<h2>The audit rejected four previously 'shipped' tasks</h2><div class='grid2'>"
+            "<div class='card'><small>01</small><p>No hash-bound calibration inside the package</p></div>"
+            "<div class='card'><small>02</small><p>One shipped on a single judged pass, not 1-3/5</p></div>"
+            "<div class='card'><small>03</small><p>Stale READMEs citing ids that never existed</p></div>"
+            "<div class='card'><small>04</small><p>A directory is not approval. Archived, not deleted.</p></div></div>"
+        ),
+        (
+            f"<h2>One task approved: {name}</h2>"
+            f"<div class='trials'>{trials}</div>"
+            "<div class='grid3'><div class='card'><small>honest passes</small><b>3 / 5</b></div>"
+            "<div class='card'><small>pooled</small><b>7 / 10 = 0.70</b></div>"
+            "<div class='card'><small>oracle · nop</small><b>3 / 3 · 0</b></div></div>"
+        ),
+        (
+            "<h2>Stretch goals — measured, including negatives</h2><div class='grid2'>"
+            "<div class='card'><small>A cost</small><b>26.5% of trials saved</b>"
+            "<p>~$3.79 vs naive 5×. Invalid-run early stops credited with nothing.</p></div>"
+            "<div class='card'><small>B tuning</small><b>not demonstrated</b>"
+            "<p>13 hash-bound tuning experiments; 0 moved into the band.</p></div>"
+            "<div class='card'><small>C diversity</small><b>TB 2.1 pool</b>"
+            "<p>Coverage, duplication and novelty on 89 published tasks.</p></div>"
+            f"<div class='card'><small>D likeness</small><b>blind {acc}</b>"
+            f"<p>95% CI {ci}. Rubric overfits: examples 0/6 vs generated 3/4.</p></div></div>"
+        ),
+        (
+            "<h2>Spend stayed inside the ceiling</h2><div class='grid3'>"
+            f"<div class='card'><small>key spend of $500</small><b>${d['spend']['conservative']:.0f}</b></div>"
+            f"<div class='card'><small>remaining</small><b>${d['spend']['remaining']:.0f}</b></div>"
+            f"<div class='card'><small>this pair's ledger</small><b>${d['spend']['this_run_ledger']:.1f}</b></div></div>"
+            "<p class='mut'>The key is authoritative. Reconciliation is unresolved.</p>"
+        ),
+        (
+            "<h2>What we would do next</h2><div class='next'>"
+            "<p><b>Small N</b> One approved task. The pool is bimodal: 0, 0, 4, 5, 5.</p>"
+            "<p><b>Self-judging</b> The author also judges and red-teams.</p>"
+            "<p><b>Novelty</b> TB 2.1 + examples — not full decontamination.</p>"
+            "<p><b>Next</b> Stronger traps, a wider solver gap, difficulty near p ≈ 0.35.</p></div>"
+        ),
     ]
 
 
@@ -200,7 +210,7 @@ p,li{{max-width:60ch}} .mut{{color:var(--mut)}}
 .warn{{color:var(--warn)}} .bad{{color:var(--bad)}}
 .foot{{position:fixed;bottom:10px;right:16px;color:var(--mut);font-size:13px}}
 .nav{{position:fixed;bottom:10px;left:16px;color:var(--mut);font-size:13px}}
-code{{background:#0b1622;padding:2px 6px;border-radius:6px}}</style></head><body>
+code{{background:#0b1622;padding:2px 6px;border-radius:6px}}.bars{{margin:18px 0 10px}}.barrow{{display:flex;align-items:center;gap:12px;margin:10px 0}}.barrow span{{width:90px;font-weight:700}}.barrow i{{min-width:12px;height:30px;border-radius:6px;display:inline-block;vertical-align:middle}}.barrow b{{width:40px;text-align:right;font-size:20px}}.pipe{{font:700 20px/1.4 Cambria,serif;color:var(--acc);margin:10px 0 6px}}.bandrow{{display:flex;gap:8px;margin:24px 0 16px}}.band{{flex:1;border-radius:14px;text-align:center;padding:22px 8px;min-height:110px;display:flex;flex-direction:column;justify-content:center}}.band em{{font:800 48px/1 Cambria,Georgia,serif;font-style:normal;color:#fff;display:block}}.band small{{color:#fff;margin-top:6px;font-size:14px;font-weight:700}}.band.ok{{background:var(--acc)}}.band.bad{{background:var(--bad)}}.band.warn{{background:var(--warn);color:#2a1a02}}.band.warn small{{color:#2a1a02}}.trials{{display:flex;gap:10px;margin:18px 0 20px}}.trial{{flex:1;border-radius:14px;text-align:center;padding:18px 10px;font-weight:800;font-size:20px;background:var(--bad);color:#fff}}.trial.ok{{background:var(--acc)}}.trial small{{display:block;font-weight:400;font-size:13px;margin-top:4px;opacity:.85}}.grid2{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:16px}}.grid3{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-top:16px}}.next p{{background:var(--panel);border-radius:12px;padding:12px 16px;margin:8px 0}}.next b{{color:var(--acc)}}</style></head><body>
 <div id="deck"></div><div class="nav">← → to navigate</div><div class="foot" id="foot"></div>
 <script>
 const S = {slides};

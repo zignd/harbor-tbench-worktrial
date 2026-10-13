@@ -89,6 +89,25 @@ flowchart LR
 
 Whatever the outcome, the study gives a measured answer rather than a claim.
 
-## 6. Status
+## 6. Measured outcome (Gemini pair, 8 specs)
+
+Full write-up: `docs/study-report.md`; deck: `docs/study-deck.pptx`; data: `runs/study/results.json`. The pair actually used is `google/gemini-2.5-flash-lite` (weak) and `google/gemini-3-flash-preview` (strong) (DeepSeek flash was too slow: 3-6 min per authoring step; partial data in `runs/study-deepseek-partial/`).
+
+| Author -> solver | Valid tasks | In band | Too easy | Too hard | Invalid | Mean pass rate |
+|---|---|---|---|---|---|---|
+| weak -> weak | 0/7 | 0 | 0 | 0 | 0 | n/a |
+| weak -> strong | 0/7 | 0 | 0 | 0 | 0 | n/a |
+| strong -> weak | 4/8 | 0 | 0 | 0 | 4 | 0.00 |
+| strong -> strong | 4/8 | 0 | 1 | 1 | 2 | 0.45 |
+
+- **The thesis was not tested:** the weak author never produced a valid package (0/7), so the trial's own setup (weak author -> strong solver) has no data. The hypotheses H1-H3 above stay hypotheses.
+- **What we did see:** author strength decided whether a task existed (0/7 vs 4/8 passing the free gates) before it decided difficulty; the strong author's 4 valid tasks gave strong-solver passes of 4, 0, 5, 0 (none in the band); the solvers differ (5/5 vs 0/5, 4/5 vs 0/5 on pilot packages).
+- **Spend:** $16.38 in the study ledger (key delta about $33.6 including the pilot's tail and unpriced calls); cap $40.
+
+## 7. Threats to validity, as measured
+
+Small N (4 valid tasks), one family, mixed repair policy (1 vs 3 repairs, flagged), the weak solver's turn-cap failures counted invalid, one judge, no pass audit, a gap check run on 3 of 5 packages (a spend-guard bug stopped it; fixed afterwards, not rerun), and one weak spec unfinished at the deadline.
+
+## 8. Status
 
 See "Study: who writes the task, who solves it" in `docs/plan.md`.

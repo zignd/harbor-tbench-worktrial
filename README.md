@@ -222,3 +222,16 @@ spec (inverse-frequency over a 10-axis taxonomy)
 - `runs/ledger.jsonl`: every stage of every candidate (cost, time, result, inputs hash).
 - `runs/candidates/<id>/`: spec, blueprint, gate decisions, the authored task, calibration with per-trial judge labels.
 - `output/`: shipped (learnable) tasks. `make test` / `make lint` / `make plan` for checks and checklist progress.
+
+### Exploratory study: who writes the task, who solves it
+
+A 2 x 2 of author and solver strength (weak/strong Gemini models), exploratory and never shipped or counted in the funnel:
+
+```bash
+uv run --env-file .env python -m scripts.study run --specs 8   # resumable; runs/study/
+uv run --env-file .env python -m scripts.study gap             # both solvers on 5 pilot packages
+uv run --env-file .env python -m scripts.study summary         # per-cell table
+uv run python -m analysis.study_figure                         # docs/figures/study-2x2.png
+```
+
+Report: `docs/study-report.md`. Deck: `docs/study-deck.pptx` (`node docs/build_deck.js`). Data: `runs/study/results.json`. The first DeepSeek pair was abandoned for speed (`runs/study-deepseek-partial/`).

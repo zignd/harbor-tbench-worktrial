@@ -1,0 +1,44 @@
+{
+ "slug": "sql-infra-migration-hash-collision",
+ "title": "SQL Migration: Deterministic Resource Sharding",
+ "scenario": "A platform engineer is migrating infrastructure metadata to a new sharded database. The environment contains a legacy compiled binary `shard_helper` that implements a specific sharding algorithm, and a SQL schema with a user-defined function meant to replicate it for batch processing.",
+ "instruction_draft": "Hey, we're moving our infrastructure metadata to the new sharded layout. I've set up a UDF in the `infra` database called `get_target_shard(resource_id)` that's supposed to match our legacy sharding logic. Can you check if it's actually correct? It needs to perfectly match the behavior of the `shard_helper` binary in the root directory for any valid resource string. If it's off, fix the SQL function so the migration doesn't put data in the wrong place. Use `infra.db` (SQLite).",
+ "requirements": [
+  "The SQL function `get_target_shard` must be defined in the SQLite database `infra.db`.",
+  "For any input string, `get_target_shard` must return the same integer shard ID (0-255) as the `shard_helper` binary.",
+  "The solution must handle all UTF-8 strings and edge cases like empty strings or extremely long IDs correctly."
+ ],
+ "environment": [
+  "A SQLite3 database `infra.db` containing a `metadata` table and an extension-loaded UDF `get_target_shard` implemented in SQL (using common string functions).",
+  "A compiled C binary `/shard_helper` (source code NOT present) that takes a string argument and prints a shard ID. The binary uses a non-standard Jenkins-style hash or a specific CRC with a custom polynomial.",
+  "The existing SQL implementation uses a simple `SUM(unicode(c)) % 256` or `hex()` based approach that works for 'resource123' but fails on specific byte sequences or case sensitivity.",
+  "Documentation for the legacy sharding logic is 'lost', requiring the solver to probe the binary."
+ ],
+ "internal_hint": "The binary implements a 32-bit FNV-1a hash followed by `hash % 256`, but the existing SQL UDF uses a naive summation. The solver must realize the SQL UDF is insufficient by testing it against the binary with diverse inputs. Since SQLite doesn't have a native FNV-1a, the solver must implement the bitwise logic (multiplication by 16777619 and XORing with the offset basis) using SQLite's limited math or by creating a Python-based SQLite extension and loading it, as standard SQL string functions cannot handle the bitwise overflow correctly.",
+ "trap": "The solver will likely test simple strings like 'web-server' or 'db-1', which might coincidentally pass if the naive SQL is 'close' or if they only test a few samples. However, the hidden test uses high-bit UTF-8 characters and strings that trigger the 32-bit integer wrap-around in the FNV algorithm, which naive SQL `SUM` or `LENGTH` implementations will fail.",
+ "tests": [
+  "Verify that `get_target_shard` exists and is callable.",
+  "Fuzzing: Generate 100 random strings (including empty, very long, and multi-byte UTF-8) and compare the SQL UDF output against the `shard_helper` binary output.",
+  "Edge case: Check a string that causes a 32-bit integer overflow in the FNV-1a calculation to ensure wrapping is handled identically to the C binary."
+ ],
+ "verifier_knob": {
+  "name": "input_complexity",
+  "value": "high",
+  "effect": "Increasing the variety of multi-byte UTF-8 characters and the length of strings to force specific hash collision/overflow scenarios."
+ },
+ "expected_failure_modes": [
+  "Agent assumes the logic is a simple ASCII sum and doesn't test enough inputs.",
+  "Agent fails to implement bitwise XOR/multiplication correctly within SQLite's type system (which handles 64-bit integers).",
+  "Agent tries to read the source of the binary and fails, then gives up on reverse-engineering the algorithm via probing."
+ ],
+ "predicted_pass_rate": 0.2,
+ "difficulty": "hard",
+ "category": "data-querying",
+ "tags": [
+  "sqlite",
+  "reverse-engineering",
+  "sharding",
+  "devops",
+  "algorithmic"
+ ]
+}

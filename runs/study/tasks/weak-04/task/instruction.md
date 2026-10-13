@@ -1,0 +1,3 @@
+An analyst reports that two data processing pipelines, written in Rust, are producing different summaries of financial transactions. The source data files are available in /data. The expected output format is a JSON file at /output/summary.json.
+
+Ensure both pipelines produce identical, correct transaction summaries based on the provided input data.

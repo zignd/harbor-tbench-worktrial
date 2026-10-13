@@ -55,7 +55,8 @@ ACCOUNT_CEILING_USD = 400.0  # user limit: total key spend never passes $400 of 
 CAP_USD = 40.0  # user-approved hard cap for the whole study (estimate ~$25)
 GAP_CAP_USD = 8.0
 EXPECTED_USD = {"author": {"weak": 0.8, "strong": 2.0}, "solve": {"weak": 0.8, "strong": 2.0}}
-MAX_REPAIRS = 1
+MAX_REPAIRS = int(os.environ.get("STUDY_REPAIRS", "3"))  # same for both authors
+BLUEPRINT_TRIES = 5  # a reply that is not valid blueprint JSON is retried, for both authors
 STUDY_DIR = Path(RUNS_DIR) / "study"
 PILOT_PACKAGES = [
     ("p0-ledger-reconcile", "task"),
@@ -107,12 +108,12 @@ def make_bp(author: str, spec: TaskSpec, d: Path, ledger: Ledger, task: str) -> 
     saved = _load(d / "blueprint.json")
     if saved:
         return Blueprint(**saved)
-    for attempt in range(3):
+    for attempt in range(BLUEPRINT_TRIES):
         guard(ledger, 0.3)
         t0 = time.monotonic()
         try:
             bp, cost = make_blueprint(
-                spec, model=MODELS[author], max_tokens=12000 * (attempt + 1)
+                spec, model=MODELS[author], max_tokens=12000 * min(attempt + 1, 3)
             )
         except Exception as e:  # noqa: BLE001  # unparseable reply or API error: the same retry for both authors
             record(ledger, task, "study_blueprint", {"ok": False, "error": str(e)[:300]}, t0=t0)
@@ -162,7 +163,10 @@ def gates(author, d, ledger, task, attempt) -> list[str]:
     tag = f"study-gate-{author}-{d.name}-a{attempt}".lower()
     t0 = time.monotonic()
     with machine_slots(1, GATE_CONCURRENCY, Path(JOBS_DIR) / ".gate-slots"):
-        problems, _, built = gate_static(d / "task", tag)
+        try:
+            problems, _, built = gate_static(d / "task", tag)
+        except FileNotFoundError as e:  # a package too incomplete to scan is an invalid task
+            problems, built = [f"structure: {e.filename or e}: missing"], False
         result = {"problems": list(problems)}
         if built:
             found, functional = gate_functional(
@@ -284,6 +288,14 @@ def collect() -> list[dict]:
         rec["solves"] = {s: _load(rec_path.parent / f"solve-{s}.json")
                          for s in MODELS if (rec_path.parent / f"solve-{s}.json").exists()}  # fmt: skip
         tasks.append(rec)
+    # A task stopped at the deadline mid-rerun keeps its earlier, shorter-policy outcome
+    # (flagged), so the weak author's tasks are not silently dropped from the counts.
+    have = {t["task_id"] for t in tasks}
+    for old in sorted((STUDY_DIR / "superseded").glob("*-record-1repair.json")):
+        rec = json.loads(old.read_text())
+        if rec["task_id"] not in have:
+            rec |= {"solves": {}, "policy": "1 repair (rerun with 3 repairs not finished)"}
+            tasks.append(rec)
     return tasks
 
 
@@ -296,7 +308,8 @@ def write_results(ledger: Ledger, n_specs: int) -> None:
                      "solve_trials": SOLVE_TRIALS, "solve_max_turns": SOLVE_MAX_TURNS,
                      "study_spend_usd": round(study_spent(ledger), 4),
                      "updated": datetime.now(UTC).isoformat(timespec="seconds"),
-                     "exploratory": "user-approved deviation; never shipped or counted"},
+                     "exploratory": "user-approved deviation; never shipped or counted",
+                     "incomplete_at_deadline": ["weak-02 (authoring still running when the study was stopped)"]},
             "summary": summary, "tasks": tasks})  # fmt: skip
 
 
@@ -328,10 +341,12 @@ def cmd_gap(ledger: Ledger) -> None:
         list(pool.map(one, jobs))
 
 
-def cmd_run(ledger: Ledger, n_specs: int, limit: int | None) -> None:
+def cmd_run(ledger: Ledger, n_specs: int, limit: int | None, first: int = 0,
+            only: list[str] | None = None) -> None:  # fmt: skip
     specs = sample_specs(n_specs, SEED)
     _write(STUDY_DIR / "specs.json", [s.model_dump() for s in specs])
-    chosen = list(enumerate(specs))[:limit]
+    chosen = list(enumerate(specs))[first:limit]
+    wanted = {(o.split("-")[0], int(o.split("-")[1])) for o in only or []}
     solve_pool = ThreadPoolExecutor(max_workers=3)
     pending = []
 
@@ -347,10 +362,10 @@ def cmd_run(ledger: Ledger, n_specs: int, limit: int | None) -> None:
             traceback.print_exc()
         write_results(ledger, n_specs)
 
-    with ThreadPoolExecutor(max_workers=2 * len(chosen)) as pool:
-        for i, spec in chosen:
-            for author in MODELS:
-                pool.submit(pipeline, author, i, spec)
+    jobs = [(a, i, spec) for i, spec in chosen for a in MODELS if not wanted or (a, i) in wanted]
+    with ThreadPoolExecutor(max_workers=max(len(jobs), 1)) as pool:
+        for author, i, spec in jobs:
+            pool.submit(pipeline, author, i, spec)
     for f in pending:
         f.result()
     solve_pool.shutdown()
@@ -365,15 +380,17 @@ def main() -> int:
     run = sub.add_parser("run")
     run.add_argument("--specs", type=int, default=8)
     run.add_argument("--limit", type=int, help="only the first N of the drawn specs")
+    run.add_argument("--first", type=int, default=0, help="skip the first N drawn specs")
+    run.add_argument("--only", nargs="*", help="author-index pairs, e.g. weak-03")
     sub.add_parser("summary")
     args = parser.parse_args()
     ledger = Ledger()
     if args.cmd == "gap":
         cmd_gap(ledger)
     elif args.cmd == "run":
-        cmd_run(ledger, args.specs, args.limit)
+        cmd_run(ledger, args.specs, args.limit, args.first, args.only)
     else:
-        write_results(ledger, 0)
+        write_results(ledger, 8)
         from analysis.study import main as show
 
         show()

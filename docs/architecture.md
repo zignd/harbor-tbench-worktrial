@@ -300,8 +300,28 @@ Quality without hand-reviewing everything: hand-audit a random sample from every
 
 The biggest calibration saving at scale is a difficulty predictor trained on the accumulated calibration records, which skips clearly too-easy or too-hard candidates before any Opus trial. Within this trial it would have to be Sonnet or Opus. We already log the blueprint's predicted pass rate against the observed one to test the idea. Curtailment saves another ~20%, and the band has to be re-calibrated as models improve.
 
+**Does a weaker author cap task difficulty?** (study, exploratory)
+We tried to measure it with a 2 x 2 (weak or strong author, weak or strong solver, Gemini flash-lite vs 3-flash). The weak author wrote 0 valid tasks of 7, so the trial's pairing is untested; the strong author's 4 valid tasks gave strong-solver pass counts 4, 0, 5, 0 (none in band). The honest answer is "not shown yet"; see `docs/study-report.md`.
+
 **Why these papers?**
 They are the 2026 terminal-task synthesis and evaluation literature: task quality (Bercovich), reward hacking (Terminal Wrench, HVTB), synthesis pipelines (CLI-Universe, Meta-Task, Tmax, SkillSynth) and learnability (Foster & Foerster). Each design decision above cites the one it came from (`docs/research/`).
+
+## 12. Study: who writes the task, who solves it (exploratory)
+
+Not part of the trial's pipeline: a 2 x 2 of author strength x solver strength with the same harness (`scripts/study.py`, `analysis/study.py`, report in `docs/study-report.md`, deck in `docs/study-deck.pptx`). Events are tagged `study`, outputs live under `runs/study/`, nothing ships, and `analysis/report.py` only reads `official` events.
+
+```mermaid
+flowchart LR
+    spec[8 specs, seed 2026] --> W[weak author<br/>flash-lite]
+    spec --> S[strong author<br/>3-flash]
+    W --> G[free gates:<br/>structure, lint, leak, build,<br/>oracle 3/3, nop 0]
+    S --> G
+    G -->|valid| T[5x terminus-2<br/>weak and strong solver]
+    T --> J[Sonnet 4.6 failure judge]
+    J --> R[runs/study/results.json]
+```
+
+Result in one line: the weak author produced 0 of 7 valid tasks (strong: 4 of 8), so the trial's own pairing could not be tested; no cell had a task in the 1-3/5 band.
 
 ## 11. Repository map
 

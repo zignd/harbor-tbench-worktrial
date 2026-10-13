@@ -282,7 +282,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 58 / 91 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 65 / 92 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -421,13 +421,13 @@ Deliverables
 After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for stronger and for cheaper models alike), we test the reason instead of tuning around it: a weaker author for a stronger solver is a student writing problems for a professor. Reasoning, design and hypotheses are in `docs/findings.md`. **Exploratory: nothing here is shipped or counted in the funnel.**
 - [x] `docs/findings.md`: the thesis, the evidence so far, the 2 x 2 design (weak/strong author x weak/strong solver), metrics, hypotheses and threats to validity.
 **Study budget (user-approved):** estimate ~$25, HARD CAP $40 for the whole study, on top of spend so far ($133.72 used, $361.53 left at 01:48). Remaining credit never below the $75 reserve; ask before any single step above ~$10. Run `make usage` before and after every paid step and log the delta in `CHANGELOG.md`. Pair: weak = `deepseek/deepseek-v4.1-flash` ($0.30/$1.20 per M), strong = `deepseek/deepseek-v4-pro` ($0.96/$1.91). Order: one spec end to end to measure real cost, then scale. Deadline: results and findings by 06:00 -03:00 on 2026-10-13 (about 3 hours of work; scale the number of specs to fit, and write findings from partial results rather than miss the deadline).
-- [ ] 💲 Finish the solver pilot (`scripts/pilot_models.py`: `qwen/qwen3.7-max` and `z-ai/glm-5.1` on the 5 too-easy packages, capped $6, already running; do not restart) and keep its table as evidence.
-- [ ] 💲 Pick the model pair and check the gap: flash (weak) and pro (strong), both solving the 5 pilot packages; if pass rates barely differ, stop and ask the user.
-- [ ] Study mode: author model and solver model chosen per role, runs and ledger events tagged `study`, outputs under `runs/study/`, never shipped (`assert_official_models` still guards shipping).
-- [ ] `scripts/study.py`: draw ~12 specs once; each author writes its own task from the same spec; free gates only (structure, lint, leak scan, build, oracle 3/3, nop 0); every valid task is solved 5 times by each solver; failures judged by one fixed judge.
-- [ ] 💲 Run the study under a spend cap (est. $25, cap $40) and record the per-cell results.
-- [ ] `analysis/study.py`: per-cell in-band share, too easy/hard/invalid shares, pass-rate distribution, task validity rate and cost; a report section and a presentation Q&A entry.
-- [ ] Research-paper-format report `docs/study-report.md` (abstract, intro, method, results, discussion, threats to validity, conclusion), presentation deck `docs/study-deck.pptx` (or a Marp/HTML deck if pptx is not practical), and updated `docs/architecture.md`, `README.md` and `CHANGELOG.md`.
+- [x] 💲 Finish the solver pilot (`scripts/pilot_models.py`: `qwen/qwen3.7-max` and `z-ai/glm-5.1` on the 5 too-easy packages, capped $6, already running; do not restart) and keep its table as evidence.
+- [x] 💲 Pick the model pair and check the gap (pair switched to Gemini flash-lite / 3-flash; gap run on 3 of 5 packages): flash (weak) and pro (strong), both solving the 5 pilot packages; if pass rates barely differ, stop and ask the user.
+- [x] Study mode: author model and solver model chosen per role, runs and ledger events tagged `study`, outputs under `runs/study/`, never shipped (`assert_official_models` still guards shipping).
+- [x] `scripts/study.py`: draw ~12 specs once; each author writes its own task from the same spec; free gates only (structure, lint, leak scan, build, oracle 3/3, nop 0); every valid task is solved 5 times by each solver; failures judged by one fixed judge.
+- [x] 💲 Run the study under a spend cap ($16.38 in the ledger; 4 valid strong-author tasks, 0 valid weak-author tasks) (est. $25, cap $40) and record the per-cell results.
+- [x] `analysis/study.py`: per-cell in-band share, too easy/hard/invalid shares, pass-rate distribution, task validity rate and cost; a report section and a presentation Q&A entry.
+- [x] Research-paper-format report `docs/study-report.md` (abstract, intro, method, results, discussion, threats to validity, conclusion), presentation deck `docs/study-deck.pptx` (or a Marp/HTML deck if pptx is not practical), and updated `docs/architecture.md`, `README.md` and `CHANGELOG.md`.
 - [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).
 
 ## Key tradeoffs (to document in the CHANGELOG)

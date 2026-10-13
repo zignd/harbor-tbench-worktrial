@@ -1,0 +1,47 @@
+{
+ "slug": "high-throughput-binary-telemetry-ingestion",
+ "title": "Optimizing High-Throughput Binary Telemetry Ingestion",
+ "scenario": "A research scientist is reproducing a high-frequency sensor study but the provided ingestion service cannot keep up with the raw binary telemetry stream, causing massive data loss. The environment contains a running C-based capture service (opaque binary), a Python processing bridge, and a Redis instance used as a message bus.",
+ "instruction_draft": "The telemetry ingestion service in `/app/ingestor` is dropping over 80% of incoming sensor packets because it cannot process the `SENS-X` binary format fast enough. You must optimize the pipeline so that it successfully ingests and stores at least 99.9% of packets from a 100,000-message burst while maintaining data consistency across the Redis buffer and the final SQLite research database. \n\nCharacterize the binary protocol used by the capture service through experimentation and update the processing bridge to handle the throughput. The final system must correctly translate the binary modality into structured database rows without losing high-precision timestamps or sensor IDs.",
+ "requirements": [
+  "Achieve >99.9% ingestion rate for a 100,000 packet burst.",
+  "Correctly parse the opaque binary protocol (ID, Timestamp, 3x Float64, Flags).",
+  "Maintain state consistency between Redis stream offsets and SQLite row counts.",
+  "Recover from buffer overflows without corrupting the database schema."
+ ],
+ "environment": [
+  "A compiled C binary `sensor_emitter` that emits UDP packets in a packed binary format (little-endian, 40 bytes: uint32 ID, int64 ns_timestamp, 3x float64 values, uint32 crc).",
+  "A Python script `bridge.py` that currently uses a slow, naive row-by-row `struct.unpack` and synchronous SQLite inserts.",
+  "A Redis container running inside the pod used for intermediate buffering.",
+  "A shell script `reproduce.sh` that triggers a high-speed burst from the emitter.",
+  "The emitter binary has no source code and variable packet sizes that must be discovered by sniffing the local interface."
+ ],
+ "internal_hint": "The bottleneck is twofold: the Python bridge uses synchronous SQLite writes, and the binary format is actually multi-modal\u2014some packets contain 'heartbeats' with a different length. A skilled engineer will use `tcpdump` or `nc` to capture the raw bytes, realize the packet schema, then rewrite the bridge to use Redis pipelining and bulk SQLite `executemany` within a transaction. They must also handle the 'opaque' heartbeat packets which, if misparsed as data, cause the SQL inserts to fail due to constraint violations.",
+ "trap": "A naive solution will simply increase the Redis buffer size or try to multi-thread the Python script. However, the 'opaque' component occasionally sends a 12-byte heartbeat packet instead of the 40-byte data packet. If the agent's parser assumes a fixed width, it will lose alignment, causing all subsequent packets in that buffer to be garbled and fail verification.",
+ "tests": [
+  "Throughput test: Verify that 100,000 packets are processed in under 30 seconds.",
+  "Integrity test: Randomly sample 100 rows from SQLite and compare against a hidden golden log from the emitter.",
+  "Recovery test: Kill the bridge mid-burst and ensure no duplicate packets exist in the DB after restart (idempotency check).",
+  "Protocol test: Ensure heartbeat packets are logged to a separate 'system_events' table as required by the hidden spec found in the research notes."
+ ],
+ "verifier_knob": {
+  "name": "packet_heterogeneity",
+  "value": "3",
+  "effect": "The number of distinct binary packet types the agent must discover and handle (e.g., Data, Heartbeat, ErrorFlag)."
+ },
+ "expected_failure_modes": [
+  "Agent fails to identify the heartbeat packet format and experiences 'alignment drift'.",
+  "Agent optimizes for speed but fails the consistency check because it doesn't use SQL transactions.",
+  "Agent's parser is too slow for the 1CPU limit because it doesn't use vectorized or bulk operations."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "systems-programming",
+  "data-processing",
+  "reverse-engineering",
+  "sqlite",
+  "redis"
+ ]
+}

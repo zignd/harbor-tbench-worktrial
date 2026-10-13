@@ -1,0 +1,3 @@
+Hey, I've got a batch of equipment usage records in `usage.db` that don't match our billing logs. The `/usr/bin/calculate_fee` binary is what we use to generate the fees from the raw `duration` and `intensity` values in the DB, but something is off in the records. 
+
+Can you write a script `/home/user/reconcile.sh` that finds all entries in the `charges` table of `/home/user/usage.db` where the `amount` column deviates from what the `calculate_fee` tool outputs? Once you've identified the discrepancies, update the `charges` table to reflect the tool's output exactly. The tool is sensitive to precision, so ensure you handle the values correctly.

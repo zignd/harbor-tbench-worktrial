@@ -1,0 +1,47 @@
+{
+ "slug": "scientific-sqlite-data-reconciliation",
+ "title": "Reconciling Scientific Records in SQLite",
+ "scenario": "A finance-ops engineer at a research institute needs to reconcile a SQLite database of lab equipment usage fees against a set of raw measurement logs. However, the 'fee_calculator' is an opaque binary that applies complex, undocumented rounding and tiered pricing rules based on floating-point precision of the measurement values.",
+ "instruction_draft": "Hey, I've got a batch of equipment usage records in `usage.db` that don't match our billing logs in `billing_records.csv`. The `calculate_fee` binary in your path is what we use to generate the fees from the raw `duration` and `intensity` values in the DB, but something is off. Can you write a script `reconcile.sh` that finds all entries in the `charges` table where the `amount` column deviates from what the `calculate_fee` tool outputs for those parameters? Once you've identified the discrepancies, update the `charges` table to reflect the tool's output exactly. The tool is finicky about input types, so you'll need to figure out its behavior.",
+ "requirements": [
+  "Identify all rows in usage.db:charges where the 'amount' does not match the output of 'calculate_fee'.",
+  "Update the 'amount' column in usage.db:charges to exactly match the output of 'calculate_fee' for the corresponding duration and intensity.",
+  "The reconciliation must handle floating-point precision issues exactly as the binary does.",
+  "The final database state must pass the hidden audit tool which checks against a large corpus of edge cases."
+ ],
+ "environment": [
+  "A SQLite database `usage.db` with a table `charges(id INTEGER, duration REAL, intensity REAL, amount REAL)`.",
+  "A compiled C binary `/usr/bin/calculate_fee` that takes two floats and prints a high-precision float to stdout.",
+  "The binary contains a 'jump' in pricing at specific intensity thresholds (e.g., if intensity > 0.8500001) and specific IEEE-754 rounding behavior that differs from standard SQL `ROUND()`.",
+  "A set of 500 initial records in the DB, where ~15% are intentionally slightly wrong (off by small epsilon or due to threshold misses).",
+  "A 'verify' script that generates 1000 new random inputs, runs them through the solver's logic (or the solver-modified DB), and compares against the oracle binary."
+ ],
+ "internal_hint": "The solver cannot rely on standard SQL arithmetic because the `calculate_fee` binary uses `long double` precision and custom tiered logic (e.g., a 5% surcharge if `intensity * duration > 100`). The solver must iterate through the database, call the binary for every row to get the ground truth, and update the records. Shallow agents might try to guess the formula or use SQL's `ROUND` function, which will fail on edge cases where binary floating-point representation (e.g., 0.1 + 0.2) matters.",
+ "trap": "The `calculate_fee` binary has a non-linear threshold: at exactly 0.999999 intensity, the fee structure changes. If the agent only tests a few samples or assumes a linear relationship, they will miss the threshold. Furthermore, simply copying the string output of the binary into SQLite is required; any intermediate casting to Python floats or SQL reals might lose the specific precision required by the verifier's exact-match check.",
+ "tests": [
+  "Check if all rows in the provided usage.db match the binary output.",
+  "Adversarial corpus test: The verifier inserts 1000 hidden rows with values like 0.8500000000000001 and 0.99999999999999 and runs the solver's `reconcile.sh` to see if it handles these precision-sensitive tiers correctly.",
+  "Check if the solver correctly handled the case where the binary returns 'NaN' or 'Inf' for certain extreme/malicious inputs (the solver should null these or handle as the binary does)."
+ ],
+ "verifier_knob": {
+  "name": "corpus_density",
+  "value": "1000",
+  "effect": "Increasing the number of hidden test cases near the tiered thresholds (e.g., 0.84999 to 0.85001) makes it harder to pass without direct binary execution for every row."
+ },
+ "expected_failure_modes": [
+  "The agent tries to reverse-engineer the fee formula into a SQL UPDATE statement, failing on floating-point edge cases.",
+  "The agent calls the binary for a few samples, assumes a linear model, and applies it to the rest.",
+  "The agent fails to handle the shell/python-to-sqlite precision loss when passing values back into the DB.",
+  "The agent times out by trying to optimize the binary calls unnecessarily instead of just running them."
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "scientific-computing",
+ "tags": [
+  "sqlite",
+  "floating-point",
+  "bash",
+  "reverse-engineering",
+  "data-integrity"
+ ]
+}

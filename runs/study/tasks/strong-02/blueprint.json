@@ -1,0 +1,47 @@
+{
+ "slug": "cryptographic-log-recovery-procedure",
+ "title": "SRE 3AM: Encrypted Log Recovery",
+ "scenario": "An on-call SRE is paged because the production audit log rotation script failed, leaving several days of sensitive logs in an encrypted, non-standard format. The environment contains a small in-house cryptographic utility `log-vault`, a set of partially corrupted encrypted logs, and a recovery toolkit that is missing a critical component to handle stateful initialization vectors.",
+ "instruction_draft": "```\n[ERROR] 2025-05-14 03:02:11 - log_rotate.py - Fatal: Integrity check failed for audit_logs_20250512.enc. Expected HMAC mismatch.\n[ERROR] 2025-05-14 03:02:11 - log_rotate.py - Data corruption detected in sequence block 0x4f2.\n```\nI just got paged. The audit logs are encrypted using our internal `log-vault` tool, but the rotation script crashed and now the encrypted files are unreadable by the standard `log-vault --decrypt` command. I suspect the internal state (IV chaining) got desynchronized when the disk filled up. \n\nYour task is to recover the plaintext logs from the files in `/var/log/audit/encrypted/`. You must identify the underlying encryption parameters from the `log-vault` source code in `/opt/internal/vault/`, fix the recovery script in `/opt/internal/vault/recovery.py` to handle the stateful IV progression correctly, and output the fully reconstructed, chronologically ordered plaintext logs to `/var/log/audit/recovered.log`. The output must match the original integrity hashes stored in `/var/log/audit/metadata.db`.",
+ "requirements": [
+  "Identify the custom AES-GCM implementation details in the `log-vault` source code.",
+  "Repair the `recovery.py` script to correctly calculate the IV for each log block based on its sequence number and the master salt.",
+  "Reconstruct the plaintext audit logs from three distinct encrypted segments found in the environment.",
+  "Ensure the final `recovered.log` is chronologically ordered and matches the SHA-256 hashes in the metadata database."
+ ],
+ "environment": [
+  "A Python-based cryptographic tool `log-vault` using `cryptography` library, implementing a stateful IV generation where `IV_n = KDF(Master_IV, Sequence_N)`.",
+  "Three encrypted log files: one clean, one with a missing header, and one where the sequence counter jumped due to a crash.",
+  "A `metadata.db` (SQLite) containing the expected SHA-256 hashes of the original log lines and their sequence numbers.",
+  "Source code for `log-vault` containing the KDF logic but no documentation on the IV-sequence relationship.",
+  "A broken `recovery.py` that assumes a static IV."
+ ],
+ "internal_hint": "The core issue is 'Adversarial Reasoning' applied to a broken system. The `log-vault` uses a custom KDF (PBKDF2-HMAC-SHA256) to derive a unique IV for every 4KB block of log data using a counter. When the rotation crashed, the counter in the file header was lost or miswritten. The agent must: 1. Reverse engineer the `vault.py` to see how the IV is derived from the block sequence. 2. Realize the encrypted files are missing the 'start sequence' header. 3. Brute-force or infer the starting sequence by attempting decryptions and checking the MAC/Tag. 4. Handle a 'hole' in the sequence where one block was dropped but the counter incremented.",
+ "trap": "The agent will likely try to decrypt all blocks using the same IV or a simple incrementing IV. However, the KDF is salted with a value hidden in a config file (`/etc/vault/config.yaml`). If they don't locate and use the salt, the IVs will be wrong. Furthermore, the hidden test logs have a sequence 'skip' that will cause a naive sequential recovery to fail halfway through.",
+ "tests": [
+  "Check if `/var/log/audit/recovered.log` exists and has the correct number of lines.",
+  "Verify that the SHA-256 of the recovered content matches the hidden oracle (which includes the skipped sequence block).",
+  "Verify that the recovery was performed without modifying the original encrypted source files (integrity test)."
+ ],
+ "verifier_knob": {
+  "name": "sequence_complexity",
+  "value": "non-linear",
+  "effect": "Low difficulty uses a linear counter; high difficulty uses a sequence derived from a Galois Linear Feedback Shift Register (LFSR) described in the code."
+ },
+ "expected_failure_modes": [
+  "Agent fails to identify the salt in the config file and produces garbage output.",
+  "Agent assumes a static IV for the whole file and only successfully decrypts the first block.",
+  "Agent fails to account for the 'sequence jump' (a gap in the log blocks) and stops when the first MAC failure occurs.",
+  "Agent verifies only against the first few lines and misses that the end of the file is still corrupted."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "devops",
+  "aes-gcm",
+  "log-processing",
+  "reverse-engineering",
+  "python"
+ ]
+}

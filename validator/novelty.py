@@ -1,7 +1,7 @@
 """Novelty against published Terminal-Bench tasks (docs/plan.md, delta 11).
 
-The reference corpus is every published TB set on the Harbor hub (`make
-tb-reference` -> data/tb-reference/<set>/<task>/) plus examples/. Three uses:
+The reference corpus is the published TB sets selected by NOVELTY_SETS (default: every set
+from `make tb-reference` -> data/tb-reference/<set>/<task>/) plus examples/. Three uses:
 
 - `concept_list()`: one line per reference task, put in the blueprint prompt
   so the author avoids those ideas in the first place.
@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 
-from generator.config import EXAMPLES_DIR, TB_REFERENCE_DIR
+from generator.config import EXAMPLES_DIR, NOVELTY_SETS, TB_REFERENCE_DIR
 
 NGRAM = 13
 _WORD = re.compile(r"[a-z0-9_]+")
@@ -98,10 +98,32 @@ def _gist(instruction: str, toml_path: Path) -> str:
     return " ".join(first.split()[:30])
 
 
+def reference_sets(
+    tb_dir: str = TB_REFERENCE_DIR, sets: tuple[str, ...] | None = None
+) -> list[str]:
+    """Names of the published sets in use: NOVELTY_SETS if set, else every downloaded set."""
+    sets = NOVELTY_SETS if sets is None else sets
+    present = sorted(p.name for p in Path(tb_dir).glob("*") if p.is_dir())
+    return [s for s in present if not sets or s in sets]
+
+
+def load_reference(
+    tb_dir: str = TB_REFERENCE_DIR,
+    examples_dir: str = EXAMPLES_DIR,
+    sets: tuple[str, ...] | None = None,
+) -> tuple:
+    """Reference tasks from the selected published sets plus examples/ (always)."""
+    return _load(tb_dir, examples_dir, tuple(reference_sets(tb_dir, sets)))
+
+
 @cache
-def load_reference(tb_dir: str = TB_REFERENCE_DIR, examples_dir: str = EXAMPLES_DIR) -> tuple:
+def _load(tb_dir: str, examples_dir: str, sets: tuple[str, ...]) -> tuple:
     refs, seen = [], set()
-    sources = [(p, f"{p.parent.name}/{p.name}") for p in sorted(Path(tb_dir).glob("*/*"))]
+    sources = [
+        (p, f"{p.parent.name}/{p.name}")
+        for p in sorted(Path(tb_dir).glob("*/*"))
+        if p.parent.name in sets
+    ]
     sources += [(p, f"examples/{p.name}") for p in sorted(Path(examples_dir).glob("*"))]
     for task_dir, ref_id in sources:
         inst = task_dir / "instruction.md"

@@ -9,11 +9,11 @@ already recorded (in the same run mode) doesn't need to run again.
 import fcntl
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from generator.config import LEDGER_PATH, RUN_MODE
+from generator.config import LEDGER_PATH, LEGACY_MODEL_LABEL, MODEL_LABEL, RUN_MODE
 
 # Files that don't change a task's meaning, so they don't change its hash.
 _HASH_IGNORE = {"__pycache__", ".pytest_cache", ".DS_Store", ".gitignore"}
@@ -44,6 +44,7 @@ class Event:
     inputs_hash: str = ""
     mode: str = RUN_MODE
     ts: str = field(default_factory=_now)
+    models: str = ""  # "<generation model>|<calibration model>"; filled on append
 
 
 class Ledger:
@@ -52,6 +53,7 @@ class Ledger:
 
     def append(self, event: Event) -> Event:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        event = replace(event, models=event.models or MODEL_LABEL)
         line = json.dumps(asdict(event), sort_keys=True) + "\n"
         # Batches, calibration and tuning append concurrently (threads and processes):
         # lock so a long event can't interleave with another.
@@ -71,7 +73,9 @@ class Ledger:
         for line in self.path.read_text().splitlines():
             if not line.strip():
                 continue
-            e = Event(**json.loads(line))
+            raw = json.loads(line)
+            raw.setdefault("models", LEGACY_MODEL_LABEL)
+            e = Event(**raw)
             if (
                 (stage is None or e.stage == stage)
                 and (task is None or e.task == task)

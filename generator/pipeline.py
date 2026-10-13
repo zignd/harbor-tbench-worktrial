@@ -38,12 +38,14 @@ from generator.config import (
     CANARY_LINE,
     DEV_MODE,
     DIFFICULTY_GATE_BLOCKS,
+    EVAL_MODEL,
     GATE_CONCURRENCY,
     JOBS_DIR,
     METATASK_MAX_TURNS,
     METATASK_REPAIR_MAX_TURNS,
     METATASK_SUMMARIZE_THRESHOLD,
     MODEL,
+    MODEL_LABEL,
     OUTPUT_DIR,
     RUN_MODE,
     RUNS_DIR,
@@ -174,6 +176,7 @@ def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
     # unrelated domains drifted back to the same ledger-reconciliation idea.
     concepts = novelty.concept_list(index)
     cand.save("spec.json", cand.spec.model_dump())
+    cand.save("models.json", {"label": MODEL_LABEL, "generator": MODEL, "calibration": EVAL_MODEL})
     feedback = None
     # Number after earlier drafts so their evidence is never overwritten.
     attempt = len(
@@ -411,6 +414,7 @@ def _calibrate_package(cand: Candidate, ledger: Ledger, attempt: int, h: str):
         "cost_usd": round(cal.cost_usd, 4),
         "package_hash": h,
         "attempt": attempt,
+        "models": MODEL_LABEL,
     }
     cal_file.write_text(json.dumps(record, indent=1, default=str))
     return cal

@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 09:10 -03:00 · Novelty pool and model labels (code)
+- **Novelty pool:** `NOVELTY_SETS` (comma-separated set names under `data/tb-reference/`; empty = all) selects the published sets for every novelty layer, since they all go through `validator/novelty.load_reference`; `examples/` is always included. `.env` sets `terminal-bench-2-1` for this run (89 tasks), and `analysis/report.py` prints the sets used. Tested: an excluded set no longer flags a near-copy, an included one does. Thresholds unchanged (the 2.1-only corpus has p90 nearest-neighbour cosine 0.48).
+- **Model labels:** `config.MODEL_LABEL` ("generation|calibration") is stored on every new ledger event (`Event.models`; old events read as the Sonnet/Opus legacy label), in `runs/candidates/<id>/models.json`, in calibration records and in shipped-task READMEs. `analysis/report.py` and the watch ETA use only the configured pair, so Sonnet -> Opus and gemini-3.8-flash results never mix in one funnel or estimate. `assert_official_models()` now accepts the configured pair and still refuses dev mode.
+- **Run configuration:** `.env` (git-ignored) sets `GENERATOR_MODEL=google/gemini-3.8-flash`, `EVAL_MODEL=openrouter/google/gemini-3.8-flash`, `NOVELTY_SETS=terminal-bench-2-1`; `.env.example` documents them. Config defaults are unchanged. 157 tests pass.
+
 ### 09:08 -03:00 · Plan for the gemini-3.8-flash run; novelty pool narrowed to TB 2.1 + examples/
 - **What:** `docs/plan.md` replaces the hypothesis track with this run's 10 items: one strong model (`google/gemini-3.8-flash`, about 89% on Terminal-Bench 2.1) in every role, tasks that fit the 1-3/5 band shipped to `output/`, a 10+ candidate batch and the Part 3 report. Budget: $150 for the run on top of ~$176 spent, inside the $400 ceiling.
 - **Decision (user):** the novelty reference becomes TB 2.1 (89 tasks) plus `examples/`; latest/4.0, Pro and Science are not compared, because the model was scored on 2.1. Thresholds unchanged. **Tradeoff:** a near-copy of a 4.0, Pro or Science task is no longer flagged automatically; the README ban on reusing or adapting public tasks still applies. AGENTS.md notes `NOVELTY_SETS`.

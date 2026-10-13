@@ -110,3 +110,33 @@ def test_judge_always_sees_our_nearest_own_tasks_even_at_low_cosine():
     result = novelty.judge_same_task("backup job for a postgres database", index, chat=fake_chat)
     assert "[ours/official-x]" in seen["prompt"]
     assert ("ours/official-x", 0.0) in [(r, round(c, 1)) for r, c in result["nearest"]]
+
+
+def test_novelty_sets_select_what_is_compared(tmp_path):
+    for set_name, task, text in [
+        (
+            "set-a",
+            "t1",
+            "Repair the broken nightly rsync job so incremental backups keep every deleted file.",
+        ),
+        (
+            "set-b",
+            "t2",
+            "Write a parser for the vendor's binary log format and print a per-hour error histogram.",
+        ),
+    ]:
+        d = tmp_path / set_name / task
+        d.mkdir(parents=True)
+        (d / "instruction.md").write_text(text)
+    ex = tmp_path / "empty-examples"
+    ex.mkdir()
+    only_a = novelty.load_reference(str(tmp_path), str(ex), sets=("set-a",))
+    both = novelty.load_reference(str(tmp_path), str(ex), sets=())
+    assert [r.ref_id for r in only_a] == ["set-a/t1"]
+    assert {r.ref_id for r in both} == {"set-a/t1", "set-b/t2"}
+    copy_of_b = (
+        "Write a parser for the vendor's binary log format and print a per-hour error histogram."
+    )
+    assert novelty.lexical_flags(copy_of_b, Index(both))  # an included set still flags it
+    assert not novelty.lexical_flags(copy_of_b, Index(only_a))  # an excluded set does not
+    assert novelty.reference_sets(str(tmp_path), ("set-b",)) == ["set-b"]

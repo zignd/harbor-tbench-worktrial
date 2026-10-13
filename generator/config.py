@@ -99,6 +99,9 @@ JOBS_DIR = os.path.join(REPO_ROOT, "jobs")  # Harbor job dirs (git-ignored)
 RUNS_DIR = os.path.join(REPO_ROOT, "runs")  # ledger + price cache (committed evidence)
 LEDGER_PATH = os.path.join(RUNS_DIR, "ledger.jsonl")
 TB_REFERENCE_DIR = os.path.join(REPO_ROOT, "data", "tb-reference")  # make tb-reference
+# Published sets the novelty gate compares against (comma-separated directory names under
+# data/tb-reference/); empty means every downloaded set. examples/ is always included.
+NOVELTY_SETS = tuple(s.strip() for s in os.environ.get("NOVELTY_SETS", "").split(",") if s.strip())
 ENV_FILE = os.path.join(REPO_ROOT, ".env")
 
 # Data-provenance canary. Harbor strips leading canary comment lines from
@@ -111,11 +114,20 @@ CANARY_LINE = (
 )
 
 
+# Label recorded on every ledger event, candidate and shipped task: which models produced it
+# (generation / calibration). Results from different pairs are never mixed in one report.
+MODEL_LABEL = f"{MODEL}|{EVAL_MODEL}"
+LEGACY_MODEL_LABEL = f"{OFFICIAL_MODEL}|{OFFICIAL_EVAL_MODEL}"  # events written before labels
+
+
 def assert_official_models() -> None:
-    """Fail loudly if a ship/report step is about to use non-official models."""
-    if DEV_MODE or MODEL != OFFICIAL_MODEL or EVAL_MODEL != OFFICIAL_EVAL_MODEL:
+    """Fail loudly if a ship/report step is about to run on dev-mode or unset models.
+
+    The configured pair (GENERATOR_MODEL / EVAL_MODEL) is accepted: models are open, and every
+    result carries MODEL_LABEL. Dev mode never ships or reports.
+    """
+    if DEV_MODE or not MODEL or not EVAL_MODEL:
         raise RuntimeError(
             f"Refusing to ship/report: models are {MODEL!r} / {EVAL_MODEL!r} "
-            f"(DEV_MODE={DEV_MODE}). Shipped tasks and metrics must use "
-            f"{OFFICIAL_MODEL!r} / {OFFICIAL_EVAL_MODEL!r}."
+            f"(DEV_MODE={DEV_MODE}). Shipped tasks and metrics need real configured models."
         )

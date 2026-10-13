@@ -16,6 +16,8 @@ from pathlib import Path
 
 from rich.text import Text
 
+from generator.config import LEGACY_MODEL_LABEL, MODEL_LABEL
+
 # key, label, ledger stages that belong to the node
 NODES = [
     ("blueprint", "blueprint + review", ("blueprint", "blueprint_gate")),
@@ -56,13 +58,21 @@ def _parse(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 
-def stage_medians(path: Path, mode: str = "official") -> dict[str, float]:
-    """Median seconds per ledger stage (events with a recorded duration)."""
+def stage_medians(
+    path: Path, mode: str = "official", models: str | None = None
+) -> dict[str, float]:
+    """Median seconds per ledger stage (events with a recorded duration) for the configured
+    model pair (timings differ a lot between models)."""
+    models = models or MODEL_LABEL
     by_stage: dict[str, list[float]] = {}
     if path.exists():
         for line in path.read_text().splitlines():
             e = json.loads(line)
-            if e["mode"] == mode and e["seconds"] > 0:
+            if (
+                e["mode"] == mode
+                and e["seconds"] > 0
+                and e.get("models", LEGACY_MODEL_LABEL) == models
+            ):
                 by_stage.setdefault(e["stage"], []).append(e["seconds"])
     return {s: statistics.median(v) for s, v in by_stage.items() if len(v) >= 3}
 

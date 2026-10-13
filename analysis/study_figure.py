@@ -1,6 +1,6 @@
 """Figure for the study report: verdict shares per author -> solver cell (docs/figures/).
 
-    uv run python -m analysis.study_figure
+uv run python -m analysis.study_figure
 """
 
 import json
@@ -28,7 +28,9 @@ def draw(summary: dict, out: Path = OUT) -> Path:
         for n in names:
             c = cells[n]
             shares.append(c["verdicts"][verdict] / c["valid"] if c["valid"] else 0.0)
-        ax.bar(names, shares, bottom=bottoms, color=COLORS[verdict], label=verdict.replace("_", " "))
+        ax.bar(
+            names, shares, bottom=bottoms, color=COLORS[verdict], label=verdict.replace("_", " ")
+        )
         bottoms = [b + s for b, s in zip(bottoms, shares, strict=True)]
     for i, n in enumerate(names):
         c = cells[n]

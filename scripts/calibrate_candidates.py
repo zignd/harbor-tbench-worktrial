@@ -16,7 +16,7 @@ from pathlib import Path
 
 from analysis.ledger import Ledger
 from evaluator.calibrate import LEGIT_PASS, VALID_FAIL, calibrate
-from generator.config import OUTPUT_DIR, assert_official_models
+from generator.config import EVAL_MODEL, MODEL, MODEL_LABEL, OUTPUT_DIR, assert_official_models
 from generator.pipeline import CANDIDATES_DIR, Candidate, stage_redteam
 from generator.spec import TaskSpec
 
@@ -27,7 +27,11 @@ README = """# {title}
 ## What it tests
 {failure_modes}
 
-## Calibration (terminus-2 + claude-opus-4.8)
+## Models
+Authored, reviewed and judged by `{model}`; calibrated by terminus-2 + `{eval_model}`. The 1-3 of 5
+band is relative to that calibration model.
+
+## Calibration (terminus-2 + {eval_model})
 {passes} of {n} judged runs passed ({verdict}; runs stop once the 5-run verdict is certain).
 
 ## Why the model fails it
@@ -51,6 +55,8 @@ def ship(cand_dir: Path, cal: dict) -> Path:
     why = "\n".join(f"- {f['mode']}: {f['explanation']}" for f in fails) or "- (none recorded)"
     (dest / "README.md").write_text(
         README.format(
+            model=MODEL,
+            eval_model=EVAL_MODEL,
             title=bp["title"],
             scenario=bp["scenario"],
             failure_modes="\n".join(f"- {m}" for m in bp["expected_failure_modes"]),
@@ -96,6 +102,7 @@ def calibrate_one(cand_dir: Path, ledger) -> dict | None:
         "outcomes": cal.outcomes,
         "trials": cal.trials,
         "cost_usd": round(cal.cost_usd, 4),
+        "models": MODEL_LABEL,
     }
     (cand_dir / "calibration.json").write_text(json.dumps(record, indent=1, default=str))
     shipped = ship(cand_dir, record) if cal.verdict == "learnable" else None

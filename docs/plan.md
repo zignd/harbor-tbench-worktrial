@@ -283,7 +283,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 69 / 102 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 72 / 102 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -440,12 +440,12 @@ Goal: tasks that fit the trial's band (1-3 of 5 passes for the calibration model
 Budget: this run is capped at $150 on top of ~$176 already spent, inside the $400 account ceiling; stop and fix generation if the pilot costs more than ~$40 per in-band task.
 - [x] Novelty pool (`f5e42db`): `NOVELTY_SETS` (unset = every set; `terminal-bench-2-1` set in `.env` for this run; `examples/` always included) applied at every layer (concept list, blueprint gate, final-package re-check, diversity report); the report states the sets used. Unit-tested (an excluded set no longer flags a near-copy, an included one does).
 - [x] Model plumbing (`f5e42db`): `GENERATOR_MODEL` / `EVAL_MODEL` reach blueprint, authoring, quality check, red-team, judges, novelty judge and calibration; `config.assert_official_models()` accepts the configured pair (refuses dev mode); the model is recorded in ledger events, calibration records, shipped-task READMEs and `reports/summary.md`. Unit-tested.
-- [x] 💲 Probe `gemini-3.8-flash` in every role (done; plus the five-model speed test in `docs/model-speedtest.md`) (blueprint, authoring round, terminus-2 trial, failure judge, red-team); record speed, cost and any JSON or tool-format problem, and fix what breaks.
+- [x] 💲 Probe `gemini-3.8-flash` in every role (done; plus the five-model speed test in `docs/model-speedtest.md`); the run switched to `luna` author / `gpt-5.4-mini` calibrator (`docs/findings.md` section 6). (blueprint, authoring round, terminus-2 trial, failure judge, red-team); record speed, cost and any JSON or tool-format problem, and fix what breaks.
 - [x] Difficulty-by-construction levers (verify-time inputs from a hidden seed, multi-stage dependent work, a shallow-self-check trap, long-horizon or large inputs) in the spec, blueprint and tuner guidance. Unit-tested.
 - [ ] 💲 Pilot: 3 candidates through the full pipeline; funnel, time and cost per task. Go/no-go at ~$40 per in-band task.
-- [ ] 💲 Batch of 10+ candidates; exact curtailment, every trial judged, tuner on near-misses; tasks in band ship to `output/<task>/` with the model in the README.
+- [x] 💲 Batch of 10+ candidates (20 through the pipeline) with `openai/gpt-5.6-luna` authoring and `openai/gpt-5.4-mini` calibrating; exact curtailment, every trial judged, tuner on near-misses; **1 task shipped** (`output/repair-log-replay-sql`, 1/3 valid).
 - [ ] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation with an instruction quote, novelty check, canary placement, `timeout_sec = 3600`.
-- [ ] `reports/summary.md` regenerated: funnel, histogram, cost and time, diversity and novelty (sets stated), labelled with the model, and compared with Sonnet -> Opus (0 of 9).
+- [x] `reports/summary.md` regenerated for this run's model label: funnel, histogram, cost/time, diversity, novelty (TB 2.1 + examples), compared with Sonnet -> Opus (0 of 9) and luna -> luna (0 shipped).
 - [ ] Stretch goals as time allows (A curtailment savings, C diversity, B tuner results, D human-likeness); skipped items stated.
 - [ ] Docs: `docs/findings.md`, `docs/architecture.md`, `README.md`, `CHANGELOG.md` updated with the outcome, spend and decisions.
 

@@ -89,6 +89,16 @@ flowchart LR
 
 Whatever the outcome, the study gives a measured answer rather than a claim.
 
+## 6. Measured outcome: luna author, gpt-5.4-mini solver (the shipped run)
+
+Full report: `reports/summary.md`; shipped task: `output/repair-log-replay-sql`. Novelty reference for this run is TB 2.1 plus `examples/` only (`NOVELTY_SETS=terminal-bench-2-1`).
+
+- **Models:** `openai/gpt-5.6-luna` authors and judges; `openai/gpt-5.4-mini` (about 60% on TB 2) calibrates. The band is relative to mini.
+- **One task shipped, first for the trial:** `repair-log-replay-sql` landed at 1 pass / 2 valid fails of 3 judged runs (exact curtailment stopped there). It passes `scripts/validate.sh`, an independent oracle 3/3 and nop. Its README records the one caveat: `harbor check` flagged `behavior_in_tests` (tests cover the core but not every documented boundary).
+- **The distribution is bimodal for this pairing**, not centred on the band: across 11 calibrated candidates the verdicts were too_easy 1 (4/4), too_hard 4 (0/5), learnable 1, invalid 5 (mostly `test_overreach`, an unstated requirement in the tests). A weaker solver did **not** simply shift tasks into the band; it added both passes and hard failures, and the invalid failures came from the instruction not stating everything the tests check.
+- **Comparison:** Sonnet 4.6 -> Opus 4.8 also produced 0 of 9 in the band; luna -> luna produced 0 shipped of ~8 (4 at 0/5, 1 at 4/4). luna -> mini produced 1 shipped, so the same-brand weaker solver helped at the margin, but the first-order problem is task construction, not the pairing.
+- **Cost and time:** about $7 of model spend for this run's 20 candidates (authoring, quality checks, red-team, 67 calibration trials), the rest of the key's spend being earlier runs. Wall clock was the binding constraint: each candidate takes 20-60 minutes because the quality gate sends packages through ~6 minute repair rounds and every repair re-calibrates.
+
 ## 6. Measured outcome (Gemini pair, 8 specs)
 
 Full write-up: `docs/study-report.md`; deck: `docs/study-deck.pptx`; data: `runs/study/results.json`. The pair actually used is `google/gemini-2.5-flash-lite` (weak) and `google/gemini-3-flash-preview` (strong) (DeepSeek flash was too slow: 3-6 min per authoring step; partial data in `runs/study-deepseek-partial/`).

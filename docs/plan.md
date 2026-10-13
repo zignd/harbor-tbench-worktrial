@@ -19,6 +19,8 @@ Hard limits:
 
 Deliverables are source, `CHANGELOG.md` and a readable git history in the private repo `zignd/harbor-tbench-worktrial`.
 
+**Current finish plan:** the "Submission readiness: evidence, reproducibility and final results" checklist below takes priority over earlier completion claims. Keep the user-approved pairing: `openai/gpt-5.6-luna` author/reviewer/judge/red-team and `openai/gpt-5.4-mini` calibration via terminus-2. The model change is recorded, not a gap to reverse. The final deliverables are one self-contained detailed report at `docs/result/report.md` and a short interview deck at `docs/result/presentation.pptx`, with an offline browser version at `docs/result/presentation.html`. Earlier reports and decks remain historical evidence, not the submission's entry point.
+
 Decisions made with the user:
 - **3-5 day timebox.**
 - **Agentic in-container authoring.** Sonnet builds and self-tests each task inside a live container. Implemented as a **Harbor meta-task** (see "Changes from the full papers", item 1).
@@ -118,7 +120,7 @@ All eight papers are downloaded to `docs/research/<arxiv-id>.pdf`, with a text c
       - `terminal-bench-pro`: 200 tasks.
       - `terminal-bench-science`: 70 tasks.
 
-      We compare against all of them, not one "target" version, because the README forbids reusing or adapting *any* public task.
+      This describes the original corpus policy. The final run automatically compares only TB 2.1 plus `examples/` (user decision); the ban on reusing or adapting any public task remains. The finish report must disclose that reduced coverage.
     - **Three layers.** Text overlap alone only catches copied wording, not the same task reworded.
       1. **Prevent at ideation.** The blueprint prompt includes a compact list of the TB task concepts (name plus one-line gist) with "don't build any of these or a variant of them".
       2. **Gate the blueprint, before any build or Opus spend.** Run 13-gram overlap and TF-IDF cosine of the blueprint's instruction draft and requirements against every reference instruction. Take the **top-3 nearest** and run a Sonnet **"same underlying task?"** judge on them (same core problem, same environment, same solution path → reject). A reject sends the spec back to resampling. Cheap: one small Sonnet call per blueprint.
@@ -224,10 +226,10 @@ If an Opus trial costs more than ~$3, shrink the batch rather than cut the numbe
 ### Spend discipline
 
 The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every rule below saves money **without** touching the work-trial constraints:
-- Opus 4.8 + terminus-2 is the only difficulty benchmark.
+- The calibration model declared for a batch + terminus-2 defines its difficulty benchmark (currently GPT-5.4-mini; historical Opus results remain separate).
 - The band is defined on 5 runs.
 - `timeout_sec = 3600`.
-- No other models for generating, benchmarking, or ship/report decisions. Dev mode (below) is plumbing only.
+- Models are configurable under the revised README/AGENTS.md; keep one declared pair and judge per batch. Dev mode (below) is plumbing only.
 - Only valid failures count.
 
 **Dev mode: a cheap model for plumbing iterations**
@@ -262,7 +264,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 2. **Exact curtailment** (`decide()`): stop as soon as the 5-run verdict can't change. Accept at ≥1 legit pass and ≥2 fails (the maximum final passes is then 5 − fails ≤ 3). Reject at 4 passes or 5 fails. **The verdict is identical to running all 5.** For transparency, every report entry shows `k/n` and states that the verdict is guaranteed. If the budget allows at the end, shipped tasks are topped up to a full 5/5 record.
 3. **Judge as you go.** Run the failure judge and pass audit after *each* Opus trial, not at the end. An *invalid* failure (spec ambiguity, test overreach, env issue, turn cap) or a hacked pass means the task can't ship as-is. **Stop calibrating it immediately** and send it to repair. Don't spend the remaining trials on a broken task.
 4. **Order by promise.** Calibrate the candidates whose blueprint has the best alignment and rubric scores (and Sonnet-predicted pass rate near 0.5) first, so the budget goes to the likeliest learnable tasks.
-5. **Target-driven batches.** Stop generating once the target number of learnable tasks is reached (README: 10+). Don't run a fixed N if the target is already met.
+5. **Target-driven batches.** The README asks for a batch aiming at 10+ generated tasks/candidates, not 10+ shipped tasks. Report fresh generations separately from reused/recalibrated packages. Ship only eligible in-band versions; do not inflate generated or shipped counts to meet a target.
 
 **Scale in steps, not all at once**
 - Batch sizes go 1 (Phase 0 spike) → 3 (pilot) → ~10 → ~12-15. After each step, compute **cost per learnable task** and the funnel yield, and decide the next batch size from those numbers.
@@ -283,7 +285,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 92 / 94 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 88 / 113 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -375,7 +377,7 @@ Red-team (part of "how we know tasks are good")
 
 Stretch B: difficulty tuning
 - [x] `analysis/tuner.py`: knob → lever → regenerate (≤2 rounds), with each mutation and its effect logged. Done: `scripts/tune_candidates.py` runs it on near-misses whose failures were all valid, and ships tasks that land in band.
-- [x] 💲 Run the tuner on every Batch 1 near-miss (0/5 with valid failures, 4-5/5). Record how many moved into the band.
+- [ ] 💲 Audit the tuner runs on Batch 1 near-misses (0/5 with valid failures, 4-5/5). Record eligible, attempted, gate-failed and recalibrated counts and how many moved into the band. Implementation and attempted runs exist; successful difficulty adjustment is not yet established.
 
 Stretch C: diversity
 - [x] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells. Done: `run_batch` samples inverse-frequency against every earlier candidate's spec.
@@ -391,25 +393,25 @@ Batch 2
 
 Part 3: pipeline metrics
 - [x] `analysis/report.py`: funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, total cost and wall time. Writes `reports/summary.md` + JSON. Done: funnel, histogram, cost/time, per-batch table, diversity, novelty, curtailment, human-likeness; regenerated from evidence on every run.
-- [x] Reconcile ledger spend against `make usage-json` (within 10%), and state the total in the report.
+- [ ] Reconcile ledger spend against `make usage-json` (within 10%), and state the total in the report. Reopened: identifying a discrepancy and choosing the key as authoritative did not reconcile it; its cause is not yet verified.
 
 Stretch A: cost-efficient evaluation
-- [x] Curtailment savings: trials run vs naive 5× per task, in $ and %.
+- [ ] Curtailment savings: trials run vs naive 5× per task, in $ and %. Trial-count percentages exist; audit the dollar calculation and separate exact-curtailment savings from early stops on invalid tasks before claiming completion.
 ~~- [ ] Simulation over the observed per-task p: expected savings and the effect of the optional aggressive 0/3 early reject (reported only, not used for shipping).~~ skipped: the report already shows the measured curtailment saving; the simulation was optional and time went to shipping.
 - [x] Predicted-vs-observed pass rate: correlation of Sonnet's blueprint-time prediction with the Opus outcome, and whether it would work as a pre-filter.
 
 Stretch D: human-likeness
-~~- [ ] 💲 Score generated tasks and `examples/` with the same TB 19-criterion rubric (`harbor check`), shown side by side.~~ skipped: stretch D was optional and budget went to shipping tasks.
-~~- [ ] 💲 Blinded "which is human-written?" discrimination test, with accuracy reported (≈50% means indistinguishable).~~ skipped: stretch D, optional.
-~~- [ ] Stylometrics: instruction length, bullets, headers and emphasis words, ours vs examples.~~ skipped: stretch D, optional.
-~~- [ ] `analysis/human_likeness.py` section in the report.~~ skipped: stretch D, optional.
+- [ ] Audit the existing generated-vs-example quality table with the same actual 16-criterion rubric, model and settings; distinguish cached historical scores from comparable new scores. The report contains a table, so "skipped" was incorrect; do not call it a 19-criterion evaluation.
+- [ ] 💲 Run a blinded human-written vs generated-instruction discrimination experiment: shuffle identities with a recorded seed, save labels/predictions, report accuracy and uncertainty, and disclose that examples were provided as format references. Near-chance accuracy is not proof of indistinguishability.
+- [x] Stylometrics: instruction length, bullets, headers and emphasis words, generated vs examples. Already present in `reports/summary.md`; the previous skipped annotation was incorrect. Audit provenance in the finish checklist.
+- [x] `analysis/human_likeness.py` section in the report. The quality comparison and stylometrics are present; the full stretch goal remains partial until the blinded evaluation is completed.
 
 Verification (see "Verification" below)
 - [x] `uv run pytest` and `uv run ruff check .` pass.
-- [x] Every task in `output/` passes `bash scripts/validate.sh`, and an independent oracle (3/3) and nop re-run.
-- [x] Every shipped task has its calibration record and a valid-failure explanation in `reports/summary.md`.
-~~- [ ] 💲 Spot-check reproducibility: rerun one shipped task 5× naively (budget permitting).~~ skipped: independent oracle 3/3 + nop were re-run instead; a 5x naive spot-check was not affordable in the time left.
-~~- [ ] 💲 If budget remains above the reserve, top up shipped tasks to full 5-run records.~~ skipped: the exact-curtailment verdict is lossless; topping up was optional.
+- [ ] Every task in `output/` passes `bash scripts/validate.sh`, and an independent oracle (3/3) and nop re-run **from a fresh clone after all packaging edits**. Earlier local checks do not prove the committed Git-history fixture still works.
+- [ ] Every shipped task has an immutable, package-hash-bound calibration record and a valid-failure explanation in `reports/summary.md`. Reopened: manual shipping, overwritten source records and live-report counts disagree.
+- [ ] 💲 Spot-check reproducibility: rerun one eligible shipped task 5× naively with the fixed solver settings; publish all outcomes, including invalid runs or a changed band. Independent oracle/nop checks do not establish solver reproducibility.
+- [ ] 💲 Top up curtailed shipped calibrations to 5 actual judged attempts on the identical package. A curtailed 1/3 verdict guarantees a pass-count interval, not that unseen trials would have valid failures or honest passes. Hold or withdraw a package if the additional attempts reveal invalidity.
 
 Deliverables
 - [x] `CHANGELOG.md` complete: every phase, measured numbers, spend per phase, tradeoffs, honest failures.
@@ -431,23 +433,43 @@ After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for 
 - [x] Research-paper-format report `docs/study-report.md` (abstract, intro, method, results, discussion, threats to validity, conclusion), presentation deck `docs/study-deck.pptx` (or a Marp/HTML deck if pptx is not practical), and updated `docs/architecture.md`, `README.md` and `CHANGELOG.md`.
 ~~- [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).~~ skipped: optional, and the shipped tasks are already banded for their own calibrator.
 
-### Run: one strong model in every role, shipping to `output/` (`openai/gpt-5.6-luna` after the speed test; started with `google/gemini-3.8-flash`)
+### Historical run: Gemini → Luna → Luna author / GPT-5.4-mini solver
 
 Goal: tasks that fit the trial's band (1-3 of 5 passes for the calibration model, valid failures only), authored and calibrated by the same strong model, a "professors helping professors" setup whose tasks can serve as a benchmark and as training data. Sonnet 4.6 -> Opus 4.8 gave 0 of 9 in band. **Final pairing (this run shipped 3 tasks).** `google/gemini-3.8-flash` (the start of this run) was too slow; the five-model speed test (`docs/model-speedtest.md`) picked `openai/gpt-5.6-luna` (about 76% on TB 2.1 with the Codex harness, $0.20/$1.20 per M tokens) as author, reviewer, quality checker, red-team and judge, and **`openai/gpt-5.4-mini`** (about 60% on TB 2, $0.75/$4.50) as the calibration solver, since a strong author writing for a somewhat weaker same-brand solver should put more tasks in the band. `CALIBRATE_FIRST=1`, a 60-turn authoring cap, `QUALITY_ADVICE_ONLY=behavior_in_tests`, `OPUS_CONCURRENCY=6` and `ORACLE_RUNS=2` via `.env` (defaults unchanged). **Shipped: `output/repair-log-replay-sql` (1/3), `output/optimize-policy-decision-audit` (3/5), `output/repair-attributed-funnel-service` (3/5), all valid failures, each re-verified (`validate.sh`, independent oracle 3/3, nop 0).** Outcome and funnel in `docs/findings.md` section 6 and `reports/summary.md`. **Model at the start (context):** `google/gemini-3.8-flash`, about 89% on Terminal-Bench 2.1, tool calls supported, $0.75/$3.75 per M tokens, used for blueprint and review, authoring, quality check, red-team, judges and the calibration solver (terminus-2, 5 trials, exact curtailment); set with `GENERATOR_MODEL` and `EVAL_MODEL`. Every result records the model.
 
 **Novelty pool (user decision):** the novelty reference is Terminal-Bench 2.1 (`data/tb-reference/terminal-bench-2-1`, 89 tasks) plus `examples/` only, because the model was scored on TB 2.1. The latest/4.0 set, Pro and Science are not compared for this run (they stay on disk; `NOVELTY_SETS` selects the sets). Thresholds (13-gram, cosine 0.70, the semantic judge) are unchanged. Tradeoff: a task close to a 4.0, Pro or Science task would no longer be flagged automatically. The README rule against reusing or adapting any public task still applies.
 
-Budget: this run was capped at $150 on top of ~$176 already spent, inside the $400 account ceiling. **Spend:** the key's authoritative total is $209.17 spent / $290.83 remaining (`make usage`, 2026-10-13 15:20); this run's models cost $10.43 in the ledger. The ledger's cross-label official total ($524.62) over-counts: it recorded estimated costs during the earlier high-burn period, so the key is the source of truth.
+Budget: this run was capped at $150 on top of ~$176 already spent, inside the $400 account ceiling. **Historical snapshot:** the key showed $209.17 conservative spent / $290.83 remaining; this run's model-labelled ledger estimated $10.43. The cross-label ledger total ($524.62) did not reconcile with that key snapshot. Earlier entries attributed the discrepancy to estimated costs during a high-burn period, but that cause has not been verified. Retain the raw counters and investigate comparable scopes before claiming reconciliation.
 - [x] Novelty pool (`f5e42db`): `NOVELTY_SETS` (unset = every set; `terminal-bench-2-1` set in `.env` for this run; `examples/` always included) applied at every layer (concept list, blueprint gate, final-package re-check, diversity report); the report states the sets used. Unit-tested (an excluded set no longer flags a near-copy, an included one does).
 - [x] Model plumbing (`f5e42db`): `GENERATOR_MODEL` / `EVAL_MODEL` reach blueprint, authoring, quality check, red-team, judges, novelty judge and calibration; `config.assert_official_models()` accepts the configured pair (refuses dev mode); the model is recorded in ledger events, calibration records, shipped-task READMEs and `reports/summary.md`. Unit-tested.
 - [x] 💲 Probe `gemini-3.8-flash` in every role (done; plus the five-model speed test in `docs/model-speedtest.md`); the run switched to `luna` author / `gpt-5.4-mini` calibrator (`docs/findings.md` section 6). (blueprint, authoring round, terminus-2 trial, failure judge, red-team); record speed, cost and any JSON or tool-format problem, and fix what breaks.
 - [x] Difficulty-by-construction levers (verify-time inputs from a hidden seed, multi-stage dependent work, a shallow-self-check trap, long-horizon or large inputs) in the spec, blueprint and tuner guidance. Unit-tested.
 - [x] 💲 Pilot: 3 candidates through the full pipeline; funnel, time and cost per task. Go/no-go at ~$40 per in-band task.
 - [x] 💲 Batch of 10+ candidates (20 through the pipeline) with `openai/gpt-5.6-luna` authoring and `openai/gpt-5.4-mini` calibrating; exact curtailment, every trial judged, tuner on near-misses; **1 task shipped** (`output/repair-log-replay-sql`, 1/3 valid).
-- [x] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation with an instruction quote, novelty check, canary placement, `timeout_sec = 3600`.
+- [ ] Every shipped task: fresh-clone validation, independent oracle 3/3 and nop, hash-bound calibration, valid-failure explanation with an instruction quote, novelty check, canary placement, `timeout_sec = 3600`. Previous local verification recorded; final audit pending.
 - [x] `reports/summary.md` regenerated for this run's model label: funnel, histogram, cost/time, diversity, novelty (TB 2.1 + examples), compared with Sonnet -> Opus (0 of 9) and luna -> luna (0 shipped).
 - [x] Stretch goals as time allows (A curtailment savings, C diversity, B tuner results, D human-likeness); skipped items stated.
 - [ ] Docs: `docs/findings.md`, `docs/architecture.md`, `README.md`, `CHANGELOG.md` updated with the outcome, spend and decisions.
+
+### Submission readiness: evidence, reproducibility and final results
+
+**Objective:** finish the modified work trial properly, not merely obtain a green checklist. Prioritize the existing shipped packages over further generation. Keep the chosen models and TB 2.1 + `examples/` novelty pool; disclose model changes and the limited automatic novelty scope. Earlier runs are observations, not controlled proof that author strength caused the outcome.
+
+**Order:** freeze evidence → verify shipping → fix reporting/accounting → complete measured stretch evaluations → consolidate report/deck → clean-clone handoff. This is a plan, not authorization to start paid jobs now. Use `make usage` before/after paid steps, respect the $400 account ceiling and $75 reserve, estimate new verification costs before running, and ask for approval where AGENTS.md requires it. Do not silently relax quality gates or hide contrary results to reach completion.
+
+- [ ] Inventory every current `output/` directory, including later background outputs, and classify it as pending audit, approved or withdrawn. Recover the exact calibration package/version and map its source candidate, model label, settings and content hash. Preserve original evidence before any edits; never infer approval from a directory name or an earlier goal verdict.
+- [ ] Persist `output/<task>/calibration.json` and a verification record with trial outcomes, audit/judge labels, verbatim instruction quotes, dates, source evidence paths and package hashes. Check quoted requirements actually occur in the instruction and manually inspect each claimed valid failure and honest pass. Add regression tests preventing shipping a different hash/model or a task with invalid/hacked runs.
+- [ ] Resolve blocking quality findings for every shipped task: test↔instruction coverage both ways, deterministic verification, leakage/reward hacking, novelty and canary placement. Audit answer-bearing alternate implementations in environments. A `behavior_in_tests` advisory override is not evidence that a coverage gap is harmless. If a package changes, rerun the affected gates and recalibrate the new hash; if it cannot qualify, preserve its history but remove it from the approved set and report the reason.
+- [ ] Restore generated Git-history fixtures reproducibly in the actual shipped package (e.g. a bundled history restored during Docker build), not only the candidate archive. Test checkout contents/history from committed files; never rely on local `.git/`, host files, pre-existing images or mutable unpinned dependencies. Revalidate after the packaging fix because previous verification predates removal of an embedded `.git/`.
+- [ ] Fix report provenance and counts: no hard-coded Opus headings; filter all evidence by declared models and package versions; derive approved shipped counts from immutable output records rather than mutable candidate calibrations. Distinguish fresh generated specs, reused packages, repair versions, incomplete/rejected candidates and unique approved tasks; avoid counting successes from unrelated versions as one cumulative success funnel. Add report tests covering manual shipping, later repairs and model-pair isolation.
+- [ ] Fix spend reconciliation without altering historical raw events: investigate estimated vs charged prices, cache-token accounting, retries, excluded/incomplete jobs, shared-key usage and counter lag. Publish timestamped key snapshots, comparable-period deltas, per-model/stage estimates and residual differences. Meet the 10% target if evidence permits; otherwise mark reconciliation unresolved and state the measured gap, not an invented cause. Separately report wall-clock time, summed stage-minutes and parallelism.
+- [ ] Establish consistency for Parts 1–3: document an auditable 10+ candidate generation batch, then confirm approved task packages satisfy the full gates and 1–3/5 criterion for GPT-5.4-mini. Summarize observed yield, failure causes, cost/time per candidate and per approved task, and uncertainty. Run the fresh-clone and five-attempt checks above; do not claim general reliability from a few selected successes.
+- [ ] Complete stretch A accounting and stretch C provenance: quantify exact-curtailment savings separately from invalid-run early stops (trials, estimated dollars and percentages); retain the exhaustive simulation and predictor correlation with limitations. Audit diversity coverage, within-batch duplication and novelty against the selected reference sets; report versions/counts and do not present the reduced reference scope as comprehensive public-task decontamination.
+- [ ] Complete stretch B evidence: produce a before/after table for every eligible tuning experiment with package hashes, mutation, gates, calibration, cost and time; distinguish repair from difficulty tuning. Seek a valid out-of-band → in-band transition within an approved spend allocation. If none occurs, report a measured negative result and label successful tuning as not demonstrated rather than achieved.
+- [ ] Complete the stretch D audit/blinded experiment above and classify each component separately: rubric comparison, stylometrics and discrimination. Save reproducible inputs, randomization and predictions; show sample sizes, confidence intervals and judge/reference bias. Do not equate polished formatting or near-chance predictions with proven human-likeness.
+- [ ] Create **one detailed, self-contained report** at `docs/result/report.md`: executive summary; requirement-by-requirement and stretch A–D status matrix (achieved/partial/not demonstrated, with evidence); final models/settings/novelty scope; architecture and design rationale; method and model speed-selection; fresh/reused candidate funnel; per-task pass records and valid-failure explanations; all quality and fresh-clone checks; tuning, diversity and human-likeness experiments; reconciled costs and wall time; earlier failed pilots; limitations, reproducibility commands, implications for training/benchmark use, references and detailed appendices. All essential details must be in this document; links to raw evidence supplement rather than replace them. Report latest audited output counts, not stale historical three-task claims.
+- [ ] Create an **easy-to-present 10–12-slide deck** at `docs/result/presentation.pptx` plus `docs/result/presentation.html` (offline, arrow-key navigation, no server needed): one claim per slide, large readable charts, little text, consistent layouts and presenter notes/Q&A. Cover problem, revised model choice, pipeline, validation, candidate funnel, approved task example, failures, stretch-goal status, cost/time, limitations and next steps. Derive figures from the same audited report data; render and visually inspect every slide, and test browser navigation. Do not reuse the old study deck as if it described final results.
+- [ ] Final handoff: add `docs/result/README.md` linking the report/deck and naming the audited revision; update root README, findings and architecture to the final pairing/results and link `docs/result/`. Run tests/lint, fresh-clone validation, history-secrets and embedded-gitlink checks; preserve raw evidence and fix stale references. Commit/push all deliverables, update checklist counts in the same commit, and ensure claimed results agree across output records, report, slides and changelog. Unresolved items stay open or explicitly partial; a high progress percentage is not proof of completion.
 
 ## Key tradeoffs (to document in the CHANGELOG)
 

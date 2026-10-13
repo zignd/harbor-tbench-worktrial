@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 15:49 -03:00 · Verification-first finish plan and consolidated submission documents
+- Updated `docs/plan.md` to retain the approved Luna → GPT-5.4-mini pairing and reopen unsupported completion claims: cost reconciliation, tuning outcomes, dollar savings, final-package verification and immutable calibration evidence. Corrected the stretch-D "skipped" annotations because quality comparisons and stylometrics already exist; the blinded experiment remains pending.
+- Added a submission-readiness checklist prioritizing exact-package evidence, blocking quality issues, reproducible Git fixtures, fresh-clone testing, full five-attempt records, report counts/model labels, comparable-period cost accounting and measured stretch A–D outcomes. Historical raw evidence stays intact; contradictory or negative results must be reported.
+- Planned one self-contained detailed report at `docs/result/report.md` and a short 10–12-slide interview deck at `docs/result/presentation.pptx`, with an offline browser version and presenter notes. A status/evidence matrix will distinguish achieved, partial and not demonstrated; earlier study documents remain historical sources.
+- Progress is now 88/113 (25 open), reflecting the actual verification work left rather than near-completion by unchecked assumptions. This commit changes the plan only; it starts no paid runs and creates no new report or deck yet.
+
 ### 15:39 -03:00 · Commit the 22 candidate evidence directories
 - Added the 22 candidate records for `openai/gpt-5.6-luna|openrouter/openai/gpt-5.4-mini`, with designs, current packages, saved attempts, reviews and available calibration results. `runs/candidates/README.md` provides a clickable index; `evidence-manifest.json` records snapshot statuses and package hashes.
 - These are candidate attempts, not 22 complete or independently generated tasks: some were rejected, and `-m` copies reuse earlier authored packages for a new calibration model. Other model pairs and unrelated untracked outputs are not included in this commit.

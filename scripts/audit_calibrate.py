@@ -18,6 +18,7 @@ from evaluator.harbor_runner import run_with_retries
 from generator.config import EVAL_MODEL, MODEL_LABEL
 
 TRIALS = 5
+MAX_TURNS_CAP = 100  # calibration turn cap; exhausting it makes a trial invalid
 
 
 def main() -> int:
@@ -39,6 +40,7 @@ def main() -> int:
             "outcome": t.outcome,
             "reward": t.reward,
             "turns": t.n_episodes,
+            "max_turns": MAX_TURNS_CAP,
             "minutes": round(t.seconds / 60, 1),
             "trial_cost_usd": round(t.priced_cost(), 4),
         }

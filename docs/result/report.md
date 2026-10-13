@@ -95,16 +95,22 @@ Four directories were previously placed in `output/`. A strict re-audit found:
 
 All four were archived **unchanged** to `runs/audit-20261013/original-output/` and moved to `runs/audit-20261013/pending/`. No evidence was deleted; the old claims are preserved as history.
 
-### 6.4 Yield
+### 6.4 A systemic finding: wall-clock performance is an invalid difficulty lever
+Two of the strongest candidates relied on a stated wall-clock performance budget ("under six seconds", "elapsed < 12", a 20-second dense-export time). The `harbor check` rubric correctly rejects these as **environment-dependent (invalid) failure modes**: a correct solution can fail under host load. This is the same tension the plan flags ("no hidden limits or timeouts"). Both tasks were repaired to remove the timing gate and keep a correctness/equivalence check on large inputs. Consequence: performance-based difficulty must be expressed deterministically (query-plan/operation checks) or dropped.
+
+### 6.5 Yield
 Stage counts for the current package hash are in `reports/summary.md`. The in-band rate is low: of 17 calibrated candidates, 3 were learnable. Cost per in-band task was correspondingly high, so the plan's own go/no-go (~$40 per in-band task) was met only weakly. This is reported honestly rather than tuned away.
 
 ---
 
 ## 7. Approved task (audit outcome)
 
-_Pending the Docker gate run recorded in `docs/result/evidence/usage-after-packager-gates.txt` and `docs/result/evidence/audit-packager-*.json`._ The repaired `releaseforge` task is the audit candidate: it passed re-authoring (12 turns), made verification fully offline (pinned `uv==0.9.5`, `uvx --offline`, pytest cached at build), generates a 6000-artifact fixture at build time, and asserts canonical fields and the stated 6-second budget. Its quality, oracle 3/3, nop and full five-attempt calibration are recorded in `docs/result/verification.json`.
+Two audit candidates were brought to full quality approval; approval also requires structure, oracle 3/3, nop and **five judged attempts in the 1–3 band with valid failures only**.
 
-If the five attempts do not land 1–3 with valid failures only, the task is **not** approved and the reason is stated in `docs/result/verification.json`; the goal then reports a measured negative rather than a shipped task.
+- **`releaseforge` (repaired):** quality approved after removing the timing gate and expanding to 15 deterministic tests; structure, oracle 3/3 and nop pass. **Calibration: 0/5 — too hard** for GPT-5.4-mini, and at least one failure judged invalid (`docs/result/evidence/packager-final-calibration.json`). **Not approved** (out of band).
+- **`optimize-policy-decision-audit` (repaired):** wall-clock gate removed, keeping the correctness/equivalence refactor. Its original five trials were 3/5 with honest passes and valid quoted failures; re-approval requires a fresh quality pass, oracle/nop and a full recalibration on the changed package.
+
+The final per-task verdict, package hashes and check results are in `docs/result/verification.json`. If neither lands 1–3 with valid failures after repair, **no task is approved** and this document states that plainly rather than shipping a weak task.
 
 ---
 
@@ -145,7 +151,26 @@ Per-scope ledger estimates (newest scope is this run):
 | official Luna→Luna (historical) | 3.99 | 10.3 | 450 |
 | **official Luna→GPT-5.4-mini (this run)** | 12.48 | 11.2 | 526 |
 
-Account key: conservative spend **$211.35**, usage counter $188.74, remaining **$288.71** at the start of the audit (`docs/result/evidence/usage-*.txt`). **Spend reconciliation is open:** the ledger's Sonnet→Opus scope alone (*$502*) exceeds the key's total (*$211*), so the ledger over-counts across scopes. The key is authoritative; the cause (estimated per-token prices during the earlier high-burn period vs the key's billing) is not fully verified, so the plan's reconciliation item stays open. Wall-clock time is reported separately from summed stage time.
+### 10.1 Reconciliation against the account key
+
+The account key is authoritative: conservative spend **$211.76**, usage counter $188.74, remaining **$288.24**. The local ledger's raw total is **$544.19** over 2,391 events and 110.5 summed stage-hours — a residual of **$332.43 (61%)**. Per raw mode/model scope:
+
+| Scope (mode · model) | Ledger est. USD | Summed stage-hours | Events |
+|---|---|---|---|
+| official · unlabeled (Sonnet→Opus era) | 502.20 | 51.9 | 1,036 |
+| official · `openai/gpt-5.6-luna` author + GPT-5.4-mini solver | 16.47 | 21.5 | 976 |
+| study · unlabeled | 16.95 | 30.7 | 218 |
+| official · `google/gemini-3.8-flash` | 7.99 | 3.7 | 121 |
+| dev · unlabeled | 0.57 | 2.7 | 10 |
+| speedtest · Gemini | 0.00 | 0.0 | 30 |
+
+**What reconciles.** Over the audit window bracketed by consecutive `make usage` snapshots, the independently priced per-step costs recorded by the audit scripts sum to **$0.4778** against a key delta of **$0.4551** — a ratio of **1.05**, inside the 10% target (`evidence/reconciliation-audit-window.json`). Counter lag is the only systematic offset; snapshots were taken ~1–2 min after each paid step.
+
+**What does not reconcile, and why it stays open.** The entire residual sits in the **unlabeled historical era** ($502.20 across 1,036 events), which predates the model labeling this audit introduced. Investigated causes that can be ruled out: retries are separate ledger rows and are not double counted; excluded and incomplete trials carry their own rows; shared-key use by other projects would push the key *above* the ledger, not below. Causes that **cannot** be verified because the data was not retained: per-event token counts and cache-token usage, so the estimated-price vs actual-charge gap cannot be recomputed; pricing tier changes during the earlier period. The plan's reconciliation item therefore remains **open with a measured gap**, not explained away. Raw snapshots, per-scope and per-stage estimates and the residual are published in `evidence/reconciliation.json` and `evidence/reconciliation-windows.json`; no raw ledger event was modified.
+
+### 10.2 Wall-clock versus summed stage time
+
+Summed stage time (110.5 h across all modes) is an upper bound, not elapsed time: gates, authoring and calibration overlapped under bounded concurrency (≤3 calibration trials). Observed elapsed work for this audit was ~2 h wall-clock from the start snapshot, of which the majority was Docker builds and model turns.
 
 ---
 

@@ -126,3 +126,19 @@ def test_generic_numbers_are_not_distinctive_tokens(tmp_path):
     (task / "instruction.md").write_text("Fix it.")
     tokens = leak_scan.distinctive_tokens(task)
     assert set(tokens) == {"482913657"}
+
+
+def test_unstated_interfaces_are_flagged():
+    from validator.lint import unstated_interfaces
+
+    tests = (
+        'subprocess.run(["/usr/local/bin/audit", "--strict"])\n'
+        'requests.get("http://127.0.0.1:8085/healthz")\n'
+        'open("/opt/svc/out/report.json")\n'
+    )
+    instruction = "Run the audit tool at /usr/local/bin/audit and keep the report in /opt/svc/out."
+    missing = unstated_interfaces(instruction, tests, "", set())
+    assert "port 8085" in missing and "flag --strict" in missing
+    assert not any(m.startswith("path") for m in missing)  # both paths are stated
+    # discoverable in the environment is fine
+    assert unstated_interfaces(instruction, tests, "usage: audit --strict  port 8085", set()) == []

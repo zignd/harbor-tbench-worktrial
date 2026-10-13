@@ -39,6 +39,42 @@ WRITE_CMD = re.compile(
 )
 
 
+# Interfaces the tests rely on must be stated: `harbor check` fails a package whose tests use
+# a path, port or flag the instruction never mentions (it measured behavior_in_task_description
+# failures on most luna-authored packages, each costing a ~6 minute repair round and a recalibration).
+_TEST_PATH = re.compile(
+    r"(?<![\w.\-/])(/(?:opt|usr/local|srv|app|var/lib|var/log|etc|home|root)/[\w.\-/]*[\w.\-])"
+)
+_TEST_PORT = re.compile(
+    r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{4,5})\b|\bport\W{1,4}(\d{4,5})\b", re.IGNORECASE
+)
+_TEST_FLAG = re.compile(r"(?<![\w-])(--[a-z][a-z0-9]*(?:-[a-z0-9]+)*)")
+PATH_SKIP = ("/tests", "/logs", "/tmp", "/proc", "/dev")
+
+
+def unstated_interfaces(
+    instruction: str, tests: str, env_text: str, env_names: set[str]
+) -> list[str]:
+    """Paths, ports and flags that tests/test_outputs.py uses but neither instruction.md nor the
+    environment (file names, contents, Dockerfile) mentions, so the solver cannot know them."""
+    known = instruction + "\n" + env_text
+    out = []
+    for m in sorted(set(_TEST_PATH.findall(tests))):
+        if m.startswith(PATH_SKIP) or m in known or Path(m).name in env_names:
+            continue
+        if any(m.startswith(k.rstrip("/") + "/") for k in re.findall(r"/[\w.\-/]*[\w\-/]", instruction)):
+            continue  # inside a directory the instruction names
+        out.append(f"path {m}")
+    for groups in sorted(set(_TEST_PORT.findall(tests))):
+        port = next(g for g in groups if g)
+        if port not in known:
+            out.append(f"port {port}")
+    for flag in sorted(set(_TEST_FLAG.findall(tests))):
+        if flag not in known:
+            out.append(f"flag {flag}")
+    return out
+
+
 def _read(path: Path) -> str:
     return path.read_text(errors="replace") if path.exists() else ""
 
@@ -121,6 +157,20 @@ def lint_task(task_dir: Path, canary_line: str) -> list[Finding]:
             for lineno, line in enumerate(_read(path).splitlines(), 1):
                 if SUGGESTIVE.search(line):
                     findings.append(("error", f"suggestive comment {rel}:{lineno}: {line.strip()}"))
+
+    # Every interface the tests use must be stated (or discoverable in the environment).
+    env_files = [p for p in env.rglob("*") if p.is_file() and "__pycache__" not in p.parts]
+    env_text = dockerfile + "\n".join(_read(p) for p in env_files if p.stat().st_size < 400_000)
+    missing = unstated_interfaces(instruction, tests, env_text, {p.name for p in env_files})
+    if missing:
+        findings.append(
+            (
+                "error",
+                "tests use interfaces the instruction never states (add each to instruction.md as "
+                "an observable requirement, or make the environment show it): "
+                + "; ".join(missing[:8]),
+            )
+        )
 
     # Tests check outcomes, not implementation.
     if SOURCE_GREP.search(tests):

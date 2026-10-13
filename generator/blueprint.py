@@ -71,7 +71,8 @@ And what makes strong agents fail for valid reasons once it is hard:
 - They implement partially: they fix or build the obvious part and miss the rest. Make the levers
   interact so a partial solution looks done.
 - They don't explore: put the key facts in the environment (code, data, logs), not the instruction.
-Every requirement the tests check must still be stated in the instruction. The solver must be able to
+Every requirement the tests check must still be stated in the instruction: list in "tests" each check together with the
+instruction sentence that states it (paths, names, ports, flags, formats, fields included). The solver must be able to
 succeed from the instruction plus what it can discover in the container.
 - State requirements as observable end states, never as descriptions of the defect. Bad: "refunds must not
   match an arbitrary charge of the same amount" (names the bug). Good: "each refund offsets the charge it

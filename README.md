@@ -6,7 +6,7 @@ Terminal-Bench 2 evaluates AI agents on coding tasks. An agent gets an instructi
 
 Now build the other side: **a pipeline that generates the tasks themselves.**
 
-A generated task is only useful if it sits in the right difficulty band. Too easy and every model solves it. Too hard and none do. The sweet spot is a **learnable** task: when run 5 times with `terminus-2` using `claude-opus-4.8`, exactly 1 to 3 out of 5 runs pass all tests. Generate tasks with `claude-sonnet-4.6` and benchmark difficulty only against `claude-opus-4.8`. Use no other models for either. Your pipeline should produce tasks that consistently land in this range.
+A generated task is only useful if it sits in the right difficulty band. Too easy and every model solves it. Too hard and none do. The sweet spot is a **learnable** task: when run 5 times with `terminus-2` using the calibration model (default `claude-opus-4.8`), exactly 1 to 3 out of 5 runs pass all tests. The authoring model (default `claude-sonnet-4.6`) and the calibration model are **open**: any model that supports tool calls may be used (prefer ones with a published Terminal-Bench score), as long as every result records which models produced it. *(Changed from the original spec, which fixed Sonnet 4.6 and Opus 4.8 and allowed no other models.)* Your pipeline should produce tasks that consistently land in this range.
 
 ## What's Provided
 
@@ -65,7 +65,7 @@ Verify by running the structural validator and by checking generated tasks again
 
 This is the core deliverable.
 
-A task is learnable if, when run 5 times with `terminus-2` using `claude-opus-4.8`, exactly 1 to 3 runs pass all tests. Tasks where 0 runs pass are too hard. Tasks where 4-5 runs pass are too easy.
+A task is learnable if, when run 5 times with `terminus-2` using the calibration model (default `claude-opus-4.8`), exactly 1 to 3 runs pass all tests. Tasks where 0 runs pass are too hard. Tasks where 4-5 runs pass are too easy.
 
 Build a pipeline that produces learnable tasks. Your system should:
 

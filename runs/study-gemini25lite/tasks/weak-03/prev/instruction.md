@@ -1,0 +1,1 @@
+Hey, could you help me test this new SQL migration binary? It's supposed to move customer data over, but I'm worried about accuracy, especially with some of the older, weirder records. Can you ensure it handles everything correctly and doesn't break anything? We need to be confident this migration is clean.

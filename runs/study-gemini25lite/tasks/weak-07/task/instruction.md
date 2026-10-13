@@ -1,0 +1,1 @@
+Hey, I've got this SQLite DB with some transaction data that looks a bit messy. Seems like the import script might have messed up some duplicate entries or maybe linked them incorrectly. Can you take a look and make sure each transaction is unique and correctly accounted for? I need a clean table at the end.

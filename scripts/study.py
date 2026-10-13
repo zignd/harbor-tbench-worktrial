@@ -45,8 +45,8 @@ from generator.spec import TaskSpec, sample_specs
 # hidden reasoning tokens per authoring step (3-6 min each). Partial evidence is archived in
 # runs/study-deepseek-partial/. Override with STUDY_WEAK / STUDY_STRONG.
 MODELS = {
-    "weak": os.environ.get("STUDY_WEAK", "google/gemini-2.5-flash-lite"),
-    "strong": os.environ.get("STUDY_STRONG", "google/gemini-3-flash-preview"),
+    "weak": os.environ.get("STUDY_WEAK", "google/gemini-3.5-flash-lite"),
+    "strong": os.environ.get("STUDY_STRONG", "google/gemini-3.7-flash"),
 }
 SEED = 2026
 SOLVE_TRIALS = 5
@@ -73,8 +73,18 @@ class CapReached(RuntimeError):
     pass
 
 
+def study_started() -> str:
+    """When this study's directory was first used: its spend cap counts from here."""
+    marker = STUDY_DIR / "started_at"
+    if not marker.exists():
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(datetime.now(UTC).isoformat(timespec="seconds"))
+    return marker.read_text().strip()
+
+
 def study_spent(ledger: Ledger) -> float:
-    return ledger.total_cost(mode="study")
+    since = study_started()
+    return sum(e.cost_usd for e in ledger.events(mode="study") if e.ts >= since)
 
 
 def guard(ledger: Ledger, expected: float, cap: float = CAP_USD) -> None:
@@ -304,7 +314,7 @@ def write_results(ledger: Ledger, n_specs: int) -> None:
         tasks = collect()
         summary = summarize(tasks)
         _write(STUDY_DIR / "results.json", {
-            "meta": {"pair": "gemini", "models": MODELS, "seed": SEED, "n_specs": n_specs, "cap_usd": CAP_USD,
+            "meta": {"pair": "-".join(m.split("/")[-1] for m in MODELS.values()), "models": MODELS, "seed": SEED, "n_specs": n_specs, "cap_usd": CAP_USD,
                      "solve_trials": SOLVE_TRIALS, "solve_max_turns": SOLVE_MAX_TURNS,
                      "study_spend_usd": round(study_spent(ledger), 4),
                      "updated": datetime.now(UTC).isoformat(timespec="seconds"),

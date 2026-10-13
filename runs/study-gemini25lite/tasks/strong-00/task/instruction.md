@@ -1,0 +1,5 @@
+Our internal proxy service is currently unprotected against traffic bursts. You must implement a thread-safe, leaky-bucket rate limiter in /app/limiter/limiter.go that strictly adheres to the RateLimiter interface defined in /app/limiter/interface.go.
+
+Your implementation must support a configurable rate (requests per second) and bucket capacity (burst size), ensuring that no request is processed if the bucket is full. The implementation must be highly performant: it must handle a sustained load of 50,000 concurrent goroutines with sub-millisecond overhead per decision while maintaining exact mathematical precision of the leak rate over long durations. Use nanosecond granularity for all time-based calculations.
+
+The final service must pass the audit script at /app/audit_traffic.sh which simulates various attack and usage patterns. The average overhead per Allow() call under high contention must be less than 500ns. Ensure the system correctly handles clock drift and potential overflow in duration calculations.

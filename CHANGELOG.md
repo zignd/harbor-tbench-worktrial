@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 08:36 -03:00 · Model constraint opened in README.md and AGENTS.md
+- **What:** the rule that only Sonnet 4.6 (authoring) and Opus 4.8 (calibration) may be used is removed from `README.md` and `AGENTS.md` (the user's decision). Any tool-calling model may author, judge, red-team or calibrate; defaults stay Sonnet 4.6 and Opus 4.8. The band is now defined relative to the calibration model.
+- **Guardrails kept:** every result must record which models produced it, one fixed calibration model and judge per batch, no mixing of models inside one funnel without labels, prefer models with a published Terminal-Bench score, no embedding models in the novelty path, dev mode still never ships.
+- **Not changed (yet):** `config.assert_official_models()` in the code still checks the default models; shipping with other models needs `GENERATOR_MODEL` / `EVAL_MODEL` and an updated guard.
+
 ### 05:50 -03:00 · Late reruns stopped at the deadline
 - Fixed the gap cap bug (it now uses the study cap) and reran the gap: one more job finished (strong 5/5 on `31ca`; 6 of 10 jobs in all). A late 3-repair rerun of the weak author's 7 specs (started 05:27) had no result by 05:47, so it was stopped by explicit pid and its containers removed; the weak outcomes in `results.json` stay the 1-repair ones, flagged. Decision made on the user's behalf to keep the 06:00 deadline over a longer wait. Key spend at that point: about $174.5 of $500.
 

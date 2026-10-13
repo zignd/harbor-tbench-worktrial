@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "metrics-relay-dual-bug-fix",
+  "title": "3am: Metrics Relay Service Dropping Gauges",
+  "scenario": "A Node.js microservice called `relay-agent` scrapes Prometheus-format metrics from downstream services and re-exposes them via a simple HTTP/TCP text protocol for a legacy aggregator. The on-call SRE is paged at 3am because the aggregator is receiving malformed frames and silently dropping ~40% of gauge metrics. The environment has ~1400 lines across a relay daemon, a protocol framer, a stats module, and realistic-looking unrelated middleware. Logs are live and show partial errors; the aggregator binary is opaque.",
+  "instruction_draft": "```\n[ALERT 03:14] relay-agent on prod-metrics-02 \u2014 aggregator reporting 41% frame rejection rate\nTail: /var/log/relay/relay.log\n  2026-10-12T03:12:44Z [warn] aggregator rejected frame: bad_checksum seq=1847\n  2026-10-12T03:12:44Z [warn] aggregator rejected frame: bad_checksum seq=1848\n  2026-10-12T03:12:45Z [info] scraped 38 metrics from node-exporter\n  2026-10-12T03:12:45Z [warn] aggregator rejected frame: bad_checksum seq=1851\n  2026-10-12T03:12:46Z [info] flushed batch seq=1852\n```\n\nThe relay-agent is running at `/opt/relay/`. The aggregator binary is at `/usr/local/bin/aggregator` and exposes a test mode: `aggregator --verify` reads frames from stdin and exits 0 only if every frame is accepted. Metrics are scraped every 10 s from a local mock exporter at `http://localhost:9101/metrics`.\n\nFix the relay-agent so that:\n1. Every frame emitted by the relay passes `aggregator --verify` with exit code 0 for any batch of scraped metrics, including batches containing gauge metrics with floating-point values, counter metrics with large integer values, histogram buckets, and metric names containing colons.\n2. The relay correctly emits all metrics it scrapes \u2014 the aggregator must receive a frame count equal to the number of distinct metric families in each scrape, with no families silently dropped.\n3. After your fix, restart the relay with `systemctl restart relay-agent` and confirm 0 rejections appear in `/var/log/relay/relay.log` for at least two consecutive scrape cycles.\n\nDo not modify the aggregator binary or the mock exporter.",
+  "requirements": [
+   "Every frame produced by the relay passes aggregator --verify (exit 0) for all metric types: gauges with floats, counters with large integers, histogram buckets, metrics with colons in names.",
+   "The count of frames per scrape equals the number of distinct metric families in the scrape payload \u2014 no families are silently dropped.",
+   "After systemctl restart relay-agent, /var/log/relay/relay.log shows zero 'aggregator rejected frame' lines across at least two consecutive 10-second scrape cycles."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install Node.js 20 LTS via nodesource, systemd stub via s6 or a simple wrapper that responds to systemctl restart.",
+   "Mock Prometheus exporter (Python) on port 9101 serving a fixed metric payload: ~30 gauge, ~10 counter, ~8 histogram metrics, several with colons in names, floats with high precision, counters up to 2^53.",
+   "/opt/relay/ \u2014 Node.js relay daemon (~600 lines across relay.js, framer.js, stats.js, middleware/auth.js, middleware/cache.js). relay.js is the entry point, reads metrics, calls framer.js to encode each metric family, writes frames to aggregator via TCP on port 9200.",
+   "framer.js has TWO bugs: (1) The checksum is computed over the frame body BEFORE a length-prefix header is prepended, but the aggregator validates the checksum over header+body \u2014 so gauges with floating-point values that produce a body longer than 255 bytes (which changes the 2-byte length field) cause checksum mismatch; for short bodies (<256 bytes) the length field byte-value happens to be stable enough that many frames pass, hiding the bug partially. (2) Metric families whose name contains a colon ':' are silently filtered out in relay.js by a misconfigured regex that was intended to sanitize label values \u2014 the regex /[^a-zA-Z0-9_]/ is applied to metric names too due to a copy-paste error in an early refactor.",
+   "The two bugs interact: fixing only the checksum makes colon-named metrics now produce correct checksums but they are still silently dropped, so the frame count stays wrong and tests still fail. Fixing only the colon filter causes colon-named metrics to appear but with bad checksums, still causing rejections.",
+   "/usr/local/bin/aggregator \u2014 a compiled Go binary (no source). It implements the relay frame protocol: 2-byte big-endian length, 1-byte version=0x02, N bytes body, 4-byte CRC32/IEEE checksum over ALL preceding bytes (length+version+body). Returns exit 0 from --verify mode if all frames on stdin are valid, exit 1 with a per-frame reason on stderr otherwise. Exposes TCP server on port 9200 in normal mode.",
+   "The frame protocol spec is documented in /opt/relay/docs/frame-protocol.md \u2014 it clearly states checksum covers the entire frame including header. The relay code has a comment 'checksum over payload' which is ambiguous.",
+   "systemctl restart relay-agent restarts the Node process (implemented as a shell wrapper that kills and relaunches with logging to /var/log/relay/relay.log).",
+   "Stats module stats.js collects per-scrape counts; logs show frame counts that look plausible even with the silent drop (the stat counts metrics not families, obscuring the drop).",
+   "Package.json, node_modules pre-installed. No internet needed.",
+   "Verification script: runs aggregator --verify on 5 fresh synthetic frame batches generated at verify time (different float values, different counter magnitudes, colon-metric-containing batches, histogram-only batches, mixed batches) plus inspects the live relay log."
+  ],
+  "internal_hint": "Two interacting bugs in framer.js and relay.js. Bug 1 (not visible by reading alone \u2014 requires running and observing): the checksum in framer.js is computed over `body` only, but the aggregator protocol requires CRC32 over `header+body`. For frames where the 2-byte length field is 0x00NN (body < 256 bytes), the first byte of the length is 0x00, so the CRC difference is data-dependent \u2014 short gauge-only frames often pass by accident, making the bug appear intermittent. Only running against real data with varied payload sizes reveals the consistent pattern. Bug 2 (visible in code but easy to miss because the regex looks like label sanitization): relay.js applies the label-value sanitization regex to metric family names, silently skipping any family whose name contains ':'. The histogram metric families all use names like 'http_request_duration_seconds:bucket' in the mock exporter's output. Fixing Bug 1 alone: colon families still dropped, frame count wrong, test fails. Fixing Bug 2 alone: colon families now produce frames but with bad checksums, rejections continue. Both must be fixed. Discovery path: (1) run aggregator --verify manually on a captured frame to see checksum failure, (2) read frame-protocol.md to find the spec, (3) diff spec against framer.js code to find the checksum scope bug, (4) notice frame count discrepancy between stats.js log output and expected family count, (5) add a debug log or read relay.js to find the regex applied to names.",
+  "trap": "A solver who runs aggregator --verify on a short test frame and sees it pass (because short bodies with 0x00 length prefix byte happen to produce matching checksums when body length < 256) will think Bug 1 is fixed or absent. They may fix only the colon regex (Bug 2) and see rejections drop on gauges but persist. Or they fix only the checksum and see the frame count stay wrong. Shallow verification against the provided sample metrics may pass (small payload, no colon names in the obvious ones) while the hidden test batches with large floats and colon-named histograms fail.",
+  "tests": [
+   "Test 1 (checksum correctness): generate 5 synthetic batches at verify time with body sizes ranging from 100 to 2000 bytes (ensuring both short and long frames); pipe each through aggregator --verify; all must exit 0.",
+   "Test 2 (colon-name metric families): generate a scrape payload containing 4 metric families with ':' in their names (histogram/summary style); run relay, capture frames, pipe to aggregator --verify; all 4 families must appear as frames and all must pass.",
+   "Test 3 (frame count integrity): for a synthetic scrape of exactly 12 distinct metric families, confirm aggregator receives exactly 12 frames (check via aggregator --verify output which reports frame count).",
+   "Test 4 (large integer counters): batch containing counters at values 2^50, 2^52, 2^53-1; frames must pass checksum verification.",
+   "Test 5 (live relay log check): after systemctl restart relay-agent, wait 25 seconds (covering 2 full scrape cycles), grep /var/log/relay/relay.log for 'aggregator rejected frame'; count must be 0."
+  ],
+  "verifier_knob": {
+   "name": "number of synthetic test batches",
+   "value": "5 batches covering distinct edge cases",
+   "effect": "Reducing to 1-2 batches (all small payloads, no colons) lets a partial fix (checksum only) pass; increasing to 8+ batches with more varied metric names and sizes makes it harder to accidentally pass with any single fix."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the checksum bug after reading frame-protocol.md; colon-named histogram families remain silently dropped; frame count test fails.",
+   "Solver fixes only the colon regex after noticing missing families in logs; checksum is still computed over body-only; large-payload frames fail verification.",
+   "Solver tests locally with a small hand-crafted frame where body < 256 bytes; checksum happens to match due to 0x00 length prefix; concludes Bug 1 doesn't exist and ships only the colon fix.",
+   "Solver reads framer.js and misidentifies the checksum field as 'correct' because the comment says 'checksum over payload' and assumes payload == frame; never runs an instrumented test to observe the failure rate by payload size.",
+   "Solver fixes both bugs but doesn't restart via systemctl (runs node directly), so the live log check sees old rejections from before the fix and fails Test 5."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "javascript",
+   "nodejs",
+   "binary-protocol",
+   "logs-metrics",
+   "two-interacting-bugs",
+   "sre"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/relay/docs/frame-protocol.md",
+   "cat /opt/relay/framer.js",
+   "cat /opt/relay/relay.js",
+   "grep -n 'checksum\\|crc\\|CRC' /opt/relay/framer.js",
+   "grep -n 'regex\\|replace\\|filter\\|family\\|name' /opt/relay/relay.js",
+   "# Identify Bug 1: checksum computed over body only; fix to cover header+body (concat length+version+body before CRC32)",
+   "# Edit framer.js: move checksum computation to after header construction",
+   "# Identify Bug 2: regex /[^a-zA-Z0-9_]/ applied to metric family names, dropping colon-named families",
+   "# Edit relay.js: fix regex to only apply to label values, not metric names",
+   "curl http://localhost:9101/metrics",
+   "node /opt/relay/relay.js 2>&1 | head -20",
+   "curl http://localhost:9101/metrics | aggregator-frame-tool | aggregator --verify",
+   "systemctl restart relay-agent",
+   "sleep 25",
+   "grep 'aggregator rejected frame' /var/log/relay/relay.log | wc -l"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The aggregator --verify frame count reporting mechanism is not specified in the instruction; agents may not know the output format to satisfy Test 3 (frame count integrity)",
+   "The systemctl wrapper reliability is environment-dependent; if the wrapper has startup latency or race conditions, Test 5 (live log check after 25s) could be flaky",
+   "Building the aggregator Go binary with correct CRC32/IEEE implementation and --verify mode is high complexity; bugs in the aggregator itself would cause solver failures that are invalid",
+   "The 'trap' of short frames passing checksum by accident requires the solver to not test with small payloads; but agents who read frame-protocol.md first will fix correctly without needing the runtime observation",
+   "Test 3 requires the aggregator --verify output to report frame count, but this capability is only described in the blueprint spec section, not confirmed in the instruction; if the binary doesn't output count, the test mechanism is broken",
+   "The interaction between s6/systemd stub and /var/log/relay/relay.log path needs to be exact; log rotation or buffering could cause Test 5 to miss rejections or find stale ones"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: both bugs are directly readable in source code (framer.js checksum scope and relay.js regex on names), and the frame-protocol.md spec makes Bug 1 unambiguous without any runtime experimentation needed, yielding a ~15-command speedrun. The verifiability also has a significant gap: Test 3 requires aggregator --verify to report frame counts, but this capability isn't specified in the instruction and the mechanism for checking it is unclear. The task design is otherwise excellent (realism, clarity, two-bug interaction), but needs the bugs to require runtime observation rather than pure source reading.",
+  "fixes": [
+   "Increase genuine_difficulty by making Bug 1 not visible from source alone: instead of a clear checksum-over-body vs header+body distinction, make the bug a subtle integer overflow in the length field calculation that only manifests for payloads >32KB, requiring the solver to instrument code and generate large batches to observe; remove or make frame-protocol.md less explicit about checksum scope",
+   "Make Bug 2 require runtime discovery: instead of a regex visibly applied to names, implement the colon-filtering as a conditional branch triggered by a feature flag read from an environment variable that happens to be set in prod but not in the obvious code path, requiring the solver to check the running process environment or trace the execution",
+   "Clarify Test 3 mechanism in the instruction: explicitly state that aggregator --verify outputs 'verified N frames' to stdout so solvers and verifiers both know how frame count checking works; alternatively, use a different verification mechanism like a counter file or TCP connection log",
+   "Add a mandatory runtime discovery step: make the mock exporter serve different metric payloads each scrape cycle (randomized float precision, randomized colon-name families) so that a solver who only reads code and doesn't observe live behavior cannot be confident their fix is complete"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/cell-lineage-reconstruction",
+     "verdict": "distinct",
+     "reason": "Completely different domain \u2014 cell tracking in video vs. network metrics relay debugging."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "NetFlow byte aggregation correctness vs. fixing a Prometheus-to-legacy-protocol relay framing bug."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "While both involve frame encoding/decoding, the candidate task is about debugging a live relay service with checksum failures across multiple metric types, whereas this reference is about implementing a simple fixed wire format codec."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Regional sales weighted aggregation correctness in a compiled service vs. Prometheus metrics relay framing bug fix."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Log enrichment pipeline with GeoIP and Flask API vs. Prometheus scrape relay with legacy framing protocol."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/cell-lineage-reconstruction",
+     0.125
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.118
+    ],
+    [
+     "ours/official-aac910462208",
+     0.104
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.067
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.058
+    ]
+   ],
+   "cost_usd": 0.013632
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058089
+}

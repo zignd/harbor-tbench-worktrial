@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "lattice-cipher-migration-refactor",
+  "title": "Lattice Cipher Service Migration",
+  "scenario": "A platform engineering team is migrating a scientific data pipeline from a legacy Go encryption service to a new one. The old service used a custom lattice-based authenticated encryption scheme implemented in a compiled binary at /app/legacy/signcrypt; the new Go service at /app/service/ is supposed to be a clean-room reimplementation that can decrypt ciphertexts produced by the old binary and produce ciphertexts the old binary can verify. The new service compiles and passes its own unit tests, but field reports say ciphertext exchange between the old and new service silently fails on certain input classes.",
+  "instruction_draft": "Hey, we're trying to finish the migration off the old lattice signcrypt binary. The new Go service at /app/service/ should be a drop-in: anything the old binary at /app/legacy/signcrypt encrypts, the new service must decrypt correctly, and anything the new service encrypts, the old binary must accept. Right now the two sides don't agree on something subtle \u2014 we've seen it fail on real traffic but the unit tests pass. There's a corpus of 50 real ciphertexts in /app/corpus/ the old binary produced; the new service must correctly decrypt all of them and re-encrypt them so the old binary round-trips cleanly. Also make sure the new service rejects all tampered/malformed ciphertexts the old binary would reject. Fix whatever is broken in /app/service/ so both directions work end-to-end. The verifier will test the service against a larger hidden corpus including edge-case inputs the sample corpus doesn't exercise.",
+  "requirements": [
+   "The new Go service must correctly decrypt every ciphertext produced by the legacy binary at /app/legacy/signcrypt, including all 50 ciphertexts in /app/corpus/.",
+   "Anything encrypted by the new service must be accepted and correctly decrypted by the legacy binary.",
+   "The new service must reject tampered or malformed ciphertexts (returning a non-zero exit code or an error response), matching the legacy binary's rejection behavior.",
+   "Both directions of the round-trip must work for all valid plaintext lengths including empty, single-byte, and messages whose length is a multiple of the lattice dimension.",
+   "The service must handle associated data (AAD) correctly: a ciphertext produced with given AAD must only decrypt when the same AAD is supplied."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with apt packages: golang-1.21, build-essential",
+   "At /app/legacy/signcrypt: a compiled Go binary (built without source in the image) implementing a custom lattice-based AEAD scheme. The binary accepts subcommands: `encrypt -key <hex> -aad <hex> -in <file> -out <file>` and `decrypt -key <hex> -aad <hex> -in <file> -out <file>`, exiting 0 on success and non-zero on auth failure.",
+   "The legacy binary's scheme: uses a 32-byte symmetric key, constructs a 512-dimensional polynomial ring Zq[x]/(x^256+1) with q=12289 (NTRU-like), does NTT-domain multiplication for a PRF to produce a keystream, then XORs plaintext. Authentication is a Poly1305 MAC over the ciphertext+AAD using a subkey derived via HKDF-SHA256 from the master key and a 16-byte nonce. Critical bug planted in new service: the NTT butterfly uses bit-reversal permutation that is off-by-one for input lengths that are not exactly 256 coefficients \u2014 when padding short messages, the pad bytes are placed BEFORE the message instead of AFTER, causing keystream misalignment.",
+   "A second planted bug: the HKDF info string in the new service omits the AAD length prefix, so two different AAD values that share a common prefix produce the same MAC subkey \u2014 meaning forgery is possible for certain AAD pairs, and the service accepts ciphertexts with swapped AADs.",
+   "At /app/service/: a Go module (~1200 lines across 6 files: main.go, lattice.go, ntt.go, aead.go, hkdf.go, codec.go) implementing the reimplementation. The code compiles cleanly. Unit tests in service_test.go pass because they only test 256-byte-aligned inputs with empty AAD.",
+   "At /app/corpus/: 50 .bin files, each a ciphertext produced by the legacy binary. They include: 10 with empty plaintexts, 10 with sub-256-byte plaintexts, 10 with exactly 256-byte plaintexts, 10 with multi-block plaintexts, 10 with non-empty AAD. A companion /app/corpus/manifest.json gives the expected plaintext hex and AAD hex for each file.",
+   "At /app/keys/: master.key (32 bytes hex) used for all corpus ciphertexts.",
+   "A helper script /app/run_roundtrip.sh that encrypts with the new service and decrypts with the legacy binary (and vice versa) for a given test vector, exiting non-zero on mismatch.",
+   "The Dockerfile builds the legacy binary from source in a separate build stage, copies only the binary into the final image (source not present in final image), then copies /app/service/ source and leaves it uncompiled for the solver."
+  ],
+  "internal_hint": "Difficulty comes from two sources that are both observe_not_read and edge_case_inputs. (1) The padding placement bug in ntt.go only manifests when message length is not a multiple of 256 \u2014 running the service against short-message corpus entries will show garbled plaintexts, but reading ntt.go looks like plausible bit-reversal permutation code. The solver must instrument the service, observe failures on the sub-256-byte corpus entries, then diff the keystream output against what the legacy binary implies to locate the pad-before-message vs pad-after-message choice. (2) The HKDF info bug is invisible without testing two ciphertexts that share an AAD prefix \u2014 none of the sample corpus entries exercise this because all AAD values in the corpus are distinct and have no common prefixes. The verifier corpus includes specifically crafted pairs: ciphertext C1 with AAD='label:foo' and ciphertext C2 with AAD='label:foobar'. A partially fixed service (fixing only the NTT padding) will fail the hidden forgery-rejection tests. The fix in hkdf.go is to include the AAD length as a 4-byte big-endian prefix in the HKDF info string before the AAD bytes themselves.",
+  "trap": "A solver that fixes only the obvious NTT padding bug (making short messages work) will pass all 50 corpus decryptions and most round-trip tests, but fail the hidden adversarial corpus tests that check: (a) the service rejects a ciphertext where AAD='label:foobar' is swapped in for a ciphertext originally encrypted under AAD='label:foo' \u2014 the broken HKDF info derivation makes these produce identical MAC subkeys so the swap is not caught; (b) the service correctly decrypts messages whose AAD is a prefix of another test AAD. The solver must discover the second bug by actually running forgery attempts, not just by reading the code.",
+  "tests": [
+   "Decrypt all 50 corpus ciphertexts with the new service and verify plaintext matches manifest.json (tests sub-256, 256-byte, multi-block, and AAD cases).",
+   "Round-trip: encrypt each corpus plaintext+AAD with the new service, then decrypt with the legacy binary \u2014 legacy binary must exit 0 and output must match original plaintext.",
+   "Round-trip reverse: encrypt 20 fresh test vectors (generated at verify time) with the legacy binary, decrypt with new service \u2014 must match.",
+   "Rejection: feed 30 tampered ciphertexts (bit-flipped at various positions: nonce, MAC, ciphertext body) to the new service \u2014 must all exit non-zero.",
+   "AAD prefix forgery: take a ciphertext encrypted under AAD='scope:read' and try to decrypt it under AAD='scope:readwrite' (which shares a prefix) \u2014 new service must reject it.",
+   "Empty plaintext edge case: verify encrypt-then-decrypt of zero-length message with non-empty AAD round-trips correctly through both directions.",
+   "Single-byte plaintext: verify encrypt-then-decrypt of a 1-byte message round-trips correctly.",
+   "Verify-time fresh corpus of 200 additional inputs (mixed lengths, mixed AAD lengths including lengths that share prefixes) all round-trip correctly and all tampered variants are rejected."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 hidden inputs (50 provided + 200 hidden)",
+   "effect": "Raising it adds more AAD-prefix collision pairs and more sub-block-size plaintext lengths, making it harder to pass without fixing both bugs; lowering it to only aligned inputs lets a partial fix pass."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the NTT padding bug, passes all 50 sample corpus entries, but fails the hidden AAD-prefix forgery rejection tests because the HKDF info bug is not visible without crafting specific adversarial AAD pairs.",
+   "Solver identifies both bugs in code review but fixes the HKDF info string in the wrong direction (e.g., appending length suffix instead of prefix), causing an off-by-one in length encoding that still produces collisions for length-prefixed AADs of certain lengths.",
+   "Solver rewrites the lattice.go from scratch based on reading the code, producing an implementation that passes unit tests but drifts from the legacy binary's specific NTT root-of-unity constants, failing on the hidden multi-block ciphertexts.",
+   "Solver fixes both bugs but introduces a new one: uses little-endian encoding for the 4-byte AAD length prefix in HKDF info, while the legacy binary uses big-endian, causing AAD-bearing ciphertexts to fail."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "lattice",
+   "refactoring",
+   "binary-black-box",
+   "aead"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/service/ntt.go  # spot pad-before-message bug visually",
+   "cat /app/service/hkdf.go  # spot missing AAD length prefix in info string",
+   "cat /app/service/aead.go",
+   "cat /app/corpus/manifest.json",
+   "cat /app/keys/master.key",
+   "cd /app/service && go build ./...",
+   "# Fix ntt.go: move padding to append after message instead of prepend",
+   "vim /app/service/ntt.go  # change prepend to append in padding logic",
+   "# Fix hkdf.go: add 4-byte big-endian len(AAD) prefix before AAD in info string",
+   "vim /app/service/hkdf.go  # insert binary.BigEndian.PutUint32 length prefix",
+   "cd /app/service && go build ./... && go test ./...",
+   "# Test sub-256-byte corpus entry decryption",
+   "/app/service/service decrypt -key $(cat /app/keys/master.key) -aad '' -in /app/corpus/001.bin -out /tmp/out.bin && xxd /tmp/out.bin",
+   "# Run all 50 corpus decryptions via manifest",
+   "bash /app/run_roundtrip.sh",
+   "# Craft AAD prefix forgery test: encrypt under scope:read, try scope:readwrite",
+   "echo -n 'hello' > /tmp/plain.txt && /app/service/service encrypt -key $(cat /app/keys/master.key) -aad $(echo -n 'scope:read' | xxd -p) -in /tmp/plain.txt -out /tmp/ct.bin",
+   "/app/legacy/signcrypt decrypt -key $(cat /app/keys/master.key) -aad $(echo -n 'scope:readwrite' | xxd -p) -in /tmp/ct.bin -out /tmp/out2.bin; echo $?  # must be non-zero",
+   "# Verify reverse round-trip: legacy encrypts, new service decrypts",
+   "/app/legacy/signcrypt encrypt -key $(cat /app/keys/master.key) -aad '' -in /tmp/plain.txt -out /tmp/ct2.bin && /app/service/service decrypt -key $(cat /app/keys/master.key) -aad '' -in /tmp/ct2.bin -out /tmp/out3.bin && diff /tmp/plain.txt /tmp/out3.bin"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Both bugs are statically visible by reading the source \u2014 the 'observe_not_read' lever fails because ntt.go padding direction and hkdf.go missing length prefix are immediately recognizable patterns to skilled engineers, making this a ~19-command code-read-and-fix task rather than a runtime-debugging task.",
+   "The blueprint states the HKDF bug is 'invisible without testing two ciphertexts that share an AAD prefix' but the fix (add 4-byte big-endian length prefix) is a textbook length-extension mitigation that any cryptography-aware engineer would spot directly in hkdf.go without needing adversarial inputs.",
+   "The 'trap' of fixing only the NTT bug relies on the solver not reading hkdf.go carefully \u2014 but a systematic solver reads all 6 files before writing any code, defeating the trap entirely.",
+   "go build verification alone doesn't confirm correctness; if the legacy binary has a slightly different NTT polynomial/root-of-unity constant than what's implied, solvers may produce a plausible-looking but wrong implementation and the error messaging may be cryptic.",
+   "The run_roundtrip.sh helper script behavior is underspecified \u2014 if it uses subshell quoting for hex AAD values inconsistently, AAD tests could produce false positives or negatives depending on shell escaping.",
+   "Endianness of the 4-byte length prefix is a valid failure mode per the blueprint, but the instruction never mentions endianness to the solver, creating ambiguity about what 'correct' means without the legacy source to diff against.",
+   "The corpus manifest.json provides expected plaintexts in hex \u2014 if the service outputs raw bytes instead of hex (or vice versa), the comparison logic in the verifier could incorrectly pass or fail solutions based on output format rather than correctness.",
+   "1 CPU / 2 GB constraint may be tight for building a Go module of 1200 lines plus running 200+ adversarial verifier tests with subprocess invocations of both binaries."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: both planted bugs are immediately visible by static reading of ntt.go (padding placement) and hkdf.go (missing length prefix), so a skilled agent can identify and fix both in a systematic file-read pass without needing any runtime observation. The 'observe_not_read' difficulty lever claimed in the blueprint is not actually enforced by the code structure \u2014 the bugs are recognizable cryptographic anti-patterns, not subtle runtime behaviors. Additionally, the endianness ambiguity in the HKDF fix creates an invalid failure risk since the solver has no way to verify the correct encoding without the legacy binary source.",
+  "fixes": [
+   "To enforce observe_not_read: make the NTT bug a wrong root-of-unity constant (e.g., using a primitive 512th root instead of 256th root) \u2014 this looks correct in code, produces no compile or test errors, and only reveals itself when comparing keystreams byte-by-byte against actual legacy binary output on specific inputs.",
+   "To enforce the HKDF bug as truly non-static: instead of a missing length prefix (obvious pattern), use a subtly wrong HKDF expansion \u2014 e.g., deriving the MAC subkey using OKM bytes [16:32] instead of [0:16], which looks like a plausible 'second half' choice but collides only for specific key+nonce combinations that appear in the hidden corpus but not the sample corpus.",
+   "Add a corpus entry in /app/corpus/ with AAD='label:foo' and a companion with AAD='label:foobar' to force the HKDF prefix collision to be observable within the provided corpus, removing the hidden-corpus-only reliance that creates unfair test conditions.",
+   "Tighten the run_roundtrip.sh script specification: document exact argument quoting, hex encoding expectations for AAD, and output format (raw bytes vs hex) to eliminate ambiguity in verifier comparisons.",
+   "Raise the difficulty lever authenticity by removing the unit tests entirely (rather than having them pass on aligned inputs) so the solver cannot use 'go test' as a partial oracle \u2014 forcing them to rely entirely on corpus-based black-box observation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation logic in a sales database service; the candidate is about debugging cross-implementation compatibility of a custom lattice-based authenticated encryption scheme."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing panics and performance in a Rust packet codec; the candidate is about making two independent implementations of a bespoke lattice cipher agree on their wire format and cryptographic behavior."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "That task is about a debug-vs-release build memory corruption bug in C++; the candidate is about cross-implementation interoperability of a custom lattice authenticated encryption scheme in Go."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC computation over a binary WAL record format via TCP; the candidate is about round-trip compatibility of a lattice-based AEAD cipher between a legacy binary and a Go reimplementation."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about JSON schema validation correctness and throughput in a Node.js log ingestion pipeline; the candidate is about cryptographic protocol compatibility between two implementations of a lattice cipher."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.227
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.18
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.178
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.152
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.144
+    ]
+   ],
+   "cost_usd": 0.013146000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.060507000000000005
+}

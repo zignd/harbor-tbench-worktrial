@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "crypto-migration-hash-service",
+  "title": "Scientific Data Hash Migration",
+  "scenario": "A platform team is migrating a scientific computing pipeline that signs experiment result bundles. The existing service is a compiled Go binary at /app/bin/hashsvc that accepts JSON payloads on stdin and returns a signed envelope. The binary was built from a now-deleted internal repo. A new Go service must be written at /app/newsvc/ that produces byte-for-byte identical output for all valid inputs and correctly rejects all malformed or adversarial ones. The old binary and a small sample corpus of inputs/outputs are available to probe.",
+  "instruction_draft": "Hey, we're finally cutting over from the old hashsvc binary to a new implementation. The binary at /app/bin/hashsvc is the ground truth \u2014 it takes a JSON payload on stdin and writes a signed envelope to stdout. There's a sample corpus in /app/samples/ to get you started. Write a replacement in Go at /app/newsvc/main.go that passes all the same inputs through and produces identical output, including the same rejection behavior on bad inputs. Build it with `go build -o /app/bin/newsvc ./newsvc`. The new binary needs to handle everything the old one handles \u2014 same signing scheme, same error codes, same edge cases. We'll test it against a broader corpus of inputs including tricky ones the samples don't cover.",
+  "requirements": [
+   "A Go source file exists at /app/newsvc/main.go and compiles with `go build -o /app/bin/newsvc ./newsvc`",
+   "For every valid input, /app/bin/newsvc produces byte-for-byte identical stdout output as /app/bin/hashsvc",
+   "For every invalid/malicious input, /app/bin/newsvc exits with the same nonzero exit code as /app/bin/hashsvc",
+   "The signing scheme (algorithm, key derivation, encoding) must be reverse-engineered from the binary's behavior, not guessed",
+   "The new service must correctly handle edge cases: empty fields, unicode in values, very large payloads, payloads with extra fields, missing required fields, duplicate keys, and inputs with canonicalization traps"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install golang-1.21, binutils, xxd, file, strace via apt",
+   "Compile the reference binary from a hidden Go source during Docker build, then DELETE the source; only the binary /app/bin/hashsvc remains",
+   "The reference binary: reads a JSON object from stdin; validates required fields (experiment_id string, timestamp int64, measurements []float64, lab_id string); computes an HMAC-SHA256 over a canonical form of the payload (sorted keys, specific float formatting with 6 decimal places, Unix timestamp as decimal string); derives the HMAC key as SHA256(lab_id + ':' + a hardcoded secret); encodes the signature as lowercase hex; outputs a JSON envelope {\"payload\": <original input verbatim>, \"signature\": \"<hex>\", \"algorithm\": \"hmac-sha256\"} followed by newline; exits 0 on success, exits 1 with a JSON error on any validation failure",
+   "The hardcoded secret embedded in the binary is a 32-byte hex string (not printable ASCII) discoverable via strings or dynamic analysis",
+   "Canonicalization: measurements formatted as %.6f joined by commas, experiment_id and lab_id URL-encoded if they contain special chars, fields concatenated as 'experiment_id=<v>&lab_id=<v>&measurements=<v>&timestamp=<v>'",
+   "Plant ~20 sample input/output pairs in /app/samples/ (inputs as .json, expected outputs as .expected); samples cover only clean ASCII inputs with positive floats; they do NOT cover: unicode lab_ids, negative/zero measurements, timestamps at year boundaries, experiment_ids with URL-special characters, payloads with extra unknown fields (which should be accepted and passed through verbatim), measurements array with a single element, NaN/Inf in measurements (rejected), lab_id empty string (rejected)",
+   "Plant a /app/go.mod for the newsvc module",
+   "The reference binary was compiled from Go 1.21 with standard library only (no external deps)"
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the cause only shows on real data \u2014 the solver cannot read the deleted source, so must experimentally probe the binary to discover the canonical form and key derivation; (2) edge-case correctness \u2014 the canonical form has subtle rules (URL-encoding of special chars in field values, %.6f float formatting, sorted key order) that the clean samples never exercise. A skilled engineer: runs strings on the binary to find the secret and any format strings; uses strace to watch syscalls; crafts probe inputs (unicode, special chars, single-element arrays, boundary timestamps) and diffs outputs; reconstructs the canonical form by varying one field at a time; discovers key derivation by testing SHA256(lab_id+':'+secret) against known output. The traps: (a) using json.Marshal to re-encode the payload instead of passing the original verbatim \u2014 fails on whitespace-different inputs; (b) missing the URL-encoding step for special characters in field values; (c) using %g or %f instead of %.6f for float formatting; (d) not sorting keys alphabetically before HMAC; (e) missing that extra/unknown JSON fields must be preserved verbatim in the output envelope.",
+  "trap": "A naive solver implements HMAC-SHA256 with the discovered secret but uses Go's json.Marshal for canonicalization, which differs from the binary's format-string-based approach on floats (e.g., 1.5 becomes '1.500000' not '1.5'), or misses URL-encoding of special characters in experiment_id/lab_id. The sample corpus only has clean ASCII and 2-6 measurements with positive floats, so the solver's implementation appears to pass all samples but silently fails on unicode lab_ids, single-element measurement arrays, and experiment_ids containing '&' or '='.",
+  "tests": [
+   "For each of 20 sample inputs, run both binaries and assert stdout is identical and exit codes match",
+   "Generate at 30 verify-time inputs: lab_ids with unicode (Chinese characters, accented letters), experiment_ids with URL-special chars (&, =, +, spaces), single-element measurements arrays, measurements with exactly 0.0, timestamps at Unix epoch boundaries (0, 2^31-1, 2^32), payloads with unknown extra fields that must pass through, payloads missing each required field, payloads with NaN/Inf as measurement values, empty measurements array \u2014 run both binaries and assert identical stdout and exit code",
+   "Run 10 adversarial inputs: duplicate JSON keys, extremely large measurements array (10000 elements), lab_id that is the empty string, measurement values requiring %.6f rounding (e.g., 1.0/3.0 represented as rational), experiment_id containing a null byte \u2014 assert exit codes match",
+   "Assert that /app/bin/newsvc is a compiled binary (file command shows ELF or Mach-O executable), not a shell wrapper",
+   "Assert that the newsvc source compiles clean with `go build` (no errors, no CGO)"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "50 total test inputs (20 sample + 30 verify-time generated)",
+   "effect": "Raising to 100+ with more Unicode scripts, more float edge cases (subnormal, large exponent), and more special-char combinations in field values makes it harder; lowering to 10 verify-time inputs with only clean ASCII makes it easier"
+  },
+  "expected_failure_modes": [
+   "Solver uses json.Marshal for canonical form instead of format-string replication, causing float formatting divergence on values like 1.0/3.0 or 1.5",
+   "Solver discovers the secret and HMAC scheme but misses the URL-encoding step, passing clean samples but failing on special characters",
+   "Solver re-encodes the payload field using Go's JSON library, changing whitespace or key order in the verbatim payload output",
+   "Solver assumes alphabetical key order in canonical form but actually the binary uses a different order, discoverable only by probing with known-answer inputs",
+   "Solver treats the canonicalization as JSON serialization rather than a custom format-string concatenation, missing subtle differences on boolean or null values in extra fields"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "reverse-engineering",
+   "hmac",
+   "canonicalization",
+   "binary-black-box",
+   "scientific-computing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "strings /app/bin/hashsvc | grep -E '([0-9a-f]{32,}|%|encode|format|experiment|lab_id|hmac)'",
+   "cat /app/samples/sample1.json && cat /app/samples/sample1.expected",
+   "for f in /app/samples/*.json; do echo $f; cat $f; done",
+   "echo '{\"experiment_id\":\"test\",\"timestamp\":1234567890,\"measurements\":[1.5,2.5],\"lab_id\":\"lab1\"}' | /app/bin/hashsvc",
+   "echo '{\"experiment_id\":\"test&eq\",\"timestamp\":1234567890,\"measurements\":[1.5],\"lab_id\":\"lab1\"}' | /app/bin/hashsvc",
+   "echo '{\"experiment_id\":\"test\",\"timestamp\":1234567890,\"measurements\":[0.1],\"lab_id\":\"\u5b9e\u9a8c\u5ba4\"}' | /app/bin/hashsvc",
+   "echo '{\"experiment_id\":\"test\",\"timestamp\":1234567890,\"measurements\":[1.5],\"lab_id\":\"lab1\",\"extra\":\"yes\"}' | /app/bin/hashsvc",
+   "echo '{\"experiment_id\":\"\",\"timestamp\":1234567890,\"measurements\":[1.5],\"lab_id\":\"lab1\"}' | /app/bin/hashsvc",
+   "echo '{\"experiment_id\":\"test\",\"timestamp\":1234567890,\"measurements\":[],\"lab_id\":\"lab1\"}' | /app/bin/hashsvc",
+   "# secret found via strings; canonical form visible in format strings; write Go solution",
+   "cat > /app/newsvc/main.go << 'EOF'\npackage main\nimport (\n  \"bufio\"\n  \"crypto/hmac\"\n  \"crypto/sha256\"\n  \"encoding/hex\"\n  \"encoding/json\"\n  \"fmt\"\n  \"math\"\n  \"net/url\"\n  \"os\"\n  \"sort\"\n  \"strings\"\n)\n// ... full implementation with verbatim payload passthrough, %.6f, URL-encode, sorted keys\nEOF",
+   "go build -o /app/bin/newsvc ./newsvc",
+   "for f in /app/samples/*.json; do diff <(cat $f | /app/bin/hashsvc) <(cat $f | /app/bin/newsvc); done",
+   "echo '{\"experiment_id\":\"a&b\",\"timestamp\":0,\"measurements\":[0.333333333],\"lab_id\":\"\u5b9e\u9a8c\u5ba4\"}' | /app/bin/newsvc",
+   "diff <(echo '{...unicode...}' | /app/bin/hashsvc) <(echo '{...unicode...}' | /app/bin/newsvc)",
+   "# iterate if diff found; fix URL-encoding or float format",
+   "go build -o /app/bin/newsvc ./newsvc  # final build"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 'strings' command on the binary is explicitly described as able to find the secret AND format strings \u2014 if the canonical form's format string is literally embedded as a Go format string (e.g., 'experiment_id=%s&lab_id=%s&measurements=%s&timestamp=%s'), the reverse-engineering challenge collapses to a single grep, undermining genuine difficulty claims",
+   "URL-encoding behavior is underspecified: Go's net/url.QueryEscape differs from net/url.PathEscape and from RFC 3986; the binary's exact encoding for spaces (+ vs %20), tildes, etc. is not stated, so a solver could implement 'correct' URL-encoding that still doesn't match the binary \u2014 this makes the test potentially flaky or ambiguous",
+   "The instruction says 'URL-encoded if they contain special chars' but the samples don't cover this; if the binary uses a non-standard or Go-internal encoding, the solver has no way to discover the exact variant without many probe inputs, which may exceed the 1-hour solvability window",
+   "The hardcoded secret is described as '32-byte hex string (not printable ASCII)' but then says it's discoverable via strings \u2014 hex strings ARE printable ASCII, creating an internal contradiction about whether strings will find it",
+   "Float formatting: the task says '%.6f' but doesn't clarify rounding mode for values like 1.0/3.0 = 0.333333(3...) \u2014 Go's fmt.Sprintf uses banker's rounding in some cases; if the binary was compiled with a specific Go version, rounding behavior on edge cases could differ from the solver's Go 1.21 environment even with identical format strings",
+   "strace availability: the blueprint installs strace but Go binaries use non-standard syscall patterns and strace may not reveal format strings or key material in a useful way; the hint implies strace is a useful tool but it may mislead solvers into wasting time",
+   "Test determinism: if the reference binary uses any time-dependent or random elements (even inadvertently), byte-for-byte comparison tests would be flaky \u2014 the design appears deterministic but this should be verified",
+   "The task says the binary exits 1 with 'a JSON error' on validation failure but doesn't specify the error JSON schema \u2014 if the solver's error JSON differs in structure, tests checking stderr or the error payload body (not just exit code) would fail unexpectedly"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty is undermined by the task's own design: the internal hint explicitly states that 'strings' reveals both the secret and format strings, meaning the core reverse-engineering challenge can be solved with a single grep rather than experimental probing. The URL-encoding specification is ambiguous enough to create invalid failures \u2014 Go has multiple URL-encoding functions with different behaviors for spaces and special characters, and the exact variant used by the binary is not determinable from the samples alone. The speedrun comes in at ~17 commands, borderline but achievable, and with the format string shortcut it's likely faster, putting genuine_difficulty at 3 rather than the required 4.",
+  "fixes": [
+   "Remove or obfuscate format strings from the binary: instead of using fmt.Sprintf with a literal format string, build the canonical form programmatically so 'strings' cannot reveal it \u2014 e.g., use string concatenation in a loop, making the order and encoding discoverable only by behavioral probing",
+   "Specify URL-encoding precisely: state whether the binary uses QueryEscape (space\u2192+) or PathEscape (space\u2192%20) or a custom RFC 3986 encoder, or better yet, design the task to use percent-encoding only (no + for spaces) and document this so it's unambiguous, preventing invalid failures from encoding variant mismatches",
+   "Resolve the contradiction about the secret: if it's '32 bytes of non-printable data', embed it as raw bytes in the binary so strings won't find it \u2014 then solvers must use dynamic analysis or known-plaintext attacks against sample outputs, genuinely raising difficulty",
+   "Add a canonicalization trap that requires multiple probe iterations to discover: e.g., measurements are sorted before formatting (not in input order), which the clean samples happen to already be sorted, so it's only discoverable with out-of-order measurement arrays",
+   "Specify the error JSON schema for validation failures (field name, message format) so that tests checking error output don't create invalid failures due to schema differences between the reference and solver implementations"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task extracts hardcoded credentials from Go source via XOR decoding; the candidate task reverse-engineers a signing/hashing scheme from a black-box binary to replicate byte-for-byte output."
+    },
+    {
+     "ref_id": "terminal-bench-pro/craft-binary-message-file",
+     "verdict": "distinct",
+     "reason": "That task crafts a binary file matching a known deserializer's expected output; the candidate task reverse-engineers a signing scheme from a black-box binary and reimplements it in Go."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "variant",
+     "reason": "Both tasks reverse-engineer a cryptographic/signing scheme from a binary (with source lost) and reimplement it so output is byte-for-byte identical, differing mainly in language, artifact type, and framing (encryption vs. signed envelope)."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task implements an HMAC-SHA256 audit service with known spec in C source; the candidate task reverse-engineers an unknown signing scheme from a black-box binary."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task fixes a broken Rust packet-codec service for correctness and performance; the candidate task reverse-engineers a Go binary's signing behavior and reimplements it."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.171
+    ],
+    [
+     "terminal-bench-pro/craft-binary-message-file",
+     0.159
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.158
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.136
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.126
+    ]
+   ],
+   "cost_usd": 0.013851
+  },
+  "novel": false
+ },
+ "cost_usd": 0.06439500000000001
+}

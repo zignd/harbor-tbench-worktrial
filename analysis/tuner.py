@@ -110,7 +110,27 @@ def plan_mutation(
     return plan, reply.cost_usd
 
 
+def fix_spec_plan(calibration: dict) -> dict:
+    """A repair plan for a task whose calibration failed for the task's own reasons."""
+    reasons = []
+    for t in calibration.get("trials", []):
+        f = t.get("failure") or {}
+        if f and not f.get("valid", True):
+            reasons.append(f"{f.get('mode')}: {f.get('requirement') or ''} {f.get('explanation')}")
+        a = t.get("audit") or {}
+        if a and not a.get("honest", True):
+            reasons.append(f"hacked pass ({a.get('label')}): {a.get('reason')}")
+    return {"kind": "fix_spec", "direction": "fix", "change": " | ".join(dict.fromkeys(reasons))}
+
+
 def directive(plan: dict) -> str:
+    if plan.get("kind") == "fix_spec":
+        return (
+            "Spec fix: calibration runs failed (or passed by cheating) because of the task, not "
+            f"the agent: {plan.get('change')} Fix the tests, or state the requirement in the "
+            "instruction, so every solution the instruction allows passes and a hollow one still "
+            "fails. Don't change the task's difficulty otherwise; the oracle must still pass 3/3."
+        )
     return (
         f"Difficulty tuning ({plan.get('direction')}, via {plan.get('kind')}): the task was "
         f"{'too easy' if plan.get('direction') == 'harder' else 'too hard'} for a frontier agent. "
@@ -156,7 +176,7 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
     calibration = resumed or calibration
 
     for rnd in range(len(record["rounds"]) + 1, max_rounds + 1):
-        if calibration["verdict"] not in ("too_easy", "too_hard"):
+        if calibration["verdict"] not in ("too_easy", "too_hard", "invalid"):
             break
         previous = cand_dir / f"before_tune_r{rnd}"
         plan_file = cand_dir / f"tune_plan_r{rnd}.json"
@@ -170,6 +190,8 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
         else:
             if resuming:  # interrupted mid-authoring: redo it from the saved snapshot and plan
                 plan, plan_cost = json.loads(plan_file.read_text()), 0.0
+            elif calibration["verdict"] == "invalid":
+                plan, plan_cost = fix_spec_plan(calibration), 0.0
             else:
                 plan, plan_cost = plan_mutation(
                     cand.blueprint.to_markdown(spec), calibration, record["rounds"]

@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "sensor-normalizer-wheel-repair",
+  "title": "Sensor Normalizer Wheel Repair",
+  "scenario": "Your team ships a Python wheel called `sensor_norm` that pre-processes raw spectral sensor readings before ML inference. The wheel wraps a compiled C extension (`_norm_core.so`) that performs the core per-channel normalization; the source was lost in a repo migration. A recent audit found that the deployed wheel produces subtly wrong normalized outputs on a subset of production sensor files, causing downstream model accuracy to drop below the required 95% agreement with the reference NumPy implementation. The environment contains the broken wheel, ~1,200 lines of surrounding pipeline code, a reference pure-Python normalizer (`ref_norm.py`), and a corpus of 40 sample `.snsr` binary data files. Hidden test inputs cover a wider distribution than the samples.",
+  "instruction_draft": "The `sensor_norm` wheel at `/opt/sensor_norm/` is producing incorrect normalized outputs on production data. The wheel's core normalization is performed by the compiled extension `/opt/sensor_norm/_norm_core.so`; its source is unavailable. A reference implementation at `/app/pipeline/ref_norm.py` defines the correct normalization contract: for each channel vector `x`, the output must be `(x - channel_mean) / channel_std` where `channel_std` is clamped to a minimum of `1e-4` to avoid division by zero, and any output value outside `[-10, 10]` is clipped to that range.\n\nRepair or replace the wheel so that `python -m sensor_norm.normalize <input.snsr> <output.npy>` produces output that agrees with the reference to within an absolute tolerance of `1e-5` on at least 95% of all channels across all test inputs. The repaired wheel must be installable via `pip install` from a local `.whl` file placed at `/app/dist/sensor_norm-2.1.0-*.whl`, and the installed command must work. The 40 sample files in `/app/data/samples/` and the checker at `/app/check_accuracy.py` are available for local validation.",
+  "requirements": [
+   "A wheel file matching `/app/dist/sensor_norm-2.1.0-*.whl` exists and is installable via pip",
+   "After installation, `python -m sensor_norm.normalize <input.snsr> <output.npy>` runs without error",
+   "Output `.npy` files agree with the reference normalization (mean-std per channel, std clamped to 1e-4, output clipped to [-10,10]) within absolute tolerance 1e-5",
+   "Agreement threshold: at least 95% of channels across all hidden test inputs pass the tolerance check"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with numpy, build tools (gcc, python3-dev) pinned",
+   "/opt/sensor_norm/ contains the original broken wheel unpacked: __init__.py, normalize.py (CLI entry point), _norm_core.so (compiled extension, no source), and a setup.py stub",
+   "_norm_core.so exports normalize_channels(arr: np.ndarray) -> np.ndarray; the .so is compiled to have TWO bugs: (1) it uses population std (divide by N) instead of sample std (divide by N-1) \u2014 but this only matters for short channels so sample data with long channels hides it; (2) it silently returns un-clipped values when any input value exceeds abs(50), which never occurs in the 40 sample files but does occur in hidden test data",
+   "/app/pipeline/ contains ~1200 lines of plausible pipeline code: ingestion, feature extraction, model loader, scheduler \u2014 none of it is the normalization bug",
+   "/app/pipeline/ref_norm.py: correct reference implementation using numpy, clearly documented",
+   "/app/data/samples/ contains 40 .snsr binary files (little-endian: 4-byte int32 n_channels, 4-byte int32 n_samples, then float32 values); all sample files have n_samples >= 200 and all values in [-40, 40], so BOTH bugs are hidden",
+   "/app/check_accuracy.py: loads each .snsr, runs both the installed sensor_norm and ref_norm, reports per-channel agreement fraction \u2014 works on the 40 samples only",
+   "/app/data/samples/ files are generated deterministically with a fixed seed; hidden test files include channels with n_samples as small as 5 (exposing bug 1) and values exceeding abs(50) (exposing bug 2)",
+   "The .snsr binary format is documented in /app/pipeline/FORMAT.md",
+   "A pyproject.toml template at /app/wheel_template/ for building a new wheel",
+   "No internet access; numpy and setuptools/wheel/build are pre-installed"
+  ],
+  "internal_hint": "Root causes: (1) _norm_core.so divides by N instead of N-1 when computing std, causing wrong normalization on short channels (n_samples < ~30 shows >1e-5 error); (2) _norm_core.so skips the [-10,10] clip when any channel value exceeds abs(50). Both bugs are invisible on sample data (all files have n_samples>=200 and values in [-40,40]). Discovery path: write a probe script that calls _norm_core.normalize_channels on synthetic arrays with controlled properties \u2014 short arrays to find bug 1, arrays with large values to find bug 2. Compare against ref_norm.py. Once both quirks are characterized, the fix is: build a new wheel that ignores _norm_core.so entirely and re-implements normalize_channels in pure Python/numpy following ref_norm.py's contract, then package it as sensor_norm-2.1.0. The solver must read FORMAT.md to parse .snsr files correctly for the CLI, and must match the exact normalization contract from ref_norm.py.",
+  "trap": "A solver who reads only the source files sees ref_norm.py and the broken normalize.py wrapper, notices the wrapper calls _norm_core.so, and might simply re-implement the wrapper to call ref_norm.py's function \u2014 but if they don't probe _norm_core.so's actual behavior on edge-case inputs, they may not realize the .so itself has bugs and might accidentally keep using it for 'performance'. More critically, a solver who validates only on the 40 sample files will see 100% agreement and ship \u2014 but hidden tests with n_samples=5 and values in [-80,80] fail both bugs simultaneously, dropping agreement well below 95%.",
+  "tests": [
+   "Install the wheel from /app/dist/sensor_norm-2.1.0-*.whl in a fresh venv and confirm import succeeds",
+   "Run `python -m sensor_norm.normalize` on 10 hidden .snsr files with n_samples in {5, 10, 15, 200} and values sampled from [-80, 80]; compute per-channel absolute error against ref_norm.py; require >=95% of channels within 1e-5",
+   "Run on 5 hidden files where some channels have all values near zero (std < 1e-4) to test the clamp behavior",
+   "Run on 5 hidden files with n_samples=5 specifically to stress-test population-vs-sample std bug",
+   "Run on 5 hidden files where max(abs(values)) > 60 to stress-test the clipping bug",
+   "Aggregate: overall channel agreement across all hidden files must be >=95%"
+  ],
+  "verifier_knob": {
+   "name": "accuracy_threshold",
+   "value": "0.95",
+   "effect": "Raising to 0.98 makes the task harder since the solver must get both bugs right with very little margin; lowering to 0.85 allows a partial fix (e.g. fixing only the clipping bug) to pass"
+  },
+  "expected_failure_modes": [
+   "Agent validates only on sample files, sees 100% accuracy, ships without discovering either bug \u2014 fails hidden tests",
+   "Agent finds and fixes the clipping bug by probing large-value inputs but misses the population-std bug because probing with n_samples=200 gives negligible error \u2014 fails short-channel hidden tests",
+   "Agent re-uses _norm_core.so for 'speed' after verifying it passes samples, wrapping it with a pre/post clip \u2014 the post-clip partially fixes bug 2 but bug 1 remains for short channels",
+   "Agent builds the wheel with incorrect .snsr parsing (wrong endianness or field order) because they didn't read FORMAT.md \u2014 CLI crashes on hidden files",
+   "Agent fixes both bugs in a Python reimplementation but makes a subtle error in std computation (e.g. axis=0 vs axis=1 for channel vs sample dimension) \u2014 fails broadly"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "opaque-component",
+   "black-box-characterization",
+   "wheel-packaging",
+   "data-files",
+   "systems-programming",
+   "metric-threshold"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/ref_norm.py  # confirm normalization contract (mean-std per channel, ddof=1, clamp 1e-4, clip [-10,10])",
+   "cat /app/pipeline/FORMAT.md  # learn .snsr binary format (int32 n_channels, int32 n_samples, float32 row-major)",
+   "cat /opt/sensor_norm/normalize.py  # see CLI structure to replicate",
+   "cat /app/wheel_template/pyproject.toml  # see packaging template",
+   "ls /opt/sensor_norm/  # confirm files: __init__.py, normalize.py, _norm_core.so",
+   "mkdir -p /app/newsrc/sensor_norm  # create fresh package dir",
+   "# Write sensor_norm/__init__.py (trivial)",
+   "# Write sensor_norm/_impl.py: pure-numpy normalize_channels(arr) with mean, std(ddof=1), clamp, clip \u2014 directly from ref_norm.py contract stated in instructions",
+   "# Write sensor_norm/normalize.py: parse .snsr per FORMAT.md (struct.unpack('<ii'), read float32s, reshape), call _impl, np.save output",
+   "# Write pyproject.toml: name=sensor_norm, version=2.1.0, module=sensor_norm",
+   "cd /app/newsrc && python3 -m build --wheel --outdir /app/dist/",
+   "pip install /app/dist/sensor_norm-2.1.0-*.whl --force-reinstall",
+   "python -m sensor_norm.normalize /app/data/samples/sample_001.snsr /tmp/out.npy  # smoke test",
+   "python /app/check_accuracy.py  # validate on 40 samples",
+   "# Optionally probe with synthetic short-channel and large-value arrays to confirm correctness"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The normalization contract is fully stated in the instructions themselves (mean-std, ddof=1 implied by 'channel_std', clamp 1e-4, clip [-10,10]), so an agent never needs to probe _norm_core.so at all \u2014 the black-box characterization difficulty lever is bypassed entirely.",
+   "The instruction says 'channel_std' without explicitly stating ddof=1 vs ddof=0 \u2014 a careful agent might implement population std (ddof=0) if they read the instruction literally and don't check ref_norm.py, potentially causing spurious failures on short-channel hidden tests even with a pure reimplementation.",
+   "If pyproject.toml template or build toolchain has subtle version incompatibilities with Python 3.13-slim-bookworm, wheel building could fail for environmental reasons unrelated to the task logic.",
+   "The 95% threshold aggregated across 'all channels across all test inputs' is ambiguous: if one hidden file has 10,000 channels and another has 10, weighting is unspecified \u2014 a solution could pass the spirit of the task but fail due to aggregation method.",
+   "FORMAT.md content is not shown; if it is ambiguous about row-major vs column-major layout (channels \u00d7 samples vs samples \u00d7 channels), a correct normalizer may parse dimensions wrong and fail all hidden tests \u2014 an invalid failure caused by environment ambiguity rather than logic error."
+  ],
+  "verdict": "reject",
+  "reasons": "The task's core difficulty lever (opaque-component black-box characterization) is bypassed because the instruction itself fully specifies the normalization contract, allowing a skilled agent to write a correct pure-Python replacement in ~15 commands without ever probing _norm_core.so. Genuine difficulty scores 2, below the required 4. Additionally, the implicit ddof=1 assumption ('channel_std' without stating sample vs population std) creates an ambiguity risk that could invalidate failures even for agents who follow the stated contract faithfully.",
+  "fixes": [
+   "Remove the explicit normalization formula from the instructions \u2014 instead say only 'the reference implementation at /app/pipeline/ref_norm.py defines the correct normalization contract' without spelling out mean/std/clamp/clip, forcing the agent to read ref_norm.py and then probe whether _norm_core.so matches it.",
+   "Explicitly state in the instructions that the normalization contract uses sample standard deviation (ddof=1) OR remove that hint entirely and let FORMAT.md + ref_norm.py be the only truth source, eliminating the ddof ambiguity.",
+   "Add a requirement that the repaired wheel must outperform a naive pure-Python reimplementation in throughput (e.g., process 40 files in under N seconds), forcing the agent to engage with _norm_core.so or write a Cython/C extension rather than trivially replacing it.",
+   "Show FORMAT.md content in the blueprint or explicitly confirm it unambiguously specifies channels-first (n_channels \u00d7 n_samples) layout to eliminate the invalid failure risk from format ambiguity.",
+   "Clarify the aggregation method for the 95% threshold (e.g., 'across all channels in all test files, weighted equally per channel') to avoid ambiguous pass/fail determinations."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering a binary normalizer's transformation and fixing a multi-stage SQL pipeline, whereas the candidate task requires replacing/repairing a broken Python wheel with a known reference implementation (mean-std normalization with clamping)."
+    },
+    {
+     "ref_id": "terminal-bench-science/eeg-erp-recovery",
+     "verdict": "distinct",
+     "reason": "That task is about EEG signal processing and ERP feature extraction from neuroscience data, with no wheel/packaging or normalization repair component."
+    },
+    {
+     "ref_id": "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task is about diagnosing and repairing a broken pip installation system, not about implementing or packaging a sensor normalization algorithm."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "distinct",
+     "reason": "That task requires fixing a bug in an EMA computation engine and meeting a throughput benchmark, not building or repairing a Python wheel for sensor channel normalization."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task requires finding a regression in a spectral entropy pipeline for cryptographic RNG auditing, a different mathematical domain and problem structure from repackaging a mean-std sensor normalizer."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.113
+    ],
+    [
+     "terminal-bench-science/eeg-erp-recovery",
+     0.103
+    ],
+    [
+     "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     0.102
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.091
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.078
+    ]
+   ],
+   "cost_usd": 0.015402
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057384000000000004
+}

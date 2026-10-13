@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "log-metrics-sql-query-service",
+  "title": "Metrics Query Daemon with Hidden Aggregation Invariant",
+  "scenario": "A data engineering team runs a pipeline that ingests structured application logs into a SQLite database and exposes query results over a simple line-protocol TCP service. The previous engineer left an incomplete query daemon at /app/queryd/ that is supposed to answer five query types over rolling time windows. The environment has ~1,400 lines across the daemon, ingestion scripts, schema migrations, and a corpus of 90 days of synthetic log/metric data already loaded into the database.",
+  "instruction_draft": "Hey, inheriting this metrics query daemon from Priya \u2014 she left mid-sprint. The service lives at /app/queryd/ and should listen on port 7700 for line-protocol requests. Each request is one line: `QUERY <type> <window_minutes>` and the response is a single line with the numeric answer. The query types are: P95_LATENCY (95th-percentile latency in ms over the window), ERROR_RATE (errors / total requests, as a float 0-1), THROUGHPUT (total requests in the window), SLOW_SERVICES (count of distinct service names whose p95 latency in the window exceeds 200ms), and BUDGET_BREACH (count of 15-minute sub-windows within the given window where error_rate > 0.01 AND p95_latency > 150ms simultaneously). The daemon is only partially wired up and at least one query type is completely unimplemented. Get it answering all five types correctly and keep it running in the background. One thing Priya warned me about: the log timestamps in the DB are stored in a non-obvious way that you'll need to dig into \u2014 don't assume they're plain Unix epoch.",
+  "requirements": [
+   "The daemon listens on TCP port 7700 and stays running in the background",
+   "QUERY P95_LATENCY <window_minutes> returns the 95th-percentile latency in milliseconds over the last <window_minutes> minutes as a float",
+   "QUERY ERROR_RATE <window_minutes> returns errors/total as a float between 0 and 1",
+   "QUERY THROUGHPUT <window_minutes> returns the integer count of requests in the window",
+   "QUERY SLOW_SERVICES <window_minutes> returns the integer count of distinct service names whose p95 latency in the window exceeds 200ms",
+   "QUERY BUDGET_BREACH <window_minutes> returns the count of 15-minute sub-windows (non-overlapping, aligned to epoch) within the given window where error_rate > 0.01 AND p95_latency > 150ms both hold simultaneously",
+   "Timestamp handling must correctly decode the stored format (discovered by exploration, not documented in the instruction)",
+   "All five query types must return numerically correct answers on fresh window sizes not present in any sample"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3 CLI, python3 packages: (no extra ORM \u2014 stdlib only for the daemon to force hand-rolled SQL)",
+   "SQLite database at /app/data/metrics.db with 90 days of pre-loaded data",
+   "Schema: table `events` with columns: id INTEGER, service TEXT, ts_encoded INTEGER, latency_ms REAL, is_error INTEGER. The ts_encoded column stores timestamps as (unix_epoch * 1000 + service_shard_offset) where service_shard_offset is a per-service constant offset stored in a separate table `service_registry(service TEXT, shard_offset INTEGER)`. This is the hidden invariant \u2014 naive epoch math gives wrong window boundaries.",
+   "Table `service_registry` exists and has the offsets, but is not referenced anywhere in the existing daemon code",
+   "Partial daemon at /app/queryd/daemon.py (~350 lines): TCP listener works, request parser works, P95_LATENCY and THROUGHPUT handlers exist but use raw ts_encoded as epoch (wrong), ERROR_RATE handler has a SQL syntax error (missing closing paren), SLOW_SERVICES and BUDGET_BREACH are stubs that return -1",
+   "Supporting module /app/queryd/db.py (~120 lines): opens the DB, has a get_connection() helper, no timestamp decode logic",
+   "Ingestion script /app/ingest/ingest.py (~280 lines): shows how ts_encoded is constructed \u2014 the formula is there but only a careful reader will find it and connect it to the query bug",
+   "Schema migration files at /app/migrations/ (3 files, ~200 lines total): show the evolution of the schema including when service_registry was added",
+   "Log corpus at /app/data/raw_logs/ (gzipped JSON, ~30 files): already ingested, present for investigation",
+   "README at /app/README.md: describes the query protocol and the five query types with example request/response, but says nothing about timestamp encoding",
+   "A sample test client /app/test_client.py that sends a hardcoded set of 3 queries and prints responses (does not cover BUDGET_BREACH or SLOW_SERVICES, and uses only one window size)",
+   "The daemon start script /app/queryd/start.sh that cd's into /app/queryd and runs python daemon.py (so relative imports work)",
+   "~200 lines of plausible but irrelevant utility code in /app/queryd/metrics_export.py (Prometheus exporter stub, not connected to anything)"
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources. First, a hidden_invariant: ts_encoded = unix_epoch_ms + shard_offset, where shard_offset is a per-service constant in service_registry. Any query that filters by time window using raw ts_encoded will include or exclude the wrong rows because different services have different offsets (spanning \u00b130 minutes). The solver must notice this by observing that P95_LATENCY returns plausible-looking but wrong values, then trace back through ingest.py to find the encoding formula, then find service_registry, then fix db.py to decode correctly before any window filter. Second, a build_component: SLOW_SERVICES requires a per-service p95 computed inside a window (requires a subquery or window function), and BUDGET_BREACH requires partitioning the window into aligned 15-minute buckets and computing two aggregate metrics per bucket, then counting qualifying buckets \u2014 this is a non-trivial SQL construction that must handle partial buckets and epoch alignment correctly. A solver that fixes the timestamp bug but implements BUDGET_BREACH with overlapping or misaligned windows will pass the sample test client but fail hidden tests.",
+  "trap": "The sample test_client.py only checks P95_LATENCY, ERROR_RATE, and THROUGHPUT with a 60-minute window, and its expected values are close to correct even with the broken timestamp logic (because most services have small offsets and the 60-minute window masks the edge error). A solver who fixes the syntax error in ERROR_RATE, implements SLOW_SERVICES and BUDGET_BREACH naively, and verifies with the sample client will see passing results \u2014 but the hidden tests use window sizes of 3, 7, and 45 minutes where offset errors push events across window boundaries, use a 120-minute window for BUDGET_BREACH checking exact bucket-aligned counts, and use SLOW_SERVICES on a window where exactly 2 services cross the 200ms threshold (naive SQL averaging instead of p95 gives the wrong count).",
+  "tests": [
+   "Smoke: daemon is listening on port 7700 (nc -z localhost 7700 exits 0)",
+   "THROUGHPUT with window=5: send QUERY THROUGHPUT 5, verify against ground truth computed at verify time by querying metrics.db with correct timestamp decode",
+   "THROUGHPUT with window=45: same, different window to catch offset errors at boundary",
+   "ERROR_RATE with window=7: verify float within 1e-4 of correct value",
+   "ERROR_RATE with window=60: sanity check on wider window",
+   "P95_LATENCY with window=3: narrow window where timestamp offset errors move events in/out; verify within 0.5ms of correct p95",
+   "P95_LATENCY with window=90: wider window",
+   "SLOW_SERVICES with window=30: verifier generates the correct count by computing per-service p95 with correct timestamps; checks integer equality",
+   "SLOW_SERVICES with window=10: uses a window where exactly 2 services are above threshold; wrong aggregation (mean vs p95) gives 3 or 1",
+   "BUDGET_BREACH with window=120: verifier independently computes aligned 15-minute buckets (floor(unix_epoch_ms/900000)*900000 boundaries), checks each for error_rate>0.01 AND p95>150ms; verifies count equals daemon response",
+   "BUDGET_BREACH with window=60: second scenario; partial last bucket must not be counted",
+   "Concurrency: send 10 rapid sequential queries on same connection; all must return valid numeric responses (no crash on repeated use)"
+  ],
+  "verifier_knob": {
+   "name": "number of window scenarios per query type",
+   "value": "2 per type (10 total checks)",
+   "effect": "Adding more window sizes (especially very small ones like 2 minutes or prime-minute values like 7, 13) increases the chance of catching timestamp offset bugs; reducing to 1 per type makes it easier to pass with a partially correct implementation"
+  },
+  "expected_failure_modes": [
+   "Agent fixes the ERROR_RATE syntax error and stubs out SLOW_SERVICES/BUDGET_BREACH to return 0, verifies with sample client which doesn't test those types, and submits \u2014 fails all SLOW_SERVICES and BUDGET_BREACH checks",
+   "Agent finds and fixes the timestamp decode for one or two query types but misses that db.py's get_connection() is used globally \u2014 only patching the SQL in the handler rather than the shared decode utility means some query types still use raw ts_encoded",
+   "Agent implements BUDGET_BREACH using overlapping sliding 15-minute windows instead of epoch-aligned non-overlapping buckets \u2014 gives wrong count on the 120-minute test",
+   "Agent implements SLOW_SERVICES using AVG(latency_ms) > 200 instead of computing p95 per service \u2014 passes when all services are clearly above or below threshold but fails the borderline test where exactly 2 services cross p95=200 but not avg=200",
+   "Agent never discovers the service_registry table or the shard_offset encoding because the existing daemon code never references it; P95 and THROUGHPUT appear reasonable on the 60-minute sample window, leading the agent to believe timestamps are fine"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "systems",
+   "hidden-invariant",
+   "tcp-service",
+   "bash",
+   "log-analysis"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/queryd/daemon.py",
+   "cat /app/queryd/db.py",
+   "cat /app/ingest/ingest.py",
+   "sqlite3 /app/data/metrics.db '.schema'",
+   "sqlite3 /app/data/metrics.db 'SELECT * FROM service_registry LIMIT 10'",
+   "Edit db.py: add decode_ts(ts_encoded, service) helper that JOINs service_registry to subtract shard_offset, yielding unix_ms",
+   "Edit daemon.py: fix ERROR_RATE handler SQL (add missing closing paren)",
+   "Edit daemon.py: fix P95_LATENCY handler to use decoded timestamp in window filter via JOIN service_registry",
+   "Edit daemon.py: fix THROUGHPUT handler to use decoded timestamp",
+   "Edit daemon.py: implement SLOW_SERVICES with subquery computing per-service p95 latency and counting those > 200ms",
+   "Edit daemon.py: implement BUDGET_BREACH with epoch-aligned 15-min buckets using integer division on decoded unix_ms, aggregating error_rate and p95 per bucket, counting qualifying buckets",
+   "bash /app/queryd/start.sh &",
+   "sleep 1 && nc -z localhost 7700",
+   "echo 'QUERY THROUGHPUT 60' | nc localhost 7700",
+   "python /app/test_client.py",
+   "echo 'QUERY SLOW_SERVICES 30' | nc localhost 7700",
+   "echo 'QUERY BUDGET_BREACH 120' | nc localhost 7700"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction explicitly warns 'don't assume they're plain Unix epoch' and points to ingest.py \u2014 this converts the 'hidden' invariant into a semi-disclosed one, weakening the trap significantly; a careful agent will find it in ~3 file reads",
+   "The BUDGET_BREACH SQL for epoch-aligned bucketing has multiple valid correct formulations (e.g., using integer division on unix_ms / 900000); if the verifier uses a slightly different alignment definition (e.g., floor vs truncate behavior for negative epochs, or how partial end-buckets are handled), correct-looking implementations might fail on edge cases the blueprint doesn't fully specify",
+   "The test for SLOW_SERVICES with window=10 where 'exactly 2 services are above threshold' requires very precise data generation \u2014 if synthetic data is generated with randomness, the threshold crossing may not be deterministic across runs or may drift; the verifier recomputes ground truth at verify-time which helps, but the data must be stable",
+   "Concurrency test sends 10 rapid sequential queries 'on same connection' \u2014 behavior depends on whether the daemon handles pipelining; if it closes connection after each response (common in simple daemons), this test may fail for protocol reasons unrelated to correctness",
+   "The sample test_client.py is described as not covering SLOW_SERVICES or BUDGET_BREACH, yet the instruction doesn't tell the solver this \u2014 a solver who only runs test_client.py and sees passing results may submit without implementing those types, which is an expected failure mode but could also be seen as an instruction gap"
+  ],
+  "verdict": "reject",
+  "reasons": "The core 'hidden' invariant is substantially disclosed by the instruction itself ('timestamps are stored in a non-obvious way \u2014 dig into ingest.py'), and the service_registry table will appear immediately in .schema, making discovery trivial for any agent that reads the code. The speedrun lands at ~18 commands and genuine_difficulty scores 3 because the timestamp bug is semi-revealed and BUDGET_BREACH, while tricky, is a known SQL pattern. The concurrency test ('same connection') may impose undocumented protocol requirements that cause valid implementations to fail, and the BUDGET_BREACH alignment specification has ambiguities around partial buckets that could produce invalid failures.",
+  "fixes": [
+   "Remove or weaken the timestamp hint from the instruction \u2014 instead of 'don't assume they're plain Unix epoch,' say something neutral like 'make sure your queries return accurate results' so the hidden invariant is truly hidden and must be discovered by observing wrong answers",
+   "Clarify BUDGET_BREACH bucket alignment precisely in the verifier spec (e.g., 'buckets aligned to UTC midnight, not Unix epoch zero' or specify exact floor formula) to eliminate ambiguity and invalid failure risk",
+   "Change the concurrency test to use 10 separate connections rather than one connection with 10 sequential queries, or explicitly document the expected protocol behavior (connection-per-request vs persistent), to avoid invalid failures from protocol mismatch",
+   "Add a 4th query type that is entirely missing (not stubbed at -1) to force the solver to both discover the type exists and implement it from scratch, increasing genuine difficulty",
+   "Make the data generation for SLOW_SERVICES window=10 deterministic and document the exact expected count in the verifier to prevent flaky threshold crossings"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing an existing SQL query for performance while preserving semantics; the candidate is about implementing missing query handlers in a TCP daemon with a hidden timestamp encoding puzzle."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-product-search-query",
+     "verdict": "distinct",
+     "reason": "That task is a multiple-choice query optimization selection problem; the candidate is about implementing and debugging a live TCP query service with reverse-engineered timestamp storage."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is purely about rewriting an SQL query for efficiency; the candidate involves implementing multiple query types in a running daemon with undocumented timestamp encoding."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "variant",
+     "reason": "Both tasks involve repairing a broken TCP query service that returns incorrect results due to a data handling bug, requiring exploration of the codebase to fix specific query logic \u2014 the core problem structure (debug running daemon, fix data parsing/aggregation, verify correctness) is nearly identical despite different domains (NetFlow vs. metrics logs)."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task is about finding a mathematical regression in a DSP/entropy pipeline's fast-path implementation; the candidate is about implementing missing query types and decoding an undocumented timestamp format in a TCP daemon."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.226
+    ],
+    [
+     "terminal-bench-pro/optimize-product-search-query",
+     0.181
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.172
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.162
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.108
+    ]
+   ],
+   "cost_usd": 0.014339999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.054521999999999994
+}

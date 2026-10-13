@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-service-repair",
+  "title": "Daily Ledger Rollup Service Repair",
+  "scenario": "An analyst at a small fintech company noticed that daily account balance summaries stopped matching raw transaction totals three weeks ago. The in-house C service `ledgerd` reads a SQLite database of transactions, aggregates them by account over configurable time windows, and serves balance queries over a simple line-delimited text protocol on port 7741. The codebase is ~1,200 lines across six files including a main daemon, a rollup engine, a protocol handler, and a schema migration script.",
+  "instruction_draft": "The ledger rollup service at /opt/ledgerd answers balance queries on port 7741. Balances returned for accounts with both credits and reversals are wrong. Fix the service so that every protocol request returns the correct balance; the service must keep running and answering requests after your fix.",
+  "requirements": [
+   "The running service on port 7741 returns correct balances for all accounts",
+   "Accounts with only credits are unaffected",
+   "Accounts with reversal transactions (negative amounts) have their balance correctly netted",
+   "Accounts with reversals that were themselves reversed (double-reversal) accumulate correctly",
+   "The service must remain running and answering new requests after the fix is applied",
+   "The balance for a time-windowed query (BALANCE account start_ts end_ts) returns only transactions in the inclusive window"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, libsqlite3-dev, sqlite3, and Python 3",
+   "Source tree at /opt/ledgerd/src: main.c (~200 lines), rollup.c (~300 lines), proto.c (~180 lines), db.c (~150 lines), migrate.sh (~80 lines), Makefile",
+   "Binary pre-compiled and installed at /usr/local/bin/ledgerd; source is present but the solver must decide whether to patch-and-recompile or work around",
+   "SQLite database at /var/lib/ledgerd/ledger.db with tables: transactions (id, account_id, amount_cents, ts, type), rollup_cache (account_id, window_start, window_end, cached_balance, dirty)",
+   "transactions table seeded with ~4,000 rows including plain credits, reversals (type='reversal', amount is already negated in the data), and double-reversals (a reversal of a reversal, making it positive again)",
+   "Bug 1 (data-dependent, not visible by reading the happy path): rollup.c uses an unsigned integer accumulator for amount_cents; reversals stored as negative values in SQLite are read correctly by db.c as int64, but rollup.c casts to uint64_t before summing, causing wrap-around only for accounts that go net-negative mid-accumulation before recovering positive \u2014 pure-credit accounts are fine and mask the bug",
+   "Bug 2 (interacting): rollup_cache is populated by migrate.sh which runs at startup; the cache-invalidation logic in rollup.c marks rows dirty when a new transaction is inserted, but proto.c reads the cached value without checking the dirty flag, so even after recompiling rollup.c to fix the cast, cached stale values are served until the cache is explicitly cleared or the service restarts with an empty cache",
+   "The dirty-flag check is present in rollup.c as dead code (behind `if (0)`) \u2014 it was disabled during a 'performance optimization' three weeks ago, which is exactly when the analyst's numbers diverged",
+   "migrate.sh pre-populates rollup_cache with balances computed using the buggy unsigned accumulator, so even a correct rollup.c will serve wrong answers until the cache is rebuilt",
+   "A supervisord or simple shell loop keeps ledgerd running; the solver must compile and hot-swap or send SIGHUP/restart cleanly",
+   "Verifier script at /opt/verify/check.py talks the protocol, inserts fresh test transactions at verify time, and checks balances against ground-truth computed in Python"
+  ],
+  "internal_hint": "Two interacting bugs: (1) rollup.c accumulates amount_cents into a uint64_t causing unsigned wraparound for accounts that go temporarily negative (reversals); (2) proto.c skips the dirty-flag check (dead code `if(0)`) so stale rollup_cache rows are served even after (1) is fixed. Ordered procedure trap: fixing (1) and recompiling is not enough because migrate.sh pre-seeded rollup_cache with wrong values and the cache is read before re-accumulation. Correct order: fix both bugs in source, recompile, clear rollup_cache, restart service. Missing any step \u2014 fixing only the cast, not clearing the cache, or not re-enabling the dirty check \u2014 produces wrong answers for accounts whose cache was pre-poisoned. The solver must instrument/experiment: the cast bug only manifests at runtime on accounts where partial sums go negative, invisible by reading the accumulation loop in isolation (looks like a standard sum). The dirty-flag disabling is visible in source but its effect requires understanding the cache-read path in proto.c.",
+  "trap": "An agent that finds and fixes the uint64_t cast bug, recompiles, and restarts the service will see correct answers for freshly inserted test accounts (which have no cache entry) but wrong answers for the pre-seeded accounts whose stale rollup_cache rows are still served. The verifier uses both pre-existing accounts (with poisoned cache) and new accounts inserted at verify time. A shallow test against only new inserts passes; the full suite fails on pre-existing accounts.",
+  "tests": [
+   "Protocol smoke test: send 'BALANCE acc_0001 0 9999999999', expect a specific known-correct value for a pure-credit account (confirms service is alive and basic path works)",
+   "Reversal account test: query balance for a pre-seeded account with 10 credits and 3 reversals; expected balance = sum of all, must not show unsigned-wraparound artifact or stale cache value",
+   "Double-reversal test: account with a reversal-of-reversal must accumulate the re-positive amount correctly",
+   "Time-windowed test: 'BALANCE acc_0042 ts1 ts2' must return only transactions in the window, excluding earlier credits",
+   "Fresh-insert test: verifier inserts a new account with credits and reversals via the protocol's INSERT command, then queries balance; must be correct (tests that the fix works for new data too)",
+   "Stress scenario: 12 distinct pre-seeded accounts each with different credit/reversal patterns queried in sequence; all must match Python ground-truth computed from raw transaction rows",
+   "Service continuity: after all balance queries, send one more INSERT and BALANCE; service must still respond (not crashed or hung)"
+  ],
+  "verifier_knob": {
+   "name": "number of pre-seeded reversal account patterns",
+   "value": "12 distinct patterns at current difficulty",
+   "effect": "Raising to 30+ patterns with more complex interleaving of reversals and double-reversals makes it harder to accidentally pass by partial fixes; lowering to 3-4 simple patterns makes it easier for a shallow fix to pass"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the uint64_t cast and restarts, passes fresh-insert tests but fails pre-seeded accounts because stale cache is still served",
+   "Agent clears the cache but forgets to re-enable the dirty-flag check, so the next rollup after a new insert is cached with the old (wrong) logic",
+   "Agent clears cache and fixes the cast, but does so in the wrong order (clears cache first, then recompiles), so the service restarts once with wrong compiled code and repopulates cache with bad values before the second restart",
+   "Agent patches proto.c to bypass cache entirely (reading raw transactions always) \u2014 this fixes correctness but the dirty-flag test in the verifier checks that the cache mechanism itself is repaired, not bypassed",
+   "Agent finds the dirty-flag dead code and re-enables it, but misses the uint64_t cast, so accounts whose partial sums never go negative pass but deeply negative mid-accumulation accounts still fail"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "service-protocol",
+   "two-interacting-bugs",
+   "ordered-recovery",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/ledgerd/src/rollup.c  # spot uint64_t accumulator",
+   "cat /opt/ledgerd/src/proto.c   # spot if(0) dead code on dirty-flag check",
+   "cat /opt/ledgerd/src/db.c      # confirm int64_t read path from SQLite",
+   "cat /opt/ledgerd/src/migrate.sh  # confirm cache pre-seeded at startup",
+   "sqlite3 /var/lib/ledgerd/ledger.db 'SELECT count(*) FROM rollup_cache'  # confirm cache populated",
+   "sed -i 's/uint64_t/int64_t/g' /opt/ledgerd/src/rollup.c  # fix cast bug",
+   "sed -i 's/if (0)/if (1)/g' /opt/ledgerd/src/proto.c  # re-enable dirty-flag check",
+   "cd /opt/ledgerd/src && make  # recompile",
+   "cp /opt/ledgerd/src/ledgerd /usr/local/bin/ledgerd  # install binary",
+   "sqlite3 /var/lib/ledgerd/ledger.db 'DELETE FROM rollup_cache'  # clear poisoned cache",
+   "pkill ledgerd; sleep 2  # restart (supervisor respawns)",
+   "echo 'BALANCE acc_0001 0 9999999999' | nc localhost 7741  # smoke test",
+   "python3 /opt/verify/check.py  # full verification"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The dirty-flag bypass failure mode ('Agent patches proto.c to bypass cache entirely') is listed as a valid failure, but the blueprint says this 'fixes correctness but the dirty-flag test in the verifier checks that the cache mechanism itself is repaired, not bypassed' \u2014 it's unclear how the verifier distinguishes a correct bypass from a correct repair without instrumenting internal state, making this test potentially overreaching or implementation-dependent",
+   "The ordering trap (clear cache before recompile causes service to repopulate with bad values) assumes the service auto-restarts and re-runs migrate.sh between the two steps; if supervisord delays or doesn't re-run migrate.sh on every restart, the trap may not trigger, making this failure mode environment-dependent and potentially flaky",
+   "The 'if (0)' string match for sed is fragile \u2014 actual source might have 'if(0)' (no space), and the blueprint doesn't specify the exact whitespace, so a solver's sed command might silently fail",
+   "The Makefile build process is not fully specified; if there are missing dependencies or the pre-compiled binary was built with different flags, recompilation might fail silently or produce a mislinked binary"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: both bugs are directly readable in source (a named uint64_t type and a literal `if (0)` block), making this a ~13-command mechanical fix matching the pattern the rubric explicitly caps at difficulty 2. The interacting-bugs and ordered-recovery framing adds narrative complexity but not agent-facing difficulty, since reading two files and doing four operations in logical order is straightforward for a frontier agent. Additionally, the verifier's ability to distinguish a cache-bypass fix from a proper dirty-flag repair is unclear and could produce invalid failures.",
+  "fixes": [
+   "Make the bugs latent rather than source-readable: instead of `if (0)`, use a runtime flag read from an environment variable or config file that happens to be set to 0; instead of `uint64_t`, use a correct-looking `int64_t` but introduce the bug in the aggregation logic (e.g., accumulating `abs(amount_cents)` instead of `amount_cents`), so the bug requires running and observing wrong output to locate",
+   "Add a third interacting factor that requires experimentation to discover: e.g., a schema inconsistency where amount_cents for reversals is stored positive (not negated) in the database, requiring the solver to inspect actual data values rather than just reading code",
+   "Replace the cache-bypass invalid failure risk with a verifier that checks cache is being used (e.g., measures query latency or checks rollup_cache is non-empty after queries) to make the bypass-vs-repair distinction deterministic",
+   "To increase ordering trap reliability, make migrate.sh run explicitly only at container startup (not on restart), so the cache repopulation scenario is predictable and not supervisord-timing-dependent"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both involve fixing incorrect financial balance calculations in a ledger system with credits/debits/reversals, but the candidate uses a C daemon with a network protocol while the reference uses Python with CSV imports."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference fixes a weighted aggregation bug in a sales service, while the candidate fixes reversal/netting logic in a financial ledger daemon."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "The reference is about debug vs release build memory corruption in C++, unrelated to financial ledger logic."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The reference fixes a NetFlow network traffic aggregation service, which is a completely different domain and protocol from a financial ledger."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "The reference fixes a binary frame codec encoding/decoding protocol service, unrelated to financial ledger balance calculations."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.186
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.141
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.121
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.109
+    ],
+    [
+     "ours/official-aac910462208",
+     0.105
+    ]
+   ],
+   "cost_usd": 0.011664
+  },
+  "novel": false
+ },
+ "cost_usd": 0.052056000000000005
+}

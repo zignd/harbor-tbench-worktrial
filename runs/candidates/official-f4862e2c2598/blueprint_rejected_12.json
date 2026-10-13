@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "metric-normalizer-query-oracle",
+  "title": "Metric Normalizer Query Oracle",
+  "scenario": "A data engineering team maintains a pipeline that ingests application logs through a compiled normalizer binary, stores them in SQLite, and is supposed to serve a TCP query protocol for dashboards. The normalizer binary (no source available) applies non-obvious transformations to metric values before storage. The query daemon was never finished \u2014 only a stub exists. The verifier will send live protocol requests and check correctness against ground truth derived from the same normalizer.",
+  "instruction_draft": "Hey, I need you to finish the query daemon for our metrics pipeline. The daemon lives in /app/queryd \u2014 there's a stub there but it doesn't actually answer anything. It needs to listen on port 7744 and answer the protocol described in /app/docs/protocol.md. The data comes from the normalizer that's been running; check /app/ingestor/ to understand the pipeline. Make sure the math in your responses is right \u2014 there are some tricky aggregations. Get it running as a background service.",
+  "requirements": [
+   "A TCP daemon listens on port 7744 and speaks the protocol in /app/docs/protocol.md",
+   "METRIC_RANGE queries return correct min/max/sum/count for a named metric within a time window",
+   "PERCENTILE queries return the correct p50/p90/p99 of a metric series",
+   "ANOMALY queries return metric samples that deviate from the rolling window mean by more than the given sigma threshold",
+   "The daemon handles pipelined requests (multiple queries per connection) without dropping responses",
+   "Results are numerically correct given the actual stored data, including whatever transformations the normalizer applies"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base",
+   "/app/ingestor/ \u2014 Python ingestor (ingest.py ~200 lines) that shells out to /app/bin/normalizer binary and writes results to /app/data/metrics.db (SQLite)",
+   "/app/bin/normalizer \u2014 compiled C binary (no source), strips/transforms metric values; ships pre-built for linux/amd64",
+   "/app/data/metrics.db \u2014 pre-populated SQLite database with ~50k rows of normalized metrics across 8 metric names, covering 72 hours of data",
+   "/app/docs/protocol.md \u2014 specifies the 4-command TCP protocol (METRIC_RANGE, PERCENTILE, ANOMALY, PING) with request/response wire format",
+   "/app/queryd/stub.py \u2014 non-functional stub that opens port 7744 and immediately closes connections",
+   "/app/queryd/query_engine.py \u2014 skeleton with TODOs, imports but no implementation",
+   "/app/logs/ \u2014 normalizer output logs showing input\u2192stored-value pairs for debugging (500 lines, enough to deduce the transformation with systematic analysis)",
+   "/app/tests/sample_queries.json \u2014 5 sample queries with expected responses for smoke-testing",
+   "/app/ingestor/run_ingest.sh \u2014 script that feeds test vectors through the normalizer for experimentation",
+   "The normalizer applies a hidden piecewise transformation: values < 1000 are stored as-is, values in [1000, 9999] are divided by 10 and floor'd, values >= 10000 are stored as log10(v)*100 rounded to int. This is NOT documented anywhere \u2014 discoverable only by running the binary or reading the log pairs.",
+   "Systemd unit or background runner not required \u2014 daemon just needs to be running",
+   "Additional plausible pipeline code: schema migration scripts, a metrics_config.yaml, a dead-letter queue handler, alerting webhook stubs (~400 lines total noise)"
+  ],
+  "internal_hint": "Root causes: (1) The query daemon stub is entirely unimplemented. (2) The normalizer silently applies a piecewise value transformation (pass-through <1000, floor-divide by 10 for [1000,9999], log10*100 for >=10000) that means raw SQL aggregations on stored values do NOT represent the original metric magnitudes. Correct METRIC_RANGE/PERCENTILE/ANOMALY answers require the solver to either: (a) discover the inverse transform and apply it before aggregation, OR (b) do all aggregations on stored values and return stored-domain results (which matches ground truth since the verifier also works in stored domain). The key trap: the logs show the transformation clearly if the solver probes systematically (e.g., pipe known values through run_ingest.sh and compare to db). The protocol has a subtle framing rule: responses are newline-terminated JSON objects, and the ANOMALY response must list samples in ascending timestamp order \u2014 not the order SQLite returns them. A solver who implements the protocol but returns unordered ANOMALY results, or who applies the inverse transform unnecessarily, fails the hidden tests.",
+  "trap": "A naive agent implements METRIC_RANGE and PERCENTILE correctly using SQLite aggregates (which happen to be in stored-domain, matching ground truth), passes the 5 sample queries, but either: (1) returns ANOMALY results in SQLite's natural order (which is insertion order, not always timestamp-ascending) causing failures on the verify-time inputs that have gaps/reingested rows, OR (2) tries to apply an inverse transform to 'get real values' because the logs show transformation happening, and returns wrong magnitudes that don't match ground truth (which is also stored-domain). The pipelined-connection requirement catches agents who open a new connection per query in their test loop but fail when the verifier sends 3 queries on one TCP socket.",
+  "tests": [
+   "PING command returns {\"status\": \"ok\"} within 1 second",
+   "METRIC_RANGE on 'cpu_usage' over a 1-hour window returns correct min/max/sum/count matching SQLite ground truth in stored domain",
+   "METRIC_RANGE on a window with zero matching rows returns {\"count\": 0, \"min\": null, \"max\": null, \"sum\": null}",
+   "PERCENTILE p90 on 'mem_bytes' over 6 hours returns value matching nearest-rank calculation on stored values",
+   "PERCENTILE p50 on a single-element window returns that element's stored value",
+   "ANOMALY with sigma=1.5 on 'disk_io' returns samples in strict ascending timestamp order",
+   "ANOMALY with sigma=3.0 on a flat metric returns empty list (no deviations)",
+   "ANOMALY response includes the sample's stored value and its timestamp",
+   "Three METRIC_RANGE queries sent on a single TCP connection without closing return three correct responses in order (pipelining test)",
+   "PERCENTILE query on a metric not in the database returns an error response matching the protocol spec",
+   "Verifier generates a fresh batch of 200 synthetic log entries, injects them via the ingestor, then queries across the new time window \u2014 results must match SQLite ground truth on the newly inserted data"
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "11 scenarios (10 fixed + 1 fresh-data injection)",
+   "effect": "Reducing to 5 scenarios (removing pipelining, empty-result, and fresh-data tests) makes it easier; raising to 20 by adding more edge cases (overlapping windows, very large sigma, metric names with special chars) makes it harder"
+  },
+  "expected_failure_modes": [
+   "Agent correctly implements METRIC_RANGE and PERCENTILE but returns ANOMALY results in wrong order (SQLite insertion order vs timestamp ascending)",
+   "Agent probes the normalizer logs, concludes it must inverse-transform values before returning, and returns magnitudes that don't match the stored-domain ground truth",
+   "Agent implements the protocol for single-query connections but fails the pipelining test because the stub's architecture reads one request then closes",
+   "Agent misreads the percentile spec and uses interpolation instead of nearest-rank, failing on the hidden p50 single-element and p99 small-sample cases",
+   "Agent never probes the normalizer and assumes stored values are raw, passes sample tests, but the fresh-data injection test reveals the mismatch because a new metric in the 10000+ range was injected"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "tcp-protocol",
+   "reverse-engineering",
+   "black-box-binary",
+   "log-pipeline",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/protocol.md",
+   "cat /app/queryd/stub.py",
+   "cat /app/queryd/query_engine.py",
+   "cat /app/tests/sample_queries.json",
+   "sqlite3 /app/data/metrics.db '.schema'",
+   "sqlite3 /app/data/metrics.db 'SELECT * FROM metrics LIMIT 10'",
+   "head -100 /app/logs/normalizer.log",
+   "bash /app/ingestor/run_ingest.sh with known values to probe normalizer",
+   "cat /app/ingestor/ingest.py",
+   "Write /app/queryd/daemon.py: asyncio TCP server, loop over newline-delimited JSON requests per connection, implement PING/METRIC_RANGE/PERCENTILE/ANOMALY using sqlite3, ORDER BY ts ASC for ANOMALY",
+   "python /app/queryd/daemon.py &",
+   "echo '{\"cmd\":\"PING\"}' | nc localhost 7744",
+   "Construct METRIC_RANGE test via nc and compare to sqlite3 ground truth",
+   "Send 3 queries on one nc connection to test pipelining",
+   "Verify ANOMALY returns ascending timestamps"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Pre-built linux/amd64 normalizer binary may fail on arm64 container hosts, breaking fresh-data injection test",
+   "Fresh-data injection test depends on ingestor + normalizer working correctly at verify time \u2014 any environment fragility causes invalid failure",
+   "Protocol.md's percentile method (nearest-rank vs interpolation) may not be explicit enough, making 'wrong' implementations ambiguous",
+   "Zero-row METRIC_RANGE null response format must exactly match protocol spec \u2014 if spec is ambiguous, valid implementations may fail",
+   "The 'stored-domain ground truth' design means agents who never discover the normalizer transformation still pass most tests, but the fresh-data injection with values >=10000 could expose this inconsistency depending on what synthetic data is generated",
+   "Systemd/background runner ambiguity: instruction says 'get it running as a background service' but requirements say daemon just needs to be running \u2014 process restart after verifier connects is a risk"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 3 falls below the required minimum of 4. The speedrun shows ~15 commands likely suffices because the primary traps (inverse transform, ANOMALY ordering) are either naturally avoided by competent agents or irrelevant since stored-domain IS ground truth. The clarity score of 3 meets the minimum but the instruction omits the zero-rows response format and never hints at stored-domain vs original-domain distinction, creating potential invalid failures. The average score of 3.6 barely meets threshold but genuine_difficulty failing disqualifies it.",
+  "fixes": [
+   "Increase genuine difficulty by making the ANOMALY ordering trap harder to stumble into correctly: specify in protocol.md that results should be in 'data arrival order' (insertion order) but make the ground truth actually require timestamp-ascending, forcing the solver to discover the discrepancy empirically",
+   "Make the stored-domain vs original-domain ambiguity a real trap by having the verifier check METRIC_RANGE min/max against original pre-transformation values for at least 2 tests, requiring the solver to discover and apply the inverse transform correctly",
+   "Add a fifth query type (e.g., METRIC_DELTA returning rate-of-change) that requires understanding the rolling window and is not trivially mappable to a single SQL query",
+   "Explicitly state the zero-rows METRIC_RANGE response format in the instruction or protocol.md to eliminate an invalid failure risk",
+   "Replace the linux/amd64-only binary constraint with a multi-arch build or a Python-based normalizer with obfuscated logic to eliminate platform-dependent invalid failures"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a broken NetFlow v9 aggregation service with UDP ingestion and JSON queries, while the candidate is about implementing a TCP query daemon with statistical aggregations (percentile, anomaly detection) over SQLite data from a black-box normalizer."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-engineer-kvstore-binary-protocol",
+     "verdict": "distinct",
+     "reason": "That task focuses on reverse-engineering a binary key-value store protocol to write a client, while the candidate focuses on implementing a query server daemon with statistical operations over a pre-existing database."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve a black-box normalizer binary with no source code that applies non-obvious transformations, requiring the solver to characterize its behavior before implementing correct downstream processing \u2014 the candidate adds a TCP query daemon layer but the core challenge of dealing with an opaque normalizer binary is essentially the same."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a broken log enrichment pipeline with a GeoIP binary and Flask API endpoints, while the candidate is about implementing a TCP query daemon with statistical aggregations (percentile, anomaly detection)."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bug in an HMAC chain verifier for audit logs with a stdin/stdout protocol, while the candidate is about implementing a new TCP query daemon with statistical aggregations over a metrics database."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-0cd67d8adf4d",
+     0.132
+    ],
+    [
+     "terminal-bench-pro/reverse-engineer-kvstore-binary-protocol",
+     0.119
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.113
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.094
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.08
+    ]
+   ],
+   "cost_usd": 0.01554
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055008
+}

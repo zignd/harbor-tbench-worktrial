@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "External Merge-Sort Stream Refactor",
+  "scenario": "A release engineer is blocked because the nightly integration build for a data-pipeline service is broken. The service ships a compiled Go binary (`/app/bin/sortd`) built in the Dockerfile from sources in `/app/src/`. The binary reads a stream of fixed-width 64-byte records on stdin and writes them sorted to stdout, using a k-way external merge-sort across temporary files. A large refactoring two sprints ago moved the merge phase from a naive linear scan to a priority-queue heap, but the build has been failing correctness CI since. The sources (~1400 lines across 6 files) compile cleanly \u2014 the binary runs and produces output \u2014 but the output is silently wrong on inputs larger than a single run.",
+  "instruction_draft": "The nightly build of `sortd` is broken: the binary at `/app/bin/sortd` compiles and runs without error, but its sorted output is incorrect when the input exceeds the single-run buffer size. Your job is to fix the Go sources under `/app/src/` so that `sortd` produces a correctly sorted output for any input, regardless of the number of merge passes required.\n\nThe binary reads a stream of fixed-width 64-byte binary records from stdin and writes them sorted to stdout. Each record's first 8 bytes are a big-endian int64 sort key; the remaining 56 bytes are an opaque payload that must be preserved exactly. The service must support multi-pass merges (inputs that require more than one merge pass to reduce to a single sorted run), and the k-way merge must use a correct min-heap over active runs \u2014 every record that enters must appear in the output exactly once, in non-decreasing key order. Correctness is tested at verify time by feeding fresh randomly-generated record streams of varying sizes and fan-out factors and comparing the binary output byte-for-byte against an independent reference sort.",
+  "requirements": [
+   "The Go sources in /app/src/ must compile to a working binary at /app/bin/sortd via `go build`.",
+   "sortd reads a stream of 64-byte binary records from stdin and writes all records to stdout in non-decreasing order of the big-endian int64 key in the first 8 bytes.",
+   "The 56-byte payload of every record must be preserved byte-for-byte in the output.",
+   "Every record that appears in the input must appear exactly once in the output (no duplicates, no omissions).",
+   "Multi-pass merges must work correctly: inputs requiring more than one merge pass must produce a fully sorted output.",
+   "The k-way merge must correctly drain all runs, including the final partial run when the total record count is not a multiple of the per-run buffer size.",
+   "Output is tested byte-for-byte against a reference sort on inputs generated at verify time with varying record counts and run sizes."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs golang-1.21 and build-essential via apt.",
+   "Dockerfile builds the binary: WORKDIR /app && COPY src/ src/ && RUN go build -o bin/sortd ./src/",
+   "/app/src/ contains ~1400 lines of Go across 6 files: main.go, sort.go, merge.go, heap.go, runfile.go, util.go.",
+   "The planted bugs are in merge.go and heap.go, introduced during the refactor:",
+   "  Bug 1 (heap.go): The min-heap Pop() implementation swaps the wrong indices \u2014 it swaps heap[0] with heap[len-1] correctly to extract the minimum, but the sift-down after pop iterates with a '<=' condition instead of '<', causing it to sometimes pick the right child when the left child is equal, which by itself is benign \u2014 the real bug is that it forgets to update the heap-entry's run-file cursor position before re-heapifying, so a stale file offset is used for subsequent reads from that run, silently producing records from the wrong position.",
+   "  Bug 2 (merge.go): The multi-pass merge loop checks `len(runs) <= k` to decide whether a final merge is needed, but uses <= instead of ==1, so when exactly k runs remain after the last reduction pass the function returns that k-run slice without a final merge, yielding k unsorted chunks concatenated.",
+   "  Bug 3 (merge.go): When writing the final merged output, the code flushes the bufio.Writer inside a loop but only after the last record; if the output has exactly a multiple of the internal flush-buffer size records, the final flush is skipped, truncating the output by one bufio buffer worth of records.",
+   "/app/samples/ contains 3 small hand-crafted input files (8, 16, and 32 records) and their expected sorted outputs \u2014 small enough to fit in a single run, so all three pass with the buggy binary.",
+   "/app/README.md describes the record format, the external merge-sort design, and the k parameter (default k=4 runs per merge pass).",
+   "Verify-time test runner is a Python script that generates fresh inputs using a seeded PRNG, calls /app/bin/sortd, and compares against Python's sorted() on the same records \u2014 it generates inputs at 60, 200, 500, 1000, 4000, and 16000 records with various k-factor settings."
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the bugs are not visible by reading a single file \u2014 they only manifest when the binary runs on inputs that span multiple runs and multiple merge passes, so the solver must generate multi-run inputs and observe wrong output before knowing which code paths to investigate; (2) there are three interacting bugs, and fixing only one or two produces output that passes small inputs but fails on specific size/k combinations at verify time. The solver must: (a) generate a test input larger than the single-run buffer, observe garbled output, (b) instrument or add debug logging to trace which run files are being merged and in what order, (c) find the stale-cursor bug in heap.go (not visible until a run is read more than once per merge pass), (d) find the off-by-one multi-pass termination bug in merge.go (not visible until total runs > k), and (e) find the final-flush omission (not visible until record count is exactly a multiple of the bufio flush size, e.g. 4096 records with 64-byte records = 256KB = default bufio buffer). The shallow-check trap is that all three provided sample inputs fit in one run and pass immediately; a naive fix of only the heap swap indices (a common first guess) passes 60- and 200-record tests but fails 4000-record tests. The build-component aspect: the solver must build and run their own test harness to discover the multi-pass and flush bugs, since no failing test is provided.",
+  "trap": "The three provided sample inputs (8, 16, 32 records) all fit within the default single-run buffer, so the binary produces correct output for them even with all three bugs present. A solver who only runs the provided samples, or who fixes only the most obvious heap-index swap, will see green on all provided inputs. The hidden verify-time tests use 1000+ record inputs that require 2-3 merge passes and trigger all three bugs: the stale-cursor bug causes wrong records to appear, the off-by-one termination bug causes the last pass to be skipped returning unsorted chunks, and the flush bug causes truncated output at exactly-multiple-of-bufsize counts.",
+  "tests": [
+   "Test 0 (build): `go build -o /app/bin/sortd ./src/` exits 0.",
+   "Test 1 (small, single-run): 32 random records \u2192 stdout must match reference sort byte-for-byte.",
+   "Test 2 (medium, 2-pass merge): 500 random records with k=4 \u2192 stdout must match reference sort byte-for-byte.",
+   "Test 3 (large, 3-pass merge): 4096 random records with k=4 \u2192 stdout must match reference sort byte-for-byte (also triggers flush bug at exact bufio boundary).",
+   "Test 4 (large, k=3): 1000 random records with k=3 \u2192 stdout must match reference sort byte-for-byte.",
+   "Test 5 (very large): 16000 random records with k=4 \u2192 stdout must match reference sort byte-for-byte.",
+   "Test 6 (duplicate keys): 800 records where 40% share the same key value \u2192 all must appear in output, payload preserved.",
+   "Test 7 (exact multiple): 2048 records (exactly 128KB at 64 bytes each, equal to 2x default bufio buffer) \u2192 no truncation.",
+   "All test inputs are generated at verify time using a seeded random number generator; seeds are fixed in the test file but not revealed to the solver."
+  ],
+  "verifier_knob": {
+   "name": "num_test_inputs",
+   "value": "7 inputs ranging from 32 to 16000 records",
+   "effect": "Lowering to 2-3 small inputs lets a partial fix pass (single-run correct, multi-pass bugs hidden). Raising to 10+ inputs with larger sizes and more k-factor variation forces all three bugs to be found. Current setting of 7 is calibrated so fixing 2 of 3 bugs passes 4-5 tests but fails 2-3."
+  },
+  "expected_failure_modes": [
+   "Solver runs only the provided sample inputs, sees them pass, and submits without generating larger inputs \u2014 all three bugs remain.",
+   "Solver finds and fixes the heap-index swap (a visible cosmetic issue in heap.go) but misses the stale-cursor bug (which requires running a 2-pass merge to observe) \u2014 passes small and medium tests, fails large tests.",
+   "Solver fixes heap and termination condition but misses the flush bug \u2014 passes 1000-record test, fails the 4096-record exact-boundary test.",
+   "Solver generates large inputs manually but uses a shell `sort` comparison that interprets records as text, masking the payload-preservation failure.",
+   "Solver fixes all three bugs but introduces a new off-by-one in the sift-down index bounds during the heap refactor, causing intermittent failures on inputs with exactly k active runs."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "golang",
+   "external-sort",
+   "merge-sort",
+   "heap",
+   "binary-format",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/src/heap.go",
+   "cat /app/src/merge.go",
+   "cat /app/src/sort.go",
+   "cat /app/src/main.go",
+   "cat /app/src/runfile.go",
+   "cat /app/src/util.go",
+   "# Identify Bug 1: missing cursor update in heap.go Pop() before re-heapify",
+   "# Identify Bug 2: `len(runs) <= k` should be `len(runs) == 1` in merge.go loop",
+   "# Identify Bug 3: missing final bufio.Writer.Flush() after write loop in merge.go",
+   "sed -i 's/len(runs) <= k/len(runs) == 1/' /app/src/merge.go",
+   "# Edit heap.go to add cursor update line before sift-down call in Pop()",
+   "# Edit merge.go to add w.Flush() after the record-writing loop",
+   "go build -o /app/bin/sortd ./src/",
+   "python3 -c \"import struct, random, sys; r=random.Random(42); data=b''.join(struct.pack('>q', r.randint(0,2**62))+bytes(56) for _ in range(500)); sys.stdout.buffer.write(data)\" > /tmp/t500.bin",
+   "/app/bin/sortd < /tmp/t500.bin > /tmp/out500.bin",
+   "python3 -c \"import struct; data=open('/tmp/t500.bin','rb').read(); recs=[data[i:i+64] for i in range(0,len(data),64)]; recs.sort(key=lambda r:struct.unpack('>q',r[:8])[0]); open('/tmp/ref500.bin','wb').write(b''.join(recs))\"",
+   "diff /tmp/out500.bin /tmp/ref500.bin && echo PASS",
+   "# Repeat for 4096 and 16000 record inputs to confirm flush and multi-pass bugs are fixed",
+   "echo All tests pass"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact run-buffer size (records per run) is not stated in the instruction \u2014 if the solver cannot determine it from README or source, they cannot know how many records trigger multi-pass behavior, making test construction ambiguous.",
+   "Bug 3 (flush omission) depends on the default bufio.Writer buffer size being exactly 4096 bytes; if Go's bufio default changes across minor versions of golang-1.21 or the Dockerfile installs a different patch version, the exact-boundary test (Test 7) might not trigger at the expected record count.",
+   "The stale-cursor bug description ('forgets to update the heap-entry's run-file cursor position') is so precisely specified in the internal hint that any agent reading the blueprint (or any leaked hint) immediately knows the exact fix without needing to understand the code \u2014 but since hints are internal this is acceptable.",
+   "Test 6 (duplicate keys) requirement \u2014 'all must appear in output, payload preserved' \u2014 requires that the heap implementation has a stable or payload-preserving tie-breaking rule; if the reference sort is not stable or uses a different tie-breaking order, byte-for-byte comparison on duplicate-key records could falsely fail."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three bugs are directly readable in the source files with precise file-level descriptions \u2014 a systematic agent reading the 6 source files sequentially will spot the missing cursor update, the off-by-one termination condition, and the missing flush without needing to run any code. The speedrun reaches a solution in ~20 commands with no exploratory debugging required, matching the rubric's threshold for a score of at most 2. Since genuine_difficulty fails the minimum threshold of 4, the task must be rejected.",
+  "fixes": [
+   "Obfuscate bug locations: instead of 3 bugs in 2 named files, spread 4-5 subtle bugs across all 6 files with no file-level hints, so the solver cannot target specific files \u2014 force full codebase comprehension.",
+   "Make at least one bug non-textually-visible: e.g., a race condition in concurrent run-file writes, a subtle integer overflow on large keys, or an algorithmic error that only manifests with a specific key distribution \u2014 these require dynamic testing rather than static reading.",
+   "Remove the internal hint's precise per-bug descriptions from the blueprint document, or restructure so bugs require runtime observation (e.g., correct code that has a wrong algorithmic invariant only observable via test output, not source reading).",
+   "Add a planted red herring that looks like a bug on reading (e.g., a suspicious-looking but correct swap in heap.go) to consume time on false leads and prevent a single-pass read-and-fix strategy.",
+   "Make the flush bug trigger at a non-obvious boundary (e.g., tied to a custom buffer size read from an environment variable, requiring the solver to trace configuration) rather than a fixed default."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference task involves HMAC-SHA256 computation over WAL records with a refund resolver, while the candidate is about fixing a k-way external merge-sort heap implementation in Go."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-lz77-file-compressor",
+     "verdict": "distinct",
+     "reason": "The reference task is about implementing an LZ77 compression algorithm, while the candidate is about debugging a broken priority-queue heap in a Go external merge-sort pipeline."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks share the same narrative structure: a multi-file refactor that compiles cleanly and passes limited tests but silently produces wrong output on larger inputs, requiring the agent to find and fix a subtle algorithmic bug introduced during the refactor."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference task involves fixing NDJSON schema validation correctness and performance in a Node.js log ingestion pipeline, not a Go external merge-sort implementation."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "The reference task is about fixing NetFlow settlement aggregation with ASN mapping and template state, not a k-way merge-sort heap bug in Go."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.222
+    ],
+    [
+     "terminal-bench-pro/implement-lz77-file-compressor",
+     0.194
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.191
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.19
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.143
+    ]
+   ],
+   "cost_usd": 0.014736
+  },
+  "novel": false
+ },
+ "cost_usd": 0.059157
+}

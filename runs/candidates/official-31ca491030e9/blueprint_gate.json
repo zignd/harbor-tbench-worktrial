@@ -1,0 +1,113 @@
+{
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/queries/report.sql",
+   "cat /app/expected_sample.txt",
+   "/app/bin/qexec /app/data/events.db /app/queries/report.sql > /tmp/out.txt 2>&1",
+   "grep -E '^(10|15|20)' /tmp/out.txt | head -30",
+   "diff <(grep -E '^(10|15|20)' /tmp/out.txt) /app/expected_sample.txt",
+   "# Observe rank=1 on lowest amount \u2192 fix ORDER BY amount ASC\u2192DESC in RANK window",
+   "# Observe running_total descending \u2192 fix ORDER BY ts DESC\u2192ASC in SUM window",
+   "sed -i 's/ORDER BY ts DESC/ORDER BY ts ASC/; s/ORDER BY amount ASC/ORDER BY amount DESC/' /app/queries/report.sql",
+   "/app/bin/qexec /app/data/events.db /app/queries/report.sql > /tmp/out2.txt",
+   "diff <(grep -E '^(10|15|20)' /tmp/out2.txt) /app/expected_sample.txt",
+   "# Sample passes. Now check instruction: 'all partitions must be correct'",
+   "grep '^01' /tmp/out2.txt | head -10",
+   "# Manually verify running_total for partition 01 using sqlite3",
+   "sqlite3 /app/data/events.db 'SELECT ts, amount FROM events WHERE partition_key=\"01\" ORDER BY ts ASC LIMIT 5'",
+   "# Notice running_total is still wrong for 01-09 \u2192 binary bug with leading zeros",
+   "# Try casting partition_key to INTEGER in SQL to force numeric comparison in binary",
+   "vim /app/queries/report.sql  # Add CAST(partition_key AS INTEGER) in PARTITION BY and ORDER BY",
+   "/app/bin/qexec /app/data/events.db /app/queries/report.sql > /tmp/out3.txt",
+   "grep '^01' /tmp/out3.txt | head -10",
+   "# Verify partition 01 running totals now correct",
+   "# Check all partitions present: wc, unique partition_key count",
+   "awk '{print $1}' /tmp/out3.txt | sort -u | wc -l",
+   "# Write python script to independently verify all partitions",
+   "python3 -I /tmp/verify.py"
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The binary bug fix interaction is architecturally fragile: the claim that CAST(partition_key AS INTEGER) in SQL fixes a C binary's strcmp logic depends on how the C code reads SQLite column values. If the binary calls sqlite3_column_text() regardless of declared type, casting in SQL won't change what the binary sees, making the described fix mechanism incorrect or non-deterministic.",
+   "The instruction says 'fix the query file' implying a pure SQL solution exists, but the actual fix requires understanding an undocumented binary behavior \u2014 an agent could produce a correct SQL fix for the wrong reasons (e.g., normalizing keys for aesthetics), making grading of understanding vs. luck ambiguous.",
+   "The expected_sample.txt covers only partitions 10, 15, 20 which 'happen to not have leading-zero issues' \u2014 but the instruction doesn't explicitly tell the solver that these partitions were chosen to hide the bug. An ambiguity exists: does the instruction sufficiently signal that the sample is adversarially incomplete?",
+   "Verify-time injection of fresh partitions ('03', '07', '11', '17', '19') into a copy of events.db could expose environmental issues if the binary has hardcoded paths or the db copy mechanism is fragile.",
+   "The 'ties broken by ts ascending' requirement for RANK with no gaps implies DENSE_RANK behavior \u2014 but RANK() in SQL with ties produces gaps. If the specification means DENSE_RANK, the test would reject correct RANK() usage, creating an ambiguous failure mode. The blueprint uses RANK() but specifies 'no gaps' which contradicts standard RANK() behavior."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical architectural flaw: the claim that casting partition_key to INTEGER in SQL fixes a binary's leading-zero string comparison bug is mechanistically dubious \u2014 it depends on undocumented assumptions about how the compiled C program reads SQLite column types, and if the binary uses sqlite3_column_text() universally, the fix won't work as designed. Additionally, the specification uses RANK() but requires 'no gaps in rank sequence' which contradicts standard SQL RANK() behavior (which does produce gaps on ties), creating an ambiguous test failure mode that could invalidate otherwise correct solutions. These are build-correctness and spec-correctness issues that could cause invalid failures.",
+  "fixes": [
+   "Clarify and verify the binary bug fix mechanism: either document exactly how the C code reads column values (e.g., 'the binary uses sqlite3_column_text() which returns the literal text, so casting in SQL changes the stored text representation') or change the bug to one that is more reliably fixed via SQL (e.g., a bug triggered by TEXT vs. INTEGER affinity in SQLite that is well-defined).",
+   "Replace 'no gaps in rank sequence' with either 'use DENSE_RANK() semantics' or explicitly clarify that RANK() is expected and gaps from ties are acceptable, or change the requirement to 'ties broken by ts ASC, with 1 assigned to highest amount and subsequent ranks incrementing by 1 per row' \u2014 pick RANK() or DENSE_RANK() and be consistent throughout.",
+   "Add to the instruction a subtle hint that the sample partitions were specifically chosen and that the solver must validate all partitions, not just the sample \u2014 e.g., 'Note: the sample covers only a subset of partition keys; your fix must be verified against the full database including partitions with single-digit keys.'"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a slow query for performance while preserving semantics; the candidate is about fixing a broken SQL query to produce correct window function and aggregation results."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is about SQL query optimization for efficiency; the candidate is about correctness of window functions and GROUP BY aggregations, not performance."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a binary normalizer and fixing a multi-stage pipeline; the candidate focuses solely on fixing SQL window function and aggregation logic in a .sql file."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Python chunked-CSV pipeline with duplicate/drop bugs; the candidate is about correcting SQL window functions and aggregations in a query file."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline and Flask API; the candidate is purely about fixing SQL window function and aggregation correctness."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.226
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.201
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.177
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.099
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.094
+    ]
+   ],
+   "cost_usd": 0.013374
+  },
+  "novel": true
+ },
+ "cost_usd": 0.061518
+}

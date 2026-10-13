@@ -1,0 +1,132 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-codec-repair",
+  "title": "Daily Ledger Rollup Service Repair",
+  "scenario": "An analyst's daily reconciliation reports stopped balancing three weeks ago after a routine 'minor update' to the in-house C ledger rollup service. The service reads raw transaction journals, aggregates debits and credits by account, and answers queries over a simple line-oriented TCP protocol. The codebase is about 1,400 lines across six files: a parser, an aggregator, a fixed-point arithmetic module, a protocol handler, a shell-script harness that manages startup/migration, and a legacy account-map file. Two bugs were introduced in the same commit but interact: one causes silent data corruption only when an account has transactions spanning a sign boundary (debit-then-credit or vice versa), and the other is an off-by-one in the protocol framing that only manifests when a response crosses a 512-byte boundary\u2014so small test accounts look fine.",
+  "instruction_draft": "The ledger rollup service at /app/ledger listens on port 7400. Fix it so that queries over the TCP protocol return correct account balances and running totals for all accounts in /app/data/journals/. The shell script /app/bin/rollup.sh must be used to rebuild and restart the service; running it out of order or skipping steps corrupts the aggregated state file that the service reads on startup.",
+  "requirements": [
+   "The TCP service on port 7400 must respond correctly to BALANCE <account_id> queries, returning the net balance (credits minus debits) in fixed-point cents.",
+   "The TCP service must respond correctly to HISTORY <account_id> queries, returning one line per transaction in chronological order with running totals.",
+   "Accounts whose transactions cross a debit-to-credit or credit-to-debit sign boundary must report the correct net balance, not a corrupted one.",
+   "HISTORY responses longer than 512 bytes must be delivered complete and correctly framed, not truncated or misaligned.",
+   "The /app/bin/rollup.sh script must be executed in the correct order (build, migrate, start) without skipping steps; an out-of-order invocation must not leave the service in a silently wrong state.",
+   "All accounts present in /app/data/journals/ must be queryable; accounts absent from the legacy account-map must not cause the service to crash or return garbage."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm with gcc, make, netcat-openbsd, socat installed via apt.",
+   "/app/ledger/src/parser.c \u2014 journal file parser, ~220 lines, correct.",
+   "/app/ledger/src/aggregator.c \u2014 aggregation logic, ~180 lines; BUG 1: when accumulating a sequence that crosses zero (e.g., running total goes positive\u2192negative), the sign of the delta is inverted due to a wrong branch predicate (`>` vs `>=`) in the fixed-point add routine called by the aggregator, silently corrupting the account balance.",
+   "/app/ledger/src/fixedpoint.c \u2014 fixed-point arithmetic library, ~150 lines, correct except the one branch in fp_add() called by aggregator (the bug is in aggregator.c's call site, not in fixedpoint.c itself, making it look like a data issue not a code issue).",
+   "/app/ledger/src/protocol.c \u2014 TCP protocol handler, ~250 lines; BUG 2: the response flush loop uses `write(fd, buf+sent, len-sent)` but the length variable `len` is computed before a trailing newline is appended, so responses whose pre-newline length is exactly 511 bytes are sent without the final newline, causing the client to hang waiting for line termination; responses shorter than 511 bytes or longer than 512 bytes work fine.",
+   "/app/ledger/src/main.c \u2014 entry point and startup logic, ~120 lines.",
+   "/app/ledger/src/accounts.c \u2014 account-map loader, ~100 lines; gracefully ignores unknown accounts if the map is loaded after the state file, but crashes with SIGSEGV if map is loaded before state (a sequencing trap in rollup.sh).",
+   "/app/ledger/Makefile \u2014 standard build, compiles all sources.",
+   "/app/bin/rollup.sh \u2014 three-phase shell script: phase 1 builds binary, phase 2 runs migrate tool to convert old state format to new, phase 3 starts service; the script checks a lockfile to enforce ordering, but the check is advisory (warns but does not abort), so a solver who runs phases out of order gets a corrupt state file silently.",
+   "/app/data/journals/ \u2014 12 journal files, each 80-300 lines; at least 4 accounts cross the sign boundary across journal files; at least 2 accounts have HISTORY responses that land in the 511-512 byte range when formatted.",
+   "/app/data/state/ \u2014 initially empty; populated by the migrate step in rollup.sh.",
+   "/app/data/account_map.txt \u2014 legacy file listing known account IDs and names; 3 accounts in journals are not in the map (testing graceful handling).",
+   "A reference Python verifier script is NOT provided to the solver; tests are run by the verifier at check time by connecting to port 7400 and issuing BALANCE and HISTORY queries against known-correct expected values computed from the raw journal files."
+  ],
+  "internal_hint": "Two interacting bugs: (1) In aggregator.c, the call to fp_add() passes the wrong sign flag when the running total crosses zero\u2014specifically, the condition `if (running_total > 0 && delta < 0)` should be `if (running_total >= 0 && delta < 0)` (or equivalently the sign inversion is applied one transaction too late). This only manifests when an account's cumulative balance transitions from positive to negative or vice versa mid-journal, so small single-journal accounts look correct. (2) In protocol.c, after constructing the response buffer and appending '\\n', the write loop uses the pre-append length, so the newline is included in the buffer but not counted in `len`, causing exactly-511-byte pre-newline responses to be transmitted without their terminating newline. The solver must: (a) run rollup.sh phase 1 (build) before phase 2 (migrate) before phase 3 (start)\u2014skipping migrate leaves an incompatible state file that causes accounts.c to load garbage balances; (b) find bug 1 by querying accounts with sign-crossing histories and comparing to manual journal totals; (c) find bug 2 by querying an account with a long HISTORY and observing the client hangs. Fixing bug 1 without fixing bug 2 means some tests pass but HISTORY queries on longer accounts hang. Fixing bug 2 without fixing bug 1 means balances are wrong. Running rollup.sh out of order after patching makes the state file corrupt and all balances wrong.",
+  "trap": "A solver that patches only the sign-inversion bug and tests a few small accounts will see correct BALANCE responses and declare success; the HISTORY hang only appears on accounts with 511-byte responses, which are not the first ones a naive probe would check. Conversely, a solver who skips the migrate step (because rollup.sh 'already warns' about ordering) gets silently wrong balances from the stale state file, making both bugs look unfixed even after correct patches. The 511-byte boundary means the solver cannot reproduce the hang with short test payloads they construct themselves.",
+  "tests": [
+   "BALANCE query for each of 12 accounts checked against verifier-computed ground truth from raw journals; at least 4 accounts require correct sign-boundary handling to pass.",
+   "HISTORY query for each account; verifier checks line count, per-line running total, and that the response is newline-terminated (catches the framing bug).",
+   "HISTORY query for the two accounts whose pre-newline response length is exactly 511 bytes; verifier connects with a 3-second timeout and asserts the connection closes cleanly (not a hang).",
+   "BALANCE query for the 3 accounts absent from account_map.txt; verifier asserts the service returns an ERROR line rather than crashing.",
+   "Verifier kills and restarts the service via rollup.sh (all three phases in order) and re-runs a subset of BALANCE queries to confirm the state survives a clean restart.",
+   "Verifier issues 50 BALANCE queries in rapid succession to confirm no state corruption under concurrent load (catches any residual locking bugs).",
+   "Verifier generates 3 fresh journal files at check time with new account IDs and known balances including sign-crossing sequences, appends them to /app/data/journals/, triggers a rebuild+migrate+restart via rollup.sh, and queries the new accounts."
+  ],
+  "verifier_knob": {
+   "name": "number_of_request_scenarios",
+   "value": "7 scenario classes (balance, history, framing-boundary, missing-account, restart, concurrent, fresh-journals)",
+   "effect": "Dropping to 3 scenarios (balance, history, restart) reduces difficulty because the framing bug and fresh-journal generation are the hardest to trigger; adding scenarios like multi-account transaction cross-references or journal-file parsing edge cases raises difficulty further."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the sign-inversion bug, tests BALANCE queries on small accounts, sees them pass, and submits without noticing the HISTORY hang on 511-byte responses.",
+   "Solver runs rollup.sh phases out of order (e.g., starts service before running migrate), gets silently corrupt state, concludes both bugs are still present even after correct patches, and wastes time re-examining the code.",
+   "Solver finds the framing bug by reading protocol.c and fixes the length calculation, but never locates the sign-inversion bug because they test only accounts that do not cross zero, so balances look correct.",
+   "Solver correctly patches both bugs but forgets to re-run the migrate step after patching aggregator.c, so the state file still contains pre-patch corrupted balances and the verifier's BALANCE checks fail.",
+   "Solver constructs short test payloads to verify the framing fix and concludes it works, but the fix is off-by-one in the other direction (now 512-byte responses hang instead of 511-byte), which only the verifier's boundary-targeted test reveals."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "fixed-point-arithmetic",
+   "tcp-protocol",
+   "interacting-bugs",
+   "ordered-procedure"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "clarity": 4,
+  "solvability": 4,
+  "verifiability": 5,
+  "genuine_difficulty": 2,
+  "realism": 4,
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "That task fixes a Python/SQLite import tool with idempotency and refund-matching bugs; the candidate involves a C TCP service with fixed-point arithmetic corruption and protocol framing bugs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task fixes a C aggregator's weighted-sum logic and config-cache mismatch; the candidate centers on sign-boundary arithmetic corruption and TCP framing off-by-one in a ledger service."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task repairs a Rust NetFlow UDP/TCP aggregation service with JSON query responses; the candidate is a C ledger rollup service with fixed-point and framing bugs over a line-oriented protocol."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task fixes an HMAC-over-WAL TCP service with refund resolver logic; the candidate fixes arithmetic corruption and framing bugs in a ledger balance/history query service."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task repairs an HMAC chain verifier with stdin/stdout protocol; the candidate is about fixed-point sign-boundary corruption and TCP 512-byte framing in a C ledger rollup service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.165
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.165
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.149
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.139
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.129
+    ]
+   ],
+   "cost_usd": 0.014493
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056109
+}

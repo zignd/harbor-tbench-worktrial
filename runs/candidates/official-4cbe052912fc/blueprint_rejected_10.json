@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "telemetry-sigverify-go-rewrite",
+  "title": "Inline Telemetry Packet Signature Verifier in Go",
+  "scenario": "Your team runs a scientific instrument telemetry ingestion service written in Go (~1,400 lines across twelve files) that validates HMAC signatures on binary measurement packets before storing them. Signature verification is currently handled by shelling out to /usr/local/bin/sigverify, a compiled binary whose source was lost during a storage migration. Edge-node deployments need the verification logic embedded directly in the service \u2014 no external binary allowed. The binary remains available locally as the authoritative reference.",
+  "instruction_draft": "Hey, can you refactor the telemetry ingestion service so it does packet signature verification inline instead of shelling out to /usr/local/bin/sigverify? The call is in verifier/verify.go. The binary is the ground truth \u2014 whatever it decides, your Go implementation has to match, VALID for VALID and INVALID for INVALID. The key material is in config/keystore.json. There are some sample packets under testdata/ you can use to sanity-check. Make sure it handles all the variety we see in production \u2014 don't just optimize for the samples.",
+  "requirements": [
+   "The Go service must not call exec.Command or os.StartProcess or any shell-out to sigverify",
+   "For every packet the verifier accepts or rejects, the inline Go implementation must return the same verdict as the binary sigverify",
+   "The implementation must handle all packet version bytes, payload sizes, sensor IDs, and extension field counts that the binary handles",
+   "The service must still compile and its existing tests must pass"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22 and build-essential",
+   "Two-stage build: first stage compiles the sigverify binary from source (source NOT copied to final image, only the binary at /usr/local/bin/sigverify)",
+   "The sigverify binary: takes a packet file path as sole argument, prints VALID or INVALID to stdout, exit 0 in both cases; implements the signing scheme with the 4 subtle behaviors",
+   "Signing scheme implemented by the binary: HKDF-SHA256 key derivation with sensor_id zero-padded to 8 bytes as the info parameter; for version 0x02 packets a 4-byte epoch prefix [0x45,0x50,0x4F,0x43] is prepended to the HMAC input; for payloads longer than 512 bytes the HMAC is computed over SHA256(payload) instead of the payload itself; zero-length extension fields are excluded from the HMAC input while nonzero-length extensions are included",
+   "Packet binary format: [1B version][4B sensor_id BE uint32][2B payload_len BE uint16][payload_len B payload][1B ext_count][for each ext: 1B ext_len then ext_len B ext_data][32B HMAC-SHA256 appended at end]",
+   "Master key in config/keystore.json as a hex string field 'master_key'",
+   "Go service: ~1,400 lines across 12 files: cmd/ingest/main.go, verifier/verify.go (calls sigverify via exec.Command), verifier/packet.go (partial packet parser, missing some edge-case fields), pipeline/store.go, pipeline/filter.go, pipeline/aggregate.go, metrics/metrics.go, config/config.go, config/loader.go, api/handler.go, api/router.go, util/hex.go",
+   "verifier/verify.go has a stub/shell-out implementation and a partially-wrong native implementation attempt that is commented out \u2014 the commented code gets the HKDF info field wrong (uses sensor_id as raw 4 bytes, not zero-padded to 8) and doesn't handle the large-payload SHA256 pre-hash or the v2 epoch prefix",
+   "testdata/ contains 8 sample packets (2 v1 small, 2 v2 small, 1 v1 large payload, 1 v2 large payload, 1 with extensions, 1 with zero-length extension mixed with nonzero) all VALID, plus 4 tampered INVALID variants",
+   "The sample packets do NOT include: a v2 packet with payload > 512 bytes (the interaction of epoch prefix + prehash), a packet with sensor_id that requires zero-padding (sensor_id < 256, so leading 3 bytes of BE representation are zero), a packet with ONLY zero-length extensions (ext_count > 0 but all ext_len = 0, making ext contribution empty), or any invalid packet where the only wrong thing is the HKDF info padding",
+   "Hidden test corpus at verify time: 200 packets covering all edge case combinations including the above, generated deterministically from a fixed seed"
+  ],
+  "internal_hint": "The root causes are four interacting subtleties in the signing scheme that are invisible from any source file (there is no source for the binary) and that the sample packets don't fully exercise: (1) HKDF info = sensor_id as 8-byte zero-padded big-endian, not 4-byte; (2) version 0x02 prepends a 4-byte epoch prefix to the HMAC input; (3) payloads > 512 bytes are SHA256-prehashed before HMAC; (4) zero-length extension fields contribute nothing to the HMAC input. A skilled engineer finds this by: (a) examining the commented-out code to understand what was attempted; (b) writing a packet generator script and running sigverify on crafted packets that isolate each dimension; (c) testing HKDF info padding by creating two packets identical except for sensor_id = 1 vs sensor_id = 0x01000000 (same 4-byte value, different zero-padding implications -- actually, probe by using sensor_id = 1, trying both 4-byte and 8-byte HKDF info and checking which produces a VALID result); (d) testing large payload behavior by creating a 513-byte payload packet; (e) testing v2 behavior by comparing v1 and v2 identical-content packets; (f) testing extension behavior with zero-length extensions. The fix is ~50 lines replacing the exec.Command call with correct Go crypto code.",
+  "trap": "A naive agent reads the commented-out code and corrects only the most obvious issue (adds the epoch prefix for v2), then tests against the 12 sample packets and gets 12/12. But the hidden corpus includes: v1 packets with sensor_id < 256 (catches HKDF 4-vs-8 byte padding), v2 packets with payload > 512 bytes (catches the missing interaction of epoch prefix + prehash), and packets where all extensions have zero length (catches the extension filtering). A partial fix passes ~60-70% of the hidden corpus, not 100%.",
+  "tests": [
+   "For each of 200 hidden corpus packets, run both /usr/local/bin/sigverify and the refactored service's verify endpoint; check verdict matches",
+   "Corpus includes v1 packets with sensor_id in range [1, 255] (tests 8-byte HKDF padding with leading zeros)",
+   "Corpus includes v2 packets with payload exactly 512 bytes, 513 bytes, and 1024 bytes (tests pre-hash threshold and its interaction with v2 epoch prefix)",
+   "Corpus includes packets with ext_count > 0 where all extensions have zero length (tests that HMAC input excludes these entirely)",
+   "Corpus includes packets with mixed zero-and-nonzero-length extensions in different orderings",
+   "Corpus includes tampered packets for each of the above categories (signature should be INVALID)",
+   "Compilation check: go build ./... must succeed with no calls to exec.Command in verifier/ package",
+   "Existing unit tests (go test ./...) must still pass"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 packets, 4 edge-case dimensions \u00d7 combinations",
+   "effect": "Lowering to 50 packets with fewer edge-case combos makes it easier to pass by partially-correct implementation; raising to 500 with more sensor_id values and payload sizes near the threshold makes it harder"
+  },
+  "expected_failure_modes": [
+   "Agent corrects only the epoch prefix for v2 (the most visible difference in commented code) and misses HKDF padding, prehash, and extension filtering \u2014 passes sample tests, fails ~40% of hidden corpus",
+   "Agent gets HKDF padding right but uses 4-byte sensor_id as info instead of 8-byte zero-padded, failing all sensor_id < 0x01000000 packets",
+   "Agent implements prehash for large payloads but uses wrong threshold (e.g., 1024 instead of 512) or applies it to v1 but not v2",
+   "Agent correctly handles zero-length extensions for VALID packets but includes the zero-length ext_len byte itself in the HMAC input, causing all extension-containing packets to fail",
+   "Agent probes the binary only with the testdata/ samples, never crafts new packets to test edge cases, so misses all four subtleties",
+   "Agent assumes the HKDF info is a fixed string like 'telemetry' based on common patterns, rather than the per-packet sensor_id"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "binary-reverse",
+   "hmac",
+   "hkdf",
+   "scientific-computing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat verifier/verify.go \u2014 read exec.Command call and commented-out attempt",
+   "cat verifier/packet.go \u2014 understand partial packet parser",
+   "cat config/keystore.json \u2014 extract master_key hex",
+   "ls testdata/ && /usr/local/bin/sigverify testdata/packet_v1_small_1.bin \u2014 confirm binary works",
+   "Write Go probe: craft packet with sensor_id=1, compute HMAC with 4-byte HKDF info, write to file, run sigverify \u2192 INVALID",
+   "Write Go probe: same packet, compute HMAC with 8-byte zero-padded HKDF info, write to file, run sigverify \u2192 VALID (discovers subtlety 1)",
+   "Write Go probe: craft v1 packet with 513-byte payload, compute HMAC over raw payload, sigverify \u2192 INVALID",
+   "Write Go probe: same packet, compute HMAC over SHA256(payload), sigverify \u2192 VALID (discovers subtlety 3)",
+   "Write Go probe: craft v2 packet with epoch prefix prepended, compute HMAC, sigverify \u2192 VALID vs without prefix \u2192 INVALID (discovers subtlety 2)",
+   "Write Go probe: craft packet with zero-length extensions included in HMAC input, sigverify \u2192 INVALID; exclude them \u2192 VALID (discovers subtlety 4)",
+   "Write probe: v2 packet with 513-byte payload + epoch prefix + prehash \u2192 sigverify \u2192 VALID (confirms interaction)",
+   "Edit verifier/verify.go: replace exec.Command block with inline Go crypto using all 4 fixes",
+   "go build ./... \u2014 confirm compiles, no exec.Command in verifier/",
+   "go test ./... \u2014 confirm existing tests pass",
+   "Run sigverify + service on all 12 testdata packets, compare verdicts \u2192 all match",
+   "Submit"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Two-stage Docker build complexity: if the sigverify source compilation fails or produces a binary with different behavior than spec, the entire task breaks \u2014 the spec must exactly match the binary's implementation",
+   "Off-by-one at the 512-byte prehash threshold: if the spec says '>512' but the binary uses '>=512' or vice versa, corpus packets at exactly 512 bytes will spuriously fail",
+   "Packet format consistency: the 200-packet corpus must be generated with the exact same binary that's installed at /usr/local/bin/sigverify; any discrepancy causes phantom failures",
+   "The 'partially-wrong commented code' in verifier/verify.go must be present exactly as described; if it's missing or different, agents lose the crucial starting hint and the task difficulty profile changes",
+   "Service verify endpoint format is not specified in the instruction \u2014 agents must infer how to call the Go service's verification endpoint vs the binary, which could cause test harness confusion",
+   "Zero-length extension edge case description says 'ext_len byte itself' might be included or excluded \u2014 the spec must be unambiguous about whether the 1-byte length field for a zero-length extension counts as part of the HMAC input or not"
+  ],
+  "verdict": "accept",
+  "reasons": "This is a well-constructed adversarial task where the ground truth oracle (the binary) is the authoritative reference, the sample data deliberately excludes edge cases, and a naive partial fix passes visible tests but fails ~40% of the hidden corpus. All four scores meet threshold (clarity 4, solvability 4, verifiability 5, genuine_difficulty 4, realism 5, average 4.4). The genuine difficulty is real: three of four subtleties require active binary probing with crafted packets, not just reading source, and frontier agents frequently skip this systematic exploration.",
+  "fixes": [
+   "Clarify the service verify endpoint interface in the instruction or test harness \u2014 specify exactly how the test calls the Go service (HTTP endpoint, CLI flag, or library call) so agents aren't guessing the integration point",
+   "Make the 512-byte threshold explicit in the instruction as '>512 bytes' (strictly greater than) to eliminate off-by-one ambiguity at the boundary",
+   "Add a note that verifier/packet.go's partial parser must also be completed (or clarify it's sufficient as-is) \u2014 if agents must also fix packet.go to parse extensions correctly, the scope should be stated",
+   "Specify in the Docker setup that the two-stage build is validated to produce a working binary, and pin the Go version used to compile sigverify to match Go 1.22 in the final image to avoid crypto library differences"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/risk-scorer-replay",
+     "verdict": "variant",
+     "reason": "Both tasks require reverse-engineering a black-box binary's behavior and reimplementing it inline in a service, with the binary as ground truth and the final code forbidden from calling it."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task is about extracting hardcoded credentials from a Go binary via source analysis, not about reimplementing cryptographic verification logic."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is a bug-fix in a sales aggregation service with a known specification, not reverse-engineering a binary to reimplement its logic inline."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is fixing a silent bug in an existing HMAC chain verifier with known specification and git history, not reverse-engineering a black-box binary to replace a shell-out."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is implementing a TCP audit service with a documented binary format and HMAC computation, not reverse-engineering an opaque binary to replace an exec.Command call."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/risk-scorer-replay",
+     0.182
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.148
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.142
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.137
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.137
+    ]
+   ],
+   "cost_usd": 0.01371
+  },
+  "novel": false
+ },
+ "cost_usd": 0.059571
+}

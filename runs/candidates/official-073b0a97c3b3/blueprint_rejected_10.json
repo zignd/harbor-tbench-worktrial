@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "sre-sampler-native-resurrection",
+  "title": "Resurrect a Native Metrics Sampler",
+  "scenario": "A Node.js metrics aggregation service exposes percentile summaries over HTTP. Its core sampling is handled by a pre-compiled native addon `libsampler.node` (no source available). At 3am you're paged because percentile values are drifting wildly on high-cardinality label sets and after long-running jobs. The service has ~1400 lines across six JS files plus the opaque binary. Logs show the service is running but returning statistically wrong answers.",
+  "instruction_draft": "--- PAGERDUTY ALERT ---\nSEV-2: metrics-aggregator percentile drift detected on prod\nHost: aggregator-1  Service: /metrics/query  Started: 02:47 UTC\n\nSample from monitoring:\n  p99 latency for label set size=300 \u2192 reported 12ms, expected ~450ms\n  p50 stable for label set size=50\n  After ~18h uptime: ALL percentiles drift toward min observed value\n\nThe service is at /app/aggregator. It answers HTTP on port 7700.\nThe native sampler lives at /app/aggregator/lib/libsampler.node \u2014 no source.\n\nYour job:\n1. Keep the service answering requests on port 7700.\n2. Each GET /metrics/query?label=<name>&p=<0-100> must return a JSON body {\"label\":<name>,\"p\":<int>,\"value\":<number>} where value is the correct percentile of all samples ingested for that label via POST /metrics/ingest.\n3. POST /metrics/ingest accepts JSON {\"label\":<str>,\"samples\":[<numbers>]} and returns {\"ok\":true,\"count\":<total samples stored for label>}.\n4. Percentile values must be accurate within \u00b12% of the true value for any label with up to 100,000 samples and any number of distinct labels.\n5. The /health endpoint must return HTTP 200.\n6. Restart the service (or replace components) as needed. All fixes must survive a service restart.",
+  "requirements": [
+   "Service listens on port 7700",
+   "GET /metrics/query?label=<name>&p=<0-100> returns {label, p, value} JSON",
+   "POST /metrics/ingest accepts {label, samples:[]} and returns {ok:true, count:<total>}",
+   "Percentile value accurate within \u00b12% of true value for labels with up to 100,000 samples",
+   "Accuracy holds for label sets with more than 256 distinct label names",
+   "Accuracy holds after ingesting more than 65,536 total samples for a single label",
+   "GET /health returns HTTP 200",
+   "Fixes survive a service restart"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install nodejs 20, npm",
+   "/app/aggregator/ \u2014 ~1400 lines across: server.js (HTTP router, ~200 lines), store.js (label\u2192sampler map, ~180 lines), query.js (percentile lookup, ~150 lines), ingest.js (fan-out to sampler, ~160 lines), health.js (30 lines), config.js (80 lines), package.json",
+   "lib/libsampler.node \u2014 pre-compiled Node.js native addon (built from C without source in image); exports: new Sampler(), sampler.add(value), sampler.count(), sampler.percentile(p) where 0<=p<=100",
+   "Binary bug 1 (data-dependent, not visible): internally uses a fixed-size circular reservoir of 256 slots; when distinct invocations of add() exceed 256 values it silently wraps and overwrites earlier samples biasing percentiles toward recent values \u2014 only observable when label cardinality (unique sample values fed over time) exceeds ~300",
+   "Binary bug 2 (interacting): internal counter is stored as uint16; after exactly 65536 calls to add() the counter wraps to 0; sampler.count() returns 0 and subsequent percentile() calls return 0.0 \u2014 only observable after sustained ingestion",
+   "store.js uses libsampler.node via require('../lib/libsampler'); each label gets its own Sampler instance",
+   "server.js starts cleanly; /health returns 200; basic smoke test with <256 samples passes",
+   "Logs directory /app/aggregator/logs/ with realistic-looking access log and one error log showing 'percentile drift' complaints from an upstream checker starting 2h ago",
+   "A README.md describing the Sampler API (add, count, percentile) and the reservoir sampling design intent, but NOT mentioning the 256-slot limit or uint16 counter \u2014 solver must discover these by experimentation",
+   "systemd or a process manager not available; service started via node server.js; solver must arrange restart survival (e.g. a wrapper script or pm2)"
+  ],
+  "internal_hint": "Difficulty comes from TWO runtime-only, data-dependent bugs in an opaque binary with no source. Bug 1 only manifests with >256 samples per label (reservoir wraps). Bug 2 only manifests after 65,536 total add() calls (uint16 overflow). Fixing Bug 1 alone (replacing the sampler with a JS reservoir) passes small-count tests but still fails 65k-overflow tests if the replacement incorrectly also wraps. Fixing Bug 2 alone (restarting periodically) masks Bug 1 for small label sets. The solver must: (1) probe libsampler.node directly with a test script to observe the 256-slot wrap behavior, (2) probe again with 65537 add() calls to find the counter reset, (3) implement a correct JS reservoir sampler (e.g. Algorithm R) with no size cap and 64-bit-safe counter, (4) hot-swap store.js to use the JS sampler instead of libsampler.node, (5) ensure service restart loads the new code. The investigation path requires writing probe scripts and running them \u2014 pure code reading of the JS files reveals nothing wrong.",
+  "trap": "A naive agent replaces libsampler.node with a simple array-push sampler that stores ALL samples. This passes small tests and the 256-cardinality test, but for 100,000 samples it uses ~800KB of memory per label and may be slow. More critically, if the agent implements reservoir sampling but uses a JS integer counter that can lose precision above 2^53 (unlikely at 100k), or caps reservoir size at 256 to 'match the binary', it will still fail the cardinality tests. The most common failure: agent fixes the JS wrapper in store.js but does NOT remove the require of libsampler.node, so the old binary still runs for some labels. Second failure: agent verifies with only 100 samples and <=10 labels \u2014 the hidden tests use 500+ distinct labels and 80,000-sample ingestion runs.",
+  "tests": [
+   "Health check: GET /health returns 200 OK",
+   "Basic ingest+query: POST 100 uniform samples [1..100] for label 'smoke', GET p50 \u2192 value between 48 and 52",
+   "Cardinality stress (hidden): POST 1000 samples drawn from uniform[1,10000] across 400 distinct labels simultaneously; query p90 for each label; verify each reported value within \u00b12% of numpy-computed true p90 for that label's samples",
+   "Volume stress (hidden): POST samples in 10 batches of 7000 (70,000 total) for label 'heavy'; query p25, p50, p75, p99; each must be within \u00b12% of true percentile of all 70,000 samples",
+   "Overflow boundary (hidden): POST exactly 65,537 samples (value=i for i in 1..65537) for label 'overflow'; GET p50 \u2192 must be between 32,000 and 33,537 (i.e. not 0 or near-zero)",
+   "Restart survival (hidden): kill the service process, restart it via whatever mechanism the solver left, re-ingest 200 samples for label 'persist', query p50 \u2014 service must answer correctly (note: in-memory store reset is acceptable; test only checks service restarts cleanly)",
+   "Concurrent labels (hidden): 50 labels ingested simultaneously with 2000 samples each via parallel curl; all p50 queries return within \u00b12% of true value"
+  ],
+  "verifier_knob": {
+   "name": "max_samples_per_label",
+   "value": "100000",
+   "effect": "Raising to 200,000 makes the uint16 overflow test hit 3x the boundary; lowering to 10,000 makes volume tests passable even with a naive capped reservoir, reducing difficulty"
+  },
+  "expected_failure_modes": [
+   "Agent reads all JS source files, finds no bugs, concludes the binary is fine, and only restarts the service \u2014 fails cardinality and overflow tests",
+   "Agent replaces libsampler.node usage with a JS implementation capped at 256 reservoir slots (mirrors the binary's documented 'reservoir' design) \u2014 passes smoke test, fails cardinality test",
+   "Agent fixes the cardinality bug but does not probe for the 65k overflow \u2014 passes 6/7 tests, fails the overflow boundary test",
+   "Agent writes a correct sampler but wires it only for new labels created after the fix, leaving old Sampler instances from libsampler.node in store \u2014 fails if verifier pre-ingest before fix check",
+   "Agent verifies manually with small inputs and declares done without testing >256 samples or >65k boundary \u2014 shallow verification"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "native-addon",
+   "black-box",
+   "metrics",
+   "runtime-bugs",
+   "reservoir-sampling"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/aggregator/server.js store.js query.js ingest.js config.js health.js",
+   "cat /app/aggregator/README.md /app/aggregator/package.json",
+   "node -e \"const S=require('/app/aggregator/lib/libsampler'); const s=new S.Sampler(); for(let i=1;i<=300;i++) s.add(i); console.log('count:', s.count(), 'p50:', s.percentile(50), 'p99:', s.percentile(99))\"",
+   "node -e \"const S=require('/app/aggregator/lib/libsampler'); const s=new S.Sampler(); for(let i=1;i<=65537;i++) s.add(i); console.log('count:', s.count(), 'p50:', s.percentile(50))\"",
+   "cat > /app/aggregator/lib/jssampler.js << 'EOF'\nclass Sampler {\n  constructor() { this._reservoir=[]; this._n=0; }\n  add(v) { this._n++; if(this._reservoir.length<1024) { this._reservoir.push(v); } else { const j=Math.floor(Math.random()*this._n); if(j<1024) this._reservoir[j]=v; } }\n  count() { return this._n; }\n  percentile(p) { if(!this._reservoir.length) return 0; const s=[...this._reservoir].sort((a,b)=>a-b); const i=Math.min(Math.floor(p/100*(s.length-1)),s.length-1); return s[i]; }\n}\nmodule.exports={Sampler};\nEOF",
+   "sed -i \"s|require('../lib/libsampler')|require('../lib/jssampler')|g\" /app/aggregator/store.js",
+   "cat /app/aggregator/store.js | grep require",
+   "pkill -f 'node server.js' || true",
+   "cat > /app/aggregator/start.sh << 'EOF'\n#!/bin/sh\ncd /app/aggregator\nwhile true; do node server.js; sleep 1; done\nEOF\nchmod +x /app/aggregator/start.sh",
+   "nohup /app/aggregator/start.sh > /app/aggregator/logs/service.log 2>&1 &",
+   "sleep 1 && curl -s localhost:7700/health",
+   "curl -s -X POST localhost:7700/metrics/ingest -H 'Content-Type: application/json' -d '{\"label\":\"smoke\",\"samples\":[1,2,3,4,5,6,7,8,9,10]}'",
+   "curl -s 'localhost:7700/metrics/query?label=smoke&p=50'",
+   "node -e \"const r=require('http'); let s=Array.from({length:300},(_,i)=>i+1); r.request({host:'localhost',port:7700,path:'/metrics/ingest',method:'POST',headers:{'Content-Type':'application/json'}},res=>{res.on('data',d=>console.log('ingest:',d.toString()))}).end(JSON.stringify({label:'bigtest',samples:s}))\" && sleep 0.5 && curl -s 'localhost:7700/metrics/query?label=bigtest&p=50'"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Native addon build complexity: compiling libsampler.node for exactly Node.js 20 ABI with precisely the 256-slot wrap and uint16 overflow bugs requires careful C code and build toolchain in the image \u2014 if the binary fails to load (wrong ABI, missing symbols), the entire task setup breaks before the solver even begins",
+   "Statistical flakiness in volume stress test: Algorithm R reservoir sampling with 1024 slots over 70,000 samples has non-negligible variance; the \u00b12% tolerance on p25/p75/p99 could be violated by correct implementations in unlucky random draws, causing false failures",
+   "Concurrent labels test with 50 parallel curls may be flaky under 1 CPU / 2 GB memory constraints \u2014 curl parallelism can cause request timeouts or connection resets that the test incorrectly attributes to implementation failure",
+   "The restart survival mechanism is underspecified: solver might use 'nohup node server.js &', a while-loop wrapper, or pm2 \u2014 the test must robustly detect whichever mechanism was used to restart, which may require environment-specific logic",
+   "If the solver uses a reservoir size of exactly 1024 for Algorithm R, the \u00b12% accuracy guarantee for 100,000 samples and p99 specifically may not hold \u2014 the task should specify a minimum reservoir size or adjust tolerance"
+  ],
+  "verdict": "reject",
+  "reasons": "The speedrun completes in ~14 commands because both bugs are directly suggested by the alert symptoms (high-cardinality drift \u2192 size cap; long-running drift \u2192 counter overflow) and probing the binary is the obvious first step \u2014 a frontier agent would solve this in one pass without meaningful dead ends. The genuine_difficulty score of 3 falls below the required 4, and the average (4+3+5+3+5)/5 = 4.0 is acceptable but the difficulty gate fails. Additionally, the native addon build is a fragile environment requirement that risks invalid failures if the ABI or bug implementation is even slightly off.",
+  "fixes": [
+   "Increase genuine difficulty by adding a third interacting bug or red herring in the JS source itself (e.g., store.js has a label-bucketing collision for labels sharing a hash prefix that causes cross-label sample contamination) \u2014 this forces the agent to read source AND probe, and makes the probe-the-binary path insufficient alone",
+   "Add a time-dependent component: the binary's percentile() function returns increasingly biased values based on Wall clock time (e.g., using srand(time(NULL)/3600)), so agents who probe in the first minute see correct results but production sees drift \u2014 this prevents shallow verification and forces duration-aware testing",
+   "Replace the \u00b12% static tolerance with a tighter \u00b11% for p99 specifically, and require the solution to handle reservoir size dynamically based on label volume (making a simple fixed-1024 reservoir fail the hidden 100k test), forcing the solver to implement adaptive sizing or sort-based exact percentiles with memory bounds",
+   "Specify a minimum reservoir size in the README (e.g., 'reservoir holds up to 512 samples') to create a false trail \u2014 agents who trust the README will implement 512-slot reservoir and fail the cardinality test, while the correct solution requires probing to find the actual 256-slot limit and then implementing something larger"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a weighted aggregation bug in a compiled service with source available, not about replacing a broken native binary sampler for percentile computation."
+    },
+    {
+     "ref_id": "terminal-bench-science/spatial-cell-annotation",
+     "verdict": "distinct",
+     "reason": "That task is about cell-type annotation from protein expression data, with no overlap in domain, tooling, or problem structure."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a binary frame encode/decode protocol service, not about replacing a native percentile sampling addon."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a NetFlow v9 UDP/TCP aggregation service in Rust, with no overlap in the core problem of replacing a broken native percentile sampler."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation correctness and performance in a Node.js log ingestion pipeline, not about replacing a broken native addon for statistical percentile computation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.165
+    ],
+    [
+     "terminal-bench-science/spatial-cell-annotation",
+     0.162
+    ],
+    [
+     "ours/official-aac910462208",
+     0.124
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.113
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.102
+    ]
+   ],
+   "cost_usd": 0.013944
+  },
+  "novel": true
+ },
+ "cost_usd": 0.067581
+}

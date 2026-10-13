@@ -100,24 +100,66 @@ def _create(messages: list[dict], model: str, max_tokens: int, temperature: floa
 _TRAILING_COMMA = re.compile(r",(\s*[}\]])")
 
 
-def extract_json(text: str) -> dict:
-    """Parse the first JSON object in a reply (bare, or inside a ```json fence).
+def _top_level_starts(text: str) -> list[int]:
+    """Positions of `{` at brace depth 0 (outside JSON strings)."""
+    starts, depth, in_str, esc = [], 0, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            esc = ch == "\\" and not esc
+            if ch == '"' and not esc:
+                in_str = False
+            elif ch != "\\":
+                esc = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                starts.append(i)
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+    return starts
 
-    Scans for the first `{` that starts a decodable object, so prose around it or a
-    second object after it doesn't matter, and retries with trailing commas removed
-    (both seen in Sonnet replies under load).
+
+def extract_json(text: str) -> dict:
+    """Parse the first top-level JSON object in a reply (bare, or inside a ```json fence).
+
+    Only `{` at brace depth 0 are tried (raw, then with trailing commas removed), so
+    prose around the object or a second object after it doesn't matter, and a
+    malformed outer object is never replaced by one of its nested values: that
+    raises, so the caller can ask again.
     """
-    decoder = json.JSONDecoder()
     fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     for source in [*fenced, text]:
-        start = source.find("{")
-        while start != -1:
-            for attempt in (source[start:], _TRAILING_COMMA.sub(r"\1", source[start:])):
-                try:
-                    obj, _ = decoder.raw_decode(attempt)
-                    if isinstance(obj, dict):
-                        return obj
-                except json.JSONDecodeError:
-                    pass
-            start = source.find("{", start + 1)
+        found = _decode_first(source, _top_level_starts(source))
+        if found is not None:
+            return found
+    # Unbalanced braces in prose before the object (shell snippets in a speedrun) can hide
+    # it from the depth scan. Then accept an object that closes the reply (only whitespace
+    # or a fence after it): a nested value of a broken outer object never does.
+    for start in (i for i, ch in enumerate(text) if ch == "{"):
+        hit = _decode_at(text, start)
+        if hit and not text[start + hit[1] :].strip().strip("`").strip():
+            return hit[0]
     raise ValueError(f"no JSON object in reply: {text[:200]!r}")
+
+
+def _decode_at(source: str, start: int) -> tuple[dict, int] | None:
+    decoder = json.JSONDecoder()
+    for attempt in (source[start:], _TRAILING_COMMA.sub(r"\1", source[start:])):
+        try:
+            obj, end = decoder.raw_decode(attempt)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            return obj, end
+    return None
+
+
+def _decode_first(source: str, starts: list[int]) -> dict | None:
+    for start in starts:
+        hit = _decode_at(source, start)
+        if hit:
+            return hit[0]
+    return None

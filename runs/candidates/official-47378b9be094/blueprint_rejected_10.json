@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "climate-regrid-pipeline-regression",
+  "title": "Climate Regridding Pipeline Regression",
+  "scenario": "You maintain `oceantools`, a ~1,400-line Python package used by oceanographic researchers to process model output from NetCDF files. The package includes a plugin-based pipeline that reprojects irregular ocean-model grids onto regular lat/lon grids before downstream analysis. After a recent refactor splitting the coordinate-transform module into a core library plus a loadable plugin, regression tests pass, but a researcher filed an issue: regridded salinity fields show small but systematic errors that only appear on their stretched-grid model output, not on the uniform test grids. The pipeline requires a `regrid` plugin (the `regrid_plugin.py` file is missing from the deployed package) and has a coordinate-transform bug that only surfaces on non-uniform grids with masked (land) cells.",
+  "instruction_draft": "The `oceantools` pipeline at `/app/oceantools/` produces incorrect regridded output on non-uniform ocean grids; fix it so that the CLI command `python -m oceantools.cli regrid <input.nc> <output.nc>` produces mass-conserving, correctly interpolated fields on both uniform and non-uniform grids with masked cells. The missing `regrid_plugin.py` must be created and the pipeline must pass validation for all grid types.",
+  "requirements": [
+   "The CLI `python -m oceantools.cli regrid <input.nc> <output.nc>` runs without error on uniform grids, stretched grids, and grids with masked land cells",
+   "Regridded scalar fields (salinity, temperature) are mass-conserving to within 0.1% relative error on all grid types",
+   "The regridded output correctly handles masked (NaN/fill-value) cells: masked source cells do not contribute to target cell values, and target cells that map entirely to masked source cells are themselves masked",
+   "The missing `regrid_plugin.py` plugin is present and loadable by the plugin registry",
+   "Interpolation weights are computed using first-order conservative remapping (area-weighted), not bilinear",
+   "The pipeline produces bit-reproducible output given the same input (no unseeded randomness)",
+   "Validation script `/app/validate.py` exits 0"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt: libhdf5-dev, libnetcdf-dev; pip: numpy==1.26.4 scipy==1.13.0 netCDF4==1.7.1 xarray==2024.6.0 pytest==8.2.2",
+   "~1,400 lines across: `/app/oceantools/__init__.py`, `cli.py`, `pipeline.py`, `transforms/coords.py`, `transforms/weights.py`, `transforms/mask.py`, `plugins/registry.py`, `plugins/io_plugin.py`, and several plausible-but-uninvolved modules (`stats.py`, `diagnostics.py`, `ensemble.py`)",
+   "The `regrid_plugin.py` is ABSENT from `/app/oceantools/plugins/` \u2014 the registry will log a warning and fall back to a broken stub that returns unmodified data",
+   "BUG 1 (runtime-only, non-uniform grids): In `transforms/weights.py`, the area-weight normalization divides by the *source* cell area instead of the *sum of contributing source areas mapped to each target cell*; on uniform grids this is numerically identical (all cells same size), but on stretched grids it silently under- or over-weights contributions, producing field integrals that drift by 2-15% depending on stretch factor",
+   "BUG 2 (masked cells, runtime-only): In `transforms/mask.py`, the masked-cell exclusion logic applies the mask to the *target* grid index rather than the *source* grid index during weight accumulation, so land cells near coastlines bleed into ocean cells; this only triggers when source-grid masked cells are present (the uniform test grid has no masked cells)",
+   "BUG 1 is data-dependent: it only manifests when the grid cell areas vary by more than ~5% (stretched grids), so the existing test suite using a 10x10 uniform grid passes cleanly",
+   "BUG 2 only manifests when the source NetCDF has a `mask` variable \u2014 the sample test file has none",
+   "The plugin registry in `registry.py` uses `importlib` to load plugins by filename scan; if `regrid_plugin.py` is absent it logs a warning at INFO level (suppressed by default) and the pipeline produces identity-passthrough output that looks plausible but is actually the unprocessed source grid",
+   "A sample input file `/app/data/sample_uniform.nc` (10x10 uniform grid, no mask) and `/app/data/sample_stretched.nc` (20x30 non-uniform grid with coastal mask) are present",
+   "The ordered procedure: (1) create `regrid_plugin.py` implementing conservative remapping by calling `transforms/weights.py` correctly, (2) fix the weight normalization bug in `weights.py`, (3) fix the mask index bug in `mask.py`, (4) re-run the plugin registry (requires process restart, not hot-reload), (5) validate \u2014 if step 2 is done before step 1, the plugin stub silently overwrites the corrected weights with identity passthrough, making the fix appear to do nothing",
+   "ORDERED PROCEDURE TRAP: if the agent fixes the Python bugs first but doesn't create `regrid_plugin.py`, the registry's fallback stub silently discards all weight computations and returns the raw source data \u2014 making the bug fixes appear ineffective and potentially causing the agent to revert correct fixes",
+   "`/app/validate.py` generates three fresh NetCDF test cases at verify time: a uniform grid, a 3x-stretched grid, and a masked coastal grid with randomness seeded from a fixed seed; it checks mass conservation (0.1% tolerance), masked cell propagation, and plugin presence"
+  ],
+  "internal_hint": "Three interacting problems: (1) missing regrid_plugin.py \u2014 the plugin registry silently falls back to a stub that returns source data unchanged, making any bug fix invisible until the plugin exists; (2) weight normalization in weights.py divides by wrong denominator \u2014 only detectable by running on a stretched grid and checking field integrals, since uniform grids have equal areas; (3) mask index transposition in mask.py \u2014 only triggered when source data has a mask variable. The ordered procedure trap is the most dangerous: fixing bugs 2 and 3 before creating the plugin causes the registry stub to silently overwrite the corrected computations, making correct fixes look broken. The solver must: first explore why the sample_stretched.nc produces wrong integrals (run it, compute sums, compare to expected), instrument the weight computation to find the normalization error, separately discover the mask bug by testing with sample_stretched.nc (which has a mask), create the plugin file with correct conservative-remapping logic, then fix both Python bugs, and finally validate. The regrid_plugin.py requires implementing first-order conservative remapping: computing overlap areas between source and target cells on a sphere, normalizing by total source area mapped to each target cell, and correctly excluding masked cells from the source side of the weight computation.",
+  "trap": "A naive agent: (1) reads weights.py, sees plausible-looking normalization, doesn't test on stretched grids, misses bug 1; (2) creates regrid_plugin.py but calls the buggy weights.py, so the plugin is present but wrong; (3) checks that sample_uniform.nc passes (it does) and stops; (4) the hidden verifier tests on a freshly generated stretched grid and masked grid, both fail. A shallower trap: an agent that fixes the Python bugs before creating the plugin will see their fixes have no effect (the stub overwrites them) and may incorrectly revert the fixes.",
+  "tests": [
+   "T1: Plugin presence \u2014 `from oceantools.plugins.registry import PluginRegistry; r = PluginRegistry(); assert 'regrid' in r.list_plugins()` must succeed",
+   "T2: Uniform grid mass conservation \u2014 generate a fresh 15x15 uniform grid NetCDF with seeded random salinity, run regrid, check that sum(output_salinity * output_cell_area) / sum(input_salinity * input_cell_area) is within 0.1%",
+   "T3: Stretched grid mass conservation \u2014 generate a fresh 25x35 grid with cell sizes varying 4:1 (stretch factor 4), run regrid, same 0.1% mass conservation check; this directly tests the weight normalization fix",
+   "T4: Masked cell propagation \u2014 generate a grid with 20% of source cells masked, verify that (a) target cells mapping entirely to masked source cells are themselves masked, and (b) target cells mapping to mixed masked/unmasked source cells use only unmasked source values (no land bleeding)",
+   "T5: No masked cell bleed \u2014 in the masked test case, pick a target cell adjacent to a coast; verify its regridded value equals the area-weighted average of only its unmasked source neighbors, not a blend including land fill values",
+   "T6: Reproducibility \u2014 run regrid twice on the same input, byte-compare the output NetCDF scalar fields (salinity, temperature); must be identical",
+   "T7: validate.py exits 0 \u2014 the provided validation script with its three seeded test cases all pass"
+  ],
+  "verifier_knob": {
+   "name": "number_of_independent_state_properties_checked",
+   "value": "7 (plugin presence, 2 mass conservation checks, 2 mask checks, reproducibility, validate script)",
+   "effect": "Reducing to 3 checks (plugin + uniform mass conservation + validate) makes it passable with a partial fix; raising to 9+ by adding more stretch ratios and mask geometries makes it harder to pass with an approximate solution"
+  },
+  "expected_failure_modes": [
+   "Agent reads weights.py, finds the normalization looks correct for uniform grids, tests on sample_uniform.nc, sees correct output, and stops without testing on a stretched grid",
+   "Agent creates regrid_plugin.py but implements bilinear interpolation instead of first-order conservative remapping, passing mass conservation on smooth fields but failing on sharp gradients in hidden tests",
+   "Agent fixes the weight normalization bug but doesn't fix the mask index bug, so T4/T5 fail",
+   "Agent fixes both Python bugs before creating the plugin, observes no improvement (stub overwrites fixes), concludes the bugs are elsewhere, and wastes time on wrong hypotheses",
+   "Agent creates the plugin correctly but doesn't fix weights.py, so the plugin calls the buggy normalization \u2014 passes uniform tests, fails on hidden stretched-grid inputs",
+   "Agent uses bilinear weights instead of area-weighted conservative remapping in the plugin, which passes mass conservation on smooth fields but fails on the hidden tests with sharp coastline boundaries"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "deployment",
+   "reverse-engineering",
+   "feature-iteration",
+   "numerical-methods",
+   "plugin-architecture",
+   "ordered-procedure"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls /app/oceantools/plugins/ \u2014 discover regrid_plugin.py is absent",
+   "cat /app/oceantools/plugins/registry.py \u2014 understand importlib scan, stub fallback behavior",
+   "cat /app/oceantools/transforms/weights.py \u2014 read normalization; spot divide-by-source-area bug",
+   "cat /app/oceantools/transforms/mask.py \u2014 read mask exclusion; spot target-index-instead-of-source-index bug",
+   "cat /app/oceantools/plugins/io_plugin.py \u2014 use as interface template for regrid_plugin.py",
+   "cat /app/oceantools/pipeline.py \u2014 confirm how plugin is invoked",
+   "cat /app/oceantools/cli.py \u2014 confirm CLI entry point",
+   "python -m oceantools.cli regrid /app/data/sample_uniform.nc /tmp/out_u.nc \u2014 baseline (passes with stub)",
+   "python -m oceantools.cli regrid /app/data/sample_stretched.nc /tmp/out_s.nc \u2014 observe wrong/identity output",
+   "Write /app/oceantools/plugins/regrid_plugin.py implementing first-order conservative remapping (area-weighted overlaps, spherical cell areas, masked-source exclusion) calling fixed weights.py",
+   "Edit /app/oceantools/transforms/weights.py: change normalization denominator from source_cell_area to sum_of_contributing_source_areas per target cell",
+   "Edit /app/oceantools/transforms/mask.py: change mask application from target grid index to source grid index during weight accumulation",
+   "python -m oceantools.cli regrid /app/data/sample_stretched.nc /tmp/out_s2.nc \u2014 verify conservative output",
+   "python /app/validate.py \u2014 exits 0 if all three test cases pass"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Conservative remapping geometry is underspecified (planar vs spherical cell area formula): a correct spherical implementation might fail if validate.py uses planar geometry or vice versa, producing spurious test failures unrelated to the bugs",
+   "Bit-reproducibility requirement (T6) is fragile: numpy/scipy floating-point reduction order can vary across platforms or with parallelism, making identical-byte output an unreliable criterion",
+   "0.1% mass conservation tolerance may be too tight for some valid implementations of area-weighted remapping when source and target grids are incommensurable, causing false failures on correct solutions",
+   "Plugin interface is not documented in the instruction \u2014 the solver must infer the required class/function signatures from registry.py and io_plugin.py; if the interface is non-obvious, the plugin may be syntactically correct but fail to register",
+   "The validate.py seeded test case may produce pathological grids (e.g., near-fully-masked grids) that break even correct implementations, and the solver cannot inspect validate.py behavior in advance",
+   "The ordered-procedure trap is described as dangerous, but a skilled agent reading registry.py first (the natural first step) sees the stub fallback immediately, making the trap largely self-defusing rather than genuinely trapping"
+  ],
+  "verdict": "reject",
+  "reasons": "The speedrun reaches a plausible solution in ~14 commands because both bugs are directly readable from source without dynamic analysis, and the ordered-procedure trap is neutralized once the agent reads registry.py first \u2014 which is the natural starting point. Genuine difficulty scores 3 (below the required 4), and the average of 3.4 is below the 3.6 threshold. Additionally, the underspecified spherical-vs-planar geometry for conservative remapping and the fragile bit-reproducibility requirement create invalid failure risks that could penalize correct solutions.",
+  "fixes": [
+   "Elevate genuine difficulty by hiding the bug mechanism: instead of a straightforward wrong-denominator line, implement the normalization bug as a subtle off-by-one in the cell-area accumulation loop that only triggers on grids wider than 20 cells, forcing the agent to write a diagnostic script and test on the stretched grid rather than spotting it by reading",
+   "Replace the bit-reproducibility test (T6) with a weaker but valid stability test: run regrid twice and verify the mass conservation metric agrees to 6 decimal places, avoiding platform-dependent byte-comparison failures",
+   "Specify the coordinate-transform geometry explicitly in the instruction (e.g., 'assume flat-Earth cell areas proportional to \u0394lat \u00d7 \u0394lon in degrees') to eliminate the spherical-vs-planar ambiguity that could cause valid implementations to fail T3",
+   "Make the ordered-procedure trap harder to defuse: have registry.py load plugins eagerly at module import time (not on first call), so fixing bugs after importing the registry in an interactive session has no effect \u2014 the agent must understand Python module caching, not just read the registry source",
+   "Add a T8 that checks interpolation accuracy on a field with a known sharp gradient (step function), distinguishing conservative remapping from bilinear with > 1% error tolerance, to prevent bilinear implementations from passing all tests on smooth seeded-random fields"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about a CSV chunking/deduplication pipeline bug, whereas this task is about scientific NetCDF regridding with conservative remapping and a missing plugin."
+    },
+    {
+     "ref_id": "terminal-bench-pro/minesweeper-safe-move-selector",
+     "verdict": "distinct",
+     "reason": "That task is a probability-based Minesweeper cell selection algorithm, entirely unrelated to oceanographic regridding."
+    },
+    {
+     "ref_id": "terminal-bench-science/tumor-immune-interface",
+     "verdict": "distinct",
+     "reason": "That task is a bioinformatics single-cell spatial analysis problem, not a geospatial/oceanographic regridding pipeline fix."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a spectral entropy DSP pipeline for cryptographic RNG auditing, not about conservative remapping of NetCDF ocean model grids."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about AES-CTR encryption correctness in a C library, entirely different from oceanographic coordinate-transform and regridding plugin development."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.109
+    ],
+    [
+     "terminal-bench-pro/minesweeper-safe-move-selector",
+     0.106
+    ],
+    [
+     "terminal-bench-science/tumor-immune-interface",
+     0.094
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.093
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.064
+    ]
+   ],
+   "cost_usd": 0.014643
+  },
+  "novel": true
+ },
+ "cost_usd": 0.066846
+}

@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "log-metrics-query-daemon",
+  "title": "Metrics Query Daemon for Log Pipeline",
+  "scenario": "A data engineer inherits a half-finished internal metrics service for a log aggregation pipeline. The system ingests structured JSON application logs, stores compressed summaries in a SQLite database, and is supposed to expose a small TCP query protocol so dashboards can pull per-service throughput, error rates, and latency percentiles. The log ingestion and compression side is complete and running; the query daemon skeleton exists but is missing its SQL execution core and has a subtle schema invariant baked into the compressed summary tables that the query layer must respect to return correct numbers.",
+  "instruction_draft": "Hey, I'm handing you the log metrics service in /app. The ingestion side is already running and populating the database, but the query daemon at /app/query_daemon.py is incomplete \u2014 dashboards can't get any data out of it. It listens on TCP port 7373 and should answer line-delimited JSON requests. Start it up, make it handle the documented request types correctly, and leave it running so the verifier can hit it. The protocol spec is in /app/docs/protocol.md. One heads-up: the numbers it returns have to match what's actually in the database, so make sure you understand how the summary tables are built before you wire up the SQL.",
+  "requirements": [
+   "The query daemon must listen on TCP port 7373 and remain running when the verifier connects",
+   "The daemon must respond to `{\"op\":\"throughput\",\"service\":\"<name>\",\"window_minutes\":<n>}` requests with the correct total event count for that service over the last n minutes",
+   "The daemon must respond to `{\"op\":\"error_rate\",\"service\":\"<name>\",\"window_minutes\":<n>}` requests with the fraction of events that are errors (0.0\u20131.0)",
+   "The daemon must respond to `{\"op\":\"latency_pct\",\"service\":\"<name>\",\"window_minutes\":<n>,\"percentile\":<p>}` requests with the p-th percentile latency in milliseconds",
+   "The daemon must respond to `{\"op\":\"services\"}` with a list of all service names present in the database",
+   "All numeric results must be within 1% of the ground-truth values derived from the raw log data",
+   "The daemon must handle unknown services and malformed requests gracefully, returning a JSON error object instead of crashing"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install sqlite3; pip install nothing extra (stdlib only)",
+   "/app/ingestor.py: a complete, already-running log ingestor that reads from /app/data/logs/ and populates /app/metrics.db; it runs as a background process started in the Dockerfile ENTRYPOINT",
+   "/app/data/logs/: directory containing ~2000 JSON log files already ingested at image build time, covering 6 synthetic services over 90 minutes of simulated time",
+   "/app/metrics.db: SQLite database with tables: raw_events(id,service,ts_unix,latency_ms,is_error), summary_buckets(service,bucket_start,bucket_end,event_count,error_count,latency_sum,latency_sq_sum,p50_ms,p90_ms,p99_ms); hidden invariant: summary_buckets rows cover non-overlapping 5-minute windows and p50/p90/p99 columns store COMPRESSED approximate percentiles using a fixed-seed reservoir sample of size 100, NOT exact values \u2014 exact percentiles require using latency_sum and latency_sq_sum plus a Gaussian approximation OR joining to raw_events",
+   "/app/query_daemon.py: skeleton with TCP server scaffolding (socket accept loop), request JSON parsing stub, and five handler stubs that all return {\"error\": \"not implemented\"}; the SQL query strings are left as TODO comments",
+   "/app/docs/protocol.md: complete protocol specification including request/response schemas and example exchanges; it documents that latency percentiles must be computed from raw_events, not from the summary p50/p90/p99 columns which are noted as 'internal approximations for dashboard sparklines only'",
+   "/app/ingestor.py continues running during the solve session, adding new log events every few seconds so the database state changes while the solver works \u2014 this means hardcoded query results will fail at verify time",
+   "A second hidden invariant embedded in ingestor.py: events are timestamped with a monotonically increasing synthetic clock stored in the database as ts_unix, but the clock epoch is NOT Unix epoch \u2014 it is offset by a fixed constant (86400 * 500) that the solver must discover by reading ingestor.py or querying the db, otherwise window_minutes calculations will return wrong buckets"
+  ],
+  "internal_hint": "Two interacting hidden invariants make this hard. First: the protocol.md explicitly says latency percentiles come from raw_events, but the summary_buckets table has p50/p90/p99 columns that look tempting \u2014 using them fails on hidden test services with skewed distributions where the reservoir approximation is off by >1%. Second: the ts_unix column uses a synthetic epoch (offset = 86400*500 = 43,200,000 seconds ahead of real Unix time), so naive `WHERE ts_unix > strftime('%s','now') - window_minutes*60` returns empty results. The solver must read ingestor.py to discover the epoch offset, then either compute the current synthetic time from the max ts_unix in the db (which advances ~1 real second per synthetic second since the ingestor keeps running) or hardcode the offset. The correct window filter is `WHERE ts_unix > (SELECT MAX(ts_unix) FROM raw_events) - window_minutes*60`. The solver has to instrument/explore to find both invariants \u2014 neither is visible from the skeleton or the protocol spec alone.",
+  "trap": "A naive solution implements the SQL queries using `strftime('%s','now')` for the time window, which returns empty result sets for all windowed queries (throughput=0, error_rate=0, latency=null) because the synthetic clock is offset by ~500 days. The shallow verifier check \u2014 does the daemon respond without crashing? \u2014 passes. The hidden tests send requests with specific window sizes and compare against ground-truth counts computed from raw log files at verify time. Additionally, using the pre-computed p50/p90/p99 columns from summary_buckets instead of computing from raw_events fails on the 2 out of 6 services that have bimodal latency distributions where the reservoir approximation diverges >1% from true percentiles.",
+  "tests": [
+   "Verify daemon is listening on port 7373 within 10 seconds of test start",
+   "Send `{\"op\":\"services\"}` and verify the response contains exactly the 6 service names present in the database",
+   "For each of 3 services, send `{\"op\":\"throughput\",\"service\":\"<name>\",\"window_minutes\":10}` and verify the count matches a ground-truth count computed by the verifier by directly querying raw_events with the correct epoch-aware window",
+   "For each of 3 services, send `{\"op\":\"error_rate\",\"service\":\"<name>\",\"window_minutes\":15}` and verify the fraction is within 0.01 of ground truth",
+   "For service 'billing' (bimodal distribution), send `{\"op\":\"latency_pct\",\"service\":\"billing\",\"window_minutes\":30,\"percentile\":90}` and verify the result is within 1% of the true p90 computed from raw_events \u2014 this fails if summary_buckets p99 columns are used",
+   "For service 'auth' (bimodal distribution), send `{\"op\":\"latency_pct\",\"service\":\"auth\",\"window_minutes\":20,\"percentile\":50}` and verify within 1% of true p50 from raw_events",
+   "Send a request for a nonexistent service and verify the response is valid JSON with an 'error' key, not a crash",
+   "Send a malformed JSON request and verify the daemon stays alive and returns a JSON error",
+   "After a 30-second pause, re-send a throughput query and verify the count has increased (daemon correctly queries live db, not cached results)"
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "8 distinct request scenarios across 6 services",
+   "effect": "Raising the number of scenarios increases coverage of edge cases (more services, more window sizes, more percentiles); lowering to 3-4 scenarios makes it easier to pass with a partially correct epoch fix but wrong percentile source; at 12+ scenarios it also tests very short windows (1 minute) where the synthetic-clock offset matters most"
+  },
+  "expected_failure_modes": [
+   "Agent uses strftime('%s','now') for time windows and gets empty results; daemon responds but all counts are 0 \u2014 passes shallow check, fails all numeric tests",
+   "Agent discovers the epoch offset by reading ingestor.py but reads the p50/p90/p99 columns from summary_buckets for latency percentiles \u2014 passes 4/6 services, fails the 2 bimodal-distribution services",
+   "Agent hardcodes the MAX(ts_unix) at solve time instead of querying it dynamically \u2014 window queries are correct during development, but the verifier runs 30+ seconds later when the ingestor has added more events, causing off-by-one window boundary errors",
+   "Agent implements only the throughput and error_rate handlers (the easy ones) and leaves latency_pct returning 'not implemented', passing half the tests",
+   "Agent queries raw_events for percentiles correctly but implements an approximate algorithm (e.g. using AVG \u00b1 stddev) that diverges on the bimodal distributions"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-engineering",
+  "tags": [
+   "sql",
+   "systems",
+   "tcp-protocol",
+   "logs",
+   "hidden-invariant",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/query_daemon.py",
+   "cat /app/docs/protocol.md",
+   "cat /app/ingestor.py  # discover epoch offset = 86400*500",
+   "sqlite3 /app/metrics.db '.schema'",
+   "sqlite3 /app/metrics.db 'SELECT MIN(ts_unix), MAX(ts_unix) FROM raw_events;'",
+   "sqlite3 /app/metrics.db 'SELECT DISTINCT service FROM raw_events;'",
+   "Write complete query_daemon.py (~80 lines): socket server + 5 handlers using MAX(ts_unix) anchor + raw_events for percentiles",
+   "python3 /app/query_daemon.py &",
+   "echo '{\"op\":\"services\"}' | nc localhost 7373",
+   "echo '{\"op\":\"throughput\",\"service\":\"auth\",\"window_minutes\":10}' | nc localhost 7373",
+   "echo '{\"op\":\"latency_pct\",\"service\":\"billing\",\"window_minutes\":30,\"percentile\":90}' | nc localhost 7373",
+   "echo '{\"op\":\"error_rate\",\"service\":\"auth\",\"window_minutes\":15}' | nc localhost 7373",
+   "echo 'bad json' | nc localhost 7373",
+   "echo '{\"op\":\"throughput\",\"service\":\"nonexistent\",\"window_minutes\":10}' | nc localhost 7373"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 'hidden' epoch invariant is not hidden \u2014 it's immediately visible in ingestor.py which any competent agent reads first; the task blueprint even calls it 'hidden' but it's in a readable source file with no obfuscation",
+   "The 'hidden' latency invariant is not hidden \u2014 protocol.md explicitly states p50/p90/p99 columns are 'internal approximations for dashboard sparklines only' and to use raw_events; the blueprint's own instruction draft says 'make sure you understand how the summary tables are built'",
+   "The 30-second re-query liveness test could be flaky if the ingestor adds events slowly or the window boundary happens to align such that no new events fall in the query window",
+   "The 1% tolerance for percentile accuracy is tight when computing exact percentiles from raw_events with SQLite \u2014 a correct solution using ORDER BY / LIMIT should pass, but if the verifier's ground truth uses a different interpolation method there could be edge-case disagreements",
+   "nc (netcat) behavior differs between BSD and GNU versions for line-delimited TCP \u2014 the daemon needs to handle connection lifecycle correctly; protocol spec must clarify whether each request is one connection or multiple per connection",
+   "The ingestor running during solve could create race conditions where the verifier's ground-truth query and the daemon's response are computed at slightly different moments, causing spurious failures on throughput tests near window boundaries"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because both 'hidden' invariants are trivially discoverable by reading the two most natural files (ingestor.py and protocol.md), and the full solution can be implemented in ~14 commands by a competent agent. The epoch offset is plainly visible in ingestor.py, and the protocol.md explicitly warns against using summary_buckets percentile columns \u2014 these are not hidden invariants but documented design notes. The speedrun reaches a correct solution in under 14 steps, well below the threshold for genuine_difficulty \u2265 4.",
+  "fixes": [
+   "Make the epoch offset genuinely hidden by computing it from a runtime environment variable or a compiled binary, not from readable Python source \u2014 or remove it and find a harder invariant",
+   "Remove the explicit protocol.md warning about p50/p90/p99 approximations \u2014 instead make the columns appear correct for most services and only fail silently on the 2 bimodal ones, forcing the solver to validate by cross-checking raw_events",
+   "Add a second database file or table that looks authoritative (e.g., a 'final_metrics' view that merges data incorrectly) to create a real trap where reading the code isn't sufficient \u2014 the solver must run experiments to detect the discrepancy",
+   "Introduce a non-obvious SQL correctness bug in the skeleton (e.g., integer division truncation for error_rate, off-by-one in percentile index) that the solver must debug rather than just 'fill in TODOs'",
+   "If keeping the epoch offset, obfuscate it: store it in a binary config file, compute it from hostname hash, or split it across two files \u2014 making grepping ingestor.py insufficient"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing an HMAC chain verifier bug in a git history; the candidate is about implementing SQL query logic for a TCP metrics daemon."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing an existing PostgreSQL query for performance; the candidate is about implementing a TCP query daemon that reads from SQLite and returns computed metrics."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bug in a compiled aggregation service that writes to a database; the candidate is about implementing the query/read layer of a TCP daemon on top of an already-populated database."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "variant",
+     "reason": "Both involve a running pipeline writing to SQLite and exposing a network API (Flask vs TCP) that must return correct computed metrics from the stored data, though the candidate adds a TCP protocol implementation layer and latency percentile computation."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "variant",
+     "reason": "Both tasks require implementing a TCP query daemon that answers structured JSON requests against an aggregated data store, with multiple query operation types and correct numeric results; the domain differs (NetFlow vs log metrics) but the core engineering problem is essentially the same."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-cff69805912b",
+     0.185
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.184
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.17
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.16
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.144
+    ]
+   ],
+   "cost_usd": 0.015036
+  },
+  "novel": false
+ },
+ "cost_usd": 0.053814
+}

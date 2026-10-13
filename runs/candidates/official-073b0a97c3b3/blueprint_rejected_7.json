@@ -1,0 +1,158 @@
+{
+ "blueprint": {
+  "slug": "canary-rollout-metrics-phantom",
+  "title": "Canary Deployment Metrics Phantom Bug",
+  "scenario": "A Node.js microservice handles HTTP traffic and emits Prometheus-style metrics to a local aggregator. The on-call SRE was paged at 3am because the canary deployment shows healthy p99 latency in the dashboard but customers are reporting timeouts. The environment contains a running metrics-aggregator service (~1200 lines across 5 files), a canary request-replay harness, and 48 hours of captured request logs. The aggregator exposes a `/query` endpoint used by the verifier.",
+  "instruction_draft": "3:07am. PagerDuty woke me up.\n\n```\nCANARY ALERT: customer_timeout_rate=4.2% but metrics dashboard shows p99_latency=180ms (healthy)\nService: order-processor v2.3.1-canary\nAggregator: http://localhost:7700\nLogs: /app/logs/\nReplay harness: /app/harness/replay.js\n```\n\nCustomers are timing out but the metrics look clean. Something is wrong with how the aggregator is computing or exposing latency metrics for the canary cohort.\n\nFix the aggregator so that:\n1. `GET /query?metric=p99_latency&cohort=canary` returns the true p99 latency computed from the actual request durations recorded in the aggregator's time-window buckets for the canary cohort.\n2. `GET /query?metric=p99_latency&cohort=stable` continues to return correct p99 for the stable cohort.\n3. `GET /query?metric=request_count&cohort=canary` and `&cohort=stable` return accurate counts.\n4. `GET /query?metric=error_rate&cohort=canary` returns the fraction of requests with status >= 500, as a decimal between 0 and 1.\n5. The `/ingest` endpoint correctly accepts and routes new request records (JSON POST) into the right cohort buckets and time windows before the query endpoints read them.\n\nThe harness at `/app/harness/replay.js` re-ingests the captured logs through `/ingest` and then queries `/query`. Run it to see what is currently happening. All fixes must be in the aggregator source under `/app/aggregator/`.",
+  "requirements": [
+   "GET /query?metric=p99_latency&cohort=canary returns true p99 computed from actual canary request duration buckets",
+   "GET /query?metric=p99_latency&cohort=stable returns correct p99 for stable cohort",
+   "GET /query?metric=request_count&cohort=canary and cohort=stable return accurate counts",
+   "GET /query?metric=error_rate&cohort=canary returns fraction of requests with status >= 500 as decimal",
+   "POST /ingest correctly routes request records into the right cohort buckets and time windows",
+   "All fixes are within /app/aggregator/ source files"
+  ],
+  "environment": [
+   "Node.js 20 installed; no internet access",
+   "/app/aggregator/server.js: main Express server (~250 lines), starts on port 7700 via `node server.js`",
+   "/app/aggregator/buckets.js: time-window bucket manager (~300 lines) \u2014 has BUG 1: cohort routing uses req.cohort but ingest parser stores it as req.segment, so all canary data lands in an 'undefined' bucket that is never queried",
+   "/app/aggregator/stats.js: percentile computation module (~200 lines) \u2014 has BUG 2: p99 interpolation uses index Math.ceil(0.99 * n) without subtracting 1, causing an off-by-one that reads undefined for arrays whose length is an exact multiple of 100, returning NaN; but this NaN is then replaced by the last known cached value (which is from the stable cohort's previous window), making canary p99 look healthy",
+   "/app/aggregator/ingest.js: request record parser (~150 lines) \u2014 stores cohort as 'segment' field instead of 'cohort'",
+   "/app/aggregator/query.js: query handler (~200 lines) \u2014 reads bucket by req.query.cohort correctly, but because buckets were stored under 'undefined' key, canary bucket is always empty; fallback logic returns cached stable value",
+   "/app/aggregator/cache.js: simple LRU cache (~100 lines) \u2014 correctly implemented, used as red herring (solver may think cache is the bug)",
+   "/app/logs/requests-48h.ndjson: 48 hours of captured request records, ~50k lines, canary requests have segment='canary' and durations ranging 800ms-4000ms (actual timeouts), stable requests have cohort='stable' and durations 100-300ms",
+   "/app/harness/replay.js: reads logs, POSTs each record to /ingest, then queries /query for both cohorts and prints results; currently shows canary p99=180ms (wrong) matching stable",
+   "/app/harness/verify_scenarios.js: verifier-side script that generates fresh synthetic request batches with known distributions and checks /ingest + /query round-trip accuracy",
+   "Dockerfile installs Node.js 20, runs npm install in /app/aggregator, starts aggregator on container start, exposes port 7700"
+  ],
+  "internal_hint": "Two interacting bugs: (1) ingest.js stores cohort as 'segment' but buckets.js routes by 'cohort', so all canary data lands in bucket key 'undefined'. (2) stats.js p99 index is off-by-one (Math.ceil(0.99*n) instead of Math.floor(0.99*n) or Math.ceil(0.99*n)-1), which produces NaN for arrays of length divisible by 100. The cache in cache.js then substitutes the previous stable p99 for the NaN, making canary look healthy. Fixing only bug 1 exposes bug 2 (p99 suddenly returns NaN for certain batch sizes). Fixing only bug 2 still routes all canary data to the wrong bucket so canary always appears empty. Both must be fixed together for /query to return correct values. The solver must run the harness to observe the wrong output, read ingest.js to find the field name mismatch, then probe stats.js with specific array sizes to find the off-by-one. The cache.js file is a deliberate red herring \u2014 it's correct but will attract attention.",
+  "trap": "A solver that only fixes the field name mismatch (bug 1) will see canary p99 suddenly return NaN or 0 for the synthetic batches the verifier generates (which use exact multiples of 100 records). They may then wrongly 'fix' the cache or add a NaN guard that hides bug 2 rather than correcting the percentile math. The verifier tests canary p99 against batches of 100, 200, and 300 records with known distributions \u2014 a NaN guard returning 0 or the last value will fail these. A solver that fixes only bug 2 will still see canary p99 as 0 or empty because canary data never lands in the canary bucket.",
+  "tests": [
+   "Verifier sends 200 POST /ingest requests with cohort='canary' and durations drawn from uniform(800,4000)ms, then GET /query?metric=p99_latency&cohort=canary must return a value between 3500 and 4000 (within 5% of true p99)",
+   "Verifier sends 100 POST /ingest with cohort='stable' and durations uniform(100,300)ms, then GET /query?metric=p99_latency&cohort=stable must return between 285 and 300",
+   "Verifier sends exactly 100 canary requests (edge case for off-by-one), p99 must not be NaN, 0, or a stable-cohort value",
+   "Verifier sends 50 canary requests with 10 having status=503, GET /query?metric=error_rate&cohort=canary must return between 0.18 and 0.22",
+   "Verifier sends mixed cohort batch (150 canary + 150 stable), request_count for each cohort must equal exactly 150",
+   "Verifier POSTs a new batch after restart (cold cache), canary p99 must not borrow from stable cohort \u2014 stable and canary p99 must differ by at least 500ms given the different duration distributions"
+  ],
+  "verifier_knob": {
+   "name": "number_of_request_scenarios",
+   "value": "6 scenarios",
+   "effect": "Reducing to 2 scenarios (basic count + p99 for 200 requests) makes it easier since the off-by-one only manifests at exact multiples of 100; raising to 8+ adds scenarios with mixed-cohort ingestion ordering and time-window expiry edge cases"
+  },
+  "expected_failure_modes": [
+   "Solver finds and fixes the field name mismatch but concludes the bug is fixed when the harness shows non-zero canary p99 on a non-multiple-of-100 sample, missing bug 2 which only manifests on exact multiples",
+   "Solver notices the cache and spends time refactoring it, missing that the cache is a red herring and the real bugs are in field naming and percentile math",
+   "Solver patches the NaN in stats.js with a fallback value instead of fixing the index arithmetic, passes some tests but fails the ones with 100-record batches",
+   "Solver fixes only stats.js off-by-one, observes canary still shows stable values, concludes the fix was wrong and reverts it",
+   "Solver fixes both bugs but introduces a regression in the ingest parser that drops the duration field for stable requests, causing stable p99 to also break"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "metrics",
+   "canary-deployment",
+   "debugging",
+   "two-bugs",
+   "percentile"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "node /app/harness/replay.js  # observe canary p99=180ms (wrong)",
+   "cat /app/aggregator/ingest.js  # find 'segment' field stored instead of 'cohort'",
+   "cat /app/aggregator/buckets.js  # confirm routing reads 'cohort' key \u2192 mismatch confirmed",
+   "cat /app/aggregator/stats.js  # find Math.ceil(0.99*n) off-by-one",
+   "sed -i 's/req.segment/req.cohort/' /app/aggregator/ingest.js  # fix bug 1",
+   "sed -i 's/Math.ceil(0.99 * n)/Math.floor(0.99 * n)/' /app/aggregator/stats.js  # fix bug 2",
+   "node /app/harness/replay.js  # verify canary p99 now shows ~3800ms",
+   "cat /app/aggregator/cache.js  # confirm red herring, no fix needed",
+   "node /app/harness/verify_scenarios.js  # run all 6 verifier scenarios"
+  ],
+  "speedrun_commands": 9,
+  "scores": {
+   "clarity": 4,
+   "solvability": 5,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The uniform distribution p99 bounds (e.g., 3500-4000 for 200 samples from uniform(800,4000)) could be flaky if the verifier uses a fixed RNG seed that happens to produce edge-case samples near the boundary",
+   "The log file inconsistency (canary records use 'segment=' but stable records use 'cohort=') is slightly implausible and could confuse a solver into thinking the log format itself is the bug rather than the ingest parser",
+   "If the verifier's 'cold cache restart' test relies on actually restarting the server process, timing/port-rebind issues on the container could cause flaky failures unrelated to correctness",
+   "The NaN guard trap (solver adds NaN fallback instead of fixing math) is described as a failure mode, but if the verifier only checks numeric range and the NaN guard returns the correct-ish value for non-100-multiple batches, it might pass some scenarios ambiguously"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2, well below the required threshold of 4. Both bugs are fully visible by reading 2-3 source files (the field name mismatch and off-by-one are single-line fixes), and the speedrun reaches a complete solution in ~9 commands \u2014 matching the rubric's explicit calibration of 'bugs visible by reading source = at most 2.' The task is well-constructed with good verifiability and realism, but the difficulty ceiling is too low for a 'hard' task because the blueprint over-specifies the bug locations and mechanisms, leaving no genuine exploration or diagnosis challenge for a skilled agent.",
+  "fixes": [
+   "Remove the explicit per-file bug descriptions from the environment spec \u2014 instead of stating 'buckets.js has BUG 1: cohort routing uses req.cohort but ingest parser stores as req.segment', just describe the files neutrally so the solver must discover the mismatch through dynamic observation",
+   "Add a third interacting bug or a non-obvious root cause that requires dynamic tracing rather than static reading \u2014 e.g., a timing-dependent race in the time-window expiry that only manifests under concurrent ingest+query load, forcing the solver to instrument and load-test rather than just read code",
+   "Increase the search space by having the field name inconsistency appear in multiple places with different aliases (e.g., 'segment', 'cohort', 'group', 'tier' used inconsistently across 4 files) so grep/read alone is insufficient and the solver must trace data flow end-to-end",
+   "Make the off-by-one in stats.js conditionally triggered by a configuration value loaded from an external config file, so the solver must understand the runtime configuration path, not just the math line itself",
+   "Add a constraint that the solver cannot modify ingest.js (it's owned by another team), forcing a more creative fix via a middleware transform or schema normalization layer in server.js"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a SQL query for performance; the candidate is about debugging a metrics aggregator's incorrect p99 latency computation for a canary deployment."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves repairing a NetFlow v9 UDP/TCP aggregation service in Rust; the candidate is about fixing a Node.js Prometheus-style metrics aggregator with cohort-based latency computation bugs."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NetFlow v9 byte attribution and template parsing in a Python settlement aggregator; the candidate is about fixing p99 latency computation and cohort routing in a Node.js metrics aggregator."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline with GeoIP enrichment, a SQLite event store, and a Flask API; the candidate is about debugging phantom metrics in a Node.js canary deployment aggregator."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect region-level sales aggregation with weighted totals in a compiled service; the candidate is about fixing p99 latency and cohort routing bugs in a Node.js metrics aggregator."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.113
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.105
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.099
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.091
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.067
+    ]
+   ],
+   "cost_usd": 0.015303
+  },
+  "novel": true
+ },
+ "cost_usd": 0.055958999999999995
+}

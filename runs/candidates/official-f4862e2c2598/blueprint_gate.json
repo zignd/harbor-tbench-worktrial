@@ -1,0 +1,113 @@
+{
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat QUERY_PROTOCOL.md",
+   "cat engine_wrapper.py",
+   "cat KNOWN_ISSUES.txt",
+   "cat tests/test_integration.py",
+   "cat schema.sql",
+   "sqlite3 /data/processed/metrics.sqlite \"SELECT service, COUNT(*) FROM raw_metrics GROUP BY service LIMIT 20\"",
+   "sqlite3 /data/processed/metrics.sqlite \"SELECT ts FROM raw_metrics WHERE service='auth' ORDER BY ts LIMIT 50\"",
+   "logbin_probe --service auth --metric request_count --start <T_epoch_aligned> --end <T+7200> --window 3600 --agg sum",
+   "sqlite3 /data/processed/metrics.sqlite \"SELECT COUNT(*) FROM raw_metrics WHERE service='auth' AND ts > T AND ts <= T+3600\"",
+   "# Compare probe output vs SQLite count to detect left-exclusive boundary semantics",
+   "sqlite3 /data/processed/metrics.sqlite \"SELECT service FROM raw_metrics GROUP BY service HAVING COUNT(*) < 10\"",
+   "logbin_probe --service mailer --metric <metric> --start <sparse_window_start> --end <sparse_window_end> --window 3600 --agg sum",
+   "# Observe NaN return for bucket with <4 entries; verify threshold by inserting exactly 3 vs 4 entries",
+   "# Write query_service.py: Flask app on port 7432, POST /query with validation",
+   "# Implement: fetch raw_metrics from SQLite with ts > bucket_start AND ts <= bucket_end (left-exclusive)",
+   "# Implement: call engine_wrapper.compute_window(); detect NaN buckets; fall back to direct SQLite aggregation for sparse buckets",
+   "# Implement: 400 for missing fields/invalid agg/end<=start; 404 for unknown service; concurrent-safe (per-request SQLite reads)",
+   "# Implement: live data by querying SQLite fresh on each request (no in-memory cache)",
+   "python query_service.py &",
+   "curl -X POST localhost:7432/query -H 'Content-Type: application/json' -d '{\"service\":\"auth\",\"metric\":\"request_count\",\"start_ts\":1700000000,\"end_ts\":1700007200,\"window_secs\":3600,\"agg\":\"sum\"}'",
+   "pytest tests/test_integration.py -v",
+   "# Fix boundary edge cases if tests fail, re-run pytest"
+  ],
+  "speedrun_commands": 21,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction never explicitly states left-exclusive semantics or the NaN threshold \u2014 an agent that correctly infers both from experiments but implements a slightly different boundary rule (e.g., ts >= start AND ts < end vs ts > start AND ts <= end) could fail hidden tests for technically-ambiguous reasons, not engineering failure",
+   "The 'partial-window edge test' requirement (no fractional-window buckets at ends) is not stated in the instruction \u2014 an agent could reasonably include partial buckets at boundaries per some interpretations of the protocol spec and fail this test unfairly",
+   "The live-data test requires writing new JSONL entries and having ingestor.py process them \u2014 if log_rotator.py timing is non-deterministic or the ingestor doesn't run fast enough after new files are written, this test could be flaky",
+   "The NaN fallback requirement (fall back to direct SQLite for sparse buckets) is an undocumented requirement that requires discovering the threshold is exactly 4 \u2014 an agent that discovers NaN but sets a different threshold (e.g., 3 or 5) would fail for ambiguous reasons",
+   "Concurrency test with 20 simultaneous requests may be sensitive to SQLite locking behavior on 1 CPU / 2GB container, potentially causing intermittent failures unrelated to implementation correctness",
+   "The 0.5% numeric accuracy requirement for p95 interacts with how the NaN fallback computes percentiles \u2014 different valid statistical implementations (e.g., nearest-rank vs interpolated) could produce values outside tolerance for small buckets"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails on clarity (score 3) because two of the most critical tested requirements \u2014 left-exclusive window semantics and the NaN-fallback behavior \u2014 are deliberately hidden from the instruction and discoverable only through experiments, yet the tests strictly enforce them; this creates invalid failure risk where agents fail for ambiguity rather than engineering incompetence. Solvability is borderline (score 3) as the 1-hour estimate is unrealistic for the required experimental archaeology plus service implementation. The average score is (3+3+5+4+5)/5 = 4.0, meeting the average threshold, but clarity does not meet the minimum of 3 for avoiding invalid failures, and the invalid failure risks are substantial enough to undermine verifiability in practice.",
+  "fixes": [
+   "Add to KNOWN_ISSUES.txt or QUERY_PROTOCOL.md a clear (but terse) statement that 'the engine uses left-exclusive intervals (start, end] \u2014 entries timestamped exactly at a window boundary belong to the prior bucket' so this is a stated requirement the agent must implement correctly, not a hidden invariant that causes ambiguous test failures",
+   "Document the NaN threshold behavior in KNOWN_ISSUES.txt as 'buckets with fewer than N entries may return NaN \u2014 your service must handle this gracefully with a fallback' (without specifying N=4, preserving discovery difficulty) so the fallback requirement is stated even if the threshold must be discovered",
+   "Add the partial-window behavior requirement explicitly to the instruction: 'the service should only return complete window buckets \u2014 do not include fractional buckets at the query time boundaries'",
+   "Make the live-data test more robust by having the verifier explicitly call the ingestor or wait for a deterministic interval rather than relying on log_rotator.py timing",
+   "Increase the expected solve time estimate to 2-3 hours or reduce scope (e.g., remove the NaN fallback requirement and just require the service to return null for sparse buckets) to improve solvability score"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a weighted aggregation bug in a compiled service and correcting a database; the candidate is about building a new HTTP query service on top of a black-box shared library with protocol implementation and concurrency concerns."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing an HMAC chain verifier bug in an existing service; the candidate is about building a new HTTP query service wrapping a black-box .so library with windowed time-series aggregations."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "That task is a C++ debug-vs-release memory corruption fix; the candidate is a Python HTTP service construction task wrapping a pre-built shared library."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task repairs an existing Rust NetFlow aggregation service with specific flow-merging and query bugs; the candidate requires building a new HTTP service from scratch over a black-box engine with time-series windowing and partial-bucket handling."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task fixes a broken log enrichment pipeline and adds a missing API endpoint; the candidate is about building an entire HTTP query service over an opaque compiled engine with windowed time-series semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.199
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.187
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.18
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.177
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.153
+    ]
+   ],
+   "cost_usd": 0.014556
+  },
+  "novel": true
+ },
+ "cost_usd": 0.064116
+}

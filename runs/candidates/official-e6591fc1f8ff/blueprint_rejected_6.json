@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "wheel-codec-threshold-repair",
+  "title": "Python Wheel Codec Compression Repair",
+  "scenario": "Your team ships a Python library as a wheel that bundles a native codec extension (`_fastcodec.so`) for encoding domain-specific binary data files used in production pipelines. After a recent refactor, the release pipeline's `encode_batch.py` script started producing wheels that are accepted by pip but whose encoded output files fail a downstream size-regression gate: encoded files must compress the input to at most 55% of the original byte size on the production dataset. The codec `.so` is shipped without source; you have only the installed binary, a `codec_wrapper.py` that calls it, a sample dataset under `data/samples/`, and the full build tooling under `build/`.",
+  "instruction_draft": "Our Python wheel release pipeline is broken. The `encode_batch.py` script at `/app/pipeline/encode_batch.py` processes `.dat` files from an input directory, writes encoded `.enc` files to an output directory, then packages everything into a distributable wheel under `dist/`. The pipeline was recently refactored and something changed that causes the encoded output to be larger than acceptable for our storage contract.\n\nFix the pipeline so that when `python /app/pipeline/encode_batch.py /app/data/samples/ /app/out/` is run, every `.enc` file it produces is no larger than 55% of its corresponding input `.dat` file's byte size. The wheel built by running `python /app/build/build_wheel.py` must install cleanly with `pip install` and the installed `encode_batch` entry point must also satisfy the 55% threshold when run against fresh `.dat` input files. The ratio is measured as `len(encoded_bytes) / len(input_bytes)` and must be strictly less than 0.55 for every input file.",
+  "requirements": [
+   "Running `python /app/pipeline/encode_batch.py <input_dir> <output_dir>` must process every `.dat` file in the input directory and write a corresponding `.enc` file to the output directory.",
+   "Every `.enc` file produced must satisfy `len(enc_bytes) / len(dat_bytes) < 0.55`.",
+   "Running `python /app/build/build_wheel.py` must produce a valid installable `.whl` under `/app/dist/`.",
+   "After `pip install` of the built wheel, the installed `encode_batch` command must also satisfy the 0.55 compression ratio threshold on fresh hidden `.dat` inputs.",
+   "The codec binary `_fastcodec.so` must not be replaced or recompiled; the fix must be in the Python wrapper layer and/or build configuration."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "Install: build, wheel, pip, setuptools, numpy (pinned versions).",
+   "Place a pre-compiled `_fastcodec.so` (x86_64 Linux CPython 3.13) that exposes two functions: `encode_raw(bytes) -> bytes` (raw RLE encoding, always produces output > 80% of input) and `encode_lz(bytes, level: int) -> bytes` (LZ77 + entropy coding; level 1-9, where level >= 6 gives < 45% on the sample data). The .so ships without source.",
+   "The `_fastcodec.so` also exposes a `get_default_level() -> int` that returns 2 (was changed in the refactor from 7).",
+   "Place `/app/pipeline/codec_wrapper.py`: imports `_fastcodec`, calls `encode_raw` by default (broken after refactor that was supposed to switch to `encode_lz`). The wrapper has a commented-out `level` parameter and a note saying 'TODO: switch to encode_lz after testing'.",
+   "Place `/app/pipeline/encode_batch.py`: reads `.dat` files, calls `codec_wrapper.encode(data)`, writes `.enc` files. Also has `--level` flag that is parsed but never passed through to the wrapper (a second independent bug).",
+   "Place `/app/pipeline/__init__.py` and `/app/pipeline/config.ini` with `[codec]\\nbackend=raw\\nlevel=2` (the config file controls backend choice but codec_wrapper.py ignores it, reading a different key name `algorithm` which is absent, defaulting to `raw`).",
+   "Place `/app/build/build_wheel.py`: uses `setuptools` to build a wheel including `_fastcodec.so` as a package data file. The MANIFEST includes `*.so` but the `package_data` dict in setup.cfg uses the wrong package name so the `.so` is excluded from the built wheel (third bug: wheel installs but import fails at encode time with ImportError on _fastcodec).",
+   "Place `/app/build/setup.cfg` with the mismatched package_data key.",
+   "Place `/app/data/samples/` with 5 sample `.dat` files (each ~50KB) of structured binary data that compresses well with LZ77 (repetitive patterns).",
+   "Place `/app/docs/codec_api.txt` documenting both `encode_raw` and `encode_lz(bytes, level)` and noting that `level >= 6` is recommended for production.",
+   "Place `/app/logs/release_changelog.md` mentioning the refactor date and that 'default level was adjusted for testing, remember to revert for release'.",
+   "The `.so` must be a real compiled shared library; use ctypes or a minimal C extension built at Docker image build time. Seed the data files with a fixed seed for determinism."
+  ],
+  "internal_hint": "There are three interacting bugs all introduced in the refactor: (1) `codec_wrapper.py` calls `encode_raw` instead of `encode_lz`, causing large output; (2) `encode_batch.py` parses `--level` but never passes it to the wrapper, so even if the wrapper is fixed, level stays at the wrapper's default of 2 which still gives >55%; and (3) `setup.cfg` has the wrong package name in `package_data`, so the built wheel omits `_fastcodec.so`, causing ImportError when installed. Finding bug (1) is easy by reading code. Bug (2) is revealed only by experimenting: fixing (1) alone makes samples pass because the wrapper hardcodes level=2 which gives ~48% on the samples BUT fails on hidden inputs with lower compressibility that need level>=6. The shallow trap: `encode_lz` at level=2 passes the five sample files (all highly repetitive, achieving ~45%) but hidden test files with moderate entropy only compress to ~58% at level=2, failing the 0.55 threshold. Bug (3) only manifests when the installed wheel is tested. The solver must: (a) probe the .so by experiment to find that level matters and threshold requires level>=6 or equivalent, (b) fix all three bugs, (c) verify the wheel builds and installs correctly.",
+  "trap": "A naive fix changes `encode_raw` to `encode_lz` in the wrapper (fixing bug 1) and verifies against the 5 provided sample files. The samples are highly repetitive and pass at any level >= 2. Hidden test inputs have moderate entropy; at level=2 they produce 57-62% ratios, failing the threshold. Additionally, the built wheel omits the .so (bug 3), so the installed entry-point raises ImportError and fails all hidden wheel tests. A solver that doesn't probe the codec experimentally across compressibility regimes and doesn't test-install the built wheel will fail 2 of 3 test categories.",
+  "tests": [
+   "Run `python /app/pipeline/encode_batch.py /app/data/samples/ /tmp/out_sample/` and assert every .enc file has ratio < 0.55 (sanity check, should pass after minimal fix).",
+   "Generate 10 fresh .dat files at verify time with controlled entropy (random-walk byte sequences, medium compressibility) using a fixed seed; run the patched encode_batch.py on them and assert every ratio < 0.55.",
+   "Generate 5 fresh .dat files at verify time with low repetition (pseudorandom but structured, needing level>=6 to compress below 55%); assert every ratio < 0.55.",
+   "Run `python /app/build/build_wheel.py`, assert a .whl is produced under /app/dist/, run `pip install --force-reinstall /app/dist/*.whl`, then run `encode_batch <fresh_dir> <out_dir>` on the medium-entropy hidden files and assert ratios < 0.55.",
+   "Assert that `_fastcodec.so` is present inside the installed wheel (i.e., importable after install without the original /app directory on sys.path)."
+  ],
+  "verifier_knob": {
+   "name": "compression_threshold",
+   "value": "0.55",
+   "effect": "Raising to 0.60 makes level=2 pass most hidden inputs (easier); lowering to 0.48 requires level>=8 and eliminates some medium-entropy files passing at level=6 (harder). Current 0.55 requires level>=6 and correct wheel packaging."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only bug 1 (encode_raw \u2192 encode_lz), verifies on sample files which pass at level=2, but hidden medium-entropy files fail at level=2.",
+   "Agent fixes bugs 1 and 2 (passes level=6) but never tests the built wheel, leaving bug 3 (missing .so in wheel), so installed entry-point tests fail with ImportError.",
+   "Agent probes the .so but misidentifies the threshold level needed, uses level=4 which passes sample files and some hidden inputs but fails the lowest-compressibility hidden batch.",
+   "Agent fixes all three Python-layer bugs but introduces a regression where the level parameter is hardcoded rather than configurable, failing a hidden test that passes --level explicitly.",
+   "Agent replaces the .so with a pure-Python reimplementation, violating the constraint that _fastcodec.so must not be replaced, causing a requirement check to fail."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-packaging",
+  "tags": [
+   "python",
+   "wheel",
+   "opaque-binary",
+   "compression",
+   "deployment",
+   "systems-programming"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/codec_wrapper.py",
+   "cat /app/pipeline/encode_batch.py",
+   "cat /app/build/setup.cfg",
+   "cat /app/docs/codec_api.txt",
+   "cat /app/logs/release_changelog.md",
+   "python3 -c \"import _fastcodec; d=open('/app/data/samples/sample1.dat','rb').read(); print('raw:', len(_fastcodec.encode_raw(d))/len(d)); [print('lz level', l, len(_fastcodec.encode_lz(d,l))/len(d)) for l in [2,4,6,8]]\"",
+   "edit codec_wrapper.py: change encode_raw to encode_lz, set default level=6",
+   "edit encode_batch.py: wire --level argument through to codec_wrapper.encode(data, level=args.level)",
+   "edit setup.cfg: fix package_data key to match actual package name",
+   "python /app/pipeline/encode_batch.py /app/data/samples/ /tmp/out_test/",
+   "python3 -c \"import os; files=os.listdir('/tmp/out_test/'); [print(f, os.path.getsize('/tmp/out_test/'+f)/os.path.getsize('/app/data/samples/'+f.replace('.enc','.dat'))) for f in files]\"",
+   "python /app/build/build_wheel.py",
+   "pip install --force-reinstall /app/dist/*.whl",
+   "encode_batch /app/data/samples/ /tmp/out_wheel/ && check ratios"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Bug #2 (--level not passed through) is explicitly described in the environment setup as 'parsed but never passed through to the wrapper' - a careful source-reading agent finds it immediately without needing to probe experimentally, undermining the 'shallow trap' design",
+   "The changelog explicitly says 'default level was adjusted for testing, remember to revert for release' - combined with codec_api.txt noting level>=6 for production, an agent reading docs can deduce the correct fix without any experimental probing",
+   "The 'trap' depends on the agent NOT reading all provided files carefully, which is not a realistic failure mode for a strong agent; it is a brittleness-of-attention test rather than genuine engineering difficulty",
+   "If the hidden test data generation seed is not fixed and documented in verifier code, there is a flakiness risk around compressibility thresholds - borderline files near 55% could behave unexpectedly",
+   "The requirement that _fastcodec.so 'must not be replaced or recompiled' is stated only in the blueprint's requirements section, not explicitly in the solver-visible instruction - a solver who rewrites it in pure Python might believe they are compliant",
+   "Architecture dependency: the pre-compiled .so is x86_64 Linux CPython 3.13 specific; any environment variation could cause import errors unrelated to the solver's changes"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: all three bugs are plainly visible by reading the source files and documentation, so a strong agent following a straightforward read-then-fix pattern solves it in ~14 commands without needing experimental probing. The 'shallow trap' design fails because the changelog and codec_api.txt directly telegraph that level>=6 is needed for production, eliminating the intended exploration challenge. The task has excellent structure (three interacting bugs, opaque binary, wheel packaging) but the difficulty relies on inattentiveness rather than genuine engineering challenge.",
+  "fixes": [
+   "Remove the explicit hints from docs/codec_api.txt and the changelog - don't say 'level>=6 recommended for production' or 'remember to revert level'; force the solver to discover the level threshold experimentally by running the codec on test data",
+   "Make bug #2 non-obvious: instead of a clearly commented-out parameter with 'TODO', have encode_batch.py pass args.level but to the wrong function (e.g., passes it to a post-processing step instead of the codec), requiring runtime experimentation to discover why level changes don't affect output",
+   "Add a fourth subtler bug or a configuration interaction that requires actual experimentation (e.g., the config.ini is read but with an off-by-one level mapping, so level=6 in config produces level=5 in the codec), ensuring at least one bug cannot be found by static reading alone"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/cobol-modernization",
+     "verdict": "distinct",
+     "reason": "The COBOL task is about re-implementing business logic in Python, not about fixing a compression pipeline or wheel packaging."
+    },
+    {
+     "ref_id": "terminal-bench-pro/migrate-fortran-mcsim-to-gfortran",
+     "verdict": "distinct",
+     "reason": "The Fortran task is about migrating a build system to a new compiler, not about fixing Python codec compression ratios in a wheel pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a corrupted pip installation, not about fixing a compression pipeline that wraps a binary codec extension."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing row-count and deduplication bugs in a CSV chunking pipeline, not about meeting a compression ratio threshold in a binary codec wheel."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing correctness and latency in a Rust packet codec, not about Python wheel packaging and compression ratio compliance for a binary .so codec."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/cobol-modernization",
+     0.197
+    ],
+    [
+     "terminal-bench-pro/migrate-fortran-mcsim-to-gfortran",
+     0.185
+    ],
+    [
+     "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     0.161
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.144
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.107
+    ]
+   ],
+   "cost_usd": 0.014232000000000002
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05337000000000001
+}

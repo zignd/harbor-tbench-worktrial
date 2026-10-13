@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "varint-frame-recovery-codec",
+  "title": "Variable-Length Integer Frame Recovery",
+  "scenario": "A small in-house telemetry daemon encodes sensor readings into a compact binary frame format using variable-length integers (varints) and length-prefixed fields. The codebase lives in /app/codec/ (~1400 lines across encoder, decoder, framer, and a ring-buffer accumulator). The format was hand-rolled to save flash space on a constrained MCU and the spec is in /app/docs/frame_spec.md. A batch of production frame dumps arrived that the decoder silently corrupts or drops on certain inputs, but unit tests on the bundled samples all pass.",
+  "instruction_draft": "Hey \u2014 the frame decoder at /app/codec/ is silently mangling some of our production captures. The samples in /app/testdata/ all pass, but when we feed it real captures from /app/captures/ the recovered sensor values are wrong or records get dropped entirely. The format spec is in /app/docs/frame_spec.md. Fix the decoder so it correctly recovers every valid frame from any conforming byte stream, rejects every malformed one without crashing, and writes recovered records to stdout as newline-delimited JSON with fields exactly matching the spec. The fix should be a proper refactor \u2014 not just patching the sample cases.",
+  "requirements": [
+   "Decoder correctly decodes all valid frames from any conforming byte stream per /app/docs/frame_spec.md",
+   "Malformed frames (bad magic, truncated varint, length-prefix overflow, wrong checksum) are rejected with a non-zero per-frame error indicator without crashing the decoder",
+   "Recovered records are written to stdout as newline-delimited JSON with field names matching the spec exactly",
+   "Decoder handles frames that span ring-buffer wrap boundaries correctly",
+   "Signed varint fields (zigzag-encoded) are decoded with the correct sign",
+   "Multi-byte varint continuation bytes are handled correctly at the 4-byte and 7-byte boundary (values near 2^28 and 2^49)",
+   "Frame checksum (Adler-32 per spec) is verified across the entire payload including the length-prefix bytes",
+   "Decoder does not treat a 0x00 payload byte as a stream terminator"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm",
+   "/app/codec/ contains ~1400 lines of Python across: encoder.py (reference, correct), decoder.py (buggy), framer.py (ring-buffer accumulator with wrap logic), accumulator.py, and cli.py",
+   "/app/docs/frame_spec.md contains the full binary format specification: magic bytes (0xAB 0xCD), 1-byte version, unsigned varint payload-length, payload (field-tag + varint pairs, signed fields zigzag-encoded), 4-byte Adler-32 checksum covering everything after magic through end of payload",
+   "/app/testdata/ contains 6 hand-crafted sample frames that all decode correctly (they avoid all the edge cases)",
+   "/app/captures/ contains 4 real binary capture files from production MCUs that trigger the bugs",
+   "Planted bugs in decoder.py: (1) zigzag decode uses arithmetic right shift on unsigned integer instead of proper zigzag formula, so negative sensor values have wrong sign; (2) multi-byte varint loop stops at 4 continuation bytes max instead of 7, silently truncating values >= 2^28; (3) Adler-32 checksum computation starts accumulation after the length-prefix bytes, omitting them from the check \u2014 so frames with corrupt length fields pass; (4) framer.py ring-buffer wrap: when a frame header spans the wrap boundary the second magic byte is re-read from index 0 instead of 1, causing the frame to be dropped",
+   "A correct reference encoder is included so the solver can generate test vectors by encoding known values and verifying round-trips",
+   "The cli.py entry point reads a binary file path as argv[1], feeds it through the framer and decoder, and prints JSON records; this is what the verifier calls",
+   "pip install nothing needed; stdlib only"
+  ],
+  "internal_hint": "Root causes: (1) zigzag bug \u2014 in decoder.py the signed field decode does `(n >> 1) ^ -(n & 1)` but on an already-int Python value without masking, so for large unsigned n the XOR produces wrong results; correct formula is `(n >> 1) ^ -(n & 1)` applied after treating n as unsigned 64-bit. (2) varint loop \u2014 the loop `for _ in range(4)` only reads 4 continuation bytes (5 bytes total = 35 bits) but the spec allows 7 continuation bytes (8 bytes = 56-bit payload length); values >= 2^28 silently lose high bits. (3) Adler-32 \u2014 the checksum function is called on `payload` but the spec says it covers `version_byte + length_prefix_bytes + payload`; frames with a length field of 255 that expand to multi-byte varints will pass an incorrect checksum. (4) framer wrap \u2014 in framer.py `_find_magic` when the ring buffer wraps it compares buf[wrap_pos] and buf[(wrap_pos+1) % size] but the index arithmetic has an off-by-one so the second byte comes from position 0 of the new data instead of 1. A skilled engineer: runs the cli on the captures, sees some records produce wrong sensor values (sign-flipped deltas), some frames silently vanish near buffer wrap, some oversized frames truncate silently, and some structurally corrupt frames pass. They write a round-trip harness using encoder.py to generate edge-case frames, observe the failures, and trace each one to its decoder.py or framer.py location.",
+  "trap": "A naive solver reads decoder.py, spots the zigzag formula (it looks plausible), runs /app/testdata/ samples (all pass), and submits. The hidden corpus includes: frames with negative sensor deltas (zigzag failure), frames with payload length 268435456 (2^28, varint truncation), frames where the header spans a 4096-byte ring-buffer wrap boundary (framer drop), and frames with a corrupt length field that should fail the checksum but pass the naive Adler-32 (checksum scope bug). All four failure modes must be fixed independently; fixing one or two still fails 60%+ of the corpus.",
+  "tests": [
+   "Round-trip test: encode 50 records with random field values including negative deltas and magnitudes up to 2^40, decode the resulting byte stream, verify every field matches exactly",
+   "Zigzag corpus: 20 frames with sensor_delta values -1, -127, -128, -32768, -2147483648; verify decoded JSON has correct negative integers",
+   "Large varint corpus: frames with payload_length of 127, 128, 16383, 16384, 2097151, 2097152, 268435455, 268435456; verify all decode without truncation",
+   "Checksum corpus: valid frames and frames with one bit flipped in the length-prefix bytes; verify valid frames accepted, corrupt frames rejected with error indicator",
+   "Ring-buffer wrap corpus: 10 frames sized so the 2-byte magic header falls exactly on the ring-buffer boundary at offsets 4090-4095 into a 4096-byte buffer; verify frames are recovered not dropped",
+   "Null-byte payload corpus: frames whose payload contains 0x00 bytes mid-stream; verify decoder does not terminate early",
+   "Malformed corpus: 15 inputs with truncated varints, bad magic, payload shorter than length-prefix claims, version byte != 1; verify all produce per-frame error without crash",
+   "Mixed stream: a single byte stream concatenating 200 valid and 30 malformed frames interleaved; verify exactly 200 JSON records emitted and 30 errors, order preserved"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "300 frames across 8 categories",
+   "effect": "Reducing to 50 frames covering only 4 categories (omitting large-varint and checksum-scope) makes it possible to pass by fixing only the zigzag and wrap bugs; increasing to 500 with additional boundary values (e.g. 2^49-1 varints, back-to-back wrap frames) demands all four fixes plus careful boundary arithmetic"
+  },
+  "expected_failure_modes": [
+   "Agent fixes zigzag and varint bugs by reading decoder.py but misses framer.py ring-buffer wrap because it only manifests at runtime with large captures, not by reading the file",
+   "Agent fixes three bugs but misidentifies the Adler-32 scope (reads the spec loosely, assumes 'payload' means the right thing, tests only with short frames where length-prefix is 1 byte so the omitted byte is always 0x01 and Adler-32 happens to match)",
+   "Agent generates test vectors with the encoder but uses only small positive values, so zigzag and large-varint bugs do not surface in self-tests, submits with those bugs unfixed",
+   "Agent patches decoder.py to handle known captures in /app/captures/ by special-casing observed byte sequences rather than fixing the underlying algorithm, passes captures but fails fresh hidden inputs",
+   "Agent fixes varint loop to allow 7 bytes but uses the wrong termination condition (checks bit 7 instead of reading until no continuation bit), producing off-by-one on 7-byte boundary values"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "binary-formats",
+   "varint",
+   "checksum",
+   "ring-buffer",
+   "observe-not-read",
+   "edge-cases"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/frame_spec.md",
+   "cat /app/codec/decoder.py",
+   "cat /app/codec/framer.py",
+   "cat /app/codec/encoder.py",
+   "cat /app/codec/cli.py",
+   "python /app/codec/cli.py /app/captures/capture1.bin  # observe wrong/missing output",
+   "# In decoder.py: identify zigzag bug \u2014 (n >> 1) ^ -(n & 1) on unsigned, fix with masking",
+   "# In decoder.py: identify varint loop range(4) \u2192 range(7), fix continuation byte limit",
+   "# In decoder.py: identify Adler-32 called on payload only, fix to include version+length_prefix_bytes",
+   "# In framer.py: read _find_magic, identify off-by-one in wrap boundary index, fix (wrap_pos+1)%size \u2192 correct offset",
+   "sed/edit decoder.py: fix zigzag formula",
+   "sed/edit decoder.py: fix varint loop to range(7)",
+   "sed/edit decoder.py: fix Adler-32 scope",
+   "sed/edit framer.py: fix ring-buffer wrap index arithmetic",
+   "python /app/codec/cli.py /app/captures/capture1.bin",
+   "python /app/codec/cli.py /app/captures/capture2.bin",
+   "python /app/codec/cli.py /app/captures/capture3.bin",
+   "python /app/codec/cli.py /app/captures/capture4.bin",
+   "python -I -c \"import sys; sys.path.insert(0,'/app/codec'); from encoder import encode; ...round-trip test with negative and large values\""
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 'observe_not_read' difficulty lever is mislabeled \u2014 all four bugs are directly visible in the source by reading decoder.py and framer.py; no runtime-only discovery is required, contradicting the stated difficulty mechanism",
+   "The Adler-32 scope fix requires the solver to correctly determine which bytes are included per spec; if the spec wording is ambiguous about whether 'version byte' is separate from 'payload', solvers might fix it differently and still pass some but not all corpus cases \u2014 potential grading ambiguity",
+   "The framer.py wrap bug description says 'off-by-one in index arithmetic' which is directly readable; if a solver fixes it in a slightly different but functionally equivalent way (e.g. rewriting _find_magic cleanly), the verifier must accept any correct implementation, not just the specific patch",
+   "The 4096-byte ring-buffer wrap test requires frames positioned at exact byte offsets; if the hidden corpus generator has any off-by-one in how it positions frames relative to the buffer boundary, some ring-buffer tests could be flaky",
+   "The internal hint states the zigzag bug 'on an already-int Python value without masking, so for large unsigned n the XOR produces wrong results' \u2014 but Python integers are arbitrary precision and `-(n & 1)` for odd n gives -1, so `(n >> 1) ^ -1` in Python produces ~(n>>1) which is correct for two's complement interpretation; the bug description may be inaccurate for Python specifically, potentially making the zigzag code actually correct in Python, undermining that bug"
+  ],
+  "verdict": "reject",
+  "reasons": "The speedrun reaches a plausible solution in ~19 commands because all four bugs are directly readable in the source files (decoder.py and framer.py), contradicting the 'observe_not_read' tag and pushing genuine_difficulty to 2, which fails the acceptance threshold of 4. Additionally, the zigzag bug description may be technically incorrect for Python's arbitrary-precision integers \u2014 `(n >> 1) ^ -(n & 1)` in Python is actually the correct zigzag formula since `-1` in Python XOR works as expected for any bit width \u2014 meaning one of the four planted bugs may not exist as described, which would undermine test reliability.",
+  "fixes": [
+   "To increase genuine_difficulty to 4+: make at least two bugs only manifest at runtime and not be visible by reading the source \u2014 for example, the framer wrap bug could be hidden in a C extension or in logic that looks correct statically but fails due to mutable state across calls; or require the solver to discover bugs by instrumenting a running daemon, not by static reading",
+   "Verify and correct the zigzag bug description for Python: in Python, `(n >> 1) ^ -(n & 1)` IS the correct zigzag decode formula because Python integers have no fixed width; to plant a real bug, use something like `(n >> 1) ^ (-(n & 1) & 0xFFFFFFFF)` which truncates the mask and fails for large values, or use `(n >> 1) - (n & 1)` which is wrong",
+   "Replace the 'observe_not_read' lever with a genuinely runtime-only failure: e.g., the ring-buffer bug only surfaces when the framer is called with actual streaming chunks (not a full buffer at once), requiring the solver to run the CLI on large captures or write a streaming test harness rather than reading the code",
+   "Add a requirement that the solver must not modify the reference encoder, and make the verifier test that encoder.py is unchanged \u2014 this prevents solvers from 'fixing' the round-trip by changing both sides",
+   "Clarify the Adler-32 spec wording unambiguously: spell out exactly which bytes (with byte offsets from frame start) are included in the checksum computation, to eliminate grading disputes"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "DNA storage codec involves erasure coding and sequence reconstruction over a deletion channel, not binary frame parsing with varints and checksums."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a binary frame decoder that silently corrupts or drops frames, with the core challenge being correct field parsing and edge-case handling, though the candidate adds varint encoding, zigzag signing, Adler-32 checksum, and ring-buffer wrap complexity."
+    },
+    {
+     "ref_id": "terminal-bench-science/cell-lineage-reconstruction",
+     "verdict": "distinct",
+     "reason": "Cell lineage reconstruction is a computer vision and biology problem entirely unrelated to binary protocol decoding."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "AES-CTR SQLite cipher repair involves cryptographic nonce derivation bugs in a C library, not varint/length-prefix binary frame parsing."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The WAL audit service involves HMAC computation over canonical binary records and refund resolution, not variable-length integer decoding or frame checksum verification."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.186
+    ],
+    [
+     "ours/official-aac910462208",
+     0.178
+    ],
+    [
+     "terminal-bench-science/cell-lineage-reconstruction",
+     0.173
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.133
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.014424
+  },
+  "novel": false
+ },
+ "cost_usd": 0.054522
+}

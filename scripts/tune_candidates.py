@@ -21,7 +21,8 @@ def tune_one(cand_dir: Path, ledger, rounds: int = 2) -> dict | None:
     cal_file = cand_dir / "calibration.json"
     if not cal_file.exists() or (cand_dir / "tuning.json").exists():
         return None
-    if json.loads(cal_file.read_text())["verdict"] not in ("too_easy", "too_hard"):
+    # too easy/hard -> difficulty mutation; invalid -> spec fix from the judged failures
+    if json.loads(cal_file.read_text())["verdict"] not in ("too_easy", "too_hard", "invalid"):
         return None
     record = tune_candidate(cand_dir, ledger, max_rounds=rounds)
     shipped = None

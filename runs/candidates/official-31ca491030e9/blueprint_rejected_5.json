@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "sql-window-agg-binary-regression",
+  "title": "SQL Aggregation Engine Silent Regression",
+  "scenario": "An open-source SQL analytics layer ships a compiled C extension (`libagg.so`) that powers window-function aggregation inside a Python-based query executor. After a recent refactor, a maintainer noticed that certain time-series rollup queries produce silently wrong numeric results on production data, but the unit tests still pass. The repo contains ~1,200 lines across a Python query planner, SQL schema definitions, seed data scripts, and a pre-built binary `libagg.so` (no source); the Python shim that calls into the binary is visible but thin.",
+  "instruction_draft": "The aggregation pipeline at `/app` produces wrong numeric results for some queries. Fix it so that every query run through `/app/run_query.py <sql_file>` returns the correct answer for any valid input.",
+  "requirements": [
+   "Running `/app/run_query.py <sql_file>` on any SQL file that uses window-function aggregations must return numerically correct results",
+   "Queries using both cumulative SUM and partitioned AVG window functions in the same statement must be correct",
+   "Queries over tables with NULL values in the aggregated column must handle NULLs correctly (NULLs excluded from SUM/AVG, not treated as zero)",
+   "Results must be deterministic for the same input SQL"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, gcc, and pins duckdb==0.10.2 and numpy==1.26.4",
+   "Pre-built opaque binary `/app/lib/libagg.so` implements two C entry points: `agg_sum_window(double*, int, int*, int) -> double` and `agg_avg_window(double*, int, int*, int) -> double`; no source is provided",
+   "The binary has TWO bugs: (1) its SUM accumulates a running total without resetting between partitions, so multi-partition queries carry state from previous partitions; (2) its NULL sentinel value is -9999.0 (documented in a comment in the Python shim), but the shim converts SQL NULLs to 0.0 before passing them to the binary, then never re-filters them\u2014so NULLs are counted as zeros in both SUM and AVG",
+   "Python shim `/app/agg_engine.py` (~150 lines) calls `ctypes` to load `libagg.so`, prepares numpy arrays from query result sets, and dispatches to the C functions; the NULL conversion bug (0.0 instead of -9999.0) is in this file",
+   "The partition-reset bug is inside the compiled binary and cannot be fixed by reading source; it must be discovered by running the binary on crafted inputs and observing that SUM across partitions accumulates",
+   "Query planner `/app/planner.py` (~300 lines) parses SQL into a naive AST and routes window functions through `agg_engine.py`; non-window queries go directly to sqlite3",
+   "Schema and seed data scripts (`/app/schema.sql`, `/app/seed.py`) populate a local SQLite DB with a `metrics` table (columns: id, partition_key, ts, value REAL nullable) with ~5,000 rows across 10 partitions, some NULLs",
+   "Four sample SQL files in `/app/samples/` that the maintainer provided as regression cases: two pass naively (single-partition SUM, single-partition AVG), one fails (multi-partition SUM), one fails (AVG with NULLs)",
+   "A reference answer file `/app/samples/expected.json` with correct outputs for the four sample queries",
+   "The correct fix requires: (1) patching `agg_engine.py` to pass -9999.0 for NULLs and filter them back out in results, AND (2) writing a Python wrapper that resets the C library's accumulator state between partitions\u2014discoverable by reading the binary's exported symbol `agg_reset_state()` via `nm libagg.so` or ctypes introspection"
+  ],
+  "internal_hint": "Two interacting bugs. Bug 1 (binary, not visible by reading): `agg_sum_window` in `libagg.so` never calls the internal reset between partition groups\u2014the C accumulator is a static variable. The binary exports `agg_reset_state()`; a skilled engineer discovers this with `nm -D lib/libagg.so` or by running SUM over two partitions and observing the second partition's result includes the first's total. Fix: call `agg_reset_state()` from the Python shim before each new partition group. Bug 2 (Python shim, data-dependent): `agg_engine.py` line ~87 converts NULLs to 0.0 (`val if val is not None else 0.0`) before building the numpy array, then passes it to the C function without marking them as sentinels. The C function treats 0.0 as a real value. The comment in the shim mentions the sentinel is -9999.0. Fix: change 0.0 to -9999.0, and after receiving results back from C, strip sentinel positions from the count/accumulation\u2014but actually since the C function itself should skip sentinels (it does: the C code checks for -9999.0 and skips), only the Python side conversion is wrong. Fixing only Bug 2 makes NULL queries pass but multi-partition SUM still fails. Fixing only Bug 1 (calling reset) makes multi-partition pass but NULLs are still treated as 0. Both must be fixed for the hidden corpus to pass.",
+  "trap": "The four sample queries include one multi-partition SUM and one NULL AVG. A naive agent fixes the NULL bug (visible in Python source) and sees the NULL test pass. The multi-partition SUM sample query happens to have only 2 partitions, and after the NULL fix the first partition's result looks plausible\u2014but the second partition's cumulative carry is small enough that the agent doesn't notice without checking carefully. The hidden corpus includes queries with 5\u20138 partitions and large value spreads where the carry-over error is unmistakable, and also mixed queries with BOTH window functions in one SQL statement where the reset must happen at the right call boundary.",
+  "tests": [
+   "Run each of the 4 sample queries and compare output to `/app/samples/expected.json` exactly",
+   "Verifier generates 20 fresh single-partition SUM queries with random partition keys and value ranges; all must match sqlite3 native window SUM",
+   "Verifier generates 20 fresh multi-partition (3\u20138 partitions) SUM queries; carry-over bug produces wrong results if not fixed",
+   "Verifier generates 15 queries with NULLs in value column; NULL-as-zero bug produces wrong SUM and AVG if not fixed",
+   "Verifier generates 10 queries that use both SUM and AVG window functions over the same partitioned table with NULLs; both bugs must be fixed simultaneously for these to pass",
+   "Verifier generates 5 queries with all-NULL partitions (SUM should be NULL/0 and AVG should be NULL); edge case for sentinel handling",
+   "Verifier checks that `/app/run_query.py` exits 0 and produces valid JSON output for all generated inputs"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "70 queries across 7 categories",
+   "effect": "Reducing to 20 queries (fewer multi-partition and NULL combinations) makes it easier to pass with only one bug fixed; increasing to 120 with more edge cases (empty partitions, single-row partitions, mixed types) makes it harder"
+  },
+  "expected_failure_modes": [
+   "Agent reads `agg_engine.py`, spots the NULL bug (0.0 sentinel), fixes it, runs the 4 samples, sees 4/4 pass, and stops\u2014missing the binary partition-reset bug that only manifests on multi-partition queries with enough partitions for the error to be visible",
+   "Agent discovers the partition bug by running the binary but assumes calling the Python-level partition loop in a different order fixes it, without finding or calling `agg_reset_state()`",
+   "Agent rewrites the aggregation in pure Python to bypass `libagg.so` entirely but the planner still routes some query shapes through the C path for certain AST nodes, leaving those broken",
+   "Agent finds `agg_reset_state` via `nm` but misidentifies which Python call site needs it (resets at the wrong granularity\u2014per-row instead of per-partition-group), causing queries with 1 partition to work but 3+ to fail"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "binary-analysis",
+   "ctypes",
+   "null-handling",
+   "window-functions",
+   "two-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/agg_engine.py  # read shim, spot NULL sentinel comment and 0.0 conversion",
+   "grep -n 'None\\|9999\\|0\\.0\\|partition' /app/agg_engine.py  # confirm bug location ~line 87",
+   "nm -D /app/lib/libagg.so  # discover exported symbols including agg_reset_state",
+   "cat /app/planner.py  # understand partition routing",
+   "python3 /app/run_query.py /app/samples/q3.sql  # confirm multi-partition SUM is wrong",
+   "python3 /app/run_query.py /app/samples/q4.sql  # confirm NULL AVG is wrong",
+   "sed -i 's/val if val is not None else 0.0/val if val is not None else -9999.0/' /app/agg_engine.py  # fix Bug 2",
+   "# Edit agg_engine.py to add ctypes declaration for agg_reset_state and call it before each partition group in the dispatch loop",
+   "python3 /app/run_query.py /app/samples/q3.sql  # verify multi-partition SUM now correct",
+   "python3 /app/run_query.py /app/samples/q4.sql  # verify NULL AVG now correct",
+   "python3 /app/run_query.py /app/samples/q1.sql  # verify single-partition SUM still correct",
+   "python3 /app/run_query.py /app/samples/q2.sql  # verify single-partition AVG still correct",
+   "python3 -c \"import json,subprocess; [print(subprocess.run(['python3','/app/run_query.py',f'/app/samples/q{i}.sql'],capture_output=True,text=True).stdout) for i in range(1,5)]\"",
+   "cat /app/samples/expected.json  # cross-check all 4 expected outputs"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The shallow_check_trap is self-defeating: sample q3 is a multi-partition SUM that fails even after fixing the NULL bug, so no agent correctly running all 4 samples can declare victory after only fixing Bug 2 \u2014 the 'trap' of stopping at 4/4 cannot actually trigger",
+   "nm -D libagg.so trivially reveals agg_reset_state, collapsing the binary reverse-engineering challenge to a single command and a simple ctypes call \u2014 the 'binary analysis' difficulty lever evaporates",
+   "The blueprint says the binary bug 'cannot be fixed by reading source' but then exports agg_reset_state as a public symbol with a self-documenting name, making it discoverable without any real binary analysis",
+   "Pinned duckdb==0.10.2 with python:3.13-slim-bookworm may have compatibility issues since DuckDB 0.10.x predates Python 3.13 stable release; build may fail",
+   "numpy==1.26.4 similarly may not have a prebuilt wheel for Python 3.13, requiring compilation which needs build tools not listed in the Dockerfile",
+   "The pre-built libagg.so architecture must match the build platform (x86_64 vs arm64); if the Docker host is Apple Silicon or a different arch, the SO will crash or not load, making the task unsolvable",
+   "The 'expected.json' approach for exact numeric comparison may introduce floating-point precision failures depending on platform, making the verifier flaky",
+   "If the agent rewrites the aggregation in pure Python (bypassing libagg.so entirely), the verifier must detect this \u2014 but the blueprint only says 'the planner still routes some query shapes through the C path,' which is vague about whether pure-Python bypass fully passes or partially fails"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score is 2 because the binary bug is trivially discoverable via `nm -D libagg.so` which directly reveals `agg_reset_state` \u2014 no real binary analysis is needed, just a ctypes call with a self-documenting symbol name. Additionally, the shallow_check_trap is broken: since sample q3 is explicitly a failing multi-partition SUM, no agent running all 4 provided samples can falsely believe they are done after fixing only Bug 1, so the 'trap' cannot fire. Finally, the pinned dependencies (duckdb==0.10.2, numpy==1.26.4 with python:3.13) are likely incompatible and may prevent the environment from building at all.",
+  "fixes": [
+   "Remove the public `agg_reset_state` export from libagg.so (strip it from the symbol table); instead, the agent must discover the reset behavior empirically by running the binary on crafted two-partition inputs and observing carry-over, then fix it by restructuring the Python call pattern (e.g., calling the C function once per partition rather than once per full result set)",
+   "Fix the shallow_check_trap: replace sample q3 (multi-partition SUM) with a query that *appears* to pass after the NULL fix due to coincidental numeric values \u2014 e.g., a 2-partition case where the carry-over is small and rounds to the same integer \u2014 so the agent believes all 4 samples pass but the hidden corpus with 5-8 partitions still fails",
+   "Fix the Python version / dependency compatibility: use python:3.11-slim-bookworm or pin duckdb and numpy to versions with known Python 3.13 wheels, or verify the combination builds cleanly",
+   "Specify the target architecture for libagg.so explicitly in the blueprint and Dockerfile (e.g., `--platform linux/amd64`) to prevent arch-mismatch failures on ARM hosts",
+   "Replace exact JSON comparison in the verifier with an epsilon-based numeric comparison (e.g., relative tolerance 1e-9) to avoid floating-point platform flakiness"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about query optimization for performance while preserving semantics; the candidate task is about debugging a silent correctness regression in a C extension binary with no source."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is purely about SQL query optimization in SQLite; the candidate involves reverse-engineering or patching a pre-built binary C extension causing silent numeric errors."
+    },
+    {
+     "ref_id": "terminal-bench-pro/python-sql-injection-sanitizer",
+     "verdict": "distinct",
+     "reason": "That task is about building a SQL injection sanitization tool; the candidate is about fixing silent numeric regressions in a C extension used for window-function aggregation."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve a pre-built binary with no source that produces silently wrong numeric results in a data pipeline, requiring the agent to characterize or fix the binary's behavior to restore correctness."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about a NetFlow UDP/TCP aggregation service returning empty or incorrect flow data; the candidate is about a C extension causing wrong SQL window-function results."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.327
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.244
+    ],
+    [
+     "terminal-bench-pro/python-sql-injection-sanitizer",
+     0.178
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.152
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.15
+    ]
+   ],
+   "cost_usd": 0.013541999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055881
+}

@@ -1,0 +1,160 @@
+{
+ "blueprint": {
+  "slug": "ledger-aggregator-silent-drift",
+  "title": "Ledger Aggregation Service Silent Drift",
+  "scenario": "An analyst noticed that daily balance summaries produced by an in-house C aggregation service started diverging from raw transaction totals three weeks ago. The codebase is roughly 1,400 lines across a request dispatcher, a rolling-window accumulator, a binary serialiser, and a small shell-based test harness. The service is running and accepts balance-query and flush-window requests over a Unix socket using a documented 8-byte binary framing protocol.",
+  "instruction_draft": "The aggregation service at /app/ledger_agg is producing incorrect balance totals. Fix it so that every balance query returns the exact sum of all transaction amounts posted since the last flush, and every flush correctly resets the accumulator for the next window.",
+  "requirements": [
+   "A balance query returns the exact integer sum of all amounts posted in the current window.",
+   "A flush resets the accumulator to zero; amounts posted after the flush appear only in the next window.",
+   "The service correctly handles transactions posted before and after a flush in the same session.",
+   "The binary framing protocol is followed exactly: 4-byte little-endian opcode, 4-byte little-endian payload length, then payload bytes.",
+   "The service remains live (no crash, no hang) across a sequence of post, balance, flush, post, balance requests."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y gcc make socat python3; no internet needed.",
+   "/app/ledger_agg/ contains: main.c (dispatcher + Unix socket loop, ~300 lines), accumulator.c (rolling window state, ~250 lines), serial.c (binary frame encode/decode, ~200 lines), protocol.h (opcode constants and struct definitions), Makefile, and run.sh (builds and starts service on /tmp/ledger.sock).",
+   "/app/ledger_agg/protocol.h defines: OP_POST=0x01 (payload: 8-byte little-endian int64 amount), OP_BALANCE=0x02 (no payload; response: 8-byte little-endian int64), OP_FLUSH=0x03 (no payload; response: 4-byte little-endian status 0=ok).",
+   "Bug 1 (data-dependent, not visible by reading alone): accumulator.c uses a signed 32-bit accumulator field but amounts are int64; amounts above 2^31-1 silently truncate. The truncation only manifests when the running total exceeds 2^31, which never happens in the small sample test supplied in /app/test/sample_run.sh but does happen in verifier-generated scenarios.",
+   "Bug 2 (interacting, ordered-procedure): serial.c decodes the payload length as big-endian but encodes it as little-endian; the service therefore misreads multi-byte payloads when the length field's high byte is nonzero (amounts >= 256 in the payload are fine because the amount field itself is correctly decoded, but the *length* field mis-parse causes the dispatcher to read the wrong number of bytes for OP_POST when payload_len >= 256 \u2014 which only happens for amounts whose 8-byte representation has a high byte set, i.e. amounts >= 2^56 approximately \u2014 no, simpler: the length field for OP_POST is always 8, so 0x00000008 vs 0x08000000; since 0x08000000 >> actual buffer, the dispatcher stalls waiting for 134 MB of payload and hangs). This only triggers for OP_POST; OP_BALANCE and OP_FLUSH have zero-length payloads so their length field is 0x00000000 regardless of endianness. The sample test only posts small amounts and never hits the hang because socat times out and the analyst blamed network issues.",
+   "Fixing Bug 2 (endianness in serial.c) is necessary to unblock large-amount posts; but after fixing it, Bug 1 (int32 accumulator) becomes visible because now large amounts actually get posted and the total overflows 32 bits.",
+   "/app/test/sample_run.sh: posts three small amounts (100, 200, 300), queries balance (expects 600), flushes, queries balance (expects 0). This passes even with both bugs present because amounts are small and lengths are correct (length=8=0x00000008, both byte orders give 8 for the low byte when high bytes are 0).",
+   "run.sh compiles with make and starts the service; the socket path is /tmp/ledger.sock.",
+   "A reference client script /app/test/client.py is provided that can send raw protocol frames, to help the solver probe the service."
+  ],
+  "internal_hint": "Two interacting bugs, neither visible purely by reading: (1) serial.c uses ntohl (big-endian) to decode the 4-byte payload-length field but htonl (big-endian) to encode responses, while the protocol spec and the encoding side of the same file use little-endian \u2014 the mismatch only manifests when a frame's payload length has a nonzero high byte, which for OP_POST (length always 8) never happens because 8 fits in one byte. The skilled engineer has to send a crafted request that exposes the stall or run under valgrind/strace to see the dispatcher blocking on recv(). Actually the cleaner trigger: send OP_POST with length field 0x00000008 (correct) vs what serial.c decodes (0x08000000 = 134217728); the dispatcher tries to read 134 MB, stalls. But wait \u2014 sample_run.sh works! Solver must figure out WHY it works and what differs in the verifier scenario. (2) accumulator.c declares `int32_t window_total` instead of `int64_t`; totals silently wrap at 2^31. Fixing only the endianness bug makes large-amount posts work, revealing the int32 overflow. Fix order matters: must fix endianness first (or simultaneously) to be able to post amounts large enough to expose the int32 overflow. A solver who fixes only the int32 bug will still see the service hang on large-amount posts in verifier tests.",
+  "trap": "The sample test passes with both bugs present (amounts are small, length byte fits in one byte, totals stay under 2^31). A solver who runs the sample, sees it pass, and stops will fail all verifier tests that post amounts summing above 2^31 or that use the hang-triggering framing. A solver who fixes only the int32 overflow (the more obvious code smell) will still fail because the verifier also posts individual large amounts whose framing triggers the endianness stall. A solver who fixes endianness but not int32 will pass the hang tests but fail the overflow tests.",
+  "tests": [
+   "Test 1 (basic correctness): post 100, 200, 300; query balance; expect 600. Flush; query balance; expect 0. Post 50; query balance; expect 50.",
+   "Test 2 (large amounts, endianness): post a single amount of 1_000_000_000 (10^9, fits in int32 but tests framing); query balance; expect 1_000_000_000.",
+   "Test 3 (int32 overflow): post 20 amounts of 200_000_000 each (total = 4_000_000_000 > 2^31-1 = 2_147_483_647); query balance; expect exactly 4_000_000_000.",
+   "Test 4 (flush isolation): post amounts summing to 3_000_000_000; flush; post amounts summing to 500_000_000; query balance; expect exactly 500_000_000 (not 3_500_000_000).",
+   "Test 5 (protocol framing stability): send 10 interleaved OP_POST and OP_BALANCE requests with amounts between 10^8 and 2*10^9; verify each OP_BALANCE returns the correct running total and the service does not hang or crash.",
+   "Test 6 (verifier-generated scenario): a Python script generates a random sequence of 50 posts (amounts drawn from [1, 5*10^8]) and 5 flushes at random positions, then verifies every balance response against an independent Python accumulator."
+  ],
+  "verifier_knob": {
+   "name": "number_of_request_scenarios",
+   "value": "6",
+   "effect": "Reducing to 2-3 scenarios (basic + one overflow) makes it passable by fixing only the most obvious bug; raising to 8+ by adding framing-stress scenarios (interleaved large and tiny amounts, rapid flush-post cycles) forces the solver to find and fix both bugs and validate the full protocol."
+  },
+  "expected_failure_modes": [
+   "Solver reads accumulator.c, spots int32_t, changes it to int64_t, runs the sample test (passes), submits \u2014 misses the endianness bug entirely; verifier tests with large amounts hang the service.",
+   "Solver spots the endianness mismatch in serial.c, fixes it, runs the sample test (passes), submits \u2014 misses the int32 overflow; verifier tests with totals > 2^31 return wrong values.",
+   "Solver fixes both bugs but introduces an off-by-one in the flush reset (sets total to 1 instead of 0, or fails to reset on the correct code path), causing flush-isolation tests to fail.",
+   "Solver does not instrument or probe the running service and instead reasons purely from source; misses that the endianness bug is latent and not triggered by the sample, concludes the framing is correct.",
+   "Solver fixes the code but forgets to recompile (or recompile-and-restart) the service before the verifier runs protocol tests against the live process."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "binary-protocol",
+   "integer-overflow",
+   "endianness",
+   "service-repair"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/ledger_agg/accumulator.c  # immediately spot int32_t window_total",
+   "cat /app/ledger_agg/serial.c       # immediately spot ntohl used for little-endian field",
+   "cat /app/ledger_agg/protocol.h     # confirm LE protocol spec",
+   "cat /app/ledger_agg/main.c         # confirm dispatcher logic",
+   "sed -i 's/int32_t window_total/int64_t window_total/' /app/ledger_agg/accumulator.c",
+   "# edit serial.c to change ntohl\u2192le32toh for payload_len decode (1 line change)",
+   "cd /app/ledger_agg && make clean && make",
+   "pkill ledger_agg; bash /app/ledger_agg/run.sh &",
+   "bash /app/test/sample_run.sh",
+   "python3 /app/test/client.py --post 1000000000 --balance  # verify 10^9",
+   "python3 /app/test/client.py --post-many 20x200000000 --balance  # verify 4*10^9",
+   "python3 /app/test/client.py --post 3000000000 --flush --post 500000000 --balance  # verify flush isolation"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Test 6 uses 'random sequence' without specifying a fixed seed \u2014 if the verifier generates a different random sequence each run, non-determinism could cause flaky pass/fail on edge cases near overflow boundaries.",
+   "The blueprint states the endianness bug 'only manifests when payload length has a nonzero high byte' but OP_POST always has length=8 (0x00000008), so the high byte is always zero \u2014 meaning the endianness bug in serial.c NEVER actually triggers for any valid OP_POST frame. This means Bug 2 as described may be a phantom bug: the service wouldn't actually hang even with the ntohl mismatch, because 8 decoded as big-endian is still 8 (0x00000008 in both byte orders). The blueprint's own hint contradicts itself on this point.",
+   "If the phantom-bug issue above is real, Test 2 and Test 5 may pass even without fixing serial.c, making the 'must fix both' requirement untestable and potentially allowing a partial fix to pass all verifier tests.",
+   "The instruction says 'fix it so that every balance query returns the exact sum' but doesn't mention the endianness bug explicitly \u2014 a solver who fixes only int32_t and passes all reachable tests would be incorrectly penalized if the endianness bug never actually triggers.",
+   "Race condition risk: run.sh kills and restarts the service; if the verifier connects before the socket is ready, tests may fail spuriously.",
+   "The blueprint is internally inconsistent: it claims the endianness bug causes a hang 'when payload_len >= 256' but OP_POST always sends length=8, so this condition is never met. The entire Bug 2 premise may be broken as designed."
+  ],
+  "verdict": "reject",
+  "reasons": "Both bugs are directly visible by reading the source code (int32_t and ntohl in a little-endian protocol), making this solvable in ~12 commands without any runtime probing \u2014 genuine_difficulty scores 2, below the required threshold of 4. Additionally, the blueprint contains a critical internal contradiction: Bug 2 (endianness) is claimed to cause a hang when payload_len has a nonzero high byte, but OP_POST always sends length=8 (0x00000008), which encodes identically in both byte orders, meaning the bug never actually triggers and the entire 'interacting bugs' premise may be broken. The task should be rejected until the bugs are redesigned to require runtime probing or dynamic analysis rather than pure source reading.",
+  "fixes": [
+   "Replace the source-visible bugs with runtime-only bugs: e.g., a race condition in the accumulator (missing mutex causing lost updates under concurrent posts), or a bug in the socket handling that only manifests with specific timing \u2014 these cannot be spotted by reading alone.",
+   "Fix the internal contradiction in Bug 2: if the endianness bug should trigger on OP_POST, the payload length must sometimes exceed 255. Design a protocol variant where length varies (e.g., variable-length amount encoding), or pick a different endianness mismatch that actually fires on the fixed 8-byte payload.",
+   "Add an obfuscation layer: compile the buggy service as a binary with source stripped, requiring the solver to use strace/gdb/valgrind to diagnose \u2014 this forces runtime analysis even if the bug would be obvious in source.",
+   "Make the bugs data-dependent in a non-obvious way: e.g., the overflow only happens when amounts cross a specific threshold that requires understanding the business logic to construct, not just reading the type declaration.",
+   "Seed Test 6's random sequence with a fixed seed and document it, or make it fully deterministic, to eliminate flakiness risk."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "Both involve binary framing protocols but the reference task is about fixing a decode/encode HTTP service for a specific wire format, while the candidate is about debugging a C accumulator service with incorrect balance aggregation logic over a Unix socket."
+    },
+    {
+     "ref_id": "terminal-bench-pro/parse-bitcoin-tx-to-json",
+     "verdict": "distinct",
+     "reason": "The reference task is about parsing a Bitcoin transaction binary format into JSON, while the candidate is about fixing a running C service with incorrect rolling-window accumulation logic."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "Both involve ledger balance correctness but the reference task is a Python/SQLite CSV import reconciliation tool with refund-offset logic, while the candidate is a live C service with binary protocol and window-flush accumulation bugs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Both involve fixing incorrect aggregation in a compiled service, but the reference task is about weighted sales summaries using config file weights and a SQLite database, while the candidate is about a rolling-window balance accumulator over a Unix socket binary protocol."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Both involve a C service with a binary protocol over a socket, but the reference task is about HMAC computation over WAL records with refund resolution, while the candidate is about fixing accumulator/flush logic for balance queries."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aac910462208",
+     0.179
+    ],
+    [
+     "terminal-bench-pro/parse-bitcoin-tx-to-json",
+     0.143
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.135
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.128
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.118
+    ]
+   ],
+   "cost_usd": 0.013953
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058158
+}

@@ -1,0 +1,179 @@
+{
+ "blueprint": {
+  "slug": "sealed-record-protocol-refactor",
+  "title": "Sealed Scientific Record Protocol Migration",
+  "scenario": "A scientific computing platform signs experiment records with a legacy `seal` binary before archiving them. The binary's source was lost in a repo incident. A new Go microservice (`archiver`) was written to replace it by reading the team's best understanding of the protocol, but downstream verification is now rejecting ~15% of records \u2014 always silently, only visible when the verification service processes the full archive batch. The environment has the opaque `seal` binary, the ~1400-line Go archiver codebase, sample input records, and a `verify` binary that checks sealed records.",
+  "instruction_draft": "Hey, so our new archiver service keeps getting verification rejections when we push a full batch \u2014 passes unit tests fine, fails on the real archive run. The `seal` binary is the ground truth for what a valid sealed record looks like, and `verify` checks them. Can you figure out what the archiver is doing differently from `seal` and fix it? The archiver lives in `/app/archiver/` and needs to produce byte-identical sealed output to `seal` for every input. There's a batch runner at `/app/run_batch.sh` that shows where things go wrong.",
+  "requirements": [
+   "The archiver binary must produce byte-identical sealed output to the `seal` reference binary for all valid inputs",
+   "Sealed output must pass the `verify` binary for inputs with empty payload fields",
+   "Sealed output must pass the `verify` binary for payloads whose length is an exact multiple of 64 bytes",
+   "Sealed output must pass the `verify` binary for records with metadata fields containing non-ASCII bytes",
+   "Sealed output must pass the `verify` binary for records with zero-length experiment ID",
+   "The archiver must handle all input record types that `seal` handles without panicking"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with Go 1.22 installed via apt/tar",
+   "Compiled `seal` binary (x86-64, stripped, no source) at `/app/bin/seal`; takes a JSON record on stdin, writes a sealed binary record to stdout",
+   "Compiled `verify` binary at `/app/bin/verify`; takes a sealed binary record on stdin, exits 0 if valid, 1 if invalid",
+   "Go archiver package at `/app/archiver/` (~1400 lines across 8 files: main.go, record.go, codec.go, mac.go, kdf.go, fields.go, batch.go, util.go)",
+   "Sample records in `/app/samples/` (10 JSON files, all 'happy path' \u2014 non-zero payloads, non-boundary lengths, ASCII-only fields)",
+   "Batch runner `/app/run_batch.sh` that seals 50 records with both `seal` and archiver, diffs results, reports pass/fail count",
+   "A larger test corpus `/app/corpus/` with 200 records including edge cases, used only at verify time",
+   "The seal binary implements: BLAKE2b-256 MAC over length-prefixed fields in canonical order; key derived via HKDF-SHA256 from a fixed installation secret + per-record nonce; the nonce is a 12-byte value where bytes 8-11 are the little-endian uint32 record sequence number, not big-endian as the Go code assumes",
+   "Bug 1 (not visible without probing): nonce byte order is little-endian for the sequence counter in bytes 8-11, but the Go kdf.go uses big-endian binary.BigEndian.PutUint32",
+   "Bug 2 (edge case): when payload length is 0, the Go codec.go writes a 4-byte zero length prefix but seal writes a 2-byte zero length prefix for empty payloads (the protocol uses variable-width length encoding: 2 bytes if value fits in uint16, 4 bytes otherwise)",
+   "Bug 3 (edge case): field ordering in mac.go \u2014 the Go code MACs fields as [nonce, metadata, payload, experiment_id] but seal's canonical order is [experiment_id, nonce, metadata, payload]; this only diverges when experiment_id is non-empty and the MAC is checked field-by-field",
+   "Bug 4 (edge case): for payloads at exact 64-byte multiples, the Go codec adds a padding byte; seal does not pad",
+   "The sample corpus (10 records) all have non-empty experiment IDs but the MAC comparison happens to cancel out due to test data being crafted to have identical experiment_id and nonce prefixes \u2014 it looks correct on samples but fails on real data",
+   "The batch script runs only the 10 samples by default; the agent must construct edge-case inputs to probe the binary",
+   "Installation secret hardcoded in `seal` binary (discoverable via strings or by probing HKDF output; needed to understand KDF but not needed to fix bugs since archiver already has the secret)"
+  ],
+  "internal_hint": "Root causes: (1) kdf.go:binary.BigEndian\u2192binary.LittleEndian for nonce[8:12]; (2) codec.go: variable-width length encoding for empty payloads (2-byte vs 4-byte prefix); (3) mac.go: field order must be experiment_id,nonce,metadata,payload not nonce,metadata,payload,experiment_id; (4) codec.go: no padding for 64-byte-aligned payloads. Discovery path: run batch on samples (all pass), probe seal with crafted inputs (empty payload, zero-length experiment_id, 64-byte payload), diff binary output byte-by-byte against archiver output, locate divergence in hex dump, map to source location. Bugs are NOT visible by reading source \u2014 they look like reasonable implementation choices. The nonce endianness requires running both binaries on the same input and comparing the MAC bytes. The field ordering bug requires an input where experiment_id differs from nonce prefix to manifest.",
+  "trap": "A shallow agent fixes bug 1 (endianness is the most obvious to spot by hex-diffing the nonce region) and verifies against the 10 sample records \u2014 all pass. The hidden corpus includes empty payloads (bug 2), long experiment IDs (bug 3), and 64-byte-aligned payloads (bug 4). A partial fix passes ~60% of the corpus. The sample data was crafted so that the MAC field-ordering bug cancels out on the samples (both orderings produce the same MAC when experiment_id bytes equal nonce bytes for the test fixtures), so the agent cannot detect bug 3 without crafting a specific probe input.",
+  "tests": [
+   "For each of 200 corpus records, pipe through archiver and check `verify` exits 0",
+   "Specifically test 20 records with empty payload (0 bytes) \u2014 checks bug 2",
+   "Specifically test 20 records with payloads of exactly 64, 128, 192 bytes \u2014 checks bug 4",
+   "Specifically test 20 records with experiment_id longer than 8 bytes and distinct from nonce prefix \u2014 checks bug 3",
+   "Specifically test 10 records with zero-length experiment_id \u2014 checks both bug 2 variant and field ordering",
+   "Specifically test 10 records with non-ASCII metadata bytes \u2014 regression check",
+   "Generate 5 fresh records at verify time with random payloads at boundary lengths and verify archiver output matches seal output byte-for-byte"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 records with full edge-case coverage",
+   "effect": "Reducing to 50 records with fewer boundary cases makes partial fixes (only bug 1 fixed) pass; increasing to 500 with more adversarial combinations makes even 3-of-4 fixes fail"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the nonce endianness bug (most prominent from hex diff) and stops after samples pass",
+   "Agent misidentifies the field ordering as correct because the sample data was crafted to make both orderings produce identical MACs",
+   "Agent fixes variable-width encoding for empty payloads but uses wrong threshold (e.g., uses 255 instead of 65535 as the 2-byte cutoff)",
+   "Agent discovers bugs 1 and 2 but misses bug 4 (padding) because they don't probe exactly-aligned payloads",
+   "Agent fixes all 4 bugs but introduces a new regression in the batch pipeline logic (batch.go), failing multi-record batches"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "cryptography",
+   "go",
+   "binary-probing",
+   "refactoring",
+   "scientific-computing",
+   "edge-cases"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/archiver/kdf.go mac.go codec.go fields.go main.go",
+   "/app/bin/seal < /app/samples/sample_01.json > /tmp/ref.bin && /app/archiver/archiver < /app/samples/sample_01.json > /tmp/arch.bin",
+   "xxd /tmp/ref.bin > /tmp/ref.hex && xxd /tmp/arch.bin > /tmp/arch.hex && diff /tmp/ref.hex /tmp/arch.hex",
+   "# Spot nonce bytes 8-11 differ \u2192 BigEndian vs LittleEndian in kdf.go",
+   "sed -i 's/binary.BigEndian.PutUint32/binary.LittleEndian.PutUint32/' /app/archiver/kdf.go",
+   "cd /app/archiver && go build -o archiver . && bash /app/run_batch.sh",
+   "# 10 samples all pass; probe empty payload edge case",
+   "echo '{\"experiment_id\":\"abc\",\"metadata\":\"x\",\"payload\":\"\",\"seq\":1}' | /app/bin/seal > /tmp/ep_ref.bin",
+   "echo '{\"experiment_id\":\"abc\",\"metadata\":\"x\",\"payload\":\"\",\"seq\":1}' | /app/archiver/archiver > /tmp/ep_arch.bin",
+   "diff <(xxd /tmp/ep_ref.bin) <(xxd /tmp/ep_arch.bin)",
+   "# Spot 2-byte vs 4-byte length prefix \u2192 fix variable-width encoding in codec.go",
+   "# Edit codec.go: use 2-byte prefix when length fits in uint16",
+   "python3 -c \"print('{\\\"experiment_id\\\":\\\"abc\\\",\\\"payload\\\":\\\"' + 'A'*64 + '\\\",\\\"seq\\\":1}')\" | /app/bin/seal > /tmp/64_ref.bin",
+   "python3 -c \"print('{\\\"experiment_id\\\":\\\"abc\\\",\\\"payload\\\":\\\"' + 'A'*64 + '\\\",\\\"seq\\\":1}')\" | /app/archiver/archiver > /tmp/64_arch.bin",
+   "diff <(xxd /tmp/64_ref.bin) <(xxd /tmp/64_arch.bin)",
+   "# Spot extra padding byte \u2192 fix codec.go: remove 64-byte-aligned padding",
+   "go build -o archiver . && bash /app/run_batch.sh",
+   "# All samples still pass; probe field ordering with long distinct experiment_id",
+   "echo '{\"experiment_id\":\"ZZZZZZZZZZZZ\",\"metadata\":\"m\",\"payload\":\"p\",\"seq\":5}' | /app/bin/seal > /tmp/ord_ref.bin",
+   "echo '{\"experiment_id\":\"ZZZZZZZZZZZZ\",\"metadata\":\"m\",\"payload\":\"p\",\"seq\":5}' | /app/archiver/archiver > /tmp/ord_arch.bin",
+   "diff <(xxd /tmp/ord_ref.bin) <(xxd /tmp/ord_arch.bin)",
+   "# Spot MAC field ordering difference \u2192 fix mac.go: reorder to experiment_id,nonce,metadata,payload",
+   "go build -o archiver . && bash /app/run_batch.sh",
+   "# Run against full corpus to verify all 200 records pass"
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'MAC cancellation' property of sample data requires extremely precise fixture construction \u2014 if the sample experiment_id bytes don't exactly cancel the nonce prefix in the MAC computation, bug 3 becomes visible in samples and difficulty collapses",
+   "Inconsistency in blueprint: instruction says batch runner processes 50 records but blueprint says 10 sample files \u2014 the actual behavior of run_batch.sh is ambiguous",
+   "Variable-width encoding threshold ambiguity: 'fits in uint16' could be interpreted differently if the agent reads it as length < 256 (byte) rather than < 65536 (uint16), leading to a plausible-looking but wrong fix",
+   "The archiver may need to be pre-built or the build step may fail silently if Go dependencies are missing; no go.mod state is specified",
+   "If the corpus generation at verify-time uses different random seeds than expected, the '5 fresh records at boundary lengths' test may inadvertently avoid testing all 4 bugs, allowing partial fixes to pass"
+  ],
+  "verdict": "accept",
+  "reasons": "The task has strong verifiability (deterministic byte-comparison tests), genuine difficulty from the deliberately crafted sample cancellation that hides bug 3, and realistic framing around legacy binary reverse-engineering. The speedrun reaches ~23 commands but would realistically be longer because discovering bug 3 requires meta-reasoning about sample crafting. The main risks are the fragile 'MAC cancellation' fixture construction and the sample count inconsistency, both of which should be fixed before deployment.",
+  "fixes": [
+   "Clarify the run_batch.sh record count: the blueprint says 10 samples but the instruction says 50 \u2014 pick one and be consistent",
+   "Add explicit documentation for environment builders: specify the exact mathematical condition that makes sample data cancel out the MAC field-ordering bug (e.g., 'experiment_id bytes 0-7 must equal the first 8 bytes of the derived nonce for records seq=1..10'), so fixture construction is reproducible",
+   "Add a note in the instruction that 'the batch runner only tests a subset of record types' to make the investigation direction clearer without revealing the bugs \u2014 currently the instruction implies samples are representative",
+   "Specify go.mod contents or ensure archiver is pre-compiled to avoid build environment issues consuming agent time on non-task problems",
+   "Consider reducing to 3 bugs (dropping either bug 2 or bug 4) to keep the task solvable in under an hour; 4 bugs with the cancellation trap pushes toward 90+ minutes for complete solutions"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a TCP service that computes HMAC-SHA256 over WAL records with a database lookup; the candidate is about reverse-engineering a binary sealing protocol and fixing a Go implementation to produce byte-identical output."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a refactored codebase producing silently wrong output compared to a reference binary, requiring diffing behavior against an opaque artifact to find and fix subtle implementation bugs \u2014 the core problem structure is essentially the same even though the domain (AES-CTR encryption vs. a sealing protocol) differs."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "That task asks to reverse-engineer a stream cipher from decryption source code and implement encryption; the candidate asks to find discrepancies between a Go reimplementation and an opaque binary to achieve byte-identical output."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log ingestion pipeline for schema validation correctness and performance; the candidate is about matching binary output of a sealing protocol to a reference binary."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a wire-format frame codec service with a clearly documented format; the candidate involves reverse-engineering an opaque binary sealing protocol to achieve byte-identical output."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.142
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.142
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.13
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.108
+    ],
+    [
+     "ours/official-aac910462208",
+     0.082
+    ]
+   ],
+   "cost_usd": 0.014853000000000002
+  },
+  "novel": false
+ },
+ "cost_usd": 0.073926
+}

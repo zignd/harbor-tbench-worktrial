@@ -1,0 +1,112 @@
+{
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/src/rollback-decider.js  # confirm stub always returns promote",
+   "cat /app/src/config.js  # find reload() with delete require.cache pattern",
+   "cat /app/src/server.js  # find setInterval(config.reload, 30000) \u2192 confirms periodic window reset",
+   "cat /app/src/pipeline.js  # understand how sampler output + original record flow to decider",
+   "cat /app/docs/sampler-protocol.md  # read weight field semantics",
+   "cat /app/config/default.json  # confirm errorThreshold=0.10, minSamples=50",
+   "cat /app/src/health-window.js  # understand window accumulation",
+   "cat /app/src/deployment.js  # understand phase state machine",
+   "# FIX 1: Edit config.js reload() \u2014 remove delete require.cache line, preserve healthWindow instance",
+   "# FIX 2: Edit rollback-decider.js \u2014 implement weighted error rate: sum(weight*isError)/sum(weight) using original statusCode (from pipeline passthrough) and input weight field; compare to threshold; return rollback if >= threshold AND sampleCount >= minSamples",
+   "# FIX 3: Verify POST /api/telemetry in server.js correctly calls pipeline with weight field",
+   "node /app/src/server.js &  # start service",
+   "# Send 40 records statusCode=200, POST /api/reload, send 20 statusCode=500 \u2192 check sampleCount=60",
+   "curl http://localhost:PORT/api/status  # verify T4 reload persistence",
+   "# Send 100 records where seq%7==3 are 500s, check phase=rolledback \u2192 T3",
+   "# Send 60 records (12 errors weight=2.0, 48 success weight=0.5) \u2192 check weighted rate ~0.5 \u2192 T7",
+   "# Send calibration traffic, compare status.sampledErrorRate vs known rate \u2192 may reveal sampler weight halving bias",
+   "# If bias detected: ensure rollback-decider uses original statusCode not sampler-adjusted weight",
+   "curl -X POST http://localhost:PORT/api/rollback  # test T5",
+   "curl http://localhost:PORT/api/status  # verify all 5 fields T6"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "T3 is ambiguous: the instruction says 'pipeline preserves original statusCode alongside sampled record' but this is only in the internal hint, not in the instruction or sampler-protocol.md. A solver has no reliable way to know pipeline.js exposes original statusCode to the decider unless they read pipeline.js carefully and it is explicitly implemented that way \u2014 if pipeline.js does NOT currently pass original statusCode through, the solver must add that wiring, but the instruction doesn't tell them to.",
+   "T7 weight semantics conflict: the instruction says rollback-decider must use the weight field from the sampler's output, but the internal hint says the sampler halves error weights, so using sampler weights would fail T7. The only robust solution is to use input weights, but the instruction never states this clearly.",
+   "The sampler binary's seq%7==3 drop behavior and weight-halving behavior are completely undocumented in any solver-visible file. The sampler-protocol.md mentions 'sequence-based deduplication filter' but not which sequences. Discovery requires experimental testing, which may be time-consuming and non-deterministic if the verifier controls seq assignment.",
+   "Flakiness risk: T4 requires sampleCount=60 exactly after reload+send. If the 30-second setInterval fires between the reload POST and the subsequent 20 records, sampleCount resets again \u2014 but this is precisely what Bug 2 causes. After fixing Bug 2, the test should be stable. However if there's a race between test execution and the watcher timer, results could vary.",
+   "The seq field assignment is underspecified: the instruction says 'the orchestrator assigns sequential seq numbers to incoming telemetry' but if the verifier sends its own seq values in the request body, the pipeline may use those instead, changing T3's assumptions about which records are dropped.",
+   "T3's pass condition 'within 120 samples' is vague \u2014 the verifier sends exactly 100 records per the test description, but the pass condition says 120 samples. If the window hasn't reached minSamples=50 from non-seq%7==3 records (which is ~86 non-dropped records out of 100 sent), this should work, but the interaction between drop rate and minSamples creates fragility.",
+   "Solvability concern: the task description mentions the environment uses 'FROM python:3.13-slim-bookworm' in the Dockerfile which builds the C binary, but the task says no internet access. The build chain (python base + nodejs + C compiler for traffic-sampler) is complex and may have dependency issues in a constrained environment."
+  ],
+  "verdict": "reject",
+  "reasons": "T3's core requirement \u2014 that the solver use original statusCode rather than the sampler's weight output \u2014 depends on pipeline.js already passing the original record through to the decider, but this is never stated in the solver-visible instruction and lives only in the internal hint. If pipeline.js doesn't already wire this, the solver must invent it without guidance, making it ambiguous rather than genuinely difficult. Additionally, the sampler's weight-halving behavior (critical for T7 vs T3 interaction) is completely undocumented in solver-visible files, requiring pure experimental discovery in a no-internet constrained environment with an opaque binary \u2014 this risks invalid failures where the solver correctly implements weighted calculation per the documented protocol but uses the wrong weight source. The task conflates 'hard to discover' with 'ambiguous specification', which produces invalid failure modes rather than genuine difficulty.",
+  "fixes": [
+   "Add to sampler-protocol.md a note that the binary may modify the weight field, and that pipeline.js passes both the original request record and the sampled record to downstream consumers \u2014 make the dual-record design solver-visible so T3's fix path is unambiguous.",
+   "Clarify in the instruction itself (not just tests) that rollback-decider should use the original request's statusCode for error classification and the input weight field (not the sampler-adjusted weight) for weighted rate calculation \u2014 or alternatively make this discoverable by ensuring sampler-protocol.md documents the weight adjustment behavior.",
+   "Add an explicit requirement in the instruction that POST /api/telemetry must preserve original record metadata (statusCode) through the pipeline, so a solver knows pipeline.js needs this wiring even if it's currently absent.",
+   "Specify in the test descriptions whether seq is assigned by the orchestrator or provided by the caller, since T3's entire premise depends on which entity controls seq values.",
+   "Consider replacing the opaque binary weight-halving bug with a source-visible bug (e.g., a weight calculation error in pipeline.js) to keep the 'experimental discovery required' element focused on the seq-drop behavior only, reducing the number of undocumented gotchas."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline with a GeoIP binary and Flask API endpoints, not a canary deployment orchestrator with traffic sampling and rollback logic."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-idcard-flask-api",
+     "verdict": "distinct",
+     "reason": "That task is about implementing an ID card management system with area queries and ID generation, completely unrelated to canary deployments."
+    },
+    {
+     "ref_id": "terminal-bench-science/xrd-multiphase-qpa",
+     "verdict": "distinct",
+     "reason": "That task involves X-ray diffraction phase composition analysis, a scientific domain entirely separate from canary deployment orchestration."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a NetFlow v9 UDP aggregation service in Rust, unrelated to canary deployment traffic shifting and rollback decisions."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js NDJSON log ingestion pipeline for schema validation and performance, not canary deployment orchestration with health-window sampling."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.152
+    ],
+    [
+     "terminal-bench-pro/implement-idcard-flask-api",
+     0.106
+    ],
+    [
+     "terminal-bench-science/xrd-multiphase-qpa",
+     0.103
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.075
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.068
+    ]
+   ],
+   "cost_usd": 0.014805
+  },
+  "novel": true
+ },
+ "cost_usd": 0.065091
+}

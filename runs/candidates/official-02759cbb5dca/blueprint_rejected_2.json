@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "Stream Merge-Sort Pipeline Refactor",
+  "scenario": "The data-platform team ships a Go binary (`/app/bin/sortmerge`) that ingests N sorted input streams via stdin (newline-delimited JSON records with an integer `key` field) and emits a single merged-sorted stream to stdout. The binary was rebuilt last sprint after a large refactor of the internal k-way merge heap and the run-length delta encoder that compresses equal-key runs; CI now reports silent wrong output on large inputs. The source lives under `/app/src/` (~1,400 lines across eight files), but the compiled binary in `/app/bin/sortmerge` was built from a different, opaque commit \u2014 it does not match any source file on disk. The solver must fix the source so that `go build` produces a binary whose output is byte-for-byte equivalent to the reference computation embedded in the test harness, for all generated inputs.",
+  "instruction_draft": "The release build of `sortmerge` at `/app/bin/sortmerge` is broken: for certain multi-stream inputs the merged output is out of order or has corrupted run-length delta payloads. Your job is to repair the Go source under `/app/src/` so that `go build -o /app/bin/sortmerge ./app/src/` produces a binary whose stdout matches the reference output for every input the verifier generates.\n\nThe binary reads a framing header on stdin: first a line containing an integer N (number of streams), then N blocks each prefixed by a line containing an integer M (record count for that stream), followed by M newline-delimited JSON objects each with an integer field `key` and an arbitrary string field `payload`. It writes merged-sorted JSON records to stdout in ascending key order. Equal-key records must appear in input-stream order (stable). Before emitting each record the encoder applies run-length delta compression: each output line is `{\"delta\":<int>,\"payload\":<string>}` where `delta` is `key \u2212 previous_key` (0 for the first record). The source compiles with Go 1.22 (`go build` with no flags beyond the output path).",
+  "requirements": [
+   "The source at /app/src/ must compile with `go build -o /app/bin/sortmerge ./app/src/` under Go 1.22 without errors.",
+   "The binary reads the framing header (N streams, then per-stream M + M records) from stdin.",
+   "Output is newline-delimited JSON with fields `delta` (int) and `payload` (string).",
+   "Records are emitted in ascending key order.",
+   "Equal-key records appear in the order of their originating stream (stable merge).",
+   "The `delta` field of the first output record equals its `key`; every subsequent `delta` equals `key \u2212 previous_key`.",
+   "The binary must produce output byte-for-byte identical to the reference computation for all verifier-generated inputs."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base image.",
+   "Install Go 1.22 via official tarball into /usr/local/go; add to PATH.",
+   "Install Python 3 packages: pytest (for the test harness).",
+   "Create /app/src/ with ~1,400 lines of Go across 8 files: main.go, heap.go, merge.go, encoder.go, decoder.go, record.go, stream.go, util.go.",
+   "The source has three interacting bugs that are NOT visible by static reading alone \u2014 they manifest only when the heap re-heapifies after a stream is exhausted, when equal keys arrive from non-adjacent streams (stream-order tie-breaking is wrong), and when delta encoding wraps around after a key decrease (which can't happen in a correctly sorted merge but does happen due to the heap bug).",
+   "Bug 1 (heap.go): When the heap pops the last element of a stream, it calls siftDown with stale stream-index metadata, causing subsequent comparisons to use a dangling stream ID \u2014 visible only when N>=3 and one stream empties mid-merge.",
+   "Bug 2 (merge.go): The stable tie-breaking comparator uses `streamID` from the heap node but the node field is named `srcIdx`; a silent field-name collision means two struct fields coexist and the wrong one is read \u2014 only triggers on equal keys from streams 0 and 2+ (streams 0 and 1 happen to coincide for small test cases).",
+   "Bug 3 (encoder.go): The run-length delta is computed as `curr.Key - prev.Key` but `prev` is updated BEFORE the delta is stored, so the first record of each new run gets delta=0 instead of the correct positive delta \u2014 masked on sample inputs where each key appears exactly once.",
+   "Compile the CORRECT version of the source into /app/bin/sortmerge (the opaque binary) before introducing the bugs into the source files, so the binary is the ground truth.",
+   "Include /app/tests/test_sortmerge.py: a pytest file that generates fresh random multi-stream sorted inputs using a seeded-but-parametrized random generator, runs both /app/bin/sortmerge and the solver's rebuilt binary on each, and asserts byte-identical output.",
+   "The test file contains a pure-Python reference implementation of the correct algorithm used to double-check the opaque binary on small cases.",
+   "Sample inputs in /app/samples/ cover only N=2, M<=5, all distinct keys \u2014 the shallow-check trap.",
+   "README at /app/README.md documents the framing format and delta encoding contract."
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the bugs are NOT visible by reading any single file \u2014 Bug 2 requires noticing a struct field shadowing issue that only fires when streams 0 and 2+ tie, which the sample inputs never produce; Bug 3 requires understanding the encoder's state-update order, which looks plausible until you trace through an equal-key run; Bug 1 requires running the binary with N>=3 and watching incorrect output appear only after stream 0 or 1 empties. The solver must instrument (add logging, write small test programs, or diff binary output vs. reference) to locate each bug. (2) The opaque binary is the ground truth \u2014 the solver cannot just 'fix obvious bugs' without verifying against it. Resolution path: run the opaque binary on crafted inputs (N=3, equal keys, streams of different lengths) and compare with the broken source binary; add debug prints or write a small Go test to exercise the heap; find the siftDown stale-index bug in heap.go; find the struct field shadowing in merge.go by printing srcIdx vs streamID; find the encoder update-order bug in encoder.go by tracing delta values on a run of equal keys.",
+  "trap": "A solver that fixes only Bug 1 (the most visible heap bug, revealed by N=3 inputs in the samples directory) will pass all 2-stream sample tests and even most 3-stream tests with distinct keys. The hidden verifier generates inputs with N up to 8 streams, equal-key runs of length 3\u201310, and streams of wildly unequal lengths (one stream has 1 record, another has 200). Bug 2 fires on equal keys from non-adjacent streams; Bug 3 fires on any equal-key run of length >=2. A partial fix passes the provided samples but fails ~60% of hidden cases.",
+  "tests": [
+   "test_compile: `go build -o /tmp/sortmerge_built ./app/src/` exits 0.",
+   "test_small_distinct_2stream: generates 5 pairs of sorted streams (N=2, M in [3,10], all distinct keys via seed); compares rebuilt binary stdout to opaque binary stdout byte-for-byte.",
+   "test_equal_keys_adjacent_streams: generates inputs where streams 0 and 1 share keys; checks stable ordering and correct delta encoding.",
+   "test_equal_keys_nonadjacent_streams: generates inputs where streams 0 and 2 share keys (stream 1 has different keys); this is the Bug 2 trigger; checks stream-order stability.",
+   "test_equal_key_runs: generates inputs with runs of 3\u201310 records sharing the same key across multiple streams; checks delta=0 for all records in a run after the first, and correct delta for the record after the run ends.",
+   "test_unequal_stream_lengths: generates N=5 streams where one has 1 record and another has 150; checks correct output after short stream exhausts (Bug 1 trigger with N>=3).",
+   "test_large_stress: generates N=8 streams, M up to 200 each, mixed equal-key runs and distinct keys, 10 random seeds; full byte-identical comparison against opaque binary.",
+   "test_single_stream: N=1 edge case; output equals input with delta encoding applied.",
+   "test_empty_streams: N=3 where one stream has M=0; binary must handle gracefully.",
+   "test_reference_parity: the pure-Python reference in the test file is run on 20 small generated inputs and compared to the opaque binary to confirm the binary is correct ground truth."
+  ],
+  "verifier_knob": {
+   "name": "num_generated_inputs",
+   "value": "30 inputs across all test functions",
+   "effect": "Increasing to 100+ inputs and wider key ranges makes it nearly impossible to pass with any single-bug fix; decreasing to 5 inputs collapses difficulty since the equal-key and unequal-length cases may not appear."
+  },
+  "expected_failure_modes": [
+   "Agent finds and fixes Bug 1 (heap siftDown), verifies against sample inputs, declares done \u2014 fails hidden equal-key tests.",
+   "Agent reads encoder.go, misidentifies the update-order bug as intentional, leaves Bug 3 unfixed \u2014 fails all equal-key run tests.",
+   "Agent rewrites the entire k-way merge from scratch but implements unstable sort \u2014 fails stable-ordering tests.",
+   "Agent compares source against a mental model of correct behavior, misses Bug 2 (struct field shadowing) because both fields exist and the code 'looks right' \u2014 fails non-adjacent equal-key tests.",
+   "Agent rebuilds binary but forgets to use the opaque binary as ground truth, self-validates against the broken source \u2014 diverges from reference on all hidden cases."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithms",
+   "merge-sort",
+   "binary-comparison",
+   "fuzz-equivalence",
+   "refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/src/heap.go \u2014 locate siftDown, find stale stream-index bug",
+   "cat /app/src/merge.go \u2014 find struct with both srcIdx and streamID fields, identify wrong field read",
+   "cat /app/src/encoder.go \u2014 trace prev-update order, find delta computed after prev updated",
+   "cat /app/src/record.go /app/src/stream.go /app/src/main.go /app/src/decoder.go /app/src/util.go",
+   "edit heap.go: fix siftDown to use correct stream-index after pop",
+   "edit merge.go: fix comparator to read srcIdx instead of streamID (or unify the fields)",
+   "edit encoder.go: compute delta = curr.Key - prev.Key BEFORE updating prev",
+   "go build -o /tmp/sortmerge_built ./app/src/ \u2014 verify exit 0",
+   "echo '2\\n3\\n{\"key\":1,\"payload\":\"a\"}\\n{\"key\":3,\"payload\":\"b\"}\\n{\"key\":5,\"payload\":\"c\"}\\n3\\n{\"key\":2,\"payload\":\"d\"}\\n{\"key\":3,\"payload\":\"e\"}\\n{\"key\":4,\"payload\":\"f\"}' | /app/bin/sortmerge > ref.out",
+   "echo '2\\n3\\n{\"key\":1,\"payload\":\"a\"}\\n{\"key\":3,\"payload\":\"b\"}\\n{\"key\":5,\"payload\":\"c\"}\\n3\\n{\"key\":2,\"payload\":\"d\"}\\n{\"key\":3,\"payload\":\"e\"}\\n{\"key\":4,\"payload\":\"f\"}' | /tmp/sortmerge_built > new.out",
+   "diff ref.out new.out",
+   "pytest /app/tests/test_sortmerge.py -v"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "JSON field ordering in output: Go's encoding/json emits fields in struct-definition order, but if the output struct field order differs between the opaque binary's Go version and the rebuilt binary, byte-identical comparison fails spuriously",
+   "Opaque binary architecture mismatch: the pre-compiled /app/bin/sortmerge must be compiled for the same OS/arch as the container; if the Dockerfile doesn't pin this, the binary may be non-executable or produce different output",
+   "Bug 2 description is misleading: Go has no true field-shadowing \u2014 two struct fields coexisting with different names is just a bug where the wrong field is used; this IS visible by static reading of the struct definition plus the comparator, making the 'not visible by static reading' claim false",
+   "Environment build correctness: constructing 1400 lines of Go with exactly 3 specific bugs that interact in specific ways is very hard to get right; if the bug-introduction step is done wrong the task is unsolvable or trivially solvable",
+   "go build path format './app/src/' assumes the working directory is /, which is non-standard; if the Go module (go.mod) setup is not documented, solvers may get build errors unrelated to the bugs",
+   "The 'Internal hint' section fully describes all three bugs with file names and mechanisms; if an agent has any access to the full task specification it trivializes the difficulty"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 3 because the speedrun reaches a likely solution in ~13 commands \u2014 all three bugs are structurally described precisely enough (stale stream-index in siftDown, wrong field name srcIdx vs streamID, update-order in encoder) that careful static reading of the eight source files guided by the structural descriptions would locate them without instrumentation. The claim that bugs are 'NOT visible by static reading alone' is not credibly supported by the descriptions given. Additionally, the environment construction risk is high: building 1400 lines of Go with exactly three specific interacting bugs that fire only on certain input shapes is difficult to implement correctly, and if done wrong the task is either unsolvable or trivially solvable, creating invalid failure modes.",
+  "fixes": [
+   "Remove or substantially obscure the bug descriptions from the blueprint's 'Environment to build' section \u2014 the 'Bug 1/2/3' paragraphs effectively give away the solution; replace with only implementation notes needed for the builder, not the solver",
+   "Make the bugs harder to find by static reading: instead of a field-name collision (obviously visible in the struct definition), use a subtle off-by-one in the heap comparison predicate, or a wrong tie-breaking direction that looks intentional",
+   "Add a concrete Go module setup (go.mod contents) to the environment spec to eliminate build-path ambiguity and prevent spurious compilation failures unrelated to the bugs",
+   "Replace byte-identical JSON comparison with a parsed-JSON comparison (checking delta values and payload order) to avoid flakiness from field-ordering differences across Go versions or struct layouts",
+   "Increase the number of bugs or make one bug require runtime instrumentation to locate (e.g., a race condition or a bug that only appears after >1000 records) to push the speedrun above 25 commands"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 tagging of WAL records over TCP with a refund resolver, not a k-way merge-sort pipeline with run-length delta encoding."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks share the same core structure: a post-refactor source diverges from a reference binary and silently produces wrong output for larger inputs; the solver must fix the source to match the reference \u2014 only the domain (AES-CTR SQLite vs. Go merge-sort) differs."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task requires extracting obfuscated credentials from a Go binary via static analysis; no merge-sort or stream-processing repair is involved."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NDJSON schema validation and performance in a Node.js log ingestion service, not a Go stream merge-sort with run-length delta encoding."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NetFlow v9 byte-count attribution in a Python aggregator, not a Go k-way merge-sort pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.239
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.196
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.178
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.155
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.13
+    ]
+   ],
+   "cost_usd": 0.014561999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.063405
+}

@@ -1,0 +1,158 @@
+{
+ "blueprint": {
+  "slug": "chacha20-migration-silent-corruption",
+  "title": "ChaCha20 Stream Cipher Migration Verifier",
+  "scenario": "A platform engineering team migrated a scientific data pipeline from AES-CTR to ChaCha20-Poly1305 for encrypting serialized measurement records. The migration shipped a compiled Go binary (`/app/bin/encstore`) built from source that is no longer present, plus a Go service (`/app/service/`) that calls it. Sample records encrypt and decrypt fine in smoke tests, but nightly runs against the real corpus silently produce corrupt decryption on a subset of records \u2014 the binary returns exit 0 and emits garbled bytes instead of plaintext. The environment contains ~1,400 lines across the binary's HTTP API shim, a record serializer, a batch runner, and supporting utilities.",
+  "instruction_draft": "Hey \u2014 we finished the AES-CTR \u2192 ChaCha20-Poly1305 migration last sprint but QA keeps flagging silent decryption failures on real batch runs. The compiled binary at /app/bin/encstore handles all the crypto; the Go service in /app/service/ feeds it records. A few sample records in /app/samples/ round-trip fine, but when you run the batch job against /app/corpus/ a bunch of records come out wrong and the binary still exits 0. Figure out what's going wrong and fix the service layer so every record in the corpus decrypts correctly and the output matches the plaintext in /app/corpus/plaintexts/. The fix must be in the Go service \u2014 don't replace or patch the binary.",
+  "requirements": [
+   "Every record in /app/corpus/ must decrypt correctly and produce byte-for-byte matching output against /app/corpus/plaintexts/",
+   "The Go service must be rebuilt (go build) and the resulting batch runner must exit 0 with all records validated",
+   "The fix must be confined to the Go service source under /app/service/ \u2014 the binary /app/bin/encstore must not be replaced or modified",
+   "Records that are currently silently corrupted must be correctly decrypted after the fix",
+   "The service must correctly handle records of all sizes present in the corpus, including records at chunk boundaries"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, then builds /app/bin/encstore from a source tree that is deleted after compilation, leaving only the binary",
+   "The binary /app/bin/encstore exposes a local HTTP API: POST /encrypt and POST /decrypt, accepting JSON with fields 'key' (hex), 'nonce' (hex), 'data' (base64); it uses ChaCha20-Poly1305 via golang.org/x/crypto",
+   "The binary has a subtle behavior: for payloads larger than 65536 bytes it silently truncates the nonce counter reset \u2014 it reuses the same nonce segment for each 64KB chunk. This is observable only on large records in the corpus.",
+   "The Go service /app/service/ contains: main.go (batch runner, ~200 lines), crypto.go (wraps the binary HTTP calls, ~180 lines), serializer.go (record framing, ~220 lines), chunker.go (splits large records into 64KB chunks, ~150 lines), util.go (~120 lines), and config.go (~80 lines)",
+   "The bug in the service: chunker.go splits records into 64KB chunks and calls /encrypt per chunk, but reuses the same 12-byte nonce for every chunk instead of incrementing the 4-byte counter field (bytes 8-11) per chunk. This is correct in ChaCha20-Poly1305 only if the binary handles chunked streams, but since the binary is stateless per-call, nonce reuse causes authentication failures or silent XOR corruption depending on the AEAD tag handling path.",
+   "The service's crypto.go has a second bug: when decrypting, it concatenates chunk plaintexts but ignores the last chunk if its length is exactly 0 mod 16 (a boundary condition), producing truncated output for records whose plaintext is a multiple of 16 bytes in length.",
+   "/app/samples/ contains 5 small records (all under 1KB) that round-trip correctly under both bugs because they fit in one chunk and are not multiples of 16 bytes",
+   "/app/corpus/ contains 200 encrypted records generated at Dockerfile build time using a seeded deterministic generator: ~60% are large (>64KB, triggering chunk nonce reuse), ~20% have plaintexts whose length is exactly 0 mod 16 (triggering the boundary bug), ~10% trigger both, ~10% are small and correct. /app/corpus/plaintexts/ holds the expected plaintext for each record.",
+   "A batch runner script /app/run_batch.sh invokes the compiled service binary and reports per-record pass/fail; currently it reports ~70% pass with exit 0 because the runner only fails on explicit AEAD authentication errors, not on byte mismatch",
+   "Supporting plausible-but-uninvolved code: a Prometheus metrics exporter (~150 lines), a record index builder (~120 lines), and a config YAML parser (~80 lines)"
+  ],
+  "internal_hint": "Difficulty comes from two levers: (1) observe_not_read \u2014 the corruption only appears on large records and on records whose plaintext length is 0 mod 16; the sample set covers neither case, so reading the code alone does not reveal why samples pass; the solver must run the batch job and observe failures. (2) edge_case_inputs \u2014 there are two interacting bugs: nonce counter not incremented per chunk (causes AEAD tag failures or XOR corruption on multi-chunk records) and off-by-one boundary in the plaintext concatenation loop (causes truncation on plaintexts of length divisible by 16). A solver who finds and fixes only one bug will pass ~50-70% of corpus records but not all. The binary's behavior on large payloads is discoverable by probing it directly with crafted requests (e.g., a 70KB payload vs a 1KB payload) and observing that chunked re-encryption of the same data with the same nonce on both chunks produces different ciphertext than a single-call encryption \u2014 the nonce counter issue is then visible. The boundary bug in plaintext concatenation is discoverable by running the batch and noting that all remaining failures have plaintexts of length 0 mod 16.",
+  "trap": "A naive solver finds chunker.go, increments the nonce per chunk, rebuilds, and sees the pass rate jump from ~30% to ~80%. They verify on the samples (all pass), conclude the fix is done, and stop. The hidden verifier runs against the full corpus including the ~20% of records with plaintexts of length 0 mod 16, which still fail due to the boundary concatenation bug in crypto.go. The solver must also notice and fix that second bug.",
+  "tests": [
+   "At verify time, regenerate the corpus with the same deterministic seed used at build time and run the fixed service batch job; every record must produce byte-for-byte matching plaintext \u2014 the verifier rejects any record mismatch",
+   "Inject 50 fresh large records (>64KB) with random keys/nonces using the same seeded generator; all must decrypt correctly through the fixed service",
+   "Inject 50 fresh records whose plaintext length is exactly 0 mod 16 (sizes: 16, 32, 48, ..., 800 bytes); all must decrypt correctly",
+   "Inject 20 records that are both large AND have plaintext length 0 mod 16; all must decrypt correctly",
+   "Verify the binary /app/bin/encstore has not been modified (checksum check against a stored hash)",
+   "Verify the fixed service is built from source under /app/service/ by checking that go build succeeds and the resulting binary is newer than the task setup timestamp",
+   "Verify that the batch runner exits 0 and reports 100% pass rate on the full corpus"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 records (60 large, 40 boundary, 20 both, 80 clean)",
+   "effect": "Increasing corpus size and the fraction of large/boundary records makes the task harder because the solver must fix both bugs to pass; decreasing the fraction of boundary records lets a single-bug fix pass most tests"
+  },
+  "expected_failure_modes": [
+   "Solver finds and fixes only the nonce-increment bug, sees pass rate jump significantly, verifies on samples (all pass), and submits \u2014 fails on the boundary-length records",
+   "Solver fixes the boundary concatenation bug but misses the nonce-increment bug \u2014 fails on large records",
+   "Solver attempts to replace the binary with a pure-Go reimplementation (violates the no-binary-replacement requirement) or wraps it incorrectly",
+   "Solver fixes both bugs but introduces a new off-by-one in the nonce increment (e.g., increments starting at 1 instead of 0 for the first chunk) \u2014 fails on all multi-chunk records",
+   "Solver probes only the sample records, concludes the service is fine, and looks for the bug in the wrong place (the binary, which they cannot fix)"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "chacha20",
+   "stream-cipher",
+   "binary-black-box",
+   "edge-cases",
+   "refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "bash /app/run_batch.sh  # observe ~70% pass rate",
+   "cat /app/service/chunker.go  # find nonce reuse per chunk",
+   "cat /app/service/crypto.go  # find boundary skip bug",
+   "cat /app/service/main.go  # understand batch flow",
+   "edit chunker.go: increment nonce counter (bytes 8-11) by chunk index for each chunk",
+   "edit crypto.go: fix boundary condition that skips last chunk when len%16==0",
+   "cd /app/service && go build ./...",
+   "bash /app/run_batch.sh  # verify 100% pass",
+   "# if ~80% pass: analyze which records still fail, note len%16==0 pattern, fix crypto.go",
+   "go build ./... && bash /app/run_batch.sh  # confirm 100%"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The batch runner 'exits 0 even with ~70% pass' is stated, but the verifier checks 100% pass and exit 0 \u2014 if the fixed batch runner's exit code behavior changes based on how the solver restructures it, exit code semantics may become ambiguous",
+   "Nonce counter increment semantics: 'increment bytes 8-11 per chunk' requires specifying endianness (little-endian per ChaCha20 spec) \u2014 if the blueprint source doesn't make this explicit in chunker.go, a solver might implement big-endian increment and produce subtly wrong ciphertext that still passes some tests",
+   "The verifier 'regenerates corpus with same deterministic seed' at verify time \u2014 if the Dockerfile build is not perfectly reproducible (e.g., timestamp-seeded randomness, OS-level entropy), the regenerated corpus may not exactly match the build-time corpus, causing false failures",
+   "The binary's 'silent truncation / nonce counter reset' behavior on >64KB payloads is described as observable by probing, but if the binary actually uses golang.org/x/crypto ChaCha20-Poly1305 (which is a single-pass AEAD), it cannot naturally truncate a nonce counter \u2014 the described binary behavior may be physically impossible with standard golang.org/x/crypto and would require custom code; this makes the binary behavior description internally inconsistent",
+   "go build version pinning: Go 1.22 must be available offline in the container; if the Dockerfile fetches Go at build time without caching, verify-time rebuilds could fail on network issues"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 3 reflects that once a solver runs the batch job and reads the two key files (chunker.go, crypto.go), both bugs are directly visible in source \u2014 the 'observe_not_read' lever only delays discovery by one iteration of run\u2192read\u2192fix, not by requiring deep inference or external probing. The speedrun reaches a solution in ~10-13 commands, well under the 20-command threshold for a difficulty score of 4. Additionally, the described binary behavior (nonce counter reset on >64KB payloads via golang.org/x/crypto ChaCha20-Poly1305) is physically implausible with the standard library since ChaCha20-Poly1305 is a single-pass AEAD that doesn't expose chunk-level nonce control, creating an internal inconsistency that could confuse solvers or make the environment unbuildable as described.",
+  "fixes": [
+   "Raise genuine_difficulty: add a third bug that is not visible in the service source \u2014 e.g., the binary's HTTP API silently base64-decodes keys with URL-safe alphabet but the service sends standard alphabet, causing failures only on keys containing + or / characters (requires probing the binary directly, not just reading service source)",
+   "Make the binary's behavior more plausible: instead of 'nonce counter reset,' describe the binary as implementing manual ChaCha20 (not the AEAD wrapper) with a specific counter convention, built from a custom implementation \u2014 this is buildable and makes the chunking nonce semantics meaningful",
+   "Force deeper investigation by hiding the correlation: make the batch runner report failures only as a summary count (no per-record detail), requiring the solver to add instrumentation or write a diagnostic script to identify which record properties correlate with failures \u2014 this adds 5-8 commands and makes the edge_case_inputs lever genuinely hard",
+   "Add a third interacting bug (e.g., serializer.go drops the last byte of records whose total serialized length is prime) to ensure solvers cannot succeed by fixing only two obvious bugs and must exhaustively characterize the failure set"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve silent decryption failures on a subset of records after a crypto library migration, with regression tests passing but real corpus failing, differing mainly in language (Go vs C), cipher (ChaCha20-Poly1305 vs AES-CTR), and fix target (service layer vs library itself)."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference task involves incorrect numerical aggregation and weight caching in a sales service, not cryptographic decryption or cipher migration bugs."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference task involves implementing a correct HMAC-SHA256 audit service over TCP with canonical binary serialization, not debugging silent decryption failures in a cipher migration."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference task involves NDJSON schema validation correctness and performance in a log ingestion pipeline, unrelated to cryptographic operations."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The reference task involves NetFlow v9 UDP/TCP aggregation and flow data correctness, with no cryptographic or cipher migration component."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.287
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.235
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.22
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.204
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.157
+    ]
+   ],
+   "cost_usd": 0.014277
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051456
+}

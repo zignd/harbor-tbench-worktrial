@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "sql-window-filter-binary-regression",
+  "title": "SQL Query Validator Binary Regression",
+  "scenario": "An open-source SQL linting tool ships a compiled binary `/app/bin/sqlcheck` that validates SQL queries against a rule set and returns structured JSON results. A regression was introduced two releases ago: certain window-function queries with FILTER clauses are being incorrectly flagged or silently miscategorized, breaking downstream CI pipelines that rely on the validator's exit codes and JSON output. The environment includes a Python test harness, a corpus of sample queries in `/app/samples/`, and a SQLite database `/app/rules.db` that the binary consults at runtime.",
+  "instruction_draft": "The SQL query validator at `/app/bin/sqlcheck` produces wrong results for some query patterns. Fix it so that every query in `/app/samples/` is classified correctly (exit code 0 = valid, exit code 1 = invalid), and the JSON output for each query includes the correct `rule_id` list and `severity` field. The same correctness must hold for fresh queries the verifier generates at check time.",
+  "requirements": [
+   "For every valid SQL query, `sqlcheck` exits 0 and returns JSON with an empty `violations` array.",
+   "For every invalid SQL query, `sqlcheck` exits 1 and returns JSON with a non-empty `violations` array where each entry has the correct `rule_id` (a positive integer) and a `severity` field of either 'warning' or 'error'.",
+   "Window functions with FILTER clauses are not flagged as violations when syntactically and semantically correct.",
+   "Aggregate functions used outside of a GROUP BY or window frame are correctly flagged with the appropriate rule_id.",
+   "The JSON output structure is `{\"valid\": bool, \"violations\": [{\"rule_id\": int, \"severity\": str, \"message\": str}]}` with no extra top-level keys.",
+   "The binary must correctly distinguish between FILTER clauses that are syntactically valid vs. those applied to non-aggregate expressions."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base image.",
+   "apt packages: sqlite3, libsqlite3-dev, gcc, make, build-essential.",
+   "pip packages: pytest, click.",
+   "A compiled binary `/app/bin/sqlcheck` (stripped ELF, no source provided) that takes a SQL string as its first argument or reads from stdin with `--stdin`, queries `/app/rules.db` for rule definitions, and outputs JSON to stdout.",
+   "The binary is built in the Dockerfile from C source that is compiled and then the source deleted; only the binary remains.",
+   "The binary has TWO interacting bugs: (1) it reads rule severity from the wrong column in `rules.db` (column index off-by-one because a migration added a column), causing all severities to be 'warning' when some should be 'error'; (2) the FILTER-clause detection regex has a greedy quantifier that matches FILTER in column aliases and string literals, causing false-positive violations on valid window queries.",
+   "`/app/rules.db` is a SQLite database with a `rules` table having columns: `id INTEGER, rule_id INTEGER, name TEXT, severity TEXT, pattern TEXT, added_version TEXT`. The binary was written when the schema had no `added_version` column, so it reads column index 3 for severity but after the migration `added_version` is column 3 and `severity` is column 4.",
+   "`/app/samples/` contains 12 SQL files: 6 valid queries (including 3 with window FILTER clauses) and 6 invalid queries (including 2 that should produce 'error' severity violations, not 'warning').",
+   "A Python test harness `/app/test_harness.py` that runs `sqlcheck` on each sample and checks exit codes and JSON structure.",
+   "The harness sample tests only check exit codes, not severity values or that FILTER-alias false positives are absent \u2014 this is the shallow-check trap.",
+   "A `/app/README.md` explaining the expected JSON schema and the rule severity semantics.",
+   "The Dockerfile compiles the C source, runs `strip` on the binary, removes all `.c` files, creates the SQLite DB with the migration already applied (4-column then 5-column), and places everything.",
+   "The C source includes a comment block explaining the FILTER regex and column indexing, making the bugs discoverable only by running the binary and observing outputs, not by reading source (source is deleted)."
+  ],
+  "internal_hint": "Two interacting bugs, both invisible without running the binary. Bug 1: The binary reads column index 3 from the `rules` table for severity, but a schema migration added `added_version` as column 3, pushing `severity` to column 4. Fix: `UPDATE rules SET ...` won't help; the solver must either patch `rules.db` to move the column (recreate the table with the old column order, or add a view that reorders columns) OR find another way to make column index 3 contain the severity string. The canonical fix is to recreate the rules table with `added_version` moved to last position. Bug 2: The binary's FILTER regex is `FILTER\\s*\\(` with no negative lookbehind, so it matches `my_filter(` in aliases and `'FILTER('` in string literals. The fix is to add a wrapper script or a pre/post-processing layer that normalizes queries before passing to the binary, stripping string literals and identifiers before the regex runs \u2014 OR by adding a `filter_whitelist` entry in `rules.db` that the binary's secondary lookup consults. Discovering Bug 1: run an invalid query that should produce 'error'; observe JSON shows 'warning'. Discovering Bug 2: run a valid window query like `SELECT SUM(x) FILTER (WHERE y > 0) OVER ()` with a column alias `AS filter_col`; observe it returns a violation. Fixing Bug 1 alone: severity now correct, but FILTER false positives remain \u2014 hidden corpus will have window queries with FILTER in aliases. Fixing Bug 2 alone: window queries pass, but error/warning distinction is still wrong \u2014 hidden corpus checks severity on error-class violations.",
+  "trap": "The sample corpus contains only simple window queries without FILTER-in-alias patterns, and the sample test harness checks only exit codes (not severity). A solver who patches only the `rules.db` column order (fixing severities) will pass all 12 sample checks because severity is not tested by the harness. But the hidden corpus includes: (a) window queries with column aliases containing the word 'filter', which still trigger Bug 2 false positives, causing wrong exit codes; and (b) queries that must produce 'error' severity, which the hidden verifier checks explicitly. A solver who only fixes the FILTER regex (via a wrapper) passes sample window queries but fails the hidden severity checks on error-class violations. Only fixing both bugs passes the full hidden corpus.",
+  "tests": [
+   "Run `sqlcheck` on each of the 12 sample queries; verify exit codes match expected (0 for valid, 1 for invalid).",
+   "Run `sqlcheck` on each sample invalid query; parse JSON and assert `violations[*].severity` matches the expected value from `rules.db` (some must be 'error', not 'warning').",
+   "Verifier generates 20 fresh valid window-function queries at check time, including ones with column aliases like `AS filter_count`, `AS filter_val`, and string literals containing 'FILTER('; asserts all exit 0 with empty violations.",
+   "Verifier generates 15 fresh invalid queries at check time, including aggregates outside GROUP BY and malformed window frames; asserts all exit 1 with non-empty violations and correct rule_ids.",
+   "Verifier generates 10 fresh invalid queries that match 'error'-severity rules (e.g., syntax errors, not just style warnings); asserts JSON has `severity: 'error'` in violations.",
+   "Verifier runs a query that is valid: `SELECT dept, SUM(salary) FILTER (WHERE active) OVER (PARTITION BY dept) AS filter_total FROM emp`; asserts exit 0 and empty violations.",
+   "Verifier runs a query with a string literal `SELECT '-- FILTER(WHERE bad)' AS note FROM t`; asserts exit 0.",
+   "JSON schema validation on all outputs: must have exactly keys `valid` (bool), `violations` (array); each violation must have `rule_id` (positive int), `severity` (one of 'warning'/'error'), `message` (non-empty string)."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "35 total hidden queries (20 valid window + 15 invalid)",
+   "effect": "Increasing adds more edge cases: FILTER in subquery aliases, CTEs with filter-named columns, nested window functions, multi-rule violations. Decreasing to 10 makes it passable with a partial fix."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the column-index bug (recreates rules table) and verifies against the 12 samples \u2014 all pass. Hidden FILTER-alias queries cause false-positive exit code 1, failing those tests.",
+   "Agent fixes only the FILTER regex (writes a wrapper that strips literals before passing to binary) \u2014 sample window queries pass. Hidden severity-check tests fail because 'error' violations still show as 'warning'.",
+   "Agent attempts to patch the binary directly with a hex editor, accidentally corrupts the ELF, binary segfaults on all inputs.",
+   "Agent rewrites sqlcheck as a pure Python script without understanding the exact rule_id and severity semantics from rules.db, producing different rule_ids than the binary would for some query patterns.",
+   "Agent discovers Bug 1 only by reading rules.db schema and assumes fixing the DB is sufficient; never tests FILTER-alias queries because none appear in the samples."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "binary-reverse",
+   "two-bugs",
+   "schema-migration",
+   "regex",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "sqlite3 /app/rules.db '.schema rules'",
+   "sqlite3 /app/rules.db 'SELECT * FROM rules LIMIT 5;'",
+   "/app/bin/sqlcheck \"SELECT SUM(x) FROM t\" && echo exit:$?",
+   "/app/bin/sqlcheck \"SELECT SUM(x) FILTER (WHERE y>0) OVER () AS filter_col FROM t\"",
+   "echo $?  # observe false positive exit 1 -> Bug 2",
+   "# Fix Bug 1: recreate rules table with severity at index 3",
+   "sqlite3 /app/rules.db \"CREATE TABLE rules_new AS SELECT id, rule_id, name, severity, pattern, added_version FROM rules; DROP TABLE rules; ALTER TABLE rules_new RENAME TO rules;\"",
+   "/app/bin/sqlcheck \"SELECT SUM(x) FROM t\"  # verify severity=error now",
+   "# Investigate Bug 2: does binary read FILTER pattern from DB or use compiled regex?",
+   "sqlite3 /app/rules.db \"SELECT pattern FROM rules WHERE pattern LIKE '%FILTER%';\"",
+   "# Try updating pattern in DB to add negative lookbehind or word boundary",
+   "sqlite3 /app/rules.db \"UPDATE rules SET pattern='\\\\bFILTER\\\\s*\\\\(WHERE' WHERE pattern LIKE '%FILTER%';\"",
+   "/app/bin/sqlcheck \"SELECT SUM(x) FILTER (WHERE y>0) OVER () AS filter_col FROM t\"  # test fix",
+   "echo $?  # check if false positive gone",
+   "# If still failing, write pre-processing wrapper script",
+   "mv /app/bin/sqlcheck /app/bin/sqlcheck_real",
+   "cat > /app/bin/sqlcheck << 'WRAPPER'\n#!/usr/bin/env python3\nimport sys, re, subprocess\nsql = sys.argv[1] if len(sys.argv)>1 else sys.stdin.read()\ncleaned = re.sub(r\"'[^']*'\", \"''\", sql)  # strip string literals\nresult = subprocess.run(['/app/bin/sqlcheck_real', cleaned], capture_output=True, text=True)\nprint(result.stdout)\nsys.exit(result.returncode)\nWRAPPER",
+   "chmod +x /app/bin/sqlcheck",
+   "python /app/test_harness.py",
+   "/app/bin/sqlcheck \"SELECT dept, SUM(salary) FILTER (WHERE active) OVER (PARTITION BY dept) AS filter_total FROM emp\""
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Internal contradiction: the spec says Bug 2 regex is FILTER\\s*\\( but also claims 'AS filter_col' (no parenthesis) triggers false positives \u2014 these are incompatible unless the regex is actually case-insensitive and matches word-suffix 'filter(' patterns, which is never clarified.",
+   "The hint gives two contradictory fix paths for Bug 2: (a) a wrapper script that strips literals before passing to binary, and (b) adding a filter_whitelist entry in rules.db \u2014 if the regex is compiled into the binary, option (b) is impossible and option (a) only fixes string-literal false positives, not alias false positives.",
+   "If the FILTER regex is hard-coded in the binary (not from rules.db), no amount of DB manipulation fixes Bug 2, making the rules.db filter_whitelist hint misleading and potentially unsolvable via that path.",
+   "The wrapper pre-processing approach strips string literals from queries before passing to binary, which may change the binary's validation outcome for other rules (e.g., rules checking string literal patterns), causing unexpected failures on the hidden corpus.",
+   "CREATE TABLE ... AS SELECT reordering may not work in older SQLite versions; column type affinity information may be lost, causing subtle type-coercion bugs in the binary's DB reads.",
+   "The verifier generates queries 'at check time' with specific patterns \u2014 if the generation logic has bugs or edge cases not anticipated by the task builder, legitimate solutions could fail.",
+   "The shallow-check trap is described as: harness only checks exit codes. But the task instructions explicitly say 'verify exit codes and JSON output.' A solver reading the instruction carefully would check severity \u2014 making the trap less effective than described.",
+   "Ambiguity in whether 'FILTER clause detection regex' lives in the binary or in rules.db patterns \u2014 this is the most critical unresolved ambiguity that could make the task unsolvable or require binary patching."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical internal contradiction: Bug 2 claims aliases like 'AS filter_col' (no parenthesis) trigger a FILTER\\s*\\( regex match, which is logically impossible without clarifying that the regex is actually a broader case-insensitive suffix match. Additionally, the hint provides two incompatible fix paths for Bug 2 (wrapper script vs. rules.db whitelist entry), without clarifying whether the FILTER regex lives in the compiled binary or is read from the DB \u2014 if compiled in, the DB fix path is impossible and the wrapper only partially fixes the issue. Solvability is compromised because a diligent solver following the DB-fix path for Bug 2 would either get stuck or produce a broken solution that fails the hidden corpus in ways that are ambiguous rather than instructive.",
+  "fixes": [
+   "Clarify exactly what triggers Bug 2 false positives: if the regex is FILTER\\s*\\( then specify the alias pattern that actually matches (e.g., use 'filter_agg(' as a column alias that ends in 'filter(' so the suffix matches), not 'AS filter_count' which has no parenthesis.",
+   "Choose ONE canonical fix path for Bug 2 and make it unambiguous: either the regex pattern IS stored in rules.db (allowing a DB-level fix) and state this explicitly in the README, OR the regex is compiled in and the only fix is a wrapper/pre-processor, removing the contradictory filter_whitelist hint.",
+   "Add a discoverable clue for Bug 2 in the environment \u2014 for example, a comment in README.md noting that 'the binary reads rule patterns from rules.db for primary matching' so a solver knows DB manipulation is viable, eliminating the ambiguity about where the regex lives.",
+   "Either increase the harness to check severity (removing the shallow-check-trap nature, which conflicts with the stated requirement that the instruction 'states every tested requirement') or explicitly note in the README that the harness is incomplete \u2014 currently the instruction implies full coverage but the trap relies on incomplete harness coverage.",
+   "Make the solvability timeline realistic: two bugs requiring binary reverse engineering, DB schema reconstruction, AND a SQL pre-processor wrapper in under 1 hour is very tight for 'hard' difficulty; either reduce scope to one non-trivial bug or extend the expected time."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a SQL query for performance while preserving semantics; the candidate is about fixing a compiled binary that validates SQL queries."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a SQL query for efficiency; the candidate is about debugging a SQL linting binary that produces wrong validation results."
+    },
+    {
+     "ref_id": "terminal-bench-pro/polyglot-yaml-config-validator",
+     "verdict": "distinct",
+     "reason": "That task is about creating a polyglot validator script for YAML config files; the candidate is about fixing a pre-existing compiled SQL validator binary with a regression."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a NetFlow aggregation service returning incorrect network flow data; the candidate is about fixing a SQL linting binary that misclassifies window-function queries."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering and repairing a sensor data normalization pipeline; the candidate is about fixing a SQL validator binary's regression with window-function FILTER clauses."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.308
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.278
+    ],
+    [
+     "terminal-bench-pro/polyglot-yaml-config-validator",
+     0.184
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.145
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.123
+    ]
+   ],
+   "cost_usd": 0.013791000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.06783
+}

@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "journal-relay-resurrection",
+  "title": "On-Call: Dead Deployment Health Journal Relay",
+  "scenario": "A Node.js deployment health relay ingests structured binary journals written by a sidecar agent, parses them into a time-series of deployment events, and answers HTTP queries about deployment health windows. At 3am it starts returning 503 on all queries. The environment contains: the relay service (~600 lines across 5 modules), a binary journal specification in docs/, a corpus of real journal files in /var/lib/deploy-agent/journals/ (written by a compiled sidecar binary that continues running), and Prometheus-style logs showing the last known good and first bad timestamps.",
+  "instruction_draft": "```\n[2026-10-12 03:17:44] ALERT: deploy-health-relay.service \u2014 query endpoint returning 503\n[2026-10-12 03:17:44] systemd: deploy-health-relay.service: Main process exited, code=exited, status=1\n[2026-10-12 03:17:52] relay[19843]: FATAL JournalParser not initialized \u2014 module missing\n[2026-10-12 03:17:52] relay[19843]: Tried: require('./journal-parser') \u2014 MODULE_NOT_FOUND\n[2026-10-12 03:17:52] relay[19843]: See docs/journal-wire-format.md for the binary format spec\n```\n\nYou are the on-call SRE. The deploy-health-relay service at `/opt/deploy-health-relay/` answers HTTP GET requests at `http://localhost:7700/health-window?deployment=<name>&from=<unix_ms>&to=<unix_ms>` and returns a JSON object describing the deployment's health during that time window. The relay reads binary journals from `/var/lib/deploy-agent/journals/`.\n\nThe service is down because `journal-parser.js` is missing. Build it from the spec in `docs/journal-wire-format.md` and restore the relay to full operation. Once running, the endpoint must correctly answer health-window queries for any deployment name and any time range present in the journal corpus, including queries that span journal file boundaries and queries issued against journal files produced after your fix is deployed.",
+  "requirements": [
+   "The file `/opt/deploy-health-relay/journal-parser.js` must exist and export a `JournalParser` class with the interface expected by the relay (discoverable from the relay source)",
+   "The relay service must start successfully and the query endpoint must return HTTP 200 with valid JSON for health-window queries covering time ranges present in the journal corpus",
+   "Health-window responses must correctly reflect the deployment events recorded in the journal files, including events that span across multiple journal files (rotation boundaries)",
+   "The `rollupStatus` field in each response must correctly reflect the worst health state seen in the window: 'healthy', 'degraded', or 'critical'",
+   "Queries for time ranges that cross a journal rotation boundary (where the new file's timestamps are adjusted by the sidecar's monotonic correction) must return continuous, correctly ordered events with no gaps or duplicates",
+   "The `eventCount` field in the response must exactly match the number of deployment events whose timestamps fall within [from, to] inclusive",
+   "The endpoint must return HTTP 404 with a JSON error body when queried for a deployment name that has no events in the requested time window",
+   "The relay must remain operational and correctly answer queries against journal files written by the sidecar after the fix is deployed (live journal files, not just the pre-existing corpus)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm, but installs Node.js 20 LTS via apt (nodejs, npm); also installs the pre-compiled deploy-agent sidecar as a binary at /usr/local/bin/deploy-agent that continuously writes journal files to /var/lib/deploy-agent/journals/",
+   "The deploy-agent binary is an opaque compiled Go binary (no source shipped); it writes binary journals according to docs/journal-wire-format.md; it performs a monotonic timestamp correction at journal rotation: when it starts a new file, it writes a ROTATE_HEADER record containing a signed int32 delta (milliseconds) that must be applied to all subsequent timestamps in that file to get wall-clock ms",
+   "The sidecar binary is seeded with a fixed seed (--seed 42) so journal content is deterministic at build time; it pre-populates /var/lib/deploy-agent/journals/ with 6 journal files covering the last 2 hours of simulated deployment events across 4 deployment names; the sidecar keeps running and appends to a 7th live file",
+   "/opt/deploy-health-relay/ contains: index.js (entry point, ~80 lines), router.js (HTTP routing, ~120 lines), window-query.js (query logic, ~150 lines), event-store.js (in-memory store with rotation-aware ingestion, ~180 lines), docs/journal-wire-format.md (full binary format spec, ~200 lines); journal-parser.js is absent",
+   "journal-wire-format.md specifies: file starts with a 16-byte magic header; records are length-prefixed with a 4-byte little-endian uint32 length, followed by record bytes, followed by a 4-byte CRC32/ISO-HDLC checksum of the record bytes only (not the length prefix); record types: ROTATE_HEADER (type=0x01), DEPLOYMENT_EVENT (type=0x02), HEARTBEAT (type=0x03); each DEPLOYMENT_EVENT contains: 1-byte type tag, 8-byte int64-LE timestamp_ms, 1-byte status (0=healthy,1=degraded,2=critical), 2-byte uint16-LE name_length, N-byte UTF-8 deployment name; ROTATE_HEADER contains: 1-byte type tag, 4-byte int32-LE delta_ms (signed); HEARTBEAT contains: 1-byte type tag, 8-byte int64-LE timestamp_ms",
+   "Bug A (data-dependent, not visible by reading): event-store.js applies the ROTATE_HEADER delta incorrectly \u2014 it adds the delta to the file's *first record's raw timestamp* to compute a base offset, then applies that base offset to all records, rather than adding delta_ms directly to each record's raw timestamp; this produces correct results when delta is 0 (first file, no rotation) but silently miscalculates timestamps for all rotated files; this only manifests when replaying journal files that have undergone rotation",
+   "Bug B (masked by Bug A, data-dependent): window-query.js has an off-by-one on the window boundary check: it uses `event.ts > query.from` (strict greater-than) instead of `event.ts >= query.from`, so events with timestamp exactly equal to `from` are excluded; this bug is masked by Bug A because Bug A shifts timestamps so that no event ever lands exactly on a rotation boundary epoch; once Bug A is fixed and timestamps are correct, the verifier's test queries are constructed to have at least one event at exactly `from`, exposing Bug B",
+   "The verifier generates fresh test queries at verify-time by reading the actual journal files and constructing queries with known expected answers, including queries with events at exact boundary timestamps",
+   "A systemd-style process supervisor script keeps the relay running but exits on module-not-found; once journal-parser.js exists, it restarts automatically",
+   "Logs at /var/log/deploy-health-relay/ show the startup errors and any runtime errors; the sidecar writes to /var/log/deploy-agent/agent.log"
+  ],
+  "internal_hint": "Resolution path: (1) The solver reads the crash log and finds journal-parser.js is missing. (2) They read docs/journal-wire-format.md to understand the binary format. (3) They build journal-parser.js implementing the spec: 16-byte magic check, length-prefix + record bytes + CRC32 loop, dispatching on record type byte, applying delta_ms correctly (add directly to each subsequent timestamp). (4) The relay starts. (5) The solver should test with a real query \u2014 queries against rotated files return wrong timestamps (too many or too few events, or wrong time ranges). This requires actually running queries and inspecting results, not just reading source. (6) Reading event-store.js carefully reveals the delta application logic but it looks plausible \u2014 the bug is that the 'base offset' calculation is wrong math; the solver must trace through with actual delta values from the journal files to realize the calculation is wrong. (7) Fixing Bug A: change event-store.js to apply delta_ms directly per-record. (8) Now the relay works for most queries but the verifier's boundary queries fail because window-query.js excludes events at ts === from. (9) The solver must observe this failure by testing with boundary-aligned queries (constructed from actual journal data) or by reading window-query.js and noticing the strict inequality. Bug B is in source but was previously masked \u2014 the solver had no reason to look at window-query.js until Bug A was fixed. Difficulty comes from: (a) building the parser with correct CRC32 and varint handling, (b) Bug A being a subtle math error that only shows on rotated files with non-zero deltas, (c) Bug B being masked until Bug A is fixed.",
+  "trap": "A naive solver builds journal-parser.js, sees the relay start, tests one query against the first journal file (no rotation, delta=0, Bug A is invisible), declares success. The hidden tests query across rotated files with non-zero deltas (Bug A) and with boundary-timestamp events (Bug B). A partially successful solver who fixes Bug A but doesn't test boundary queries misses Bug B entirely because Bug B was masked during their testing.",
+  "tests": [
+   "Test 1: Relay starts and returns HTTP 200 for a basic health-window query against events in the first (non-rotated) journal file",
+   "Test 2: Query spanning journal files 1 and 2 (a rotation boundary with non-zero delta) returns the correct eventCount and events in monotonic timestamp order \u2014 tests Bug A fix",
+   "Test 3: Query spanning all 6 pre-populated journal files returns correct eventCount \u2014 exercises full rotation chain",
+   "Test 4: Verifier computes the exact timestamp of the first event in a rotated journal file; issues a query with from=that_timestamp; verifies the event is included in eventCount \u2014 tests Bug B fix",
+   "Test 5: Query for a deployment name with events exactly at the to boundary; verifies event at to is included (inclusive boundary on both ends)",
+   "Test 6: Query for a nonexistent deployment name in a real time range returns HTTP 404 with JSON error body",
+   "Test 7: Query for a real deployment in a time range with no events returns HTTP 404 with JSON error body",
+   "Test 8: rollupStatus is 'critical' when any event in the window has status=2, even if surrounded by healthy events",
+   "Test 9: rollupStatus is 'degraded' when worst status in window is 1 (no critical events)",
+   "Test 10: Query against the live (7th) journal file written after the fix is deployed returns correct results \u2014 tests that the parser handles the currently-being-written file correctly including partial/incomplete last record gracefully"
+  ],
+  "verifier_knob": {
+   "name": "number_of_rotation_boundary_queries",
+   "value": "6 rotation boundaries tested, 2 exact-timestamp boundary queries",
+   "effect": "Raising adds more journal files with varied delta_ms values and more exact-boundary test cases; lowering to 1 rotation and no boundary tests would let a partial fix pass"
+  },
+  "expected_failure_modes": [
+   "Solver builds journal-parser.js correctly but tests only against the first non-rotated journal file (delta=0), misses Bug A entirely, submits with Bug A unfixed",
+   "Solver finds and fixes Bug A in event-store.js but never tests with a query where from equals an event's exact timestamp, so Bug B remains unfixed",
+   "Solver implements journal-parser.js with incorrect CRC32 algorithm (e.g., uses CRC32C instead of CRC32/ISO-HDLC, or includes the length prefix in the checksum) causing silent record drops on journal files with non-trivially failing checksums",
+   "Solver applies the ROTATE_HEADER delta only once globally (to the file's base time) rather than to each record's raw timestamp, matching the existing bug pattern rather than the spec",
+   "Solver correctly implements the parser and fixes both bugs but mishandles the case where the live journal file has a partial/truncated final record, causing the relay to crash when the sidecar is mid-write"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "binary-protocol",
+   "log-parsing",
+   "on-call",
+   "interacting-bugs",
+   "feature-iteration"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /var/log/deploy-health-relay/*.log \u2014 read crash logs, confirm MODULE_NOT_FOUND for journal-parser",
+   "ls /opt/deploy-health-relay/ \u2014 confirm missing journal-parser.js",
+   "cat /opt/deploy-health-relay/docs/journal-wire-format.md \u2014 read binary spec",
+   "cat /opt/deploy-health-relay/index.js \u2014 understand startup/usage",
+   "cat /opt/deploy-health-relay/event-store.js \u2014 understand JournalParser interface expected (reveals Bug A if read carefully)",
+   "cat /opt/deploy-health-relay/window-query.js \u2014 understand query logic (Bug B visible as strict > but not flagged as bug yet)",
+   "cat /opt/deploy-health-relay/router.js \u2014 understand routing",
+   "Write /opt/deploy-health-relay/journal-parser.js: magic check, CRC32/ISO-HDLC loop, record type dispatch (ROTATE_HEADER/DEPLOYMENT_EVENT/HEARTBEAT), delta_ms applied per-record",
+   "node -I -e 'require tests' to smoke-test the parser against a sample journal file",
+   "Wait for supervisor auto-restart or manually trigger relay restart",
+   "curl 'http://localhost:7700/health-window?deployment=app1&from=<ts>&to=<ts>' \u2014 basic query against file 1 (delta=0, passes)",
+   "Write node script to extract timestamps from journal files 1 and 2 to find rotation boundary",
+   "curl with from/to spanning file 1-2 rotation boundary \u2014 gets wrong eventCount (Bug A visible)",
+   "Re-read event-store.js carefully, trace delta application logic with actual delta value",
+   "Identify Bug A: delta applied as base-offset from first record timestamp, not added directly to each record ts",
+   "Fix event-store.js: change delta application to add delta_ms directly to each raw timestamp",
+   "Restart relay, retest rotation-boundary query \u2014 eventCount now correct",
+   "Test with from=exact_first_event_timestamp_in_rotated_file \u2014 eventCount is 1 short (Bug B visible)",
+   "Read window-query.js, spot event.ts > query.from (strict) vs >= needed",
+   "Fix window-query.js: change > to >=",
+   "Restart relay, retest all: basic query, rotation boundary, exact-boundary, 404 cases",
+   "curl for nonexistent deployment \u2014 confirm 404 with JSON error body"
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Go sidecar binary architecture mismatch: if the pre-compiled binary targets linux/amd64 but CI runs arm64 (or vice versa), the entire task environment is broken for all solvers \u2014 binary must be built for the correct target arch and this is fragile",
+   "Test 10 (live journal file) is potentially flaky: the sidecar may be mid-write during the query; whether a partial final record causes a crash or graceful skip depends on solver's implementation, and the expected correct behavior needs to be unambiguous in the spec",
+   "CRC32/ISO-HDLC implementation ambiguity: multiple npm packages implement CRC32 with different polynomials/init values; if the spec in docs/ doesn't include a test vector or the exact polynomial (0xEDB88320 reflected), solvers may use the wrong variant and get silent record drops on some files but not others",
+   "int64 timestamp handling in Node.js: 8-byte LE int64 for timestamps may exceed Number.MAX_SAFE_INTEGER if using epoch milliseconds far in the future; spec should clarify whether BigInt is needed or timestamps are guaranteed safe-integer range",
+   "Auto-restart reliability: if the supervisor script doesn't reliably detect journal-parser.js creation and restart promptly, solver may be confused about whether their fix took effect, leading to wasted debugging time that could push them past the time limit",
+   "Bug B discoverability relies on solver constructing exact-boundary test queries: a strong solver who fixes Bug A and tests with 'reasonable' time ranges may never observe Bug B, making a partial fix appear correct \u2014 the task relies on the verifier catching this, but the solver has no feedback mechanism to know they missed it"
+  ],
+  "verdict": "reject",
+  "reasons": "The task has strong bones \u2014 realistic scenario, well-designed interacting bugs, good verifier design \u2014 but falls short on solvability (score 3) due to the fragile pre-compiled Go binary dependency and the substantial effort of building a correct CRC32/ISO-HDLC binary parser plus finding two interacting bugs within an hour. The average score is 4.0 which meets the threshold, but the Go binary architecture risk is an invalid failure mode that could make the task broken for all solvers, not just weak ones. Additionally, the CRC32 variant ambiguity could cause silent failures that are extremely hard to debug.",
+  "fixes": [
+   "Replace the pre-compiled Go binary with a Node.js or Python script that generates deterministic journal files \u2014 eliminates architecture mismatch risk entirely while keeping the scenario realistic",
+   "Add a CRC32 test vector in docs/journal-wire-format.md (e.g., 'the 4-byte sequence 0x01 0x02 0x03 0x04 has CRC32/ISO-HDLC checksum 0xB63CFBCD') and specify the exact polynomial to eliminate ambiguity between CRC32 variants",
+   "Make the supervisor restart mechanism explicit and testable (e.g., a script at /opt/deploy-health-relay/restart.sh that the solver can call, rather than relying on inotify-style auto-detection of file creation)",
+   "For Test 10 (live file), define 'graceful handling of partial records' explicitly in the spec: the parser must silently skip any final record whose CRC check fails or whose length extends beyond the current file size, rather than crashing",
+   "Add a hint in the instruction that the relay may have additional bugs beyond the missing module, to prevent the naive trap of stopping after the relay first starts \u2014 this reduces the 'hollow success' failure mode without giving away what the bugs are"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/build-nginx-1-24-production-server",
+     "verdict": "distinct",
+     "reason": "That task is about building and configuring NGINX from source; the candidate is about implementing a binary journal parser for a Node.js deployment health relay service."
+    },
+    {
+     "ref_id": "terminal-bench-pro/build-prime-factorization-http-api",
+     "verdict": "distinct",
+     "reason": "That task is a straightforward HTTP API for prime factorization; the candidate involves reverse-engineering a binary wire format spec and restoring a missing parser module in a complex multi-file service."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8adf0",
+     "verdict": "distinct",
+     "reason": "That task fixes a broken log enrichment pipeline with GeoIP enrichment and a Flask API; the candidate requires implementing a binary journal parser from a wire format spec to restore a Node.js health relay."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task fixes a WAF's rule compiler and deployment pipeline for request classification; the candidate is about building a missing binary journal parser for a deployment health relay."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task repairs a NetFlow v9 aggregation service with UDP/TCP parsing; the candidate requires implementing a binary journal parser from a spec to restore an HTTP health-window query endpoint."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/build-nginx-1-24-production-server",
+     0.093
+    ],
+    [
+     "terminal-bench-pro/build-prime-factorization-http-api",
+     0.093
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.077
+    ],
+    [
+     "ours/official-10912a593843",
+     0.073
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.069
+    ]
+   ],
+   "cost_usd": 0.016167
+  },
+  "novel": true
+ },
+ "cost_usd": 0.077007
+}

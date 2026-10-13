@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "metric-rollup-query-service",
+  "title": "Metric Rollup Query Service",
+  "scenario": "A data pipeline ingests application logs, computes per-minute metric rollups into SQLite, and exposes them via a small HTTP query service. You are inheriting this pipeline; the rollup writer and query service exist but the query service is returning wrong answers for multi-window aggregation requests. The environment has ~1,200 lines across the writer, query service, schema migrations, and test fixtures.",
+  "instruction_draft": "Hey, I'm handing off the metrics pipeline to you. The rollup writer at /app/writer/ reads raw logs from /app/data/logs/ and populates /app/db/metrics.db. There's an HTTP query service at /app/service/ that's supposed to answer rollup queries on port 7700. The problem is: when you POST a query like {\"metric\": \"req_count\", \"from_ts\": ..., \"to_ts\": ..., \"window\": \"5m\"} it comes back with numbers that are clearly wrong \u2014 they don't match what's actually in the logs. I need the service to answer those POST /query requests correctly for any metric name, any time range, and any window size (1m, 5m, 15m, 1h). The writer should also correctly populate the db before the service starts. Run both so they work end-to-end. The service must pass queries I'll throw at it programmatically after you're done.",
+  "requirements": [
+   "The writer at /app/writer/ must read all log files from /app/data/logs/ and populate /app/db/metrics.db with correct per-minute rollup rows",
+   "The HTTP service must listen on port 7700 and answer POST /query requests with JSON",
+   "Queries specify metric name, from_ts, to_ts (Unix timestamps), and window ('1m', '5m', '15m', '1h')",
+   "Returned aggregated values must be the sum of the underlying per-minute rollup rows that fall within the requested time range, grouped by window",
+   "The response must include each window bucket's start timestamp and the aggregated value for that bucket",
+   "The service must handle metrics not present in any log with an empty result list (not an error)",
+   "Both the writer and service must run correctly end-to-end without manual intervention"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with packages: flask==3.0.3, sqlite3 (stdlib), pytest==8.2.0",
+   "/app/writer/writer.py: reads /app/data/logs/*.log, parses lines of format 'TIMESTAMP METRIC_NAME VALUE', writes per-minute rollups to SQLite. Has a silent bug: it uses REPLACE INTO on (minute_ts, metric) but the minute_ts is computed with an off-by-one in integer division (uses // 60 * 60 + 60 instead of // 60 * 60), so all rows are bucketed one minute into the future \u2014 this is not visible by reading quickly, only apparent when you compare raw log timestamps to db contents",
+   "/app/service/app.py: Flask service that queries the db. Has a compounding bug: the window aggregation groups by integer division of bucket_ts by window_seconds, but it uses the *stored* (shifted) minute_ts values in the GROUP BY without adjusting for the shift \u2014 so window boundaries are consistently off by one minute, and for window='1m' results appear correct (masking the bug) while 5m/15m/1h are wrong",
+   "/app/db/metrics.db: pre-populated with some data via the buggy writer (wrong timestamps throughout)",
+   "/app/data/logs/: 3 log files covering 6 hours of traffic, ~2000 lines each, metrics: req_count, error_count, latency_p99, latency_p50, cache_hit. Files are named app-2024-03-15-{00,06,12}.log",
+   "/app/schema.sql: correct schema with CREATE TABLE rollups (minute_ts INTEGER, metric TEXT, value REAL, PRIMARY KEY (minute_ts, metric))",
+   "/app/run.sh: starts writer then service, currently runs both but produces wrong answers",
+   "/app/README.md: describes the log format, db schema, and query API with example request/response",
+   "Hidden invariant planted in data: latency_p99 values in logs follow a bimodal pattern \u2014 two deployment windows have 3x higher values, and the correct aggregation must sum raw values per minute then the query layer must expose the sum (not average) \u2014 the service incorrectly uses AVG() for latency metrics because a comment in writer.py says 'latency metrics use averaging' but the actual schema and README spec say all metrics are summed",
+   "The AVG vs SUM discrepancy is the hidden invariant: it only becomes apparent when you check latency query results against manually summed log values, not from reading code alone (the AVG call is in a helper that looks reasonable)",
+   "/app/tests/sample_queries.json: 3 sample queries with expected outputs (all use req_count with 5m window \u2014 the one combination that appears almost-correct due to cancellation of errors in the test data)"
+  ],
+  "internal_hint": "Three interacting bugs must all be found by running the system and comparing output to ground truth computed from raw logs: (1) writer.py off-by-one in minute_ts bucketing (floor division error) \u2014 visible only when comparing raw log timestamps to DB contents; (2) query service uses the shifted timestamps in GROUP BY without correcting, so window boundaries are wrong for all window sizes except trivially for 1m where the shift cancels out in relative comparisons; (3) the query service uses AVG() instead of SUM() for value aggregation, which the sample queries hide because req_count is additive and the test fixture chose time ranges where avg \u2248 sum / n doesn't matter to the integer check. The solver must: write a script to parse raw logs and compute expected values, query the service, compare, notice the timestamp shift in the DB, fix the writer, repopulate the DB, notice the AVG/SUM mismatch by checking latency_p99 queries, fix the service. All three fixes are required; fixing only one or two produces a service that passes the sample but fails hidden tests.",
+  "trap": "The sample_queries.json only tests req_count with a 5m window over a period where the timestamp shift and AVG/SUM difference happen to produce values close enough to pass a loose check. A naive agent fixes the most obvious issue (perhaps the GROUP BY window boundary logic), verifies against the sample, and submits. Hidden tests use latency_p99 with 1h windows, error_count with 15m windows, and time ranges that straddle the deployment windows \u2014 exposing both the timestamp shift and the AVG/SUM bug simultaneously.",
+  "tests": [
+   "Test 1 (basic correctness): POST /query with req_count, 1m window, 30-minute range \u2014 verify each bucket matches sum of raw log values for that exact minute",
+   "Test 2 (window boundary alignment): POST /query with req_count, 5m window \u2014 verify bucket start timestamps are aligned to 5-minute epoch boundaries (300-second multiples), not offset by 60 seconds",
+   "Test 3 (latency aggregation): POST /query with latency_p99, 15m window over a 3-hour range \u2014 verify returned values are sum (not average) of per-minute values; the bimodal pattern means AVG and SUM diverge by >2x in the high-traffic windows",
+   "Test 4 (1h window multi-metric): POST /query with error_count, 1h window over full 6-hour range \u2014 verify exactly 6 buckets with correct sums; wrong timestamp bucketing shifts all boundaries by 1 minute causing bucket 0 to be empty and bucket 6 to appear",
+   "Test 5 (missing metric): POST /query with nonexistent_metric over any range \u2014 verify empty results array, HTTP 200",
+   "Test 6 (edge: range exactly on window boundary): POST /query with cache_hit, 15m window where from_ts is exactly on a 15m boundary \u2014 verify the first bucket includes that boundary minute and not the minute before",
+   "Test 7 (fresh log file): verifier generates a new log file with known values, drops it into /app/data/logs/, runs writer, queries service \u2014 verifies new data is correctly ingested and queryable"
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "7 distinct query scenarios",
+   "effect": "Reducing to 3 scenarios (tests 1, 3, 5) means only one of the three bugs needs fixing to pass; increasing to 10+ by adding more window/metric combinations and edge timestamps makes each additional bug independently blocking"
+  },
+  "expected_failure_modes": [
+   "Agent reads the code, spots the GROUP BY issue, fixes it, verifies against sample_queries.json (which passes), misses the timestamp shift and AVG/SUM bugs entirely",
+   "Agent fixes the timestamp shift and GROUP BY but misses the AVG/SUM bug because all sample queries use req_count where the distinction isn't visible",
+   "Agent fixes all three bugs in the service but forgets to re-run the writer to repopulate the DB with correct timestamps, so the service code is correct but the data is still shifted",
+   "Agent fixes the writer off-by-one correctly but introduces a new off-by-one in the opposite direction (uses // 60 * 60 - 60), passing some tests but failing edge cases near range boundaries",
+   "Agent notices the timestamp shift from DB inspection but misattributes it to timezone handling and adds a UTC offset instead of fixing the floor division"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "logs",
+   "metrics",
+   "hidden-invariant",
+   "flask",
+   "sqlite",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/writer/writer.py  # spot: ts // 60 * 60 + 60 (off-by-one)",
+   "cat /app/service/app.py  # spot: AVG() in helper, GROUP BY using shifted ts",
+   "cat /app/schema.sql",
+   "head -20 /app/data/logs/app-2024-03-15-00.log",
+   "sqlite3 /app/db/metrics.db 'SELECT * FROM rollups LIMIT 5'  # confirm shift in data",
+   "sed -i 's|// 60 \\* 60 + 60|// 60 * 60|g' /app/writer/writer.py",
+   "# Edit service/app.py: fix AVG(value) -> SUM(value) in aggregation helper",
+   "# Edit service/app.py: fix GROUP BY window boundary (remove +60 shift)",
+   "python /app/writer/writer.py  # repopulate DB with correct timestamps",
+   "python /app/service/app.py &  # start service on port 7700",
+   "curl -s -X POST localhost:7700/query -H 'Content-Type: application/json' -d '{\"metric\":\"req_count\",\"from_ts\":1710457200,\"to_ts\":1710458100,\"window\":\"5m\"}'",
+   "cat /app/tests/sample_queries.json  # compare output to expected",
+   "# Spot-check latency_p99: parse raw log manually and compare sum to service response",
+   "bash /app/run.sh  # end-to-end verification"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The sample_queries.json 'trap' may not work as intended: a careful agent reads all source files before running anything, making all three bugs visible from code alone without needing to run and compare outputs",
+   "Bug 1 is described with the exact bad expression '// 60 * 60 + 60' in the blueprint \u2014 a code-reading agent trivially spots and fixes it without any runtime comparison",
+   "Bug 3 (AVG vs SUM) is described as being in 'a helper that looks reasonable' but the blueprint simultaneously describes it as AVG() which is immediately suspicious in a metrics sum context \u2014 low concealment",
+   "The bimodal latency pattern intended to expose AVG/SUM divergence requires correct test data generation; if log file generation is imprecise the >2x divergence claim may not hold for all query ranges",
+   "Test 7 (drop new log file and re-run writer) requires the writer to be idempotent or handle duplicate data correctly \u2014 the REPLACE INTO primary key behavior on (minute_ts, metric) means re-running writer on original logs is fine, but the blueprint should clarify whether the writer is expected to be run once or be idempotent",
+   "Flaky risk: starting Flask in background during testing may have port-binding race conditions if the verifier queries immediately after run.sh",
+   "The blueprint states the AVG/SUM bug is 'not visible by reading code alone' but simultaneously describes it as being in an explicit AVG() call \u2014 this is self-contradictory and means the concealment claim is false"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are directly visible from reading the source files: the blueprint itself names the exact bad expressions ('// 60 * 60 + 60', 'AVG()'), meaning a code-reading agent finds and fixes all bugs in ~15 commands without needing any runtime comparison or log analysis. The task's intended difficulty mechanism \u2014 that bugs only become apparent by comparing runtime output to ground truth \u2014 is undermined by the bugs being trivially readable in source. The sample_queries.json trap only catches agents who skip reading source files, which is not a realistic failure mode for frontier agents.",
+  "fixes": [
+   "Conceal the bugs better: instead of an obvious arithmetic literal like '// 60 * 60 + 60', use a confusingly-named helper function like 'def floor_minute(ts): return (ts // 60 + 1) * 60' that looks like it might be correct \u2014 forcing runtime comparison to discover the issue",
+   "Replace the AVG/SUM bug with something less syntactically obvious, such as a correct SUM but with an incorrect time-range filter (e.g., using BETWEEN with exclusive instead of inclusive bounds), which only manifests when boundary minutes are involved",
+   "Add a working but misleading comment near the GROUP BY that says 'align to window boundaries' with plausible-looking math, so agents must actually test rather than just read to know if the alignment is correct",
+   "Make at least one bug require runtime data comparison to discover \u2014 for example, plant a subtle integer overflow or floating-point precision issue that only manifests with large accumulated values, not inspectable from code alone",
+   "Ensure sample_queries.json includes at least one latency_p99 query so agents who only verify against sample tests are not given a false pass \u2014 or remove the sample file entirely to force agents to derive expected values from raw logs"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation in a sales pipeline with config-driven weights; this task is about fixing time-windowed metric rollup queries in an HTTP service over SQLite."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a PostgreSQL query for performance while preserving semantics; this task is about fixing correctness bugs in a SQLite-backed HTTP metric rollup service."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a Rust NetFlow UDP ingestion and TCP query service; this task involves fixing a Python/similar HTTP service doing time-window aggregation over SQLite."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing an HMAC chain verifier for audit logs with a stdin/stdout protocol; this task is about fixing a time-windowed metric rollup HTTP query service backed by SQLite."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js NDJSON log ingestion pipeline for schema validation correctness and performance; this task is about fixing a metrics rollup writer and HTTP query service for correct time-window aggregation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.211
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.174
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.167
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.156
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.141
+    ]
+   ],
+   "cost_usd": 0.014373
+  },
+  "novel": true
+ },
+ "cost_usd": 0.054825
+}

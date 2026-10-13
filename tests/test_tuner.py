@@ -71,3 +71,18 @@ def test_resume_rounds_restores_finished_rounds_from_the_ledger(tmp_path):
     assert [r["round"] for r in rounds] == [1]
     assert cal["verdict"] == "too_easy" and cal["trials"] == [{"outcome": "pass", "turns": 9}]
     assert tuner._resume_rounds("other", ledger) == ([], None)
+
+
+def test_invalid_calibration_gets_a_spec_fix_plan_from_the_judged_failures():
+    cal = {"verdict": "invalid", "outcomes": ["invalid"] * 2, "trials": [
+        {"outcome": "invalid", "failure": {"valid": False, "mode": "test_overreach",
+                                           "requirement": "tied rows in SQLite order",
+                                           "explanation": "order of ties is unstated"}},
+        {"outcome": "invalid", "failure": {"valid": False, "mode": "test_overreach",
+                                           "requirement": "tied rows in SQLite order",
+                                           "explanation": "order of ties is unstated"}},
+    ]}  # fmt: skip
+    plan = tuner.fix_spec_plan(cal)
+    assert plan["kind"] == "fix_spec" and plan["change"].count("tied rows") == 1  # deduplicated
+    text = tuner.directive(plan)
+    assert "Spec fix" in text and "every solution the instruction allows passes" in text

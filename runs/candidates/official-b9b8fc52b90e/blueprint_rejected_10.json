@@ -1,0 +1,160 @@
+{
+ "blueprint": {
+  "slug": "rollup-daemon-correction-drift",
+  "title": "Daily Rollup Service Correction Drift",
+  "scenario": "A small analytics team runs a C daemon called 'rollupd' that reads a binary transaction log and answers per-day net-total queries over a simple line protocol. The analyst noticed that daily figures stopped matching the source ledger after a series of end-of-period corrections were posted three weeks ago. The codebase is ~1200 lines across six files: a record parser, a windowed accumulator with a state machine, a protocol handler, an index builder, an admin CLI, and a replay tool. The binary data file and its companion index are live on disk.",
+  "instruction_draft": "The rollupd service on port 7741 is returning wrong net totals for some days. Fix it so every day's net total matches the authoritative figures in /app/data/ledger_truth.tsv.",
+  "requirements": [
+   "The rollupd service must be running on port 7741 after the fix",
+   "A QUERY <YYYY-MM-DD> request must return the correct net total matching /app/data/ledger_truth.tsv for every date present in that file",
+   "The service must handle at least 30 distinct date queries correctly at verify time, including dates with correction-then-reset sequences and dates with negative net totals"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, socat",
+   "Six C source files totaling ~1200 lines: record.c/h (binary format parser), accum.c/h (windowed accumulator state machine), proto.c/h (line protocol: QUERY <date> \u2192 TOTAL <amount>\\nOK or ERR), index.c/h (day-boundary offset index), replay.c (replays data file to rebuild index), rollupd.c (main server loop)",
+   "Binary data file /app/data/txlog.bin containing ~8000 records: TYPE(1 byte) + DATE(4 bytes, days since epoch) + AMOUNT(8 bytes, int64 cents). Record types: 0x01=CREDIT, 0x02=DEBIT, 0x03=CORRECTION (delta to apply before next record), 0x04=RESET (zero the day accumulator)",
+   "Bug 1 planted in accum.c: when pending_correction flag is set and a RESET record arrives, the code applies the stashed correction delta to the post-reset zero baseline instead of discarding it; this is a state machine transition error only visible when a CORRECTION record is immediately followed by a RESET record in the same day window \u2014 looks plausible when reading but only wrong at runtime on specific sequences",
+   "Bug 2 planted in proto.c: the response serialization function encode_amount() uses a custom sign-magnitude encoding (sign byte 0x00/0xFF + 3-byte big-endian magnitude) for the TOTAL response, but for negative values the magnitude is computed as abs(val) >> 8 instead of abs(val) & 0xFFFFFF, producing garbage; this path only executes when the day net total is negative",
+   "Interaction: Bug 1 inflates CORRECTION\u2192RESET day totals upward, preventing them from going negative, which masks Bug 2; fixing Bug 1 alone causes those days to return correct values but newly-negative days now produce garbage from Bug 2",
+   "The index file /app/data/txlog.idx is pre-built with the buggy accumulator state baked in; if the solver deletes/rebuilds the index before fixing both bugs, replayed totals for indexed days are wrong in a different way",
+   "Authoritative truth file /app/data/ledger_truth.tsv: tab-separated DATE\\tNET_CENTS with ~150 entries including at least 20 CORRECTION\u2192RESET days, 15 days with negative net totals, and 10 days where both conditions apply",
+   "A test client script /app/tools/query_client.sh that sends a QUERY <date> to localhost:7741 and prints the response, for the solver's convenience",
+   "rollupd is started by /app/run.sh and listens on 0.0.0.0:7741; the solver must leave it running"
+  ],
+  "internal_hint": "Genuine difficulty from two runtime-only bugs: Bug 1 (accum.c state machine) only fires on CORRECTION\u2192RESET record sequences \u2014 you cannot see it by reading because the logic looks plausible, only running queries on affected dates reveals wrong values vs truth. Bug 2 (proto.c encode_amount) only fires when net total is negative \u2014 and Bug 1's inflation hides those dates. The ordered danger: rebuilding the index with buggy code before both fixes are applied silently bakes wrong day-boundary offsets, causing replayed totals to be off even after patching. Correct procedure: (1) identify discrepant dates by querying vs truth, (2) instrument/add logging to trace which record sequences cause drift, (3) fix Bug 1 in accum.c (discard pending_correction on RESET instead of applying it), (4) observe that some days are now negative and Proto responses are garbled, (5) fix Bug 2 in proto.c (magnitude = abs(val) & 0xFFFFFF not >> 8), (6) rebuild the index only after both fixes are in place, (7) restart daemon.",
+  "trap": "A solver who fixes only Bug 1 will pass all the CORRECTION\u2192RESET dates but fail dates with negative net totals (which are now reachable). A solver who fixes only Bug 2 will fail CORRECTION\u2192RESET dates because Bug 1 still inflates those values above zero, making Bug 2's path unreachable and the fix look unnecessary. A solver who rebuilds the index before fixing both bugs will corrupt day-boundary offsets and see a third class of wrong answers that obscures the root cause.",
+  "tests": [
+   "Test 1: Query 10 dates that have only normal CREDIT/DEBIT records \u2014 must return correct net totals (baseline sanity)",
+   "Test 2: Query 20 dates that have CORRECTION\u2192RESET sequences \u2014 must return correct net totals (Bug 1 must be fixed)",
+   "Test 3: Query 15 dates that have negative net totals (no correction sequences) \u2014 must return correct encoded negative values (Bug 2 must be fixed)",
+   "Test 4: Query 10 dates where both CORRECTION\u2192RESET and a negative net total occur on the same day \u2014 requires both bugs fixed in correct order",
+   "Test 5: Verify rollupd is still running on port 7741 and responds to a fresh QUERY for a date not in the solver's visible test set (generated at verify time from the same txlog.bin with a fresh correct implementation)"
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "55 total queries across 5 test classes",
+   "effect": "Reducing to 20 queries (fewer negative-net and dual-condition days) makes it easier to pass with only Bug 1 fixed; raising to 80 queries adds more edge cases including multi-correction chains"
+  },
+  "expected_failure_modes": [
+   "Agent reads accum.c, thinks the pending_correction logic is correct (it looks intentional), skips to proto.c and only fixes Bug 2 \u2014 fails all CORRECTION\u2192RESET dates",
+   "Agent fixes Bug 1, sees some dates now correct, spot-checks a few negative-net dates with the provided sample, misses that encode_amount is wrong for negative values because the sample only shows positive days",
+   "Agent rebuilds the index (a natural step after patching C code) before both fixes are in, silently baking wrong offsets, causing a third failure class that sends the agent on a wrong investigation path",
+   "Agent patches proto.c encode_amount to use abs(val) & 0xFFFFFF but forgets the sign byte convention (0x00 for positive, 0xFF for negative) and outputs 0x00 for negative amounts \u2014 passes sign-magnitude format check but wrong value"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "state-machine",
+   "protocol",
+   "two-bugs",
+   "ordered-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/data/ledger_truth.tsv | head -30",
+   "cat /app/src/record.h",
+   "cat /app/src/accum.c  # spot pending_correction applied after RESET \u2014 visible bug",
+   "cat /app/src/proto.c  # spot abs(val) >> 8 in encode_amount \u2014 visible arithmetic bug",
+   "grep -v '^DATE' /app/data/ledger_truth.tsv | awk -F'\\t' '$2 < 0' | head -5  # confirm negative totals exist",
+   "bash /app/tools/query_client.sh 2024-03-07  # sanity check current wrong output",
+   "nano /app/src/accum.c  # fix: on RESET, set pending_correction=0 instead of applying delta",
+   "nano /app/src/proto.c  # fix: change abs(val) >> 8 to abs(val) & 0xFFFFFF",
+   "cd /app && make",
+   "/app/tools/replay  # rebuild index with correct accumulator",
+   "pkill rollupd && bash /app/run.sh &",
+   "bash /app/tools/query_client.sh <correction-reset-date>  # verify",
+   "bash /app/tools/query_client.sh <negative-date>  # verify"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The index rebuild ordering trap is avoidable by any agent who fixes code before rebuilding artifacts \u2014 it's not a reliable difficulty lever for agents who work methodically",
+   "Bug 2 (abs(val) >> 8 vs & 0xFFFFFF) is immediately visible by code reading \u2014 no runtime investigation required, undermining the 'only visible at runtime' claim",
+   "Bug 1's state machine error in the CORRECTION\u2192RESET transition is also readable in source \u2014 the blueprint incorrectly claims these are 'runtime-only' bugs",
+   "The masking interaction (Bug 1 inflates values so Bug 2 path unreachable) only matters if the agent does NOT read source carefully; a code-reading agent bypasses the interaction entirely",
+   "encode_amount sign byte convention (0x00/0xFF) is an extra detail that must be precisely specified in proto.h or comments, or it becomes ambiguous what 'correct' means",
+   "The 3-byte big-endian magnitude custom encoding is unusual enough that verifier correctness depends on verifier implementing the same spec \u2014 risk of spec mismatch",
+   "Flakiness risk: if rollupd doesn't cleanly restart after pkill (port still bound), test 5 could fail spuriously",
+   "The blueprint says 'index has buggy state baked in' but if the solver rebuilds with correct code, this is fine \u2014 the trap only catches agents who rebuild with still-buggy code, which is a procedural error not a technical one"
+  ],
+  "verdict": "reject",
+  "reasons": "Both planted bugs are directly readable in source code \u2014 Bug 2's arithmetic error (>> 8 vs & 0xFFFFFF) is immediately obvious, and Bug 1's state machine error is visible to any careful reader of accum.c \u2014 making the speedrun only ~13 commands and genuine_difficulty scores 2, below the required threshold of 4. The blueprint incorrectly characterizes these as 'runtime-only' bugs; the masking interaction only forces runtime investigation if the agent skips source reading, which a skilled agent won't do. The ordered-index trap is also easily avoided by any methodical engineer who fixes code before rebuilding artifacts.",
+  "fixes": [
+   "Make Bug 1 invisible to source reading: instead of a clear state-machine flag error, plant it as an off-by-one in day-window boundary detection (e.g., >= vs > in timestamp comparison) that only manifests when a CORRECTION record lands exactly at midnight boundary \u2014 looks like defensive coding when reading",
+   "Make Bug 2 invisible to source reading: instead of an obvious arithmetic operator swap, plant it as a subtle endianness issue \u2014 e.g., the magnitude bytes are written in little-endian order but the protocol spec says big-endian, which only matters for values > 0xFFFF (two bytes) and only for negatives \u2014 not obvious without knowing the wire format spec",
+   "Add a third file (e.g., index.c) with a subtle off-by-one in the offset calculation that is only triggered by the buggy accumulator state, creating a genuine three-way dependency that cannot be resolved by source reading alone \u2014 forces runtime binary tracing",
+   "Remove the query_client.sh helper and the truth file from obvious locations, requiring the agent to also reconstruct the expected values \u2014 or make ledger_truth.tsv only partially overlap with the test set so spot-checking passes but systematic verification is needed",
+   "Ensure the custom wire encoding (sign-magnitude) is complex enough that even after finding encode_amount, the correct fix requires understanding the full protocol spec in proto.h \u2014 add a checksum byte or length prefix that interacts with the sign byte"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/mendota-ice-phenology",
+     "verdict": "distinct",
+     "reason": "Ice phenology classification from satellite imagery is entirely unrelated to fixing a C daemon's accumulator bug in a binary transaction log service."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a running aggregation service whose computed totals drift from authoritative reference values due to a bug in the accumulation/weighting logic, verified by comparing output against a ground-truth file."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC computation over WAL records with a refund-resolver lookup, whereas this task is about fixing net-total accumulation drift in a binary transaction log daemon."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task involves HMAC chain verification over audit logs with a line-oriented protocol, not fixing per-day net-total drift in a windowed accumulator."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about NDJSON schema validation correctness and performance in a Node.js pipeline, not fixing a C daemon's binary log accumulation bug."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/mendota-ice-phenology",
+     0.157
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.138
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.119
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.114
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.11
+    ]
+   ],
+   "cost_usd": 0.01341
+  },
+  "novel": false
+ },
+ "cost_usd": 0.052842
+}

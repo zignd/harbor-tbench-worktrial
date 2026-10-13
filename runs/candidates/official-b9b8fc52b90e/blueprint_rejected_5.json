@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-codec-repair",
+  "title": "Daily Ledger Rollup Service Repair",
+  "scenario": "An analyst at a small trading desk noticed that their end-of-day position summaries stopped balancing three weeks ago: long and short legs of the same instrument report different net exposures. The desk runs a small in-house C service (`ledgerd`) that listens on a Unix socket, accepts simple text-protocol requests to POST transactions and GET rolled-up positions, and persists state in a flat binary journal file. The codebase is ~1,200 lines across six source files. Two bugs were introduced in the same commit: one corrupts the on-disk journal encoding for amounts that cross a sign boundary, and a second causes the in-memory rollup to apply a scale factor twice when a new trading day is initialized from a non-empty journal replay. Because the scale-factor bug surfaces only after a journal replay (which only happens on service restart), fixing the encoding bug alone makes the service appear healthy on a fresh start but silently double-scales positions after the first restart.",
+  "instruction_draft": "The ledgerd service at /app/ledgerd listens on /tmp/ledgerd.sock and answers requests of the form POST <instrument> <amount> and GET <instrument>; it should return the correct net position. Fix the service so that posted transactions accumulate correctly across service restarts, and GET returns the true net position for any instrument.",
+  "requirements": [
+   "GET <instrument> returns the exact algebraic sum of all previously POSTed amounts for that instrument",
+   "Positions survive service restarts: after restarting ledgerd and replaying no new transactions, GET returns the same value as before the restart",
+   "The property holds for amounts that mix positive and negative values across multiple restart cycles",
+   "The property holds for amounts whose absolute value crosses 2^15 (32768), including amounts that are negative",
+   "No transaction posted before a restart is counted more than once, and no transaction is lost"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm, installs gcc, make, socat, python3",
+   "/app/ledgerd/ directory containing: main.c (socket listener, dispatch loop), journal.c + journal.h (binary append-only journal writer/reader), rollup.c + rollup.h (in-memory hash-table accumulator), proto.c + proto.h (text protocol parser), day.c + day.h (trading-day initialisation, reads journal on startup), Makefile",
+   "journal.c bug: amounts are serialised as int16_t (2 bytes) but the field in the on-disk struct is declared as uint16_t, causing sign-extension to be lost on replay for negative amounts and amounts >= 32768; the write casts to uint16_t discarding the sign bit pattern correctly on little-endian for values in [-32768,32767] BUT the read decodes them back with an unsigned cast so negatives come back as large positives",
+   "day.c bug: day_init() calls rollup_apply_scale(day->scale_factor) after replaying all journal entries; rollup_apply_scale is also called from within the journal replay loop for every 'day-open' record, so on a non-empty replay the scale is applied twice; on a truly empty journal only one call fires so the bug is invisible on first startup",
+   "The two bugs interact: if the analyst only fixes the sign-extension bug, the first GET after a fresh start looks correct; but after one restart, GET returns a value off by scale_factor (typically 1 for a single-day scenario, so it looks fine UNTIL a multi-day journal exists); the verifier tests across two restart cycles with mixed-sign amounts and instruments that cross 32768 threshold",
+   "A pre-populated journal file /app/ledgerd/testdata/sample.journal is included showing a benign single-day scenario where neither bug manifests (all amounts small and positive, no restarts)",
+   "A helper script /app/ledgerd/send.sh wraps socat commands for manual testing",
+   "Total codebase ~1,100 lines; other files (config.c, stats.c) are present but irrelevant to the bugs",
+   "Service is not running at task start; solver must build and start it"
+  ],
+  "internal_hint": "Bug 1 (journal encoding): In journal.c, the struct field `uint16_t amount` must be changed to `int16_t amount`, and both the write path (jrnl_write_tx) and read path (jrnl_read_tx) must use int16_t; alternatively widen the field to int32_t throughout. Bug 1 is not visible by reading journal.h alone because the field type looks plausible; it only manifests when a negative or large-magnitude amount is replayed (run the service, POST -500, restart, GET -- wrong answer). Bug 2 (double scale): In day.c, day_init() calls rollup_apply_scale(factor) unconditionally after the replay loop; the replay loop itself calls rollup_apply_scale whenever it encounters a DAY_OPEN journal record. On a non-empty journal this fires twice. Fix: remove the unconditional post-loop call in day_init(), or gate it on (journal_was_empty). Bug 2 only manifests after at least one restart on a non-empty journal; if the solver fixes Bug 1 and tests on a fresh journal they will see correct output and stop. The ordered_procedure trap: if the solver fixes Bug 2 first without fixing Bug 1, restarts look correct for positive small amounts (scale applied once) but large/negative amounts are still wrong. Fixing Bug 1 first and testing with fresh data misses Bug 2 entirely because fresh-start has no journal. The solver must instrument by: (1) POST some transactions, (2) restart, (3) GET -- observe scale doubling; AND separately POST a negative or large amount, restart, GET -- observe sign corruption. Both experiments needed.",
+  "trap": "A solver who fixes only the uint16_t/int16_t sign-extension bug and tests with freshly-started service and small positive amounts will see correct GET responses and declare victory. The verifier injects a two-restart scenario with mixed-sign, mixed-magnitude amounts; the scale double-application then produces GET values that are off by exactly the scale factor. Conversely, a solver who only fixes the double-scale bug passes simple restart tests but fails on negative or large-magnitude amounts. Shallow verification against the provided sample.journal (all positive, small, single-day) passes both bugs silently.",
+  "tests": [
+   "Test 1 (basic accumulation, no restart): start ledgerd, POST AAPL 100, POST AAPL -40, GET AAPL -> must return 60",
+   "Test 2 (sign survival across restart): POST AAPL 200, POST AAPL -350, kill service, restart service, GET AAPL -> must return -150 (tests sign-extension bug with negative net)",
+   "Test 3 (large magnitude across restart): POST GOOG 40000, POST GOOG -5000, kill, restart, GET GOOG -> must return 35000 (crosses int16_t positive limit of 32767, tests width bug)",
+   "Test 4 (double-restart, multiple instruments): POST MSFT 1000, POST MSFT 500, POST TSLA -200, kill, restart, GET MSFT -> 1500, GET TSLA -> -200; kill, restart again, GET MSFT -> still 1500, GET TSLA -> still -200 (tests scale doubling across two restart cycles)",
+   "Test 5 (generated at verify time): verifier picks random amounts in range [-60000, 60000] for 5 randomly named instruments, posts 3-8 transactions each, performs 2 restart cycles, checks all GET values equal the algebraic sum",
+   "Test 6 (interleaved instruments): POST of alternating positive/negative across 3 instruments, restart, verify each instrument independently correct",
+   "All tests run against the binary the solver compiles from the fixed source; the verifier rebuilds from source before testing"
+  ],
+  "verifier_knob": {
+   "name": "restart_cycles",
+   "value": "2",
+   "effect": "Increasing to 3+ restart cycles exposes any residual accumulation or scale errors more dramatically; reducing to 0 makes the task trivial (no journal replay needed)"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the uint16_t -> int16_t sign bug, tests with a freshly-seeded journal, observes correct results, and submits without testing the restart-scale scenario",
+   "Solver notices the double-scale in day.c and fixes it but misses the journal encoding bug because sample.journal uses only small positive values and the default test POST amounts are small",
+   "Solver fixes both bugs but tests only with amounts < 32768 and net-positive positions, so the int16_t width issue (amounts > 32767 signed) is never triggered",
+   "Solver widens the journal field to int32_t (correct) but forgets to update the binary serialization byte-count in jrnl_write_tx / jrnl_read_tx, corrupting all journal reads",
+   "Solver reads both source files, sees the two issues, patches them, but reuses the existing sample.journal from before the fix \u2014 the old journal has misencoded entries that the fixed reader now misinterprets, causing a confusing apparent failure that leads them to revert the encoding fix"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "shell-scripting",
+   "c",
+   "binary-protocol",
+   "two-interacting-bugs",
+   "journal-replay",
+   "feature-iteration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls /app/ledgerd/",
+   "cat /app/ledgerd/journal.h",
+   "cat /app/ledgerd/journal.c  # spot uint16_t amount field, unsigned read cast",
+   "cat /app/ledgerd/day.c  # spot rollup_apply_scale called inside loop AND after loop",
+   "cat /app/ledgerd/rollup.h",
+   "sed or edit journal.c: change uint16_t amount -> int16_t amount in struct, fix read cast",
+   "edit day.c: remove unconditional post-loop rollup_apply_scale call",
+   "make -C /app/ledgerd/",
+   "/app/ledgerd/ledgerd &",
+   "echo 'POST AAPL 100' | socat - UNIX:/tmp/ledgerd.sock",
+   "echo 'POST AAPL -40' | socat - UNIX:/tmp/ledgerd.sock",
+   "echo 'GET AAPL' | socat - UNIX:/tmp/ledgerd.sock  # verify 60",
+   "kill ledgerd; /app/ledgerd/ledgerd &",
+   "echo 'GET AAPL' | socat - UNIX:/tmp/ledgerd.sock  # verify still 60",
+   "echo 'POST GOOG 40000' | socat - UNIX:/tmp/ledgerd.sock",
+   "kill ledgerd; /app/ledgerd/ledgerd &",
+   "echo 'GET GOOG' | socat - UNIX:/tmp/ledgerd.sock  # verify 40000",
+   "echo 'POST MSFT -500' | socat - UNIX:/tmp/ledgerd.sock",
+   "kill ledgerd; /app/ledgerd/ledgerd &",
+   "echo 'GET MSFT' | socat - UNIX:/tmp/ledgerd.sock  # verify -500"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The sample.journal file contains pre-encoded data with the buggy uint16_t encoding; after fixing the read path to use int16_t, replaying this old journal will misinterpret the already-stored bytes, causing confusing test failures that could lead solvers to revert correct fixes \u2014 the blueprint acknowledges this but the verifier must handle or clear this file before testing",
+   "Test 3 requires amounts > 32767 (e.g., 40000) which exceed int16_t range even after the sign fix; the blueprint implies the fix should widen to int32_t or larger, but the instruction only says 'change uint16_t to int16_t' in the hints \u2014 if the solver changes to int16_t (max 32767) they still fail Test 3, creating an underspecified fix path",
+   "The scale_factor value is described as 'typically 1 for a single-day scenario' \u2014 if scale_factor is always 1, the double-scale bug produces results that are off by factor 1 (i.e., identical), making Test 4 pass even with the bug unfixed; the verifier must use a scale_factor != 1 or the double-application is undetectable",
+   "Service startup timing: if the verifier restarts ledgerd and immediately queries it before the socket is ready, socat may fail with a connection error, causing flaky test results",
+   "The blueprint says amounts > 32767 need to work (Test 3: POST GOOG 40000), but if the fix is only uint16_t -> int16_t, int16_t still cannot hold 40000; the full fix requires widening to int32_t throughout, which involves more pervasive changes than the hint suggests \u2014 this creates ambiguity about what constitutes a correct fix"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score of 2 disqualifies this task: both bugs are directly visible by static reading of journal.c and day.c without needing to run experiments, and a skilled agent can identify and patch both in ~20 commands. More critically, the blueprint contains a serious internal contradiction: Test 3 requires handling amounts of 40000 (exceeding int16_t max of 32767), but the internal hint only suggests changing uint16_t to int16_t \u2014 the correct fix requires widening to int32_t, a more invasive change not clearly scoped in the instruction. Additionally, if scale_factor equals 1 (as described for single-day scenarios), the double-application bug produces no observable difference, potentially making Test 4 vacuously pass with the bug intact.",
+  "fixes": [
+   "Raise genuine difficulty: obscure the double-scale bug by having the replay loop call a *different* function (e.g., rollup_day_open()) that internally calls rollup_apply_scale, so the double-call is not visible by text-searching for the function name \u2014 the solver must trace the call graph",
+   "Resolve the int16_t vs int32_t ambiguity: either change Test 3 to use amounts within int16_t range (e.g., POST GOOG 30000, POST GOOG -5000 = 25000) and scope the fix as uint16_t->int16_t, OR explicitly scope the fix as widening to int32_t and make the instruction hint at 'amounts in the tens of thousands' requiring wider storage",
+   "Ensure scale_factor != 1 in the multi-day test scenario (e.g., use a multiplier of 100 representing cents-to-dollars conversion) so the double-application produces a result that is 100x off, making the bug unmistakably detectable",
+   "Handle the sample.journal backward compatibility issue explicitly: either have the verifier delete /app/ledgerd/testdata/sample.journal before running tests, or document that the solver must regenerate it, to prevent invalid failures from stale misencoded data"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a weighted aggregation calculation in a sales service with a SQLite database, not about binary journal encoding bugs and scale-factor double-application in a C network service."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing wire-protocol encode/decode bugs in a frame codec service, not about journal persistence and rollup scaling bugs in a trading ledger service."
+    },
+    {
+     "ref_id": "terminal-bench-pro/find-invalid-blockchain-transactions",
+     "verdict": "distinct",
+     "reason": "That task is about identifying invalid blockchain transactions within a call budget constraint, not about fixing C service bugs related to binary encoding and scale-factor double-application."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a NetFlow v9 UDP/TCP aggregation service in Rust, not about fixing sign-boundary encoding corruption and restart-triggered double-scaling in a C ledger service."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation correctness and performance in a Node.js log ingestion pipeline, not about binary journal encoding and in-memory rollup bugs in a C trading ledger service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.136
+    ],
+    [
+     "ours/official-aac910462208",
+     0.116
+    ],
+    [
+     "terminal-bench-pro/find-invalid-blockchain-transactions",
+     0.107
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.092
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.081
+    ]
+   ],
+   "cost_usd": 0.013218
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057393000000000007
+}

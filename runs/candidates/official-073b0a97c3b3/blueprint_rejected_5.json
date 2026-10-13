@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "metric-relay-dual-fault-repair",
+  "title": "3AM: Metric Relay Service Silent Data Loss",
+  "scenario": "A Node.js metrics relay service sits between instrumented microservices and a Prometheus-compatible scrape endpoint. It receives JSON line-delimited metric events over TCP, aggregates them into 60-second windows, and exposes a /metrics endpoint. The on-call SRE got paged because dashboards show gaps and stale counters. The repo is ~1,400 lines across 8 files. A pre-built opaque binary (`relay-core.node`, a native Node addon) handles the hot inner loop of window bucketing; its source is not present.",
+  "instruction_draft": "```\n[ALERT] metric-relay: stale_window_count=47 dropped_events=1823 at 2026-10-12T02:58:11Z\nProcess: metric-relay (pid 3847) on prod-relay-01\nLast successful scrape: 2026-10-12T02:41:00Z\n```\n\nYou are on-call. The metric relay service at `/app` is running but silently corrupting or dropping data. Prometheus scrapes `/metrics` on `localhost:9100` every 60 seconds and the verifier will check it directly.\n\nYour job:\n1. The service must be running and reachable at `localhost:9100/metrics`.\n2. Sending a batch of counter events via the TCP intake port (9200) must result in those events appearing correctly aggregated in the next scrape of `/metrics`, with no dropped events for well-formed input.\n3. Counter metrics must be monotonically non-decreasing across scrape cycles when new events are sent.\n4. Gauge metrics sent with a `window_key` must reflect the latest value for that key at scrape time, not a stale or averaged value.\n5. The `/metrics` endpoint must emit valid Prometheus text exposition format (each metric family prefixed with `# HELP` and `# TYPE` lines, values as bare numbers, no trailing commas or JSON artifacts).\n6. Under concurrent intake (multiple TCP connections sending simultaneously), no events from well-formed connections must be lost or double-counted.\n\nInvestigate the logs, the running process, and the service code to understand what is going wrong. The service is already started; do not change the port numbers or the wire protocol documented in `/app/docs/protocol.md`.",
+  "requirements": [
+   "Service running and responding on localhost:9100/metrics",
+   "Counter events sent via TCP port 9200 appear correctly summed in the next /metrics scrape",
+   "Counter metrics are monotonically non-decreasing across scrape cycles",
+   "Gauge metrics reflect the latest value per window_key, not stale or averaged values",
+   "/metrics output is valid Prometheus text exposition format with # HELP and # TYPE headers",
+   "No events dropped or double-counted under concurrent TCP connections"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base, with nodejs 20.x, npm installed via apt",
+   "/app/service/index.js - main entry point (~200 lines), starts TCP server and HTTP server",
+   "/app/service/intake.js - TCP intake handler (~180 lines), has bug #1: flushes the per-connection buffer only on socket 'end', not on each newline-delimited record, so partial writes from concurrent senders lose trailing events when the connection closes mid-write",
+   "/app/service/aggregator.js - window aggregator (~220 lines), calls relay-core.node for bucketing; has bug #2: for gauge metrics it passes the accumulated sum to the native addon instead of the last-seen value, so gauges report wrong values; this bug is hidden when bug #1 is present because fewer events arrive",
+   "/app/service/exporter.js - Prometheus formatter (~150 lines), correct but only called correctly if aggregator state is consistent",
+   "/app/service/relay-core.node - pre-built native Node.js addon (binary, no source); implements ring-buffer window management; correctly implements its documented API but silently returns 0 for gauge type if passed a sum > INT32_MAX, which only manifests after many events accumulate (data-dependent path that requires bug #2 to be fixed first)",
+   "/app/service/config.json - service configuration with port numbers and window sizes",
+   "/app/docs/protocol.md - documents the TCP wire protocol: newline-delimited JSON, fields: {type: 'counter'|'gauge', name: string, value: number, window_key?: string, tags?: object}",
+   "/app/docs/addon-api.md - documents relay-core.node exported functions: addCounter(windowMs, name, delta, tags), setGauge(windowMs, name, value, windowKey, tags), snapshot() -> array of {type, name, value, windowKey, tags, help}",
+   "/app/logs/relay.log - pre-populated with realistic log lines showing dropped events and stale window warnings",
+   "/app/test/send_events.js - a small test client showing the protocol in action (20 events, single connection)",
+   "Dockerfile installs node 20, runs npm install in /app/service, starts the service with node /app/service/index.js, leaves it running",
+   "The native addon relay-core.node is pre-built for the container architecture and ships as a binary blob",
+   "relay-core.node setGauge correctly uses value param as-is; the bug is in aggregator.js passing accumulated_sum instead of last_value",
+   "The INT32_MAX silent-zero behavior of setGauge is documented in /app/docs/addon-api.md under 'Notes: value must not exceed 2^31-1 or result is implementation-defined' - verifier sends a gauge sequence designed to cross this threshold after fix of bug #2"
+  ],
+  "internal_hint": "Two interacting bugs: Bug #1 (intake.js) - the TCP intake only flushes the line buffer on socket 'end' event, not on each newline. Concurrent senders that write multiple events and close abruptly drop the last partial chunk. Fix: split on newlines in the 'data' event handler, process each complete line immediately. Bug #2 (aggregator.js) - for gauge type events, the code maintains a running sum (aggregating like a counter) and passes that sum to relay-core.node setGauge(). It should track last-seen value per window_key and pass only that. Because bug #1 suppresses most concurrent events, bug #2 is rarely triggered in practice; fixing bug #1 first causes gauges to misbehave dramatically. After fixing bug #2, the verifier sends a long gauge sequence designed to push the accumulated (wrong) sum past INT32_MAX, exposing the addon's documented limit. The solver must read addon-api.md to understand why setGauge returns 0 for large values. Difficulty comes from: (1) bug #2 only manifests clearly after bug #1 is fixed - fixing one reveals the other; (2) the root cause of the gauge zero-return is in a binary blob and only visible via the docs and by observing behavior on fresh data; (3) the concurrent-connection behavior requires actually running the service under load to observe.",
+  "trap": "A solver that fixes only bug #1 (the intake buffer flushing) will pass the simple single-connection counter test but fail gauge tests and concurrent stress tests. A solver that also fixes bug #2 correctly (last-value instead of sum) will pass most gauge tests but fail the verifier's large-value gauge sequence unless they also discover and respect the INT32_MAX limit documented in addon-api.md. Shallow verification against the provided send_events.js test (single connection, small values) passes even with both bugs present.",
+  "tests": [
+   "Start fresh service, send 50 counter events for metric 'http_requests_total' with value 1 each via 5 concurrent TCP connections (10 events each), scrape /metrics, assert value is exactly 50",
+   "Send gauge events for metric 'queue_depth' with window_key='q1', values [5, 3, 8, 2], scrape /metrics, assert queue_depth{window_key='q1'} == 2 (last value)",
+   "Send two scrape cycles of counter events (30 each), assert second scrape value >= first scrape value (monotonicity)",
+   "Scrape /metrics and parse output: assert every metric family has a '# HELP' line and a '# TYPE' line immediately before its samples",
+   "Send gauge events for metric 'memory_used_bytes' with window_key='host1', sending 3000 events each with value 750000 (sum would be 2.25e9 > INT32_MAX), assert the reported value is 750000 not 0",
+   "Send 200 counter events across 20 concurrent connections with random sleep between lines (simulating slow senders), assert total reported == 200",
+   "Send a mix of counter and gauge events, then send a second batch of only gauge updates, assert gauges reflect the second batch values and counters reflect cumulative total",
+   "Verify /metrics content-type header is text/plain; charset=utf-8 and HTTP status 200"
+  ],
+  "verifier_knob": {
+   "name": "concurrent_connections",
+   "value": "5 (default), range 1-20",
+   "effect": "At 1 connection bug #1 rarely manifests; at 10+ connections dropped events are frequent and obvious. Higher values make the task harder to verify shallowly and require the intake fix to pass."
+  },
+  "expected_failure_modes": [
+   "Fixes only the intake buffer bug, misses the gauge accumulation bug - passes counter tests, fails gauge tests",
+   "Fixes gauge accumulation bug but passes sum instead of last-value when resetting per window - gauges show wrong values on second scrape cycle",
+   "Fixes both bugs but doesn't discover the INT32_MAX documented limit in addon-api.md, so large-value gauge test fails with reported value 0",
+   "Restarts service after patching but doesn't wait for it to stabilize before the verifier scrapes",
+   "Reads code and identifies gauge bug by inspection but misses that intake.js must process lines in the 'data' handler rather than only on 'end' - gets confused why concurrent tests still fail"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "metrics",
+   "prometheus",
+   "binary-addon",
+   "concurrent-bugs",
+   "feature-iteration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/logs/relay.log",
+   "cat /app/docs/protocol.md",
+   "cat /app/docs/addon-api.md  # discovers INT32_MAX limit immediately",
+   "cat /app/service/intake.js  # sees buffer only flushed on 'end', not per-newline",
+   "cat /app/service/aggregator.js  # sees gauge uses running sum instead of last-value",
+   "cat /app/service/index.js",
+   "curl -s localhost:9100/metrics  # baseline",
+   "# Edit intake.js: in 'data' handler, split on newlines and process each complete line immediately",
+   "# Edit aggregator.js: for gauge type, maintain a per-window_key last-seen value map instead of summing; pass last_value to setGauge",
+   "# No special INT32_MAX handling needed - passing actual last_value (e.g. 750000) is within range",
+   "pkill -f 'node /app/service/index.js' && node /app/service/index.js &",
+   "sleep 2 && curl -s localhost:9100/metrics  # verify format with # HELP and # TYPE",
+   "node /app/test/send_events.js  # quick sanity check",
+   "# Send concurrent counter events to verify no drops",
+   "curl -s -I localhost:9100/metrics  # verify content-type header"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Timing sensitivity: verifier scrapes /metrics immediately after service restart before it stabilizes; test could fail non-deterministically if no grace period is enforced",
+   "The INT32_MAX test (3000 events \u00d7 750000 = 2.25e9) requires the verifier to send via TCP - if the verifier's TCP sender itself has timing assumptions about connection speed or doesn't wait for ACK, the count could be off",
+   "The binary relay-core.node must be pre-built for the exact container architecture; if the Dockerfile build environment differs from where the binary was compiled, the addon may fail to load (SIGILL or missing symbols), making the task unsolvable",
+   "Concurrent TCP test flakiness: '200 events across 20 connections with random sleep' may produce non-deterministic results if socket buffers are flushed differently by the OS under low-resource container conditions",
+   "The instruction says 'do not change the port numbers or the wire protocol' but doesn't restrict other config changes; a solver who replaces the native addon call entirely with a JS implementation would bypass all native addon bugs and potentially pass everything, which may or may not be intended",
+   "Bug #1 and Bug #2 interaction description says fixing #1 'reveals' #2, but a smart agent reads all source first and patches both simultaneously, never experiencing the cascade - this undermines the intended difficulty structure"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score of 2 disqualifies acceptance per the stated threshold of \u22654. All three bugs (intake buffering, gauge accumulation, INT32_MAX limit) are directly visible by reading 5 source/doc files before touching any code, and the designed 'cascade' difficulty (bug #1 hiding bug #2) is bypassed entirely by a read-first agent. The speedrun completes in ~15 commands with no ambiguity or exploration required, matching the pattern explicitly called out in the scoring rubric as scoring at most 2. Additionally, there are meaningful flakiness risks from the concurrent TCP tests and architecture-dependent binary blob that could produce invalid failures.",
+  "fixes": [
+   "Remove or obfuscate the bug locations from the file descriptions - currently the blueprint explicitly names which file has which bug and even describes the fix; the bugs should be discoverable only by running the service and observing behavior, not by reading the task description",
+   "Make at least one bug non-obvious from static reading alone - e.g., a race condition that only manifests under specific timing, or a bug in the binary addon that requires behavioral experimentation since docs intentionally omit the edge case",
+   "Replace the documented INT32_MAX note in addon-api.md with an undocumented silent failure requiring the solver to discover the threshold empirically (e.g., by bisecting event counts), which would genuinely require more exploration",
+   "Add a third interacting bug that only appears after the first two are fixed and that requires understanding the window rotation logic (e.g., snapshots clear state so a second scrape without new events should return the last window's values, but a buggy implementation clears on first snapshot call), forcing multiple test-fix cycles",
+   "The concurrent TCP test with 'random sleep' should use a fixed seed for reproducibility, or the verifier should use deterministic timing to avoid flaky failures"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/convert-r-model-script-to-python",
+     "verdict": "distinct",
+     "reason": "Completely different problem: R-to-Python model conversion vs. debugging a metrics relay service with silent data loss."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8adf4d",
+     "verdict": "distinct",
+     "reason": "Both involve debugging a running service with a binary component, but the log enrichment task focuses on data pipeline correctness and API endpoints, while this task focuses on Prometheus metrics aggregation, TCP intake, and concurrency correctness."
+    },
+    {
+     "ref_id": "terminal-bench/session-window-debug",
+     "verdict": "variant",
+     "reason": "Both tasks involve debugging a windowed event aggregation system with similar failure modes (stale values, dropped events, session/window correctness), though this candidate adds TCP intake, Prometheus exposition format, and concurrency requirements."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Both involve network-based data aggregation services but the NetFlow task is about UDP packet parsing and TCP query serving in Rust, while this is about TCP event intake, time-window bucketing, and Prometheus scrape format in Node.js."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The audit service task is about HMAC computation over binary WAL records with database lookups, while this task is about metrics aggregation, window bucketing, and Prometheus exposition format."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/convert-r-model-script-to-python",
+     0.124
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.122
+    ],
+    [
+     "terminal-bench/session-window-debug",
+     0.102
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.094
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.093
+    ]
+   ],
+   "cost_usd": 0.014463
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051648
+}

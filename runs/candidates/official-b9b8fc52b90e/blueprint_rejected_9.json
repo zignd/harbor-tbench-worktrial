@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "timeseries-rollup-variance-migration",
+  "title": "Time-Series Rollup Service: Variance and Migration Repair",
+  "scenario": "An analyst at a small data team notices that hourly rollup summaries from their in-house C time-series daemon ('tsd') have been producing subtly wrong aggregate statistics for high-variance sensor streams. They also need to run a backfill migration script to re-index six months of archived data into a new partition scheme \u2014 but the last engineer who tried running the migration left the service in a broken state. The environment contains: the tsd service source (~1400 lines across 6 .c/.h files), a pre-compiled libstats.so (no source) that tsd links for summary computations, a shell-based migration script (migrate.sh), a SQLite archive of historical rollups, and a small test harness.",
+  "instruction_draft": "The tsd service on port 7400 answers rollup queries but returns wrong aggregate statistics for some sensor streams; fix it so all rollup protocol responses are numerically correct. The migration script migrate.sh must also be run to completion so the archive is fully re-indexed; the service must answer queries correctly against the migrated archive afterward.",
+  "requirements": [
+   "The tsd service must respond correctly to rollup protocol requests (mean, variance, count, min, max) for all sensor streams including high-variance ones",
+   "Variance responses must be numerically accurate to within 1e-4 relative error compared to the true population variance",
+   "The migrate.sh script must complete successfully, re-indexing all historical partitions",
+   "After migration, rollup queries against archived partitions must return correct results",
+   "The service must remain running and answering new requests after the migration is complete",
+   "Timestamps in migrated records must be preserved exactly (no truncation or wrap-around)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, sqlite3, libsqlite3-dev, socat, bc, python3",
+   "Directory /app/tsd/ contains: main.c, protocol.c, rollup.c, archive.c, partition.c, util.c, and corresponding headers (~1400 lines total). tsd links against /app/lib/libstats.so",
+   "/app/lib/libstats.so is a pre-compiled shared library (no source) exporting: stats_init(ctx), stats_push(ctx, double val), stats_finalize(ctx, double *mean, double *variance, double *min, double *max, uint32_t *count). It uses Knuth's online algorithm BUT with a subtle bug: it resets accumulator state when count crosses 1000, causing variance to be computed only over the tail window, not the full stream",
+   "/app/tsd/rollup.c calls libstats with a fresh context per rollup window BUT also calls stats_push() once with a pre-computed 'seed mean' before pushing real values \u2014 this interacts with the library's internal reset: for streams with count near 1000, the reset discards the seed offset, producing a mean that is also wrong (not just variance)",
+   "/app/migrate.sh is a ~120-line bash script that reads the SQLite archive, re-partitions records by sensor_id % 8, and re-inserts them. It has a bug: it uses a shell arithmetic expression `$(( timestamp / 1000 * 1000 ))` when reformatting timestamps, which truncates sub-second precision for Unix timestamps > 2^31 (i.e., after 2038), but all test timestamps are in 2024-2025 range so this silently truncates to-the-second only when the intermediate division overflows bash's 32-bit arithmetic on the partition-key computation \u2014 specifically when sensor_id > 2147483647/sample_count, triggering integer overflow in the partition key formula that maps records to wrong partitions",
+   "The interaction: rollup.c's seed-mean injection means that fixing libstats.so's reset bug alone (e.g. by wrapping stats_push to skip the seed call) makes variance correct but the migrate.sh partition-key overflow now puts records in partition 0 for all overflowing sensors, which looks correct on spot-check (partition 0 exists) but fails query routing for sensors 4-7",
+   "The SQLite archive /app/data/archive.db contains ~50,000 rollup records across 8 sensor streams, spanning 6 months, with sensor_ids 0-7 and Unix timestamps in [1700000000, 1730000000]",
+   "A test harness /app/test/harness.py that sends protocol requests and checks responses is provided for the solver's use",
+   "The tsd Makefile compiles the service; tsd binds to port 7400 and speaks a simple line-oriented protocol: 'ROLLUP <sensor_id> <start_ts> <end_ts>' returns 'OK mean=<f> var=<f> min=<f> max=<f> count=<d>'",
+   "Verification script /app/verify.sh (run by judge) sends 12 protocol scenarios: 4 fresh-stream queries on high-count sensors, 4 archive queries post-migration on sensors 4-7, 2 edge-case queries on sensors with exactly 1000 samples, 2 cross-partition boundary queries; all must match reference values within tolerance",
+   "A plausible-but-uninvolved cache layer cache.c exists in the source tree and handles LRU eviction \u2014 it is correct and should not need modification, but agents may waste time investigating it",
+   "A plausible-but-uninvolved config parser config.c reads tsd.conf \u2014 also correct"
+  ],
+  "internal_hint": "Two interacting runtime bugs: (1) libstats.so resets its accumulator at count==1000 \u2014 only observable by streaming exactly 1000+ values and checking variance; discoverable by running the test harness with a synthetic high-count stream. (2) migrate.sh uses bash 32-bit integer arithmetic for partition key: `$(( sensor_id * sample_count ))` overflows for large sample_counts, routing records to wrong partitions \u2014 only observable by querying migrated data for sensors 4-7. The interaction: rollup.c injects a 'seed mean' via a spurious stats_push() before real data; this means fixing the stats reset (by patching rollup.c to not call stats_push with the seed) changes the count at which reset fires, making variance correct but also changing which sensors trigger the migrate.sh overflow \u2014 so running migration before fixing rollup.c puts records in different (wrong) partitions than running it after. Correct ordered procedure: (1) investigate the service with the test harness on a fresh high-count stream to find the variance bug, (2) patch rollup.c to remove the spurious seed push (this is the C fix, in source), (3) recompile, (4) investigate migrate.sh by running it on a copy of the DB and querying sensors 4-7 to find the partition routing bug, (5) fix the bash arithmetic to use python or awk for 64-bit math, (6) run migrate.sh on the real archive, (7) restart tsd. Doing migration before the rollup.c fix causes partition assignments to differ, and records end up in wrong locations that survive into the final state.",
+  "trap": "An agent that fixes only the libstats wrapper (adding a shim that resets context between calls without removing the seed push) will see variance become correct for the test harness but the seed-push still present means the per-stream count seen by libstats is inflated by 1, so streams with exactly 999 real samples now cross the 1000 threshold and corrupt. An agent that runs migrate.sh before fixing rollup.c and recompiling will get partition routing based on the buggy count values, placing sensors 4-7 data in partition 0; subsequent archive queries for those sensors return empty or wrong results. Shallow verification (checking only sensors 0-3 or only fresh streams) passes but sensors 4-7 archive queries fail at verify time.",
+  "tests": [
+   "Test 1: Send ROLLUP 2 <start> <end> for sensor 2 with a window containing exactly 1200 fresh samples pushed via the load generator; verify variance within 1e-4 of true population variance (libstats reset bug must be fixed)",
+   "Test 2: Send ROLLUP 5 <start> <end> querying archived data for sensor 5 post-migration; verify mean and count match reference (partition routing bug must be fixed and migration run after rollup.c fix)",
+   "Test 3: Send ROLLUP 7 <start> <end> querying archived data for sensor 7 post-migration; verify all five statistics correct (tests both bugs fixed in correct order)",
+   "Test 4: Send ROLLUP 1 <start> <end> for a window with exactly 1000 samples; verify variance not reset/zeroed (edge case at the reset boundary)",
+   "Test 5: Send ROLLUP 3 <cross-partition-start> <cross-partition-end> spanning two partitions; verify count equals sum of both partition record counts (tests partition boundary handling)",
+   "Test 6: Send ROLLUP 6 <start> <end> for a high-variance sensor stream with 2000 samples; verify variance > 0 and within tolerance (would be ~0 or wrong if reset fires at 1000 and only tail is used)",
+   "Test 7: Query sensors 4 and 6 both for archived data; verify neither returns empty result set (would fail if partition overflow routed their records to partition 0 under wrong count values)",
+   "Test 8: Verify service is still running (port 7400 accepting connections) after migration completes",
+   "Test 9: Send a novel sensor stream (sensor_id=9, never in archive) with 1500 samples; verify variance correct (regression test that fix generalizes)",
+   "Test 10: Cross-check that migrated archive record count equals pre-migration count (no records lost or duplicated by the migration fix)",
+   "Test 11: Query sensor 0 archive (should be unaffected by partition routing bug); verify correct as sanity baseline",
+   "Test 12: Verify timestamps of migrated records for sensor 5 match originals exactly to the second (no truncation from bash arithmetic on timestamp reformatting)"
+  ],
+  "verifier_knob": {
+   "name": "number_of_test_scenarios",
+   "value": "12",
+   "effect": "Reducing to 4 (only fresh-stream variance tests) makes the task easier since the migration bug and ordering constraint are never tested; increasing to 16 by adding more cross-partition and exact-count edge cases raises difficulty"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the libstats wrapper (adding a shim) without removing the seed push in rollup.c, causing off-by-one count that breaks the exactly-1000-sample edge case",
+   "Agent runs migrate.sh before fixing and recompiling rollup.c, causing partition routing to use inflated counts, putting sensors 4-7 in wrong partitions permanently",
+   "Agent verifies only sensors 0-3 or only fresh streams, declares success, but sensors 4-7 archive queries fail at verify time",
+   "Agent discovers the libstats reset bug by reading disassembly but misidentifies the reset threshold as 512 (a plausible power-of-two) and applies wrong workaround",
+   "Agent fixes migrate.sh arithmetic but forgets to re-run the migration after fixing it, leaving archive in corrupted state from the first (pre-fix) run",
+   "Agent patches rollup.c correctly but forgets to recompile before running migration, so migration still uses old count values for partition routing",
+   "Agent investigates cache.c and config.c extensively, consuming most of the time budget on uninvolved components"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "shell-scripting",
+   "c",
+   "binary-analysis",
+   "data-migration",
+   "service-protocol",
+   "two-interacting-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/tsd/rollup.c  # spot spurious stats_push(ctx, seed_mean) before real data loop",
+   "cat /app/migrate.sh    # spot $(( sensor_id * sample_count )) integer overflow in partition key",
+   "# Plan: fix rollup.c first, recompile, then fix migrate.sh, then run migration",
+   "sed -i '/stats_push(ctx, seed_mean)/d' /app/tsd/rollup.c  # remove seed push",
+   "make -C /app/tsd && pkill tsd; /app/tsd/tsd &  # recompile and restart",
+   "python3 -I /app/test/harness.py --fresh-stream sensor=2 count=1200  # verify variance fix",
+   "# Fix migrate.sh: replace $(( sensor_id * sample_count )) with python3 -c 'print(sid*sc)' equivalent",
+   "sed -i 's/$(( sensor_id \\* sample_count ))/$(python3 -c \"print($sensor_id * $sample_count)\")/g' /app/migrate.sh",
+   "cp /app/data/archive.db /app/data/archive.db.bak",
+   "bash /app/migrate.sh   # run migration on real archive",
+   "python3 -I /app/test/harness.py --archive sensor=5  # verify sensor 5 partition routing",
+   "python3 -I /app/test/harness.py --archive sensor=7  # verify sensor 7",
+   "python3 -I /app/test/harness.py --all               # full harness run"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'permanent corruption from wrong-order migration' trap is not warned in the instruction; agents who run migrate.sh first, then fix rollup.c, then re-run migrate.sh may recover if the script is idempotent (upsert vs insert), but the blueprint implies it is not \u2014 this ambiguity could cause valid-effort solutions to fail for environmental reasons rather than skill",
+   "libstats.so's reset at exactly count==1000 must be triggered deterministically; if the load generator or test harness has timing variance that occasionally pushes fewer samples, Tests 1, 4, and 6 may be flaky",
+   "The 'interaction' claim that fixing rollup.c changes which sensors overflow in migrate.sh depends on exact sample_counts in the archive; if those counts are fixed in the SQLite DB, this is deterministic, but if they vary across runs (e.g., from a load generator), the behavior changes",
+   "The instruction says 'fix it so all rollup protocol responses are numerically correct' without mentioning the ordering requirement between rollup fix and migration \u2014 an agent who does everything correctly but in wrong order may fail Tests 2/3/7 with no clear feedback",
+   "Disassembling libstats.so to find the reset threshold is plausible but objdump/gdb behavior depends on the binary being unstripped; if it is stripped, the threshold 1000 may not be symbolically readable, making the bug harder to discover by binary analysis than described"
+  ],
+  "verdict": "reject",
+  "reasons": "The two core bugs (seed push in rollup.c and arithmetic overflow in migrate.sh) are both directly visible by reading source files, making the speedrun approximately 13 commands and capping genuine_difficulty at 2 per the scoring rubric. The ordering dependency (fix rollup.c before running migration) is the real difficulty lever, but it is not mentioned in the instruction, creating an invalid failure mode where a competent agent does all the right fixes but in wrong order and receives no diagnostic feedback. The clarity score of 3 and genuine_difficulty of 2 fall below the acceptance thresholds (every score \u2265 3 and genuine_difficulty \u2265 4).",
+  "fixes": [
+   "Move the libstats.so bug discovery requirement to be non-trivial: make the seed push in rollup.c not obviously spurious (e.g., name it 'baseline_calibration' with a comment explaining its purpose, so agents must run experiments to discover it causes variance corruption, rather than spotting it by visual inspection)",
+   "Add an explicit instruction warning or omit any hint of ordering, but ensure the migration script is idempotent (or explicitly non-idempotent) so the failure mode is clear and not ambiguity-based \u2014 alternatively, document that 'migration must be run exactly once after the service is corrected'",
+   "Increase task surface area to push speedrun above 20 commands: add a third, genuinely non-obvious bug (e.g., in protocol.c's response formatter that truncates variance to 2 decimal places, only visible by running the verifier), or make the libstats.so bug require binary analysis (strip the library, obfuscate the threshold) to prevent source-reading shortcuts",
+   "Make migrate.sh's arithmetic overflow non-obvious: instead of $(( sensor_id * sample_count )), use a multi-step computation where the overflow occurs in an intermediate variable, requiring the agent to trace the logic across several lines to find it",
+   "Add the ordering constraint explicitly to the instruction ('the service must be corrected and recompiled before migration is run') to remove the ambiguous invalid failure mode, while compensating difficulty by making each individual bug harder to find"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/secure-postgres-schema-migration",
+     "verdict": "distinct",
+     "reason": "That task is about creating a secure backup-and-migration automation script for PostgreSQL with encryption; the candidate is about debugging numerical correctness in a C time-series daemon and running a SQLite re-indexing migration."
+    },
+    {
+     "ref_id": "terminal-bench/live-database-cutover",
+     "verdict": "distinct",
+     "reason": "That task is about zero-downtime database engine switching (MySQL to PostgreSQL) for a live API; the candidate is about fixing variance computation bugs in a C service and repairing a broken archive migration."
+    },
+    {
+     "ref_id": "terminal-bench-pro/secure-db-migration-and-wipe",
+     "verdict": "distinct",
+     "reason": "That task is about creating encrypted archive backups with checksums; the candidate is about debugging numerical bugs in a C time-series service and completing a partition re-indexing migration."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "variant",
+     "reason": "Both involve fixing incorrect aggregate statistics produced by a compiled C/native service against a SQLite database, though the candidate adds a migration repair component and focuses on variance accuracy with a precompiled shared library."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both involve diagnosing and repairing a pipeline where sensor data rollup statistics are numerically wrong, with a black-box binary component (precompiled .so vs. precompiled normalizer binary), though the candidate adds a broken migration repair requirement."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/secure-postgres-schema-migration",
+     0.202
+    ],
+    [
+     "terminal-bench/live-database-cutover",
+     0.18
+    ],
+    [
+     "terminal-bench-pro/secure-db-migration-and-wipe",
+     0.148
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.125
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.104
+    ]
+   ],
+   "cost_usd": 0.014631
+  },
+  "novel": false
+ },
+ "cost_usd": 0.064497
+}

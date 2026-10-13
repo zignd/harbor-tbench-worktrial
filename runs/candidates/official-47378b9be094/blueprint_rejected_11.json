@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "particle-sim-regime-migration",
+  "title": "Particle Simulation Regime Migration Repair",
+  "scenario": "You maintain `fluxcore`, an ~1,400-line in-house Monte Carlo particle transport library used by a small astrophysics group. A recent 'v2 deployment' refactored how the pipeline reads configuration and added a result-normalisation step backed by an SQLite database. Since then, users report that simulations in the high-energy regime (>1e4 eV) silently produce wrong flux integrals, while low-energy runs still pass CI. The deployed system has a migration script that must be run after any schema change, but the order in which it interacts with a post-processing step is not documented.",
+  "instruction_draft": "The particle transport pipeline at `/app/fluxcore/` is producing wrong integrated-flux results for high-energy particle inputs; low-energy inputs still pass. Fix the pipeline so that `python -m fluxcore.run --config /app/fluxcore/config/main.toml` produces correct flux integrals across all energy regimes, and ensure the SQLite result store at `/app/fluxcore/results.db` reflects the corrected outputs with a consistent schema.",
+  "requirements": [
+   "Running `python -m fluxcore.run --config /app/fluxcore/config/main.toml` completes without error for both low-energy (\u22641e3 eV) and high-energy (>1e4 eV) input particle sets.",
+   "Integrated flux values stored in results.db match the analytic reference integrals within 1% relative error for all energy bins.",
+   "The results.db database has schema_version=2 in the metadata table.",
+   "All rows in results.db have the normalized_flux column populated with non-null, finite values.",
+   "The pipeline reads its cross-section data from the correct source (not a stale override) for all energy regimes."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt installs: sqlite3; pip installs (pinned): numpy==1.26.4, scipy==1.13.1, toml==0.10.2, pytest==8.2.0",
+   "Directory layout: /app/fluxcore/{__init__.py, run.py, transport.py, cross_section.py, normalizer.py, db.py, migrate.py, config/, tests/, data/}",
+   "run.py (~180 lines): orchestrates load_config -> load_cross_sections -> run_transport -> store_results -> normalize_results; load_config uses toml with an explicit override mechanism: it merges config/main.toml then any file matching config/overrides/*.toml (alphabetically, later keys win); a planted override file config/overrides/dev_legacy.toml silently sets cross_section_model = 'legacy' which only affects the >1e4 eV regime (the legacy model is wrong above that threshold)",
+   "cross_section.py (~220 lines): implements two cross-section models 'standard' (correct) and 'legacy' (uses an approximation valid only below 1e3 eV); the branch is entirely data-dependent on the energy of the current particle batch, so the bug only triggers on high-energy inputs",
+   "transport.py (~300 lines): correct Monte Carlo transport loop, no bugs; realistic physics code with mean-free-path calculation, scattering angle sampling, energy loss",
+   "normalizer.py (~150 lines): reads results from the DB, applies a solid-angle normalization factor; has a latent bug: it reads schema_version from the metadata table and if version==1 it applies a legacy scaling factor of 4*pi instead of 2*pi (wrong); the migration sets version=2 which triggers the correct factor",
+   "db.py (~120 lines): creates/reads the SQLite DB; initial schema is version 1 (missing normalized_flux column); correct implementation otherwise",
+   "migrate.py (~80 lines): adds the normalized_flux column and sets schema_version=2; MUST be run before normalizer.py re-runs, otherwise normalizer reads version=1 and applies wrong factor; MUST be run after the config fix and re-run of transport, otherwise it migrates stale (wrong) flux values",
+   "config/main.toml: sets cross_section_model = 'standard', energy_bins = [10, 100, 1000, 10000, 100000], n_particles = 50000",
+   "config/overrides/dev_legacy.toml: sets cross_section_model = 'legacy' (the planted regression: a 'dev' override that was accidentally left in the deployed config directory)",
+   "data/: particle input files particles_low.json (energies 10-1000 eV) and particles_high.json (energies 10000-100000 eV); analytic reference integrals stored in data/reference_integrals.json for verification",
+   "tests/test_low_energy.py: only exercises low-energy inputs, passes with the bug present; tests/test_high_energy.py: exercises high-energy inputs but is not in the default CI run (discovered only by reading the test directory)",
+   "results.db: pre-seeded with stale schema_version=1 results from a previous run (wrong fluxes, no normalized_flux column), so the agent must detect staleness and regenerate"
+  ],
+  "internal_hint": "Root causes: (1) config/overrides/dev_legacy.toml silently overrides cross_section_model to 'legacy', causing wrong cross-section lookup for energies >1e4 eV \u2014 the agent must discover the override merge logic in run.py by running the pipeline and observing wrong high-energy outputs, then trace back to discover the override directory; (2) normalizer.py applies 4*pi instead of 2*pi because schema_version==1 in the stale DB \u2014 the agent must run migrate.py AFTER re-running transport (to get correct flux values into the DB) and BEFORE running normalizer \u2014 wrong order silently produces wrong normalized_flux even with correct transport results. Investigation path: run pipeline on both energy sets, observe high-energy divergence, instrument/log cross_section calls to find 'legacy' is selected, search for where that config value comes from, find override file, remove or fix it, re-run transport to get correct raw fluxes, run migrate.py, run normalizer, verify. If agent runs migrate.py first (before fixing config and re-running transport), the migration stamps version=2 on wrong data, normalizer then applies correct 2*pi factor to wrong fluxes, and the final values are still wrong but in a different way.",
+  "trap": "An agent that (a) removes the override file and immediately runs migrate.py + normalizer without re-running transport will normalize stale/wrong flux values from the pre-seeded DB and produce wrong normalized_flux; (b) an agent that re-runs transport correctly but runs normalizer before migrate.py will apply the wrong 4*pi factor; (c) an agent that only checks low-energy outputs will miss the high-energy divergence entirely since low-energy tests pass throughout. The hidden verify-time test generates fresh energy bins spanning both regimes and checks normalized_flux values against analytic integrals computed at verify time.",
+  "tests": [
+   "T1: results.db has metadata row with schema_version=2",
+   "T2: results.db has normalized_flux column; all rows have non-null finite values",
+   "T3: for each energy bin in the pre-defined low-energy set (10-1000 eV), relative error of normalized_flux vs reference integral < 1%",
+   "T4: for each energy bin in the pre-defined high-energy set (10000-100000 eV), relative error of normalized_flux vs reference integral < 1%",
+   "T5 (verify-time generated): verifier runs `python -m fluxcore.run --config /app/fluxcore/config/main.toml` with a fresh particle input set covering three hidden energy decades [500, 5000, 50000 eV]; checks that all normalized_flux values in the resulting DB rows are within 1% of analytic references computed by the verifier",
+   "T6: config/overrides/dev_legacy.toml no longer causes cross_section_model to be 'legacy' at runtime (either deleted, emptied, or main.toml explicitly overrides it after the override merge \u2014 verified by running the pipeline and checking a logged config dump)"
+  ],
+  "verifier_knob": {
+   "name": "number of hidden energy decades tested at verify-time",
+   "value": "3 decades (500, 5000, 50000 eV)",
+   "effect": "Raising to 5 decades forces the agent to handle edge cases at the model transition boundary (~1e3 eV) where both models give similar but not identical results; lowering to 1 decade makes T5 much easier to satisfy accidentally"
+  },
+  "expected_failure_modes": [
+   "Agent fixes the override file but runs migrate.py before re-running transport, leaving stale wrong fluxes in the DB that get normalized and stored as the final answer",
+   "Agent re-runs transport correctly but runs normalizer.py before migrate.py, so the 4*pi factor is applied and normalized_flux is off by a factor of 2",
+   "Agent only checks low-energy outputs after fixing the override (because low-energy CI was always passing), misses that high-energy transport is now correct but normalization is still wrong",
+   "Agent discovers the override mechanism but edits main.toml directly rather than removing the override file, and the override still takes precedence (override merge order: overrides win over main)",
+   "Agent runs migrate.py idempotently multiple times causing a schema conflict (column already exists error) if migrate.py is not written to be idempotent \u2014 leaving the DB in a broken state"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "deployment",
+   "ordered-procedure",
+   "data-dependent-bug",
+   "sqlite",
+   "configuration",
+   "monte-carlo"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/fluxcore/run.py  # discover override merge logic and pipeline structure",
+   "ls /app/fluxcore/config/overrides/  # find override files",
+   "cat /app/fluxcore/config/overrides/dev_legacy.toml  # confirm legacy override bug",
+   "cat /app/fluxcore/cross_section.py  # confirm legacy vs standard behavior above 1e4 eV",
+   "cat /app/fluxcore/normalizer.py  # find 4*pi vs 2*pi schema_version branch",
+   "cat /app/fluxcore/migrate.py  # understand what migration does and when to run it",
+   "cat /app/fluxcore/db.py  # understand schema version initial state",
+   "sqlite3 /app/fluxcore/results.db 'SELECT schema_version FROM metadata;'  # confirm stale v1",
+   "rm /app/fluxcore/config/overrides/dev_legacy.toml  # fix bug 1: remove stale override",
+   "python -m fluxcore.run --config /app/fluxcore/config/main.toml  # re-run transport with correct config to get correct raw fluxes in DB",
+   "python /app/fluxcore/migrate.py  # bump schema to v2, add normalized_flux column AFTER correct fluxes are stored",
+   "python -m fluxcore.run --config /app/fluxcore/config/main.toml  # re-run to trigger normalizer with v2 schema and correct 2*pi factor",
+   "sqlite3 /app/fluxcore/results.db 'SELECT schema_version FROM metadata; SELECT normalized_flux FROM results LIMIT 5;'  # verify"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 2,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "T5 verifier injects hidden energy decades by running `python -m fluxcore.run` with a 'fresh particle input set', but the pipeline reads from fixed paths (data/particles_low.json, particles_high.json). It is not explained how the verifier swaps in different energy inputs \u2014 if it modifies files, the mechanism is undocumented; if run.py has no CLI flag for particle input, T5 is structurally impossible without modifying run.py, making the test flaky or unfair.",
+   "The ordering trap (migrate.py must run AFTER transport re-run but BEFORE normalizer) is only a real trap if run.py calls normalizer.py internally as part of a single atomic pipeline. If so, an agent cannot interleave migrate.py between transport and normalize without modifying run.py \u2014 but instruction only says to 'fix the pipeline so that python -m fluxcore.run produces correct results', not to modify run.py. This ambiguity could make the correct solution require undocumented code surgery.",
+   "migrate.py idempotency is listed as a failure mode (column already exists error on multiple runs), but whether migrate.py is written idempotently is unspecified. If it isn't, an agent who runs the full pipeline twice (common verification pattern) will corrupt the DB silently, making a correct solution appear to fail.",
+   "The 1% relative error tolerance for 50,000-particle Monte Carlo simulations may be borderline achievable depending on RNG seed behavior. If the verifier uses the same code path with different random seeds, variance in the MC integral could push results outside 1%, creating flaky test outcomes.",
+   "T6 checks that dev_legacy.toml 'no longer causes cross_section_model to be legacy at runtime' \u2014 but the blueprint states that if the agent edits main.toml directly (rather than deleting the override), the override still wins. This is a valid failure mode but may be surprising and undocumented behavior that constitutes ambiguity for the solver."
+  ],
+  "verdict": "reject",
+  "reasons": "Verifiability scores 2 because T5's mechanism for injecting hidden energy inputs into a pipeline that reads from fixed file paths is unexplained and potentially structurally broken. The ordering trap \u2014 the core difficulty lever \u2014 collapses if run.py calls normalizer internally as part of one atomic command, because then the agent cannot interleave migrate.py without modifying run.py, which the instructions don't mention. With 13 speedrun commands and both bugs directly visible in source code, genuine_difficulty is at most 3, failing the minimum threshold of 4.",
+  "fixes": [
+   "Specify in the environment description how T5 injects hidden particle inputs: either run.py must accept a --particles CLI argument, or the verifier swaps data/particles_hidden.json into a known path before running \u2014 document this explicitly so the test is deterministic and fair.",
+   "Make the ordering constraint a genuine multi-step trap by having run.py split into `run.py transport` and `run.py normalize` subcommands, so the agent must explicitly decide when to call migrate.py between them; document in the instruction only that 'a migration script exists' without revealing order.",
+   "Raise genuine_difficulty by adding a third bug: e.g., a subtle off-by-one in the energy bin boundary check in transport.py that only manifests at the 1e4 eV boundary itself (not clearly visible from reading, requires running tests to discover), making source-reading alone insufficient.",
+   "Ensure migrate.py is explicitly non-idempotent (raises on duplicate column) and add to the test suite a check that the schema is valid after the agent's full procedure \u2014 this forces the agent to understand and handle idempotency, adding a real engineering decision.",
+   "Increase n_particles to 200,000 and set the tolerance to 0.5% to reduce MC variance risk in T3/T4/T5, or use a fixed RNG seed in the pipeline (config-settable) so results are deterministic across runs."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/si-fracture-fbc",
+     "verdict": "distinct",
+     "reason": "That task requires implementing a specific continuum-elasticity fracture mechanics model from scratch; the candidate is about debugging a multi-regime Monte Carlo pipeline with SQLite schema migration issues."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering a black-box binary normalizer; the candidate is about fixing a Python simulation pipeline with a known codebase and SQLite schema versioning bugs."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-based CSV pipeline deduplication and row-count correctness; the candidate is about a physics simulation producing wrong results for a specific energy regime with SQLite schema migration issues."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about incorrect region-level weighted aggregations from a config file mismatch; the candidate is about a Monte Carlo particle transport simulation silently producing wrong flux integrals for high-energy inputs with database schema versioning."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task requires fixing AES-CTR per-record encryption nonce derivation in a C library after a refactor; the candidate is about a Python particle simulation pipeline producing wrong results for high-energy regimes with SQLite migration ordering bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/si-fracture-fbc",
+     0.102
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.1
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.099
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.093
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.086
+    ]
+   ],
+   "cost_usd": 0.014982000000000002
+  },
+  "novel": true
+ },
+ "cost_usd": 0.060177
+}

@@ -1,0 +1,61 @@
+{
+ "slug": "canary-orchestrator-silent-promote",
+ "title": "Canary Deployment Orchestrator: Silent Promotion Repair",
+ "scenario": "A Node.js canary deployment orchestrator at /app manages gradual traffic shifting for microservices. It feeds incoming telemetry through a pre-compiled traffic-sampler binary (/app/bin/traffic-sampler, no source available) that applies weighted reservoir sampling before updating the health window. The orchestrator has structured JSON logs, a Prometheus /metrics endpoint, and an HTTP API. Tonight the payments-v2 canary was silently promoted to 100% traffic despite a 23% error rate in production\u2014the orchestrator never triggered a rollback.",
+ "instruction_draft": "ALERT [03:14 UTC]: canary=payments-v2 PROMOTED_TO_100PCT | p99_error_rate=23.4% | 847 downstream 5xx in 5min | PagerDuty #INC-4821\n\nThe canary orchestrator at /app promoted a broken deployment without rolling back. The orchestrator feeds incoming request telemetry through /app/bin/traffic-sampler (pre-compiled, no source) before updating its health window and deciding whether to promote or roll back.\n\nFix the orchestrator so that all of the following hold when the service is restarted with node /app/src/server.js:\n\n1. A canary whose sampled error rate exceeds config.errorThreshold (default 0.10) for at least config.minSamples (default 50) samples enters 'rolledback' phase and never advances to 'promoted'.\n2. Health-window state and accumulated sample counts survive a configuration reload (triggered by POST /api/reload or the periodic 30-second watcher).\n3. GET /api/status returns JSON with at minimum: { phase, sampleCount, sampledErrorRate, stableVersion, canaryVersion }.\n4. POST /api/rollback immediately sets phase to 'rolledback' regardless of current health.\n5. The rollback-decider module at /app/src/rollback-decider.js must be fully implemented (it is currently a stub returning {decision:'promote'} unconditionally).\n6. POST /api/telemetry accepts { statusCode, latencyMs, weight } records, routes them through the sampler pipeline, and updates the health window.\n\nThe verifier will start the service, send sequences of telemetry records, and check phase transitions and /api/status accuracy via HTTP.",
+ "requirements": [
+  "A canary with sampled error rate > errorThreshold after minSamples records enters 'rolledback' phase",
+  "A canary with sampled error rate <= errorThreshold after minSamples records advances to 'promoted' phase",
+  "Health-window sample counts and accumulated rates survive POST /api/reload",
+  "GET /api/status returns JSON with phase, sampleCount, sampledErrorRate, stableVersion, canaryVersion",
+  "POST /api/rollback sets phase to 'rolledback' immediately",
+  "rollback-decider.js must implement weighted error rate calculation using the sampler's output",
+  "POST /api/telemetry routes records through the sampler binary and updates the health window",
+  "Weighted error rate calculation uses the weight field from each sample, not a simple count"
+ ],
+ "environment": [
+  "Node.js 20 installed, no internet access",
+  "Pre-compiled traffic-sampler binary at /app/bin/traffic-sampler: reads newline-delimited JSON from stdin, applies weighted reservoir sampling with a specific bias that systematically under-represents records where (seq % 7 === 3), writes sampled records (with weight field possibly adjusted) to stdout; documented behavior in /app/docs/sampler-protocol.md",
+  "~1400 lines of JS across: src/server.js (express HTTP, config watcher setInterval 30s calls config.reload() which does delete require.cache[require.resolve('./health-window')] then re-requires it, resetting state \u2014 Bug 2), src/health-window.js (sliding window), src/config.js (config loader with reload()), src/rollback-decider.js (stub: always returns {decision:'promote'}), src/pipeline.js (spawns sampler binary, pipes telemetry through it)",
+  "Ancillary files: src/metrics.js (Prometheus formatting), src/logger.js (JSON structured log), src/deployment.js (phase state machine), src/version-store.js (stable/canary version tracking)",
+  "Realistic logs directory /app/logs/ with 3 days of historical JSON logs showing the payments-v2 canary being processed, including entries showing the window reset events",
+  "/app/docs/sampler-protocol.md: describes the binary's input/output JSON format, mentions 'sequence-based deduplication filter' as a feature, documents the weight field semantics but does NOT say which sequence numbers are filtered",
+  "/app/config/default.json: errorThreshold=0.10, minSamples=50, canaryWeight=0.2, reloadIntervalMs=30000",
+  "package.json with express, winston dependencies pre-installed",
+  "Dockerfile FROM python:3.13-slim-bookworm, installs nodejs npm, builds the traffic-sampler binary from C source (not left in image), copies compiled binary"
+ ],
+ "internal_hint": "Two interacting causes: (1) BUG - DATA-DEPENDENT, NOT SOURCE-VISIBLE: The traffic-sampler binary silently drops records where (record.seq % 7 === 3). Since the orchestrator assigns sequential seq numbers to incoming telemetry, this drops approximately 1/7 of all records. For error rates just above the threshold (e.g., 12% errors), the dropped records are drawn uniformly from errors and successes, so the sampled error rate is approximately correct \u2014 BUT the binary also applies a weight adjustment that halves the weight of error records when sampledCount > 20, causing systematic underestimation of error rates. Discovery requires: sending controlled streams with known error rates and comparing actual vs sampled rates \u2014 you cannot see this by reading any source file. (2) BUG - STATE-DEPENDENT: In src/config.js, the reload() method calls `delete require.cache[require.resolve('./health-window')]; this.healthWindow = require('./health-window');` which re-instantiates the health window module with zero counts. The setInterval in server.js calls config.reload() every 30 seconds. An agent reading config.js sees the delete+require pattern and might not realize this is called periodically \u2014 you must run the service and observe the window reset in logs. FIX SEQUENCE: (a) Investigate sampler binary by sending test streams via /api/telemetry and watching what comes through the pipeline (check pipeline.js for how sampler stdout is consumed); observe that sampleCount doesn't grow as fast as expected and error rates are lower than sent. (b) Fix rollback-decider.js: implement weighted error rate = sum(weight * isError) / sum(weight) for all samples in the window, compare against threshold. (c) Observe via logs that window resets every 30s \u2014 find the delete require.cache line in config.js and remove it (preserve the window instance across reloads by not destroying the module cache). (d) Account for sampler weight adjustment by either bypassing the sampler for the error classification (using raw statusCode from the original record, which the pipeline passes through alongside the sampled record) or by tuning threshold to account for the bias \u2014 the verifier's hidden tests send specific patterns, so the only robust fix is to not rely on the sampler's weight for the error decision, using the original statusCode instead. The interaction: fixing Bug 2 (window persistence) reveals that Bug 1 is still preventing rollbacks on error bursts that the sampler underweights. A shallow fix of only Bug 2 will pass the reload test but fail the high-error-rate tests. Fixing only Bug 1 fails because the window always resets before minSamples is reached.",
+ "trap": "An agent that fixes rollback-decider.js (obvious stub) and the require cache reset (visible with some reading) but trusts the sampler's weight field for error rate calculation will fail hidden tests where the sampler's weight halving causes the computed error rate to stay below threshold even when the actual error rate is 18-22%. The service reports a sampledErrorRate of ~9% (below the 10% threshold) when actual is 15%, so it promotes instead of rolling back. The agent must discover this discrepancy experimentally by sending calibrated traffic and comparing status.sampledErrorRate against the known input error rate.",
+ "tests": [
+  "T1 - healthy canary: send 80 telemetry records with statusCode=200, weight=1, sequential seq \u2192 GET /api/status must show phase='promoted' and sampledErrorRate < 0.10",
+  "T2 - unhealthy canary clear majority: send 70 records statusCode=200 then 30 statusCode=500 (30% errors), weight=1, random seq \u2192 after >50 samples status must show phase='rolledback'",
+  "T3 - marginal error rate with sampler bias: send 100 records where seq%7==3 are all statusCode=500 and rest are statusCode=200 (so actual error rate ~14.3% but sampler drops seq%7==3, meaning sampler sees ~0% errors) \u2014 service must still show phase='rolledback' within 120 samples, because the pipeline preserves original statusCode alongside sampled record; this test ONLY passes if rollback-decider uses original statusCode not sampler weight",
+  "T4 - reload persistence: send 40 records (below minSamples=50), POST /api/reload, send 20 more records all statusCode=500 \u2192 sampleCount in status must be 60 (not 20), confirming window survived reload",
+  "T5 - manual rollback: send 30 healthy records (phase=canary or warming), POST /api/rollback \u2192 status.phase must equal 'rolledback'",
+  "T6 - status schema: GET /api/status must have all five required fields with correct types: phase(string), sampleCount(number), sampledErrorRate(number), stableVersion(string), canaryVersion(string)",
+  "T7 - weight-adjusted error rate: send 60 records where 12 are errors (20% actual), all with weight=2.0 for errors and weight=0.5 for successes \u2192 sampledErrorRate must reflect weighted calculation ~(12*2)/(12*2+48*0.5)=0.5, exceeding threshold \u2192 phase=rolledback (verifier generates specific weight patterns at test time)",
+  "T8 - no premature promotion: send 49 records all statusCode=200 \u2192 phase must NOT be 'promoted' (minSamples not yet reached)"
+ ],
+ "verifier_knob": {
+  "name": "number_of_request_scenarios",
+  "value": "8 scenarios",
+  "effect": "Reducing to 4 scenarios (T1,T2,T4,T5) makes the task passable by fixing only the obvious stub and the window reset. The full 8 scenarios require discovering and compensating for the sampler binary's bias (T3) and implementing correct weighted arithmetic (T7), which requires runtime experimentation."
+ },
+ "expected_failure_modes": [
+  "Agent fixes rollback-decider stub with simple error count / total count (not weighted), failing T7",
+  "Agent discovers the require.cache reset in config.js but doesn't connect it to the setInterval periodic call (reads the code but doesn't run long enough to observe the 30s reset in logs), failing T4",
+  "Agent trusts the sampler's weight output for error classification, missing that seq%7==3 records are dropped, failing T3 because errors at those sequence positions are silently discarded",
+  "Agent fixes the sampler bias by adjusting threshold (e.g., sets errorThreshold=0.07) rather than using original statusCode, which breaks T1/T2 under different traffic distributions generated at verify time",
+  "Agent implements rollback-decider correctly but doesn't wire POST /api/telemetry to the sampler pipeline properly, so records bypass the pipeline and T3's interaction with the binary never manifests"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "deployment",
+ "tags": [
+  "canary-deployment",
+  "nodejs",
+  "binary-reverse-engineering",
+  "state-machine",
+  "telemetry"
+ ]
+}

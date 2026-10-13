@@ -1,0 +1,180 @@
+{
+ "blueprint": {
+  "slug": "log-aggregator-query-protocol",
+  "title": "Metrics Aggregation Query Service",
+  "scenario": "A data engineer inherits a log metrics pipeline built around a pre-compiled binary aggregator (no source available) that processes structured access logs and writes time-bucketed summaries into a SQLite database. The environment has the binary, several days of raw access logs, the partially-populated SQLite database, a protocol specification for a query service that was never implemented, and a handful of hand-checked sample queries with expected answers. The binary's bucketing behavior has a non-obvious invariant that only surfaces when you probe it with boundary-crossing data.",
+  "instruction_draft": "Hey \u2014 I'm handing off the metrics pipeline to you. The log aggregator binary at /app/bin/logagg writes bucketed summaries into /app/data/metrics.db, and there's a protocol spec at /app/docs/query_protocol.md that describes a TCP service we need running on port 7055. The service was never built. Can you implement it so it answers the query types in the spec correctly? There are sample queries in /app/docs/sample_queries.json you can use for sanity checks, but the real tests will throw fresh data at it. Make sure bucket boundaries and metric values are exact \u2014 the ops team gets paged if numbers drift.",
+  "requirements": [
+   "A TCP service listens on port 7055 and speaks the protocol defined in /app/docs/query_protocol.md",
+   "RANGE queries return per-bucket counts, sum, min, max, and p99 latency for the requested time window and endpoint path prefix",
+   "INSTANT queries return the single bucket containing the given timestamp with the same fields",
+   "TOPK queries return the K endpoint paths with the highest total request count over a time window, ordered descending",
+   "All bucket boundaries must match exactly those produced by the binary aggregator /app/bin/logagg",
+   "p99 latency values must be computed using the same method the binary uses, discoverable by probing it",
+   "The service must handle concurrent connections without dropping or corrupting responses",
+   "Responses must use the JSON framing specified in query_protocol.md (length-prefixed)"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base image",
+   "apt packages: sqlite3, netcat-openbsd, python3-dev, gcc",
+   "pip packages: none required (solver may install what they need)",
+   "/app/bin/logagg: compiled C binary (no source), takes a log file path as argument, appends bucketed rows to /app/data/metrics.db. Buckets are aligned to UTC midnight (start of day) in 5-minute intervals \u2014 NOT to Unix epoch multiples of 300. This is the hidden invariant.",
+   "/app/data/metrics.db: SQLite database pre-populated with 3 days of aggregated data from the binary. Schema: buckets(bucket_start INTEGER, endpoint TEXT, req_count INTEGER, latency_sum REAL, latency_min REAL, latency_max REAL, latency_p99 REAL). The bucket_start values look like normal Unix timestamps but are offset to day boundaries.",
+   "/app/logs/: raw access log files (Apache combined log format with extra latency_ms field), 3 days worth, roughly 500k lines total. These were the input to the binary.",
+   "/app/docs/query_protocol.md: describes the TCP protocol \u2014 JSON messages prefixed with 4-byte big-endian length, three query types (RANGE, INSTANT, TOPK) with their request/response schemas",
+   "/app/docs/sample_queries.json: 8 sample query/response pairs, all chosen to avoid bucket boundaries so they don't reveal the midnight-alignment invariant",
+   "/app/bin/logagg binary behavior details for author: bucket_start = (unix_ts - day_start_seconds) // 300 * 300 + day_start_seconds, where day_start_seconds = (unix_ts // 86400) * 86400. So bucket 0 of each UTC day starts at midnight. The binary computes p99 as the value at index ceil(0.99 * count) - 1 in a sorted array of latencies stored internally, which is the nearest-rank method with 1-based indexing. The binary stores individual latency values in a hidden JSON blob column 'latency_raw' as a sorted JSON array \u2014 this is how p99 is persisted and what the service must use.",
+   "The SQLite schema has a hidden column: latency_raw TEXT (JSON array of sorted floats). The sample_queries.json does not reference p99 for any bucket with count > 1, so this column's existence and purpose must be discovered by inspecting the schema.",
+   "Planted in the database: a 'metadata' table with one row containing the aggregator version and a 'bucket_align' field set to 'utc_midnight' \u2014 discoverable but easy to overlook",
+   "The raw logs span across UTC midnight on at least two nights, so probing the binary with a mini log file crossing midnight will reveal the alignment",
+   "Verifier generates fresh log entries at verify time, runs the binary to aggregate them, then queries the solver's service and compares responses"
+  ],
+  "internal_hint": "Root cause 1 (hidden_invariant, runtime-only): The binary aligns bucket boundaries to UTC midnight, not to Unix epoch. A solver who assumes standard 5-minute epoch buckets (ts // 300 * 300) will produce bucket_start values that differ from the binary's for any day after day 0. This is invisible by reading any file \u2014 it only appears when you probe the binary with a test log that crosses midnight and compare the resulting bucket_start values to what epoch-alignment would produce. The metadata table has a hint ('utc_midnight') but is easy to miss. Root cause 2 (build_component): The p99 computation uses nearest-rank (1-based), not interpolation, and the raw latency arrays are persisted in a latency_raw column not shown in any documentation. The solver must discover this column exists (via .schema or SELECT *), understand it holds a sorted JSON array, and implement the same indexing. p99 differs from interpolation-based percentiles for small buckets and is checked on fresh data. The TCP service itself is a non-trivial construction: length-prefixed framing, three query types, concurrent connections. A solver who implements epoch-aligned buckets will pass all 8 sample queries (which don't straddle midnight) but fail fresh verify-time queries that do.",
+  "trap": "A solver who implements epoch-aligned buckets (ts // 300 * 300) passes all 8 sample queries but fails hidden verify-time queries whose buckets straddle UTC midnight. Similarly, a solver who uses numpy/scipy interpolated p99 instead of nearest-rank (ceil(0.99*n)-1, 1-based) fails on fresh buckets with small counts. Both bugs are invisible without probing the binary on boundary-crossing data.",
+  "tests": [
+   "Test 1 (protocol framing): Send a malformed request (truncated length prefix) and verify the service closes the connection gracefully without crashing",
+   "Test 2 (INSTANT, non-boundary): Query a timestamp mid-day for a known endpoint; verify bucket_start, req_count, latency_sum, latency_min, latency_max, latency_p99 match binary-computed values",
+   "Test 3 (RANGE, midnight-crossing): Verifier generates ~200 log lines crossing UTC midnight, runs logagg, then issues a RANGE query spanning the midnight boundary; verifies that bucket_start values use day-aligned boundaries, not epoch multiples",
+   "Test 4 (INSTANT, first bucket of day): Query timestamp = UTC midnight + 30 seconds; verify bucket_start equals exactly midnight (not midnight rounded to prior epoch-300 boundary)",
+   "Test 5 (p99 correctness, small bucket): Fresh bucket with exactly 7 requests; verify p99 = value at index ceil(0.99*7)-1 = index 6 (0-based) in sorted latency_raw array, not interpolated",
+   "Test 6 (TOPK): Issue TOPK k=3 over a fresh 24-hour window; verify ordering by req_count descending, correct endpoint strings, correct counts",
+   "Test 7 (concurrency): Open 5 simultaneous connections, issue interleaved queries, verify all 5 receive correct independent responses",
+   "Test 8 (empty result): RANGE query for a future time window with no data; verify service returns empty bucket list rather than error or null",
+   "Test 9 (path prefix filter): RANGE query with prefix '/api/v2'; verify only endpoints starting with that prefix appear in results",
+   "Test 10 (TOPK tie-breaking): Two endpoints with equal req_count; verify alphabetical tiebreak as specified in protocol.md"
+  ],
+  "verifier_knob": {
+   "name": "number_of_midnight_crossings",
+   "value": "3 (three separate UTC midnight crossings in fresh verify data)",
+   "effect": "Raising adds more midnight-crossing test cases that must all use correct day-aligned buckets; lowering to 0 makes the hidden invariant undetectable by the verifier, making the task easier but less discriminating"
+  },
+  "expected_failure_modes": [
+   "Implements epoch-aligned buckets (ts // 300 * 300) \u2014 passes all 8 samples but fails midnight-crossing tests",
+   "Computes p99 with interpolation (numpy percentile default) instead of nearest-rank \u2014 fails small-bucket p99 tests",
+   "Misses the latency_raw column entirely and tries to recompute p99 from latency_sum/count (impossible) \u2014 fails all p99 tests",
+   "Implements the service single-threaded, failing the concurrency test",
+   "Discovers the midnight alignment but implements it only for INSTANT queries, not RANGE bucket enumeration",
+   "Correctly implements bucketing but uses the wrong day boundary (local timezone instead of UTC) if the container's TZ is not UTC"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-systems",
+  "tags": [
+   "sql",
+   "systems",
+   "black-box-binary",
+   "protocol-implementation",
+   "time-series",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/query_protocol.md",
+   "cat /app/docs/sample_queries.json",
+   "sqlite3 /app/data/metrics.db \".schema\"  # discovers latency_raw column",
+   "sqlite3 /app/data/metrics.db \"SELECT * FROM metadata\"  # finds bucket_align='utc_midnight'",
+   "sqlite3 /app/data/metrics.db \"SELECT bucket_start, endpoint, latency_raw FROM buckets LIMIT 5\"",
+   "python3 -c \"import math; arr=sorted([120.5,200.1,88.3,300.0,150.0,99.9,175.2]); n=len(arr); print(arr[math.ceil(0.99*n)-1])\"  # verify p99 formula",
+   "Write /tmp/test_midnight.log with entries spanning UTC midnight",
+   "/app/bin/logagg /tmp/test_midnight.log  # confirm midnight alignment behavior",
+   "sqlite3 /app/data/metrics.db \"SELECT bucket_start % 300, count(*) FROM buckets GROUP BY bucket_start % 300\"  # verify alignment",
+   "python3 -c \"ts=1700006400+30; day=ts//86400*86400; print((ts-day)//300*300+day)\"  # confirm formula",
+   "Write /app/service.py: TCP server with length-prefix framing, RANGE/INSTANT/TOPK handlers, SQLite queries, p99 from latency_raw, threading for concurrency",
+   "python3 /app/service.py &",
+   "python3 -c \"import socket,struct,json; s=socket.socket(); s.connect(('127.0.0.1',7055)); q=json.dumps({'type':'INSTANT','timestamp':...}).encode(); s.send(struct.pack('>I',len(q))+q); n=struct.unpack('>I',s.recv(4))[0]; print(json.loads(s.recv(n)))\"",
+   "Test all 8 sample queries programmatically",
+   "Test malformed/truncated prefix closes connection gracefully",
+   "Test RANGE with future timestamp returns empty list",
+   "Test TOPK ordering and tiebreak",
+   "Open 5 parallel Python sockets and send concurrent queries, verify all respond correctly"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The metadata table contains 'bucket_align'='utc_midnight' which directly reveals the hidden invariant; a systematic agent finds this in step 2 of DB exploration, bypassing the need to probe the binary \u2014 the primary difficulty lever is substantially weakened",
+   "Tiebreak rule for TOPK (alphabetical) must be explicitly and unambiguously specified in query_protocol.md or the test is unfair \u2014 the blueprint mentions it only in test 10 and says 'as specified in protocol.md', so the protocol doc must be carefully authored",
+   "SQLite concurrent read access from a multi-threaded Python server could cause 'database is locked' errors under the concurrency test if WAL mode is not enabled or connection pooling is not handled, creating environment-dependent flakiness",
+   "The verifier runs logagg to add fresh data to the same metrics.db that the solver's service is querying; if the service caches or holds a connection open, it might not see new rows \u2014 test could flake depending on SQLite read isolation and timing",
+   "The 'hidden' latency_raw column is only hidden from documentation; .schema reveals it immediately, so calling it 'hidden' overstates the discovery difficulty for any agent that inspects schema",
+   "If the container's TZ is not explicitly set to UTC, a local-timezone bug becomes a valid failure mode that is environment-dependent rather than solver-dependent",
+   "The instruction says 'no source available' for the binary but the blueprint gives the exact formula; if a solver reverse-engineers the binary instead of probing it, this is an alternative valid path not accounted for in difficulty estimation"
+  ],
+  "verdict": "reject",
+  "reasons": "The primary hidden invariant (UTC midnight bucket alignment) is directly exposed by the metadata table ('bucket_align'='utc_midnight'), which a systematic agent finds within the first few database inspection commands \u2014 this collapses the discovery challenge from 'probe the binary' to 'read a table row', reducing genuine_difficulty to 3 and failing the minimum threshold of 4. The overall design is otherwise strong (realistic scenario, deterministic verifier, well-layered traps), but the metadata hint fatally undermines the core difficulty lever. Additionally, the SQLite concurrency behavior under the verifier's concurrent logagg writes creates a plausible flakiness risk.",
+  "fixes": [
+   "Remove the metadata table entirely, or replace 'bucket_align'='utc_midnight' with a non-revealing value like 'v2' \u2014 force the solver to discover the alignment by probing the binary with boundary-crossing data",
+   "Alternatively, keep the metadata table but make the hint require non-trivial interpretation: e.g., store the epoch of the first bucket and let the solver derive the alignment formula by arithmetic, not by reading a human-readable string",
+   "Ensure the protocol.md explicitly specifies alphabetical tiebreak for TOPK to make test 10 fair and unambiguous",
+   "Set TZ=UTC explicitly in the Dockerfile/container environment to eliminate timezone-dependent failure modes",
+   "Add a note in the environment spec that the SQLite connection in the service should use WAL journal mode or check_same_thread=False with proper locking to prevent concurrency flakiness",
+   "To strengthen genuine_difficulty to 4-5, also remove the 'latency_raw' column from being trivially discoverable via .schema by instead having the binary write the p99 value computed from a non-obvious method \u2014 force the solver to probe with known small-count buckets and reverse-engineer the percentile formula from observed values"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a broken aggregation service with source code available; the candidate task is about implementing a new TCP query service over a pre-compiled binary with no source, reverse-engineering bucketing invariants."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a broken NetFlow aggregation service in Rust; the candidate task is about implementing a new TCP query protocol service on top of a pre-compiled SQLite-writing binary with reverse-engineered p99 semantics."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing bugs in an existing log enrichment pipeline and adding a missing API endpoint; the candidate task is about implementing an entirely new TCP query service with a specific wire protocol and reverse-engineered binary bucketing behavior."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing HMAC-SHA256 computation over a binary wire format with WAL record parsing; the candidate task is about implementing a TCP query service for time-bucketed metrics with reverse-engineered p99 and bucket boundary semantics."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a broken HMAC chain verifier with a silent bug in git history; the candidate task is about implementing a new TCP metrics query service with reverse-engineered bucketing and p99 semantics from a pre-compiled binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.185
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.165
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.161
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.138
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.134
+    ]
+   ],
+   "cost_usd": 0.015606
+  },
+  "novel": true
+ },
+ "cost_usd": 0.063156
+}

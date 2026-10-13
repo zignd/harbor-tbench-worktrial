@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "slo-burn-relay-dark-failure",
+  "title": "SLO Burn-Rate Relay: Silent Dark Failures at 3am",
+  "scenario": "A deployment health monitoring service ingests structured deployment event logs and answers HTTP protocol queries about SLO burn rates. The service has two components: a pre-compiled binary aggregator (`slo-agg`) that computes per-service burn rates from log streams, and a Node.js relay (`relay.js`) that translates HTTP health-check protocol requests into aggregator queries and formats responses. The system has been producing wrong burn-rate answers since the canary deploy three hours ago. PagerDuty shows 23 downstream monitors have gone dark \u2014 they're getting HTTP 200 responses but the burn rates are all reporting 0.0, masking a real incident.",
+  "instruction_draft": "```\n[03:17:42] ALERT pagerduty: slo-monitor downstream health checks returning HTTP 200 but burn_rate=0.0 for ALL services\n[03:17:43] Last known-good deploy: v2.4.1 (6h ago). Current: v2.4.2 (3h ago)\n[03:18:01] slo-agg binary unchanged. relay.js patched in v2.4.2.\n[03:18:15] Log pipeline appears healthy. No parse errors in relay logs.\n[03:18:22] 23/23 downstream monitors dark. SLO breach in ~40min if real traffic burn continues.\n```\n\nThe SLO burn-rate relay is at `/opt/slo-relay/`. The relay answers health-check protocol requests on port 7700. The protocol is documented in `/opt/slo-relay/PROTOCOL.md`.\n\nFix the relay so that:\n1. Every valid protocol request returns the correct burn rate for the requested service and window (1m, 5m, 30m, 1h) drawn from the live log stream.\n2. Requests for unknown services return the documented error response.\n3. Requests with malformed fields return the documented error response.\n4. The burn rate for a service over a window is the ratio of error-class events to total events in that window, expressed as a float between 0.0 and 1.0, computed from `/var/log/deploy-events/current.log` which is appended to in real time.\n5. The service must remain live on port 7700 and answer correctly for at least 30 consecutive valid protocol requests covering all four time windows and at least 5 distinct service names.\n\nThe log format, protocol wire format, and aggregator CLI interface are your resources. Investigate before patching.",
+  "requirements": [
+   "Valid protocol requests return correct burn_rate float (0.0\u20131.0) for the requested service and window",
+   "Requests for unknown services return the documented error response (not 0.0)",
+   "Malformed protocol requests return the documented error response",
+   "Burn rate is computed as error-class events / total events within the time window from /var/log/deploy-events/current.log",
+   "Service stays live on port 7700 answering correctly for 30+ consecutive requests across all 4 windows and 5+ service names"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs Node.js 20, writes all files, compiles slo-agg binary from C source (then deletes source), starts log generator and relay as background services",
+   "Pre-compiled binary /opt/slo-relay/bin/slo-agg: reads a log file path and a time window (1m|5m|30m|1h) from CLI args, prints JSON {service_name: {total:N, errors:M}} for all services seen in that window. Has an undocumented behavior: when total event count across all services in window exceeds 500, it silently switches to sampling mode and reports counts that are 1/10th of actual (both total and errors \u2014 so ratio is preserved, BUT the threshold check in relay.js uses raw counts, not ratio)",
+   "Bug 1 (data-dependent, invisible in source): relay.js checks `if (data[svc].total < 10) return 0.0` as a 'minimum sample' guard. Under low load (<500 total events) this never triggers. Under high load (>500 events), slo-agg samples to 1/10th, so a service with 80 events appears to have 8 \u2014 below the threshold \u2014 and relay returns 0.0 instead of computing burn rate. This is the primary visible symptom.",
+   "Bug 2 (interaction, only reveals after Bug 1 fixed): relay.js parses the protocol request using a regex that fails to match service names containing hyphens (e.g., 'auth-service', 'deploy-manager'). It silently falls through to the 'unknown service' path but returns burn_rate=0.0 instead of the documented error code. When Bug 1 is present, all services return 0.0 so this is indistinguishable. After Bug 1 fix, hyphenated services still return wrong response.",
+   "Missing component: the protocol uses a custom length-prefixed binary frame format (4-byte little-endian length header + UTF-8 JSON body) that relay.js partially implements \u2014 it can READ requests correctly but its RESPONSE encoder has an off-by-one on the length field (writes body.length instead of Buffer.byteLength(body)) which only differs for non-ASCII or >127-byte payloads. The verifier sends service names with unicode (e.g., service name containing em-dash) and responses with burn rates that format to long JSON strings.",
+   "/opt/slo-relay/relay.js: ~350 lines, the broken relay",
+   "/opt/slo-relay/PROTOCOL.md: documents the binary frame format, request/response JSON schemas, error codes",
+   "/opt/slo-relay/bin/slo-agg: compiled binary, no source",
+   "/var/log/deploy-events/current.log: live-appended NDJSON deployment events, format documented in /opt/slo-relay/LOG-FORMAT.md",
+   "/opt/slo-relay/LOG-FORMAT.md: documents the event log format",
+   "A log generator runs as a background process, appending realistic events to current.log at ~100 events/sec, with service names including hyphenated ones and sufficient volume to trigger the sampling mode",
+   "A test client /opt/slo-relay/test-client.js that sends 5 sample requests and prints results \u2014 this passes even with all bugs because it only uses short service names and low-volume windows"
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) Bug 1 is data-dependent \u2014 the slo-agg binary enters sampling mode above 500 events, making the relay's minimum-sample guard fire on real data but never on low-volume tests. The solver must observe this by running slo-agg manually against the live log and comparing raw counts to what relay.js checks. (2) Bug 2 only becomes visible after Bug 1 is fixed, because before the fix all responses are 0.0 anyway. (3) The response encoder bug only appears for the verifier's unicode service names and long JSON responses \u2014 the sample test client uses ASCII short names. The solver must read PROTOCOL.md carefully, instrument the relay, run slo-agg against live data, and notice the count discrepancy before understanding why.",
+  "trap": "A naive agent fixes Bug 1 (removes or adjusts the minimum-sample guard), runs test-client.js, sees correct burn rates for the 5 sample services, and declares success. The hidden tests then send hyphenated service names (which return wrong responses due to Bug 2) and unicode service names with long responses (which return corrupt frames due to the encoder bug). The agent never discovers Bug 2 because the sample log and test client only use underscore-separated names.",
+  "tests": [
+   "T1: Send 10 valid protocol requests for services with underscore names that exist in the log \u2014 verify burn_rate is a non-zero float matching slo-agg output / total (not 0.0)",
+   "T2: Send 10 valid protocol requests for services with hyphenated names (e.g., 'auth-service', 'deploy-manager', 'cache-writer') \u2014 verify response matches documented format and burn_rate is correct non-zero float",
+   "T3: Send requests for 3 service names not present in the log \u2014 verify response uses documented error code (not burn_rate=0.0)",
+   "T4: Send 5 malformed requests (missing fields, wrong types) \u2014 verify documented error responses",
+   "T5: Send requests for a service name containing a unicode character and a long-format response \u2014 verify the 4-byte length prefix in the binary frame correctly equals Buffer.byteLength(body), not body.length",
+   "T6: Send requests for all four time windows (1m, 5m, 30m, 1h) for the same service \u2014 verify values are monotonically non-decreasing (longer windows include more events) and all non-zero",
+   "T7: Inject a burst of 600 events for a single service into the log, wait 2s, then request 1m window \u2014 verify burn_rate is non-zero and within 5% of the true ratio (confirming sampling-mode compensation works)",
+   "T8: Send 30 consecutive valid requests covering all windows and 5+ distinct service names \u2014 verify all return HTTP 200 with correct protocol frames and no connection resets"
+  ],
+  "verifier_knob": {
+   "name": "distinct_service_count",
+   "value": "8 services including 4 hyphenated and 1 unicode",
+   "effect": "Reducing to 3 all-ASCII underscore services makes Bug 2 and Bug 3 invisible; raising to 12 with more unicode names increases chance of catching the encoder bug"
+  },
+  "expected_failure_modes": [
+   "Agent fixes Bug 1 only, runs sample test client, declares done \u2014 fails T2 (hyphenated names)",
+   "Agent fixes Bug 1 and Bug 2 but misses the response encoder off-by-one \u2014 fails T5 (unicode payload length)",
+   "Agent reads relay.js carefully but never runs slo-agg against live high-volume log, so never realizes the 500-event sampling threshold exists in the binary",
+   "Agent patches the minimum-sample guard incorrectly (raises threshold instead of computing ratio before checking), so burn rates are computed but wrong for services near threshold",
+   "Agent doesn't consult PROTOCOL.md and implements response framing from inference, getting the length field wrong in a different way"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "binary-protocol",
+   "log-analysis",
+   "slo",
+   "black-box-binary",
+   "two-interacting-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/slo-relay/PROTOCOL.md",
+   "cat /opt/slo-relay/LOG-FORMAT.md",
+   "cat /opt/slo-relay/relay.js  # read all ~350 lines",
+   "# Identify Bug 1: `if (data[svc].total < 10) return 0.0` guard",
+   "# Identify Bug 2: regex missing hyphens e.g. /^[a-z_]+$/ won't match auth-service",
+   "# Identify Bug 3: response encoder uses body.length instead of Buffer.byteLength(body)",
+   "/opt/slo-relay/bin/slo-agg /var/log/deploy-events/current.log 1m  # confirm output shape",
+   "# Fix Bug 1: remove or replace the minimum-sample guard with ratio check",
+   "# Fix Bug 2: update service name regex to include hyphens",
+   "# Fix Bug 3: replace body.length with Buffer.byteLength(body) in response encoder",
+   "pkill -f relay.js; node /opt/slo-relay/relay.js &",
+   "node /opt/slo-relay/test-client.js  # verify basic pass",
+   "# Manual test hyphenated service: echo request | nc localhost 7700",
+   "# Manual test unicode service name frame length check",
+   "# Verify T6 monotonicity with manual requests across 4 windows"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "T7 is timing-sensitive: injecting 600 events and waiting 2s may not reliably land in the 1m window if log generator activity or window boundary shifts affect slo-agg output",
+   "T6 monotonicity assumption is incorrect for real traffic: burn rate for 1m window can legitimately exceed 5m window if recent traffic is worse than historical, making this test scientifically wrong",
+   "The 500-event sampling threshold is volume-dependent on the live log generator; if generator rate varies or falls behind, the threshold may not be crossed reliably during testing, making Bug 1 not reproducible",
+   "Bug 3 (unicode payload) requires the verifier to send a specific unicode service name, but the solver instruction never mentions unicode service names will be tested \u2014 solver may fix all visible bugs and still fail T5 without knowing to look for this",
+   "Fixing Bug 1 by 'compensating for sampling' (multiply counts by 10) vs 'removing the guard' are both plausible but produce different behavior at edge cases \u2014 the task doesn't specify which correct approach to take"
+  ],
+  "verdict": "reject",
+  "reasons": "All three bugs are directly readable from the relay.js source code in a single file review pass, making the speedrun ~15 commands and genuine_difficulty score 2 per rubric rules (bugs visible by reading source). The difficulty framing as 'data-dependent' is undermined because the fix for Bug 1 is obvious from source inspection regardless of whether the agent runs slo-agg manually. Additionally, T6's monotonicity assumption is scientifically invalid for live traffic, and the unicode service name requirement (T5) is never hinted at in the solver-facing instruction, creating an unfair hidden test.",
+  "fixes": [
+   "To raise genuine_difficulty: move Bug 2 (hyphen regex) into the compiled slo-agg binary behavior rather than relay.js source \u2014 force the solver to discover it by black-box testing the binary with hyphenated names, not by reading source",
+   "Remove T6 monotonicity requirement or replace with a weaker claim (e.g., 'longer windows return >= as many total events') since burn rate need not be monotone across windows with live traffic",
+   "Add an explicit hint in the instruction that the verifier uses unicode service names and non-ASCII payloads, so T5 is not a purely hidden test \u2014 or document it in PROTOCOL.md with an example",
+   "Make Bug 1 harder to spot by removing the comment explaining it, or by hiding it in a helper function with an innocuous name, so source inspection alone is insufficient without understanding the sampling interaction",
+   "Specify exactly what 'compensation' means for the sampling mode (e.g., 'multiply sampled counts by 10 before computing ratio') to eliminate ambiguity in correct fix for Bug 1 when near-threshold"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task fixes a log tailer + GeoIP enricher pipeline with a Flask API returning wrong stats, while the candidate fixes a protocol relay translating HTTP requests to aggregator queries with silent zero burn-rate responses \u2014 different artifacts, protocols, and debugging challenges."
+    },
+    {
+     "ref_id": "terminal-bench-pro/configure-apache-logging-and-rate-limit",
+     "verdict": "distinct",
+     "reason": "That task is about configuring Apache with logging and rate limiting from scratch, while the candidate is about debugging a silent correctness bug in an existing SLO burn-rate relay service."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task fixes an HMAC chain verifier with a silent bug in cryptographic chaining logic over a stdin/stdout protocol, while the candidate fixes an HTTP relay silently returning 0.0 burn rates by miscomputing or mis-querying an aggregator binary."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task fixes incorrect weighted aggregation in a compiled service writing to SQLite, while the candidate fixes an HTTP relay silently masking real burn rates from a log stream."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task fixes a Node.js NDJSON schema-validation pipeline for correctness and performance, while the candidate fixes an HTTP relay returning wrong burn rates from a binary aggregator queried via protocol translation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.149
+    ],
+    [
+     "terminal-bench-pro/configure-apache-logging-and-rate-limit",
+     0.133
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.131
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.098
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.095
+    ]
+   ],
+   "cost_usd": 0.015528
+  },
+  "novel": true
+ },
+ "cost_usd": 0.063141
+}

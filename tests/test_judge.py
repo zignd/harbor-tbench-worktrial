@@ -40,7 +40,8 @@ def test_audit_pass_maps_labels():
 
 
 def test_failure_judge_requires_a_known_valid_mode():
-    ok = {"valid": True, "mode": "weak_verification", "explanation": "x"}
+    ok = {"valid": True, "mode": "weak_verification", "explanation": "x",
+          "instruction_quote": "Fix the repository so all commits are kept."}  # fmt: skip
     assert judge.analyze_failure(TASK, OPUS_TRIAL, TRAJ, chat_fn=lambda *a, **k: _reply(ok))[
         "valid"
     ]
@@ -69,3 +70,33 @@ def test_extract_json_survives_prose_second_objects_and_trailing_commas():
     assert extract_json('Here: {"a": 1, "b": [1, 2,],} and then {"c": 2}') == {"a": 1, "b": [1, 2]}
     assert extract_json('```json\n{"x": {"y": 1}}\n```\n```json\n{"z": 2}\n```') == {"x": {"y": 1}}
     assert extract_json('note {not json} then {"ok": true}') == {"ok": True}
+
+
+def test_extract_json_never_returns_a_nested_object_of_a_broken_outer_one():
+    import pytest
+
+    from analysis.llm import extract_json
+
+    with pytest.raises(ValueError):
+        extract_json('{"slug": "x", "knob": {"name": "n"}, oops}')
+    assert extract_json('{"slug": "x", "knob": {"name": "n"}}') == {
+        "slug": "x",
+        "knob": {"name": "n"},
+    }
+
+
+def test_extract_json_finds_the_object_after_unbalanced_shell_braces():
+    from analysis.llm import extract_json
+
+    reply = (
+        "Speedrun:\n1. awk '{print $1' broken\n2. done\n\n"
+        + '{"scores": {"clarity": 4}, "verdict": "reject"}'
+    )
+    assert extract_json(reply) == {"scores": {"clarity": 4}, "verdict": "reject"}
+
+
+def test_valid_failure_without_an_instruction_quote_is_overruled():
+    unstated = {"valid": True, "mode": "weak_verification", "explanation": "tie order differs",
+                "requirement": "tied rows in SQLite's natural order", "instruction_quote": ""}  # fmt: skip
+    result = judge.analyze_failure(TASK, OPUS_TRIAL, TRAJ, chat_fn=lambda *a, **k: _reply(unstated))
+    assert result["valid"] is False and result["mode"] == "test_overreach"

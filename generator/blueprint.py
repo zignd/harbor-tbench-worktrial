@@ -198,7 +198,7 @@ RETRY_SECTION = """
 ## Previous blueprints for this spec were rejected
 Reasons: {feedback}
 Write a substantially different task: a different system, failure and investigation path, not a
-rewording of the rejected one."""
+rewording of the rejected one. Think it through silently and reply with only the JSON object."""
 
 
 def make_blueprint(
@@ -211,7 +211,7 @@ def make_blueprint(
     reply = chat(
         prompt,
         system=SYSTEM,
-        max_tokens=6000,
+        max_tokens=12000,
         temperature=0.9,
     )
     return Blueprint(**extract_json(reply.text)), reply.cost_usd

@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "fixedpoint-raf-checksum-recovery",
+  "title": "RAF Image Checksum Recovery",
+  "scenario": "A small in-house RAW photo ingestion pipeline processes Fujifilm RAF files from field cameras. The pipeline's validator module reads each RAF file, extracts the embedded JPEG preview, the raw data block offsets/lengths, and a 32-bit rolling Adler-32 checksum stored in a proprietary trailer. After a refactor to support a new camera model, the validator silently accepts corrupt files and rejects valid ones. The codebase is ~1,200 lines across a parser, a validator, a checksum module, and a CLI harness.",
+  "instruction_draft": "Hey, the RAF validator in `/app` is broken after the refactor last week \u2014 it's letting bad files through and bouncing good ones. The CI ran fine on the three sample files in `/app/testdata/` but we're seeing failures on real camera output. The tool is `python /app/raf_validator.py <file>` and should exit 0 for valid RAFs and exit 1 for corrupt ones. Fix it so it works correctly on arbitrary RAF files. The checksum algorithm and trailer layout are documented in `/app/docs/raf_trailer_spec.md`.",
+  "requirements": [
+   "raf_validator.py exits 0 for every valid RAF file in the hidden corpus",
+   "raf_validator.py exits 1 for every corrupt RAF file in the hidden corpus",
+   "No valid file is rejected (false negative rate = 0)",
+   "No corrupt file is accepted (false positive rate = 0)",
+   "The tool must handle all documented edge cases: zero-length raw data blocks, JPEG previews at non-standard offsets, trailer at EOF with no padding, and Adler-32 wrap-around at 2^16-1 boundary"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm with no extra pip packages (stdlib only)",
+   "/app/raf_validator.py \u2014 CLI harness, ~120 lines, calls parser and validator",
+   "/app/raf_parser.py \u2014 reads RAF binary structure: header magic, directory offsets, JPEG block, raw data block, trailer; ~300 lines with a subtle off-by-one in the trailer seek that only triggers when the raw data block length is a multiple of 512 bytes",
+   "/app/raf_checksum.py \u2014 Adler-32 implementation with a bug: the modulo reduction uses 65521 correctly for the A accumulator but uses 65536 (power of 2) for the B accumulator, making it wrong on data longer than ~700 bytes; the three sample files are all under 700 bytes so the bug is invisible on testdata",
+   "/app/raf_validator.py \u2014 validation logic also has a range check that tests `offset + length > file_size` with `>=` instead of `>`, wrongly rejecting files where a block ends exactly at EOF",
+   "/app/docs/raf_trailer_spec.md \u2014 complete specification: RAF magic bytes (FUJIFILM\\x0c\\x00\\x00\\x00\\x00\\x00), directory layout, trailer format (4-byte Adler-32 over the raw data block, little-endian), correct Adler-32 algorithm with mod 65521 for both A and B, edge case notes",
+   "/app/testdata/ \u2014 three small RAF files (all under 700 bytes of raw data, raw blocks not multiples of 512, blocks not ending at EOF) that pass the broken code",
+   "/app/generate_testdata.py \u2014 the script used to create testdata, showing the intended format (solver can read this to understand the format)",
+   "~400 lines of plausible but uninvolved utility code: /app/raf_exif.py (EXIF tag reader), /app/raf_thumbnailer.py (JPEG extraction), /app/raf_catalog.py (SQLite catalog writer)"
+  ],
+  "internal_hint": "Three independent bugs interact: (1) raf_checksum.py uses mod 65536 for the B accumulator instead of mod 65521 \u2014 invisible on small files but wrong on any raw block longer than ~700 bytes; (2) raf_parser.py has an off-by-one in the trailer seek: it seeks to `file_size - 4` but should seek to the documented trailer offset computed from the directory (the bug surfaces only when raw_data_length % 512 == 0 because that's when the parser miscounts padding); (3) raf_validator.py uses `offset + length >= file_size` instead of `>` for the bounds check, rejecting valid files whose block ends exactly at EOF. The three provided testdata files were carefully sized to avoid all three failure modes. The solver must run the tool against larger/differently-structured inputs, observe failures, instrument the checksum and parser, read the spec, and fix all three sites. Finding bug #1 requires either reading the spec carefully or testing on a file >700 bytes. Finding bug #2 requires a file whose raw_data_length is divisible by 512. Finding bug #3 requires a file whose block ends exactly at EOF.",
+  "trap": "A solver that fixes only the Adler-32 modulus (bug #1, the most obvious one after reading the spec) will pass files with large raw blocks but still fail on: files where raw_data_length % 512 == 0 (bug #2 causes wrong trailer read \u2192 wrong checksum comparison), and valid files whose data block ends at EOF (bug #3 causes false rejection). The hidden corpus specifically includes files hitting each of the three failure modes independently and in combination. A solver that only runs the three provided testdata files after any fix will see green and stop.",
+  "tests": [
+   "Corpus of 60 valid RAF files, generated at verify time with seeded PRNG: 20 with small raw blocks (<700 bytes), 20 with large raw blocks (>2000 bytes, triggering Adler-32 B-accumulator bug), 10 with raw_data_length divisible by 512 (triggering parser off-by-one), 10 with data block ending exactly at EOF (triggering bounds check bug) \u2014 all must exit 0",
+   "Corpus of 60 corrupt RAF files: 20 with single-byte flips in the raw data block (checksum mismatch), 20 with correct checksum but wrong magic bytes, 20 with checksum computed with wrong modulus (as the buggy code would produce) to verify the fixed code rejects them \u2014 all must exit 1",
+   "Edge case: RAF file where raw data block is empty (length=0); Adler-32 of empty data is A=1, B=0 per spec; validator must accept if trailer matches and reject if it doesn't",
+   "Edge case: RAF file where Adler-32 A accumulator wraps exactly at the 65521 boundary mid-stream; verify correct wrap-around behavior",
+   "Edge case: JPEG preview at a non-standard offset (offset > 0x100); parser must not assume fixed offset",
+   "Regression: all three original testdata files must still exit 0 after the fix"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "60 valid + 60 corrupt",
+   "effect": "Raising to 120+120 adds more combinations of the three bug triggers and more Adler-32 edge cases (wrap-around, block-aligned sizes, EOF-aligned blocks), making partial fixes fail more reliably; lowering to 20+20 reduces coverage and may let a fix of only bug #1 scrape through"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the Adler-32 modulus bug (most spec-readable), misses the parser off-by-one and the bounds-check sign error, passes on large-block files but fails on block-aligned and EOF-aligned files",
+   "Solver rewrites the checksum module from scratch correctly but doesn't discover the parser trailer seek bug because it only manifests on raw_data_length % 512 == 0, which doesn't appear in testdata",
+   "Solver fixes bugs #1 and #3 but misses #2 because the off-by-one in the seek requires understanding that the parser counts padding bytes differently for 512-aligned blocks \u2014 this is only visible by running on generated inputs or tracing the seek arithmetic",
+   "Solver verifies only against the three provided testdata files after fixing, sees all pass, submits without testing edge cases",
+   "Solver reads the spec and reimplements the parser from scratch but introduces a new off-by-one in JPEG offset parsing for non-standard offsets"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "binary-format",
+   "checksum",
+   "observe-not-read",
+   "edge-case-inputs",
+   "refactoring",
+   "specification-adherence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/raf_trailer_spec.md",
+   "cat /app/raf_checksum.py  # spot mod 65536 vs 65521 bug",
+   "cat /app/raf_parser.py  # spot off-by-one in trailer seek arithmetic",
+   "cat /app/raf_validator.py  # spot >= vs > bounds check",
+   "cat /app/generate_testdata.py  # understand format",
+   "# Fix bug #1: change B accumulator modulus from 65536 to 65521 in raf_checksum.py",
+   "sed -i 's/% 65536/% 65521/' /app/raf_checksum.py",
+   "# Fix bug #3: change >= to > in bounds check in raf_validator.py",
+   "sed -i 's/offset + length >= file_size/offset + length > file_size/' /app/raf_validator.py",
+   "# Fix bug #2: read parser seek logic, compute correct trailer offset from directory entry rather than file_size - 4",
+   "# Edit raf_parser.py to fix seek to use directory-computed offset, not file_size minus constant",
+   "python /app/raf_validator.py /app/testdata/sample1.raf",
+   "python /app/raf_validator.py /app/testdata/sample2.raf",
+   "python /app/raf_validator.py /app/testdata/sample3.raf",
+   "python /app/generate_testdata.py --size 1024 --aligned 512 > /tmp/test_aligned.raf",
+   "python /app/raf_validator.py /tmp/test_aligned.raf",
+   "python /app/generate_testdata.py --eof-aligned > /tmp/test_eof.raf",
+   "python /app/raf_validator.py /tmp/test_eof.raf"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "All three bugs are source-readable; a frontier agent reading the spec then the three source files will identify them without any dynamic testing, making the 'observe-not-read' tag misleading",
+   "generate_testdata.py exposes the full intended format, potentially allowing a solver to re-generate test inputs to validate fixes without deeply understanding the bugs",
+   "The parser off-by-one description is complex ('only when raw_data_length % 512 == 0 because that's when the parser miscounts padding') \u2014 if the actual implementation doesn't match this exact description precisely, the verifier corpus may not trigger the bug correctly",
+   "The spec documenting correct behavior means a solver who reads only the spec and rewrites from scratch would pass without finding any bugs \u2014 this may not test debugging skill as intended",
+   "If generate_testdata.py can be run with flags to produce 512-aligned and EOF-aligned files, the solver can self-verify all edge cases trivially, reducing difficulty"
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 3, below the required minimum of 4, because all three bugs are directly visible by reading source files and the spec \u2014 no dynamic observation is required. A frontier agent will find all three bugs in a single pass through the four relevant files, making the 'observe-not-read' tag inapplicable. The speedrun reaches a likely-correct solution in ~18 commands purely through source reading, consistent with the rubric's calibration that source-visible bugs score at most 2-3.",
+  "fixes": [
+   "Make at least one bug non-source-visible: e.g., the Adler-32 bug should be in a C extension or compiled module where the solver must infer the bug from behavioral testing, not code inspection",
+   "Remove or restrict generate_testdata.py from the solver environment (keep it only for verifier use) so the solver cannot trivially generate edge-case inputs that reveal which code paths are broken",
+   "Add a fourth bug that requires dynamic observation to find \u2014 e.g., a race condition in file handle management, or a bug that only manifests when two specific conditions coincide and isn't visible from reading any single file",
+   "Increase the testdata corpus to include some files >700 bytes so the Adler-32 bug is discoverable without reading source \u2014 then the observe-not-read tag would be justified and a solver who only reads source without testing would miss it"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/polyglot-yaml-config-validator",
+     "verdict": "distinct",
+     "reason": "That task is about creating a polyglot bash/Python validator for YAML config fields; the candidate is about debugging a binary file parser (RAF/Fujifilm RAW) with a proprietary Adler-32 checksum trailer \u2014 entirely different domain, artifact, and algorithm."
+    },
+    {
+     "ref_id": "terminal-bench-pro/polyglot-bash-python-config-validator",
+     "verdict": "distinct",
+     "reason": "That task is about creating a polyglot script to validate KEY=VALUE config files; the candidate is about fixing a broken RAF binary file parser/checksum verifier \u2014 different problem, domain, and technique."
+    },
+    {
+     "ref_id": "terminal-bench-pro/train-loan-default-logreg-model",
+     "verdict": "distinct",
+     "reason": "That task is about training a logistic regression model and computing a SHA-256 checksum of a CSV; the candidate is about debugging a RAF binary file format parser with Adler-32 checksums \u2014 completely different."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a black-box binary normalizer and fixing a SQL pipeline; the candidate is about debugging a Python source-available RAF file parser with a specific checksum algorithm \u2014 different artifacts, approach, and skills required."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding a silent regression in a ~1,200-line Python pipeline (introduced by a refactor) where tests still pass but real inputs fail, and fixing it to meet a correctness threshold \u2014 the domain (spectral entropy vs. RAF checksum) differs but the core problem structure, debugging challenge, and evaluation pattern are essentially the same."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/polyglot-yaml-config-validator",
+     0.222
+    ],
+    [
+     "terminal-bench-pro/polyglot-bash-python-config-validator",
+     0.124
+    ],
+    [
+     "terminal-bench-pro/train-loan-default-logreg-model",
+     0.089
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.072
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.072
+    ]
+   ],
+   "cost_usd": 0.016385999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.058595999999999995
+}

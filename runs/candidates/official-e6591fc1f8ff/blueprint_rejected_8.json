@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "wheel-codec-deployment-repair",
+  "title": "Wheel Codec Deployment Repair",
+  "scenario": "You are a release engineer at a data-infrastructure company. The team ships a Python wheel (`packbench`) that wraps a compiled codec extension (`_packcodec.so`) used to encode/decode variable-length binary records from rotational sensor logs. The wheel was built two sprints ago and deployed to staging; QA now reports that decoded records silently corrupt the payload tail on a subset of inputs, but only after the wheel is pip-installed \u2014 the dev editable install passes all existing unit tests. The repo contains ~1,400 lines across the build harness, a pure-Python reference codec, a C extension source stub (no longer compiled into the shipped binary \u2014 that binary is pre-built and opaque), and roughly 400 MB of rotational sensor log shards in `/app/data/`.",
+  "instruction_draft": "Our staging deployment of the `packbench` wheel (`/app/dist/packbench-1.4.0-cp313-cp313-linux_x86_64.whl`) is producing corrupted output on real sensor log shards. When the installed wheel's `packbench.decode(buf)` is called on records from `/app/data/`, decoded payloads must match the pure-Python reference implementation (`packbench.ref_decode(buf)`) byte-for-byte on every record. The mismatch rate on any shard must be 0.0% \u2014 not just on the three sample shards already in `/app/data/samples/`, but on all shards the verifier generates at check time.\n\nYour deliverable is a repaired wheel at `/app/dist/packbench-repaired.whl`. Installing it with `pip install --force-reinstall /app/dist/packbench-repaired.whl` and then running `python -I /app/verify_local.py` must exit 0. The repaired wheel must expose the same public API (`packbench.decode`, `packbench.encode`, `packbench.ref_decode`) and must be a valid wheel (passes `wheel tags` inspection). Do not modify `/app/verify_local.py` or any file under `/app/verifier/`.",
+  "requirements": [
+   "The repaired wheel is at `/app/dist/packbench-repaired.whl` and is a valid Python wheel installable with pip.",
+   "After installation, `packbench.decode(buf)` returns bytes identical to `packbench.ref_decode(buf)` for every record in every shard, including verifier-generated shards not present at solve time.",
+   "Mismatch rate across all shards is exactly 0.0% \u2014 not merely below some threshold.",
+   "The wheel exposes `packbench.decode`, `packbench.encode`, and `packbench.ref_decode` with the same call signatures.",
+   "No files under `/app/verifier/` or `/app/verify_local.py` are modified."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm; apt-get install -y build-essential xxd file binutils; pip install wheel setuptools auditwheel",
+   "/app/packbench/ \u2014 Python package source tree (~600 lines): __init__.py (imports _packcodec C extension, exposes decode/encode/ref_decode), ref_codec.py (pure-Python reference: correct variable-length zigzag + checksum), build_ext stubs, setup.py, MANIFEST.in",
+   "/app/dist/packbench-1.4.0-cp313-cp313-linux_x86_64.whl \u2014 pre-built wheel containing a _packcodec.cpython-313-x86_64-linux-gnu.so that has an off-by-one in the tail-trim logic: it strips `checksum_len` bytes from the *decoded* payload instead of from the *encoded* buffer before decoding \u2014 so short payloads are fine but payloads >128 bytes are silently truncated by 4 bytes",
+   "/app/data/samples/ \u2014 three small shards (all records <=100 bytes payload): these pass even the broken codec",
+   "/app/data/shards/ \u2014 twenty shards with realistic rotational sensor records (payload lengths 20\u2013512 bytes, seeded deterministically); the broken codec corrupts roughly 35% of records across these shards",
+   "/app/verify_local.py \u2014 runs packbench.decode vs packbench.ref_decode on /app/data/samples/ only; exits 0 against the broken wheel (the shallow-check trap)",
+   "/app/verifier/ \u2014 verifier scripts (read-only to solver) that at check time generate fresh shards with a fixed seed offset and measure mismatch rate, asserting it is 0.0%",
+   "/app/packbench/ref_codec.py \u2014 the correct pure-Python codec; solver can read and use it",
+   "/app/build.sh \u2014 script that builds a wheel from /app/packbench/ source; it compiles _packcodec.c (which the solver must write or repair) and packages it",
+   "The pre-built .so has no debug symbols and is stripped; its source is NOT present anywhere in the repo \u2014 only the .so inside the wheel",
+   "The C extension stub /app/packbench/_packcodec_stub.c is present as scaffolding with correct API glue but an empty encode/decode body that returns None \u2014 it is NOT the source of the pre-built .so"
+  ],
+  "internal_hint": "Difficulty comes from two interacting levers: (1) opaque_component \u2014 the pre-built _packcodec.so has no source; the solver must characterise its bug by experiment (binary probing: feed records of varying payload lengths, compare to ref_decode, find the crossover at 128 bytes, deduce the tail-trim off-by-one); (2) shallow_check_trap \u2014 verify_local.py only tests shards with short payloads that the broken codec handles correctly, so running verify_local.py and seeing it pass is a false positive. Resolution path: (a) explore the installed wheel's .so by disassembling or binary-diffing, OR by generating records of increasing length and comparing decode vs ref_decode outputs; (b) identify that records with payload >128 bytes are truncated by exactly 4 bytes (the checksum length); (c) write a correct _packcodec.c that reimplements encode/decode matching ref_codec.py exactly, or alternatively wrap ref_decode in a C extension shim; (d) rebuild the wheel with build.sh so the new .so replaces the broken one; (e) verify on the full /app/data/shards/ (not just samples). The solver must not simply re-export ref_decode as decode \u2014 the encode function also has matching requirements checked by verifier-generated round-trip tests.",
+  "trap": "The provided `verify_local.py` only tests `/app/data/samples/` which contain exclusively short records (payload \u2264100 bytes). The broken codec's off-by-one only manifests when the encoded buffer length crosses 128 bytes (payload \u2265125 bytes after encoding overhead). A solver who rebuilds the wheel by wrapping ref_decode for decode but uses a naively ported encode that doesn't invert the zigzag correctly will pass decode tests but fail the verifier's round-trip encode\u2192decode tests on hidden inputs. A solver who patches only the installed .so without packaging it into a valid wheel fails the pip-install check.",
+  "tests": [
+   "Install /app/dist/packbench-repaired.whl with pip --force-reinstall; assert exit 0.",
+   "Verify the wheel is valid: `python -m wheel tags /app/dist/packbench-repaired.whl` exits 0.",
+   "Import packbench; assert decode, encode, ref_decode are all callable with correct signatures.",
+   "Generate 500 records with payload lengths uniformly sampled from [20, 512] using seed 0xdeadbeef; for each, assert packbench.decode(packbench.encode(record)) == record (round-trip correctness).",
+   "For the same 500 records, assert packbench.decode(buf) == packbench.ref_decode(buf) where buf = packbench.encode(record) (codec equivalence).",
+   "Generate 5 fresh shards (seed offset +1 from solve-time shards) each with 1000 records; measure mismatch rate between decode and ref_decode; assert rate == 0.0%.",
+   "Specifically test 100 records with payload lengths in [125, 200] to cover the off-by-one boundary.",
+   "Assert /app/verify_local.py and /app/verifier/ are unmodified (sha256 check of both)."
+  ],
+  "verifier_knob": {
+   "name": "payload_length_floor",
+   "value": "125",
+   "effect": "Raising the minimum payload length in generated shards increases the fraction of corrupted records in a naive partial fix; lowering it toward 20 makes partial fixes (that only handle short records) appear to pass more tests. Setting it to 200 makes nearly all generated records trigger the bug, increasing pressure on the solver to find and fix the exact boundary."
+  },
+  "expected_failure_modes": [
+   "Agent runs verify_local.py, sees it pass with the original wheel, concludes there is no bug in the binary and looks for a configuration issue instead \u2014 never experiments with long payloads.",
+   "Agent correctly identifies the binary is broken but rebuilds the wheel without writing a correct C extension: imports ref_decode as decode (works) but copies a broken encode from the .so behavior, causing round-trip failures on hidden tests.",
+   "Agent identifies the off-by-one in the .so via disassembly but patches the installed .so directly without repackaging it into a wheel, so pip install of the repaired wheel still installs the old broken .so.",
+   "Agent writes a correct C extension for decode but doesn't realise encode must also be correct and independently tested \u2014 the verifier's round-trip test catches an encode bug that none of the sample shards exercise.",
+   "Agent spends time trying to find the C source in the repo (it isn't there), loses time, and submits an incomplete solution."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "deployment",
+   "opaque-binary",
+   "wheels",
+   "systems-programming",
+   "codec",
+   "python-c-extension"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pip install /app/dist/packbench-1.4.0-cp313-cp313-linux_x86_64.whl",
+   "python -I /app/verify_local.py  # passes \u2014 shallow trap confirmed",
+   "python -c \"import packbench; r1=packbench.decode(packbench.encode(b'A'*130)); r2=packbench.ref_decode(packbench.encode(b'A'*130)); print(len(r1), len(r2))\"  # find bug: decode truncates long payloads by 4 bytes",
+   "python -c \"import packbench; [print(n, len(packbench.decode(packbench.encode(b'A'*n)))==len(b'A'*n)) for n in range(120,135)]\"  # find crossover at ~125 bytes",
+   "cat /app/packbench/ref_codec.py  # read correct encode/decode logic",
+   "cat /app/packbench/_packcodec_stub.c  # read C API glue structure",
+   "cat /app/packbench/__init__.py  # understand imports",
+   "cat /app/build.sh  # understand build/packaging process",
+   "cat /app/packbench/setup.py  # understand build config",
+   "# Write /app/packbench/_packcodec.c: correct encode/decode using zigzag+checksum from ref_codec.py, no tail-trim bug",
+   "bash /app/build.sh  # build new wheel",
+   "cp /app/dist/packbench-1.4.0-cp313-cp313-linux_x86_64.whl /app/dist/packbench-repaired.whl  # rename if needed, or build.sh already names it",
+   "pip install --force-reinstall /app/dist/packbench-repaired.whl",
+   "python -I /app/verify_local.py  # verify passes",
+   "python -c \"import packbench; records=[bytes(range(i%256))*((125+i)//256+1) for i in range(100)]; errs=sum(1 for r in records if packbench.decode(packbench.encode(r))!=r); print('errors:', errs)\"  # self-check round-trip on long payloads",
+   "python -m wheel tags /app/dist/packbench-repaired.whl  # validate wheel"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Python module bypass: if __init__.py uses standard 'import _packcodec', a solver could place _packcodec.py (pure Python) instead of compiling a C extension, avoiding C entirely and potentially reducing difficulty below intended level.",
+   "build.sh output naming ambiguity: if build.sh produces a wheel named differently from packbench-repaired.whl, solver must rename \u2014 the blueprint does not state whether build.sh handles this, creating friction that could cause spurious failures.",
+   "auditwheel behavior on linux_x86_64: if build.sh invokes auditwheel repair and it rewrites the wheel filename or fails due to missing shared libraries, the agent gets an unexpected output name or build failure, causing potentially flaky task behavior.",
+   "ref_encode not in public API: the blueprint exposes packbench.ref_decode but does not mention packbench.ref_encode; if agent needs to implement encode correctly and ref_encode is not accessible, they must reverse-engineer the encode format from ref_codec.py \u2014 this is fine but should be made explicit.",
+   "400 MB data directory plus build artifacts in a 2 GB container may cause disk pressure during wheel build, potentially causing intermittent build failures.",
+   "wheel tags check does not verify .so presence: an agent could package a pure-Python _packcodec.py with a faked cp313 wheel tag and pass python -m wheel tags, satisfying that test without a real C extension \u2014 the verifier should also check that _packcodec is a compiled extension module."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is creative and well-designed with strong verifiability, but solvability scores only 3 because the 1-hour constraint is tight for writing a correct C extension implementing zigzag encoding from scratch, and the Python-module bypass shortcut (placing _packcodec.py instead of compiling C) is not explicitly blocked, which could either trivialize the task or cause confusion about what is required. The build.sh output naming and auditwheel behavior are under-specified, creating real invalid-failure risks. The average score is 4.2 but solvability at 3 and the bypass risk threaten genuine_difficulty.",
+  "fixes": [
+   "Explicitly block the pure-Python bypass: in __init__.py, add a check like 'if not hasattr(_packcodec, \"__file__\") or not _packcodec.__file__.endswith(\".so\"): raise ImportError(\"_packcodec must be a compiled extension\")' and add a verifier test that confirms the installed _packcodec is a .so file.",
+   "Specify build.sh output: state explicitly that build.sh produces /app/dist/packbench-repaired.whl (or update build.sh to rename the output), and confirm auditwheel is either not required or pre-configured to avoid filename surprises.",
+   "Add ref_encode to public API or explicitly state encode must be implemented from scratch: clarify whether ref_encode is accessible as packbench.ref_encode so solvers know exactly what scaffolding is available for implementing the encode function.",
+   "Reduce data footprint: 400 MB of shards is heavy for a 2 GB container with build tooling; consider reducing to 40-80 MB of shards (same number of records, smaller payloads per shard) to avoid disk pressure during wheel build."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a broken pip tool itself; the candidate task is about repairing a Python wheel that produces incorrect decode output, a completely different problem."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a Rust packet-codec service for correctness and performance; the candidate task involves repairing a Python wheel wrapping a pre-built binary codec to eliminate silent payload corruption."
+    },
+    {
+     "ref_id": "terminal-bench-pro/restore-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task restores pip executables from backups; the candidate task requires diagnosing and repairing a Python wheel that silently corrupts decoded binary records."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task fixes a running HTTP framecodec service with a specific wire format bug; the candidate task requires repackaging a Python wheel so its decode function matches a pure-Python reference implementation."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a refactored codec library that silently produces wrong output on inputs outside a small regression corpus while passing existing tests, requiring the solver to identify and fix the subtle correctness bug \u2014 the core diagnostic challenge is essentially the same despite different languages and packaging."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     0.092
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.088
+    ],
+    [
+     "terminal-bench-pro/restore-broken-pip-installation",
+     0.088
+    ],
+    [
+     "ours/official-aac910462208",
+     0.068
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.066
+    ]
+   ],
+   "cost_usd": 0.014907
+  },
+  "novel": false
+ },
+ "cost_usd": 0.074103
+}

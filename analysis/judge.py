@@ -129,9 +129,18 @@ Valid failure modes: {valid}
 Invalid failure modes: {invalid}
 
 Be strict about invalid modes: if the instruction did not state (or unambiguously imply) what the
-failing test checks, that is test_overreach or spec_ambiguity, not a valid failure.
+failing test checks, that is test_overreach or spec_ambiguity, not a valid failure. Typical traps:
+the test expects one particular order of tied or unordered items, a sort key or tie-breaker the
+instruction never names, exact float formatting or whitespace, or an implementation-defined default
+(e.g. SQLite's row order without ORDER BY). A reasonable choice the instruction allows is not the
+agent's mistake.
 
-Return only JSON: {{"valid": true|false, "mode": "<one mode name>", "failing_tests": ["..."],
+First name the exact requirement the failing check enforces, then quote the instruction sentence that
+states it. If no sentence states or unambiguously implies it, write "" for the quote.
+
+Return only JSON: {{"requirement": "what the failing check enforces",
+"instruction_quote": "verbatim sentence from the instruction, or empty",
+"valid": true|false, "mode": "<one mode name>", "failing_tests": ["..."],
 "explanation": "2-3 sentences citing the step where it went wrong"}}"""
 
 
@@ -180,9 +189,16 @@ def analyze_failure(task_dir: Path, trial_dir: Path, trajectory_path: Path, chat
     verdict = extract_json(reply.text)
     mode = verdict.get("mode", "")
     valid = bool(verdict.get("valid")) and mode in VALID_MODES
+    quote = (verdict.get("instruction_quote") or "").strip()
+    if valid and not quote:
+        # Enforced here, not left to the model: a failure on a requirement the instruction
+        # never states is the task's fault (8a6e: 5/5 "valid" failures on unstated tie order).
+        valid, mode = False, "test_overreach"
     return {
         "valid": valid,
         "mode": mode,
+        "requirement": verdict.get("requirement", ""),
+        "instruction_quote": quote,
         "failing_tests": verdict.get("failing_tests", []),
         "explanation": verdict.get("explanation", ""),
         "cost_usd": reply.cost_usd,

@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "Stream Merge-Sort Refactor",
+  "scenario": "A data-pipeline team ships a compiled Go binary that merges pre-sorted shards of integer streams and emits a single sorted output. The binary was built from a multi-file codebase inside the Docker image; the source lives at /app/src but is ~1 400 lines spread across eight files with substantial plumbing code. After a large-scale refactor to support variable-width integer encoding, the binary began producing wrong output on certain shard layouts. The release engineer blocked the build and needs the binary to be replaced with a corrected one before the next deploy.",
+  "instruction_draft": "You are a release engineer. The pipeline binary at /app/bin/smerge reads a list of pre-sorted shard files (paths given as arguments), merges them, and writes a single ascending-sorted stream of integers to stdout, one per line. The binary was recently refactored and now produces incorrect output in some cases. The source is at /app/src. Fix the source, rebuild the binary in place at /app/bin/smerge, and verify it passes the supplied sample:\n\n    /app/bin/smerge /app/sample/shard_a.txt /app/sample/shard_b.txt /app/sample/shard_c.txt\n\nshould print the integers sorted in ascending order. The correctness requirement is: for every possible set of input shards whose per-file contents are already sorted and whose values fit in a signed 64-bit integer, the merged output must be sorted, contain exactly the union (with multiplicity) of all input integers, and terminate with exit code 0.",
+  "requirements": [
+   "The binary at /app/bin/smerge must produce a fully sorted (ascending) output stream.",
+   "The output must contain every integer from every input shard exactly as many times as it appears across all shards (multiset union).",
+   "The binary must exit with code 0 on well-formed input.",
+   "The binary must handle an arbitrary number of shards, including edge cases: one shard, two shards with identical values, shards containing negative numbers, shards with a single element.",
+   "The binary must correctly handle large values up to the limits of signed 64-bit integers."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base image with golang-1.21 installed via apt.",
+   "/app/src/ contains eight .go files totaling ~1 400 lines: main.go, merge.go, heap.go, encode.go, decode.go, shard.go, pipeline.go, util.go. Most files are plumbing; the bug lives in merge.go and decode.go.",
+   "The Dockerfile runs 'cd /app/src && go build -o /app/bin/smerge .' so the binary is pre-compiled.",
+   "Bug 1 (shallow-check trap): In merge.go the k-way merge heap comparison is inverted for negative numbers \u2014 the custom Less() on the min-heap uses the decoded integer's absolute value for comparison, so negative numbers sort after positives instead of before them. The sample shards /app/sample/shard_*.txt contain only non-negative integers, so the sample passes but hidden tests with negatives fail.",
+   "Bug 2 (build component): In decode.go, the variable-width integer decoder introduced in the refactor has an off-by-one in the continuation-bit loop: it stops one byte early when the encoded value spans exactly 5 bytes (values >= 2^28), silently truncating the high bits. Values in range [268435456, 2^63-1] decode to wrong numbers. This is invisible from reading decode.go in isolation because the encoder and decoder were refactored independently; the solver must run the encode/decode round-trip to observe it.",
+   "/app/sample/shard_a.txt, shard_b.txt, shard_c.txt contain small positive integers (< 1000) in sorted order, chosen so both bugs are invisible on the sample.",
+   "A /app/tools/gen_shards.go helper is present (compilable separately) that the solver can use to generate test cases, but it is not required.",
+   "The Go module is self-contained with no external dependencies beyond the standard library."
+  ],
+  "internal_hint": "Difficulty comes from two interacting bugs neither of which is visible by reading one file in isolation. Bug 1 (adversarial reasoning / working memory): the heap's Less() method in merge.go compares decoded int64 values but applies abs() before comparison \u2014 this appears in a helper called cmpKey() buried in util.go and referenced from heap.go; tracing the call chain requires holding several files in working memory simultaneously. Bug 2 (substantial construction / data-dependent): the varint decoder in decode.go uses a loop `for shift := 0; shift < 28; shift += 7` which processes at most 4 groups (28 bits), but a 5-byte varint encoding covers 35 bits; values >= 2^28 lose their high 7 bits. The solver must (a) notice the sample uses small values, (b) generate a test with negatives to expose Bug 1, (c) generate a test with large values (>= 268435456) to expose Bug 2, (d) trace the cmpKey() call chain across three files, and (e) fix the loop bound in decode.go. A naive solver fixes only the obvious abs() call (Bug 1) because the sample now passes, but hidden tests with large integers still fail.",
+  "trap": "A solver that fixes only the heap comparison inversion (Bug 1) will pass the provided sample and also pass hidden tests with negative numbers \u2014 but will fail on any integer >= 268435456 because Bug 2 (varint decoder truncation) corrupts the value before it ever reaches the heap. The two bugs are independent in their trigger conditions, so fixing one makes all shallow tests pass while the other silently corrupts large-value cases.",
+  "tests": [
+   "Smoke test: run /app/bin/smerge on the three sample shards and verify the output is numerically sorted and contains the exact expected integers.",
+   "Negative-value test: generate two shards at verify time containing negative int64 values (e.g., [-1000000, -500, -1] and [-999999, -2, 0, 1]), merge them, and assert the output is sorted ascending (negative before positive).",
+   "Large-value test: generate shards at verify time with values in [2^28, 2^32] and [2^32, 2^40], assert round-trip correctness (output sorted, multiset preserved).",
+   "Near-max test: generate shards containing math.MaxInt64, math.MaxInt64-1, and 0, assert sorted output [0, MaxInt64-1, MaxInt64].",
+   "Mixed-sign large-value test: shards containing [-math.MaxInt64, -1, 0, 2^35, math.MaxInt64], assert full sorted output.",
+   "Multiplicity test: two shards each containing [5, 5, 10], assert output is [5, 5, 5, 5, 10, 10] (6 elements).",
+   "Single-shard test: one shard with 100 000 pre-sorted values drawn from the full int64 range, assert output matches input exactly.",
+   "Exit-code test: well-formed input exits 0; a missing file path exits non-zero.",
+   "Build verification: /app/bin/smerge must be an ELF executable or Mach-O binary rebuilt after the fix (mtime check or go version stamp)."
+  ],
+  "verifier_knob": {
+   "name": "num_generated_inputs",
+   "value": "200",
+   "effect": "Raising the count increases the probability that random shard generation exercises the exact boundary at 2^28 and the negative-sorting edge; lowering it below ~50 reduces the chance of hitting Bug 2's trigger range, making a Bug-1-only fix more likely to pass by luck."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the abs() comparison in heap.go/util.go (Bug 1), sees the sample pass, and submits \u2014 fails hidden large-value tests due to Bug 2.",
+   "Agent locates Bug 2 but misidentifies the loop bound (changes 28 to 32 instead of 35), fixing some large values but still truncating values >= 2^32.",
+   "Agent rewrites the decoder from scratch using a standard varint algorithm but forgets to handle signed integers (zigzag or sign extension), corrupting negative values.",
+   "Agent fixes both bugs in source but forgets to rebuild the binary, so the old binary remains at /app/bin/smerge.",
+   "Agent rebuilds but with a different output path, leaving the canonical path stale."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "golang",
+   "algorithmic",
+   "refactoring",
+   "fuzz-equivalence",
+   "binary",
+   "sorting"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/merge.go",
+   "cat /app/src/heap.go",
+   "cat /app/src/util.go  # find cmpKey() uses abs()",
+   "cat /app/src/decode.go  # read varint decoder loop",
+   "cat /app/src/encode.go  # understand encoding scheme",
+   "/app/bin/smerge /app/sample/shard_{a,b,c}.txt  # sample passes",
+   "echo '-1000\\n-500\\n-1' > /tmp/neg_a.txt && echo '-999\\n0\\n1' > /tmp/neg_b.txt && /app/bin/smerge /tmp/neg_a.txt /tmp/neg_b.txt  # expose Bug 1",
+   "# Confirm output is wrong (negatives sort after positives)",
+   "sed -i 's/abs(a.val)/a.val/' /app/src/util.go  # fix cmpKey() \u2014 remove abs()",
+   "cd /app/src && go build -o /app/bin/smerge .  # rebuild",
+   "/app/bin/smerge /tmp/neg_a.txt /tmp/neg_b.txt  # Bug 1 fixed",
+   "python3 -c \"for v in [268435456, 268435457, 1073741824]: print(v)\" > /tmp/big.txt && /app/bin/smerge /tmp/big.txt  # expose Bug 2",
+   "# Observe corrupted/wrong output for large values",
+   "# Re-read decode.go: spot 'for shift := 0; shift < 28; shift += 7' \u2014 only 4 iterations, need 5 for 35-bit values",
+   "sed -i 's/shift < 28/shift < 35/' /app/src/decode.go  # fix varint loop bound",
+   "cd /app/src && go build -o /app/bin/smerge .  # rebuild again",
+   "/app/bin/smerge /tmp/big.txt  # verify large values correct",
+   "/app/bin/smerge /app/sample/shard_{a,b,c}.txt  # verify sample still passes"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The varint loop fix 'shift < 28' \u2192 'shift < 35' is straightforward once decode.go is read carefully; a strong agent reading the file may spot it without needing to generate large-value test cases, reducing difficulty.",
+   "The cmpKey() call chain across util.go/heap.go/merge.go is described as requiring 'working memory' but all three files are short enough to read sequentially in 3 commands \u2014 no real memory challenge for an agent with a context window.",
+   "Bug 2's exact fix depends on the encoding scheme (zigzag vs. standard varint, signed vs. unsigned) \u2014 if the encoding is nonstandard and the blueprint's description of 'off-by-one in continuation-bit loop' is imprecise, the correct loop bound may not be simply 35, creating ambiguity about what constitutes a correct fix.",
+   "The build verification test (mtime check or go version stamp) may be flaky if the container filesystem has unusual mtime behavior or if the agent rebuilds with an intermediate path and renames.",
+   "The instruction says the binary reads 'variable-width integer encoding' but the sample shards appear to contain plain text integers one-per-line ('one per line' in instruction). If shard files are text and the varint encoding is internal/in-memory only, Bug 2 may never trigger on file-based tests, making the test setup contradictory.",
+   "If sample shards are plain-text line-delimited integers (as implied by the instruction 'writes a single ascending-sorted stream of integers to stdout, one per line'), the varint decoder might only apply to an internal wire format not used for file I/O \u2014 making Bug 2 unreachable from the described test interface."
+  ],
+  "verdict": "reject",
+  "reasons": "The speedrun reaches a solution in ~18 commands because both bugs are visible by careful source reading without requiring complex reasoning \u2014 the abs() call is findable in util.go directly and the loop bound 'shift < 28' is obviously wrong once decode.go is read. Genuine difficulty scores 3 (not the required 4) because a strong agent reading all source files will likely spot both bugs in a single pass. More critically, there is a fundamental architectural ambiguity: if shard files contain plain-text integers (as the instruction implies with 'one per line' output), the varint decoder may only apply to internal encoding and Bug 2 may be unreachable through the file-based test interface, making the entire Bug 2 scenario potentially untestable as described.",
+  "fixes": [
+   "Obscure Bug 2 further by placing the loop in a generated or compressed form, or by making the off-by-one appear only in a conditional branch that requires a specific multi-shard layout to trigger \u2014 not just a single large value.",
+   "Clarify the I/O format: explicitly state whether shard files use the varint binary encoding or plain text, and ensure the varint decoder is on the critical path for file reading (not just internal). If shards are plain text, replace Bug 2 with a different data-path bug that is actually exercised by the file interface.",
+   "Add a third bug or a more complex multi-file interaction that requires holding more than 3 files in working memory simultaneously, and ensure no single bug is directly visible by reading its file in isolation \u2014 e.g., the bug appears only when two helper functions from different files compose incorrectly.",
+   "Replace the mtime-based build verification with a deterministic check (e.g., embed a build timestamp via -ldflags and grep for it) to avoid flakiness.",
+   "Increase the sample shard values to include some in the range [2^20, 2^27] so agents cannot distinguish 'sample passes because values are small' from 'sample passes because decoder is correct for this range', forcing more thorough testing."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/reverse-engineer-physics-simulator",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering a black-box binary and reimplementing it; this task requires finding and fixing a bug in existing Go source code and rebuilding."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task involves fixing SQL query logic for window functions and aggregations; this task involves debugging a Go merge-sort implementation in a compiled binary pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/analyze-arm-shellcode-network-connections",
+     "verdict": "distinct",
+     "reason": "That task is about ARM shellcode emulation and network traffic capture; this task is about fixing a Go k-way merge-sort bug."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a TCP audit service with HMAC computation and WAL record serialization; this task is about fixing a merge-sort bug in a Go binary."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves characterizing a black-box normalizer binary and repairing a SQL pipeline; this task involves finding and fixing a source-level bug in a Go merge-sort program."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/reverse-engineer-physics-simulator",
+     0.145
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.141
+    ],
+    [
+     "terminal-bench-pro/analyze-arm-shellcode-network-connections",
+     0.14
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.127
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.01449
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056331000000000006
+}

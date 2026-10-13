@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "crypto-migration-hash-pipeline",
+  "title": "Cryptographic Hash Pipeline Migration",
+  "scenario": "A platform engineering team is migrating a scientific data integrity service from SHA-1 to SHA-256 across a Go codebase. The service is a compiled binary (`/app/verifier`) that accepts input records over stdin, computes a chained HMAC-based digest tree across record batches, and outputs a final verification token. The source is not shipped \u2014 only the binary, a config file, and a reference implementation stub in Go that the previous engineer left half-finished during the migration. The team needs the replacement Go binary to produce tokens that the adversarial corpus verifier accepts for all valid inputs and rejects for all tampered or malformed ones.",
+  "instruction_draft": "Hey \u2014 we're in the middle of migrating our record integrity service and the previous engineer left things in a weird state. There's a reference binary at `/app/verifier` that accepts newline-delimited JSON records on stdin (one per line) and prints a hex verification token to stdout. There's also a partial Go reimplementation at `/app/reimpl/` that was supposed to replace it but clearly isn't done or correct. Your job is to get `/app/reimpl/reimpl` (built from `/app/reimpl/`) to produce identical tokens to the reference binary for all valid inputs, and to correctly reject malformed inputs the same way the reference does (exit code 1, nothing printed). The binary reads a config at `/app/config.toml` that controls some of the crypto parameters. Don't touch the config or the reference binary. Build the reimpl with `go build -o /app/reimpl/reimpl ./` from inside `/app/reimpl/`. The tests will throw a wide range of inputs at both binaries and compare outputs.",
+  "requirements": [
+   "The built binary `/app/reimpl/reimpl` must produce byte-identical hex tokens to `/app/verifier` for all valid input corpora",
+   "For malformed or tampered inputs, `/app/reimpl/reimpl` must exit with code 1 and produce no stdout output, matching `/app/verifier` behavior",
+   "The binary must read `/app/config.toml` for crypto parameters (key material, batch size, algorithm variant) at runtime",
+   "The reimplementation must be built from `/app/reimpl/` using `go build -o /app/reimpl/reimpl ./`",
+   "Token output must be correct for edge cases: empty input, single record, records whose batch boundary falls exactly on a power-of-two count, records with unicode/binary-safe field values"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with golang:1.22 multi-stage or apt-installed Go toolchain",
+   "Compiled reference binary `/app/verifier` (built from hidden Go source during Docker build, stripped, no source shipped)",
+   "Reference binary reads `/app/config.toml` containing: hmac_key (hex), batch_size (int, e.g. 7 \u2014 not a power of two), tree_depth (int), variant string ('sha256-truncated-48' \u2014 first 48 bits of each HMAC node are kept for the tree, full 256 for leaf)",
+   "Partial Go reimplementation at `/app/reimpl/main.go` and `/app/reimpl/chain.go`: main.go correctly parses JSON lines and config; chain.go has the tree accumulation logic but uses wrong truncation (truncates to 32 bits instead of 48, and uses the raw record bytes instead of the canonical JSON re-serialization with sorted keys as the HMAC message)",
+   "A sample corpus at `/app/samples/` with 5 example input files and their expected token outputs (but these samples all have record counts that are multiples of batch_size, hiding the boundary edge case)",
+   "A `go.mod` in `/app/reimpl/` with correct module name and dependencies (crypto/hmac, encoding/hex, etc. from stdlib only)",
+   "A `run_check.sh` at `/app/` that runs the reference binary and reimpl on a given file and diffs output, for the solver's convenience",
+   "The verifier binary is deterministic: same input always produces same output"
+  ],
+  "internal_hint": "Three compounding bugs must all be found by running both binaries and observing divergence on real data:\n1. TRUNCATION BIT WIDTH: The tree nodes use the first 48 bits (6 bytes) of each HMAC-SHA256 output, not 32 bits. The stub truncates to 4 bytes. This is invisible in the samples because the low 2 bytes happen to be 0x0000 in all sample inputs (the sample keys and records were chosen to make this so).\n2. CANONICAL SERIALIZATION: The HMAC message for each leaf is the canonical JSON re-serialization (keys sorted lexicographically, no extra whitespace) of the parsed record object, not the raw input line. The stub passes raw bytes. Records in the sample corpus are already in canonical form, hiding this.\n3. TREE BOUNDARY HANDLING: When the total record count is not a multiple of batch_size, the final partial batch is padded with a sentinel record `{\"_pad\":true}` before computing its batch root. The stub drops the final partial batch entirely. No sample has a non-multiple record count.\nThe solver must: (a) run both binaries on the samples to see they match, then construct non-multiple-count inputs to find divergence, (b) instrument the stub or add print statements to trace intermediate HMAC values, (c) compare byte-by-byte intermediate outputs against the reference, (d) discover the truncation and serialization bugs by binary search over the algorithm.",
+  "trap": "A solver that verifies only on the provided samples will see perfect agreement and ship the stub as-is. The hidden corpus includes: inputs with record counts not divisible by batch_size (exposes padding bug), inputs with records whose JSON keys are not in lexicographic order (exposes canonical serialization bug), and inputs chosen so the truncation difference produces non-zero divergence (exposes the 48-vs-32 bit bug). A partial fix (e.g., fixing only padding) still fails ~67% of hidden cases. All three bugs must be found and fixed.",
+  "tests": [
+   "For each input in the hidden corpus (50+ files), run `/app/reimpl/reimpl` and `/app/verifier` on the same input and assert stdout is byte-identical",
+   "For each malformed input in the hidden corpus (truncated JSON, invalid UTF-8 in a field, extra bytes after last newline), assert both exit code 1 and empty stdout from `/app/reimpl/reimpl`",
+   "Run `/app/reimpl/reimpl` on the empty file (zero records) and assert it matches `/app/verifier` output",
+   "Run on inputs with exactly `batch_size` records, `batch_size - 1` records, `batch_size + 1` records, and `2 * batch_size - 1` records",
+   "Run on inputs where JSON field order varies (keys not sorted) and assert token matches the reference (which re-serializes canonically)",
+   "Assert `go build -o /app/reimpl/reimpl ./` succeeds with exit code 0 from `/app/reimpl/`",
+   "Assert the binary reads `config.toml` at runtime: swap in a config with batch_size=3 and verify output changes accordingly on a test input"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "50 files covering all three bug dimensions",
+   "effect": "Lowering to 10 files with only power-of-two counts makes the padding bug undetectable and the task easier; raising to 100 files with all combinations of record counts, key orders, and adversarial values makes it harder to miss any bug"
+  },
+  "expected_failure_modes": [
+   "Solver verifies against the 5 provided samples, sees agreement, and submits the unchanged stub \u2014 fails all three hidden bug classes",
+   "Solver finds the padding bug (most visible via experimentation) but misses the truncation and serialization bugs \u2014 passes ~33% of hidden corpus",
+   "Solver finds two of three bugs but gets the truncation bit width wrong (tries 32 or 64 instead of 48) \u2014 still fails truncation-sensitive cases",
+   "Solver reverse-engineers the binary with strings/objdump but misreads the truncation constant from the binary and implements 4 bytes instead of 6",
+   "Solver correctly identifies canonical serialization but uses a library that sorts keys differently than Go's encoding/json (which sorts by key string lexicographic order) \u2014 fails on multi-key records"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "black-box",
+   "refactoring",
+   "hmac",
+   "scientific-computing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/config.toml \u2014 see variant='sha256-truncated-48', batch_size=7",
+   "cat /app/reimpl/chain.go \u2014 see truncation to 4 bytes (should be 6), raw bytes (should be canonical JSON)",
+   "cat /app/reimpl/main.go \u2014 confirm JSON parsing and config loading",
+   "Immediately identify Bug 1: config says 'truncated-48' (6 bytes), stub uses [:4]",
+   "Immediately identify Bug 2: stub passes raw line bytes, not re-serialized canonical JSON",
+   "echo '{\"b\":1,\"a\":2}\\n{\"z\":3}' | /app/verifier \u2014 test with 2 records (not multiple of 7) to probe padding",
+   "Construct 8-record input (7+1), run /app/verifier vs /app/reimpl/reimpl \u2014 see divergence \u2192 Bug 3 confirmed",
+   "Edit chain.go: fix truncation [:4] \u2192 [:6]",
+   "Edit chain.go: replace raw bytes with json.Marshal of parsed record (sorts keys by encoding/json default)",
+   "Edit chain.go: add sentinel {\"_pad\":true} padding for final partial batch",
+   "cd /app/reimpl && go build -o reimpl ./",
+   "bash /app/run_check.sh on all 5 samples \u2014 verify match",
+   "Manually test 6-record input and 8-record input against /app/verifier"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Go's encoding/json key sort order must exactly match what the reference binary uses \u2014 if the reference binary was built with a custom JSON marshaler or different key ordering, a solver using standard encoding/json could fail without any way to detect the discrepancy from the spec",
+   "The 'sha256-truncated-48' variant string in config.toml directly reveals Bug 1 to any agent that reads it, undermining the 'observe_not_read' difficulty lever \u2014 the bug is not hidden at all",
+   "The sentinel record format {\"_pad\":true} must be exactly as specified and match the reference binary \u2014 if there's any ambiguity in how Go marshals this (field ordering, boolean representation) it could cause flaky failures",
+   "Multi-stage Docker build complexity: building a stripped Go binary from hidden source during Docker build, then shipping only the binary, risks platform-specific binary incompatibility (amd64 vs arm64) if the review/test environment differs",
+   "The instruction says 'no internet needed' but doesn't specify Go module proxy settings \u2014 if go build tries to fetch dependencies, it will fail; go.mod must use only stdlib packages as stated",
+   "The tree_depth parameter is mentioned in config but its role in the algorithm is never defined in the instruction \u2014 a solver must reverse-engineer this entirely from the binary, creating potential ambiguity"
+  ],
+  "verdict": "reject",
+  "reasons": "The critical flaw is that Bug 1 (truncation bit width) is directly and unambiguously revealed by the config file value 'sha256-truncated-48', which any competent agent reads in the first 2 commands \u2014 this collapses the supposed 'observe_not_read' difficulty lever entirely. Bug 2 is similarly obvious from reading chain.go. With all three bugs findable in ~13 commands via straightforward source reading, genuine_difficulty scores 2, which fails the minimum threshold of 4. Additionally, the tree_depth parameter's role is never specified, creating an ambiguous failure mode that could invalidate solutions.",
+  "fixes": [
+   "Remove 'sha256-truncated-48' from config.toml \u2014 replace with an opaque variant string like 'v2-integrity' that doesn't reveal the truncation width; the truncation constant must be discovered purely by binary analysis or output comparison",
+   "Remove all comments and variable names in chain.go that hint at canonical serialization \u2014 the stub should appear to correctly re-serialize (e.g., it does call json.Marshal but with an incorrect field subset or wrong struct tag ordering) so the bug is only visible through output divergence, not code reading",
+   "Define tree_depth's role explicitly in the instruction, or remove it from config to eliminate the ambiguous failure risk",
+   "Add a deliberate red herring in the stub (e.g., a comment saying 'TODO: verify truncation matches spec \u2014 currently using 4 bytes per design doc v1.2') that leads a code-reading agent to confirm the wrong behavior rather than discover the right one",
+   "Ensure the Docker build explicitly sets GONOSUMCHECK and GOFLAGS=-mod=vendor or copies stdlib deps to guarantee no network access is needed during go build"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 tagging of WAL records over TCP with database lookups; this task is about reverse-engineering a chained HMAC digest tree from a black-box binary and reimplementing it in Go."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "That task reverses a stream cipher from source code to implement encryption; this task reverse-engineers a HMAC-based digest tree protocol from a black-box binary to produce a byte-identical reimplementation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task extracts obfuscated credentials via XOR decoding; this task reimplements a cryptographic hash pipeline from a closed binary."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task debugs a refactored AES-CTR library with known regression tests; this task reverse-engineers an undocumented HMAC tree protocol from a binary-only reference."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task fixes an NDJSON validation pipeline for correctness and performance; this task reverse-engineers and reimplements a cryptographic digest protocol from a black-box binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.161
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.124
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.12
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.109
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.107
+    ]
+   ],
+   "cost_usd": 0.014919
+  },
+  "novel": true
+ },
+ "cost_usd": 0.049524000000000006
+}

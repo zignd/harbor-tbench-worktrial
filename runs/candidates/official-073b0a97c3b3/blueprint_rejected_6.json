@@ -1,0 +1,180 @@
+{
+ "blueprint": {
+  "slug": "node-metrics-relay-resurrection",
+  "title": "Night-shift Metrics Relay Outage",
+  "scenario": "A Node.js metrics relay service collects tagged log lines from upstream producers, aggregates per-minute counters and percentiles, then re-emits them as newline-delimited JSON over a TCP socket. The on-call SRE woke to a PagerDuty alert at 3 AM: Datadog shows a flat line on all dashboards and the relay's own health endpoint is returning stale timestamps. The repo (~1,400 lines across eight source files) shipped a rushed feature-iteration commit six hours ago that added tag-cardinality limiting and a percentile approximation algorithm. The service appears to start and accept connections, but downstream consumers receive either malformed frames or silent zeros.",
+  "instruction_draft": "```\n[PAGERDUTY] 03:14 CRITICAL metrics-relay health-check latency=stale, downstream=flatline\n$ journalctl -u metrics-relay --since '1 hour ago' | tail -40\nOct 12 02:47:01 node[3821]: INFO  relay starting on :9900 (aggregation) :9901 (sink)\nOct 12 02:47:01 node[3821]: INFO  tag limiter active, max_cardinality=200\nOct 12 02:47:12 node[3821]: WARN  flush #1: 0 series emitted\nOct 12 02:47:22 node[3821]: WARN  flush #2: 0 series emitted\nOct 12 02:47:32 node[3821]: WARN  flush #3: 0 series emitted\n...\nOct 12 02:58:44 node[3821]: ERROR frame encode: buf.write is not a function\nOct 12 02:58:44 node[3821]: WARN  flush #72: 0 series emitted\n```\n\nThe metrics relay at `/app/relay/` is broken after last night's feature push. Producers send tagged log lines over TCP to port 9900. Every 10 seconds the relay must flush aggregated metrics\u2014counts, sum, p50, p95, p99\u2014as length-prefixed newline-delimited JSON frames to any consumers connected on port 9901. A frame's 4-byte big-endian length prefix must exactly match the byte length of the JSON payload that follows. Each flush must emit one JSON object per distinct metric name+tag-set combination seen in that window; zero-count series must be dropped. The p50/p95/p99 fields must be computed with a t-digest-style interpolation over bucketed samples (the bucket configuration is already present in the codebase). Tag cardinality limiting must enforce a per-metric-name cap: once a metric has seen `max_cardinality` distinct tag-sets, new tag-sets for that metric are silently dropped (existing ones still accumulate). The relay must recover from upstream producer disconnects and continue serving consumers without restart. Bring the service to a state where it correctly handles all of these behaviors; the verifier will connect producers and consumers over the real TCP protocol and check frame correctness across multiple flush windows with varied cardinality, disconnects, and percentile distributions.",
+  "requirements": [
+   "Port 9900 accepts producer TCP connections sending tagged log lines in the format: `<metric_name> <value> <tag1=v1>[,<tag2=v2>...]\\n`",
+   "Port 9901 accepts consumer TCP connections and receives flushed frames every 10 seconds",
+   "Each frame consists of a 4-byte big-endian unsigned integer (byte length of the following payload) immediately followed by the UTF-8 JSON payload",
+   "The 4-byte length prefix must exactly equal the byte length of the JSON string that follows it",
+   "Each flush emits one JSON object per distinct (metric_name, tag-set) combination observed in the current window",
+   "Each emitted JSON object contains fields: metric (string), tags (object), count (integer), sum (number), p50 (number), p95 (number), p99 (number)",
+   "Percentiles p50/p95/p99 are computed using the bucketed t-digest interpolation already configured in the codebase",
+   "Series with zero count in the current window are not emitted",
+   "Tag cardinality limiting: once a metric_name has accumulated max_cardinality distinct tag-sets, any incoming line with a new tag-set for that metric is silently dropped; existing tag-sets still accumulate values",
+   "The relay must survive upstream producer TCP disconnects and reconnects without requiring a restart",
+   "The relay must continue serving existing consumer connections across flush cycles"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm (Node.js 20 installed via apt/nodesource, pinned)",
+   "/app/relay/ contains ~1,400 lines across 8 source files: index.js (entry, TCP server setup), aggregator.js (flush loop, series management), frame.js (length-prefix encoder), percentile.js (t-digest bucket logic), tag_limiter.js (cardinality cap), parser.js (line parser), health.js (HTTP health endpoint), config.js (constants including max_cardinality=200, BUCKET_CONFIG array)",
+   "Bug 1 (not visible by reading alone \u2014 data-dependent): in frame.js the length prefix is computed as `payload.length` (character count) instead of `Buffer.byteLength(payload, 'utf8')` \u2014 invisible for ASCII-only inputs but breaks on any tag value containing a non-ASCII character (the verifier injects tag values with UTF-8 multi-byte chars like accented names); also the `buf.write` call uses incorrect argument order, causing the 'buf.write is not a function' error only when the Buffer is created with the wrong constructor path introduced by the feature commit",
+   "Bug 2 (interacting): in tag_limiter.js the cardinality check incorrectly uses a single global Map keyed only on metric_name instead of a Map<metric_name, Set<tag_set_key>> \u2014 this causes all metrics to share one cardinality counter; when the global counter hits max_cardinality all new tag-sets across ALL metrics are dropped, which (combined with the fact that the flush still increments its own counter) causes the flush to emit 0 series after the limiter fires, masking the frame encoding bug since no frames are ever sent; fixing only the frame bug leaves the cardinality bug causing silent data loss on multi-metric workloads; fixing only the cardinality bug lets the relay emit frames but they have wrong length prefixes for non-ASCII inputs",
+   "percentile.js is correct but requires the aggregator to call it with the right bucket accumulator object \u2014 the feature commit changed the accumulator shape in aggregator.js to an array instead of the object that percentile.js expects, so percentiles silently return 0 unless the aggregator is also fixed",
+   "A plausible but uninvolved monitoring.js (~120 lines) that logs internal queue depths \u2014 does not affect correctness",
+   "A plausible but uninvolved retry.js (~80 lines) for outbound HTTP health-push \u2014 not involved in TCP path",
+   "Startup script /app/start.sh launches `node /app/relay/index.js`",
+   "Service is pre-started via Docker CMD so the solver sees it running but producing zero output",
+   "Sample producer script /app/tools/producer.js and sample consumer /app/tools/consumer.js provided for manual testing"
+  ],
+  "internal_hint": "Two interacting causes plus a third subtler issue: (1) tag_limiter.js uses a flat global counter shared across all metrics instead of per-metric Sets \u2014 once this fires, all series are dropped and 0 frames are sent, which masks bug 2. (2) frame.js computes the length prefix using `.length` (codepoint count) instead of `Buffer.byteLength(payload,'utf8')` AND has a broken Buffer constructor path from the feature commit causing the 'buf.write is not a function' error on first non-empty flush. Fixing bug 1 alone: relay starts emitting frames but with wrong length prefixes on UTF-8 tag values, causing consumer protocol parse failures. Fixing bug 2 alone: relay still silently drops everything due to bug 1, appears fixed in logs but no frames reach consumers. (3) aggregator.js passes a plain array as the accumulator to percentile.js which expects `{buckets: [...], count: N}` \u2014 percentiles are all 0. The solver must instrument the running service, observe the cardinality limiter firing (add logging or inspect state), fix the per-metric cardinality accounting, then observe frame encoding failures on UTF-8 inputs, then fix the Buffer construction and byte-length calculation, then notice percentiles are zero and fix the accumulator shape. The difficulty comes from: (a) bug 1 hiding bug 2 until bug 1 is fixed, (b) the frame bug only manifesting on non-ASCII tag values which the provided sample tools don't use but the verifier does, (c) the percentile bug being a data-shape mismatch not a logic error.",
+  "trap": "A shallow solver fixes the obvious 'buf.write is not a function' error (the logged error) by patching the Buffer constructor call but does not fix the byte-length calculation. Tests with ASCII-only tag values pass. The verifier then sends tag values with accented characters (e.g. `region=S\u00e3o_Paulo`, `env=M\u00fcnchen`), causing length prefix to be off by the number of extra UTF-8 bytes. Consumers parsing the stream get desynchronized and all subsequent frames are rejected. Additionally, a solver who fixes frame.js and tag_limiter.js but not the accumulator shape in aggregator.js will emit frames with p50=0/p95=0/p99=0 for all series, failing the percentile correctness tests.",
+  "tests": [
+   "Test 1 (basic protocol): verifier connects a consumer to :9901, sends 50 ASCII log lines for 3 distinct metric+tag combos to :9900, waits 12 seconds, reads one flush frame; checks 4-byte big-endian prefix equals exact byte length of following JSON; checks JSON contains exactly 3 objects with correct metric/tags/count/sum",
+   "Test 2 (UTF-8 frame integrity): verifier sends lines with tag values containing multi-byte UTF-8 chars (accented city names); reads flush frame; checks prefix == Buffer.byteLength(payload,'utf8'); deserializes without error; checks count/sum correct",
+   "Test 3 (percentile correctness): verifier sends a known distribution (100 values uniformly spaced 1..100) for one metric; reads flush; checks p50 in [49,51], p95 in [94,96], p99 in [98,100] using the relay's own bucket resolution",
+   "Test 4 (cardinality limiting per-metric): verifier sends lines for metric_A with 250 distinct tag-sets and metric_B with 5 tag-sets; reads flush; checks metric_A has exactly 200 series (max_cardinality), metric_B has exactly 5 series (independent cap)",
+   "Test 5 (cross-metric isolation): verifier sends metric_A with 201 tag-sets and metric_B with 201 tag-sets; checks that both are independently capped at 200, not that the combined total is 200",
+   "Test 6 (producer disconnect recovery): verifier connects producer, sends 20 lines, closes TCP connection abruptly, waits 3 seconds, reconnects and sends 20 more lines; reads two consecutive flush frames; checks both frames are well-formed and second has count >= 20",
+   "Test 7 (zero-count series dropped): verifier sends lines in window 1, waits for window 2 with no new lines; reads window-2 flush; checks frame contains 0 JSON objects (empty payload) or no frame is sent",
+   "Test 8 (multiple consumers): verifier connects two consumers; producer sends 30 lines; checks both consumers receive identical well-formed frames in the same flush cycle",
+   "Test 9 (mixed workload): 8 metrics, varied cardinalities, UTF-8 tags, 3 flush windows observed; checks per-window correctness of counts, sums, and that p99 is non-zero for metrics with > 20 samples"
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "9",
+   "effect": "Dropping to 4 scenarios (basic protocol + one UTF-8 + cardinality + percentile) makes it solvable with only the two main bugs fixed; raising to 12+ adds more edge cases (concurrent producers, backpressure on slow consumers, very large tag-set strings) increasing required correctness depth"
+  },
+  "expected_failure_modes": [
+   "Solver fixes the logged 'buf.write is not a function' error by using the correct Buffer API but keeps `.length` instead of `Buffer.byteLength`, passing all ASCII tests and failing UTF-8 frame tests",
+   "Solver fixes frame.js and tag_limiter.js but misses the aggregator.js accumulator shape mismatch, producing p50=p95=p99=0 on all series",
+   "Solver fixes tag_limiter.js (per-metric Sets) but misunderstands the cardinality-reset behavior and resets counts on each window instead of accumulating across the service lifetime",
+   "Solver observes zero output, checks the logs, patches only the tag limiter to raise max_cardinality to a huge number as a workaround \u2014 fixes the silence but leaves the frame encoding bug and the percentile bug",
+   "Solver verifies with the provided /app/tools/producer.js (ASCII only), sees frames flowing, declares done \u2014 misses UTF-8 breakage and percentile zeroes"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "tcp-protocol",
+   "metrics",
+   "feature-iteration",
+   "two-interacting-bugs",
+   "utf8"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/relay/frame.js  # see payload.length bug + broken Buffer constructor causing logged error",
+   "cat /app/relay/tag_limiter.js  # see global flat Map shared across all metrics",
+   "cat /app/relay/aggregator.js  # see array accumulator passed to percentile.js",
+   "cat /app/relay/percentile.js  # confirm expects {buckets:[...], count:N} object shape",
+   "cat /app/relay/config.js  # confirm max_cardinality=200, BUCKET_CONFIG",
+   "cat /app/relay/index.js  # confirm port setup, entry point",
+   "# Fix frame.js: replace payload.length with Buffer.byteLength(payload,'utf8'); fix Buffer constructor call",
+   "sed or direct edit of frame.js with correct Buffer.alloc(4) + buf.writeUInt32BE(Buffer.byteLength(payload,'utf8'),0)",
+   "# Fix tag_limiter.js: replace global Map with Map<metric_name,Set<tag_set_key>>",
+   "edit tag_limiter.js to use perMetricSets = new Map(); check/create Set per metric_name",
+   "# Fix aggregator.js: change array accumulator to {buckets:[...], count:0} matching percentile.js expectation",
+   "edit aggregator.js accumulator initialization and update logic",
+   "# Restart service",
+   "pkill -f 'node /app/relay/index.js' && node /app/relay/index.js &",
+   "# Test with provided tools",
+   "node /app/tools/producer.js &  # send some lines",
+   "node /app/tools/consumer.js  # verify frames flow with correct prefix",
+   "# Verify UTF-8 by sending accented tag values manually or with quick script",
+   "echo 'metric1 5 region=S\u00e3o_Paulo' | nc localhost 9900  # UTF-8 test",
+   "# Confirm no restart needed after disconnect test",
+   "# Done"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Bug 1 is described as 'not visible by reading alone \u2014 data-dependent' but payload.length vs Buffer.byteLength is plainly visible in source; the difficulty lever is mislabeled",
+   "The 'buf.write is not a function' error is explicitly logged at runtime AND visible in source, making it trivially discoverable by two independent signals",
+   "A methodical agent reads all files before fixing anything, so the 'bug 1 masks bug 2' interaction has zero practical effect on agent behavior \u2014 all three bugs are found in one reading pass",
+   "The accented character test (Test 2) requires the verifier to inject non-ASCII tag values, but if the solver tests only with provided ASCII tools and the verifier catches it, the failure mode is valid \u2014 however the frame.js fix is still source-visible regardless",
+   "Test 7 (zero-count series dropped) is ambiguous: 'empty payload' vs 'no frame is sent' are two different behaviors, and the instruction doesn't specify which the relay should implement \u2014 both are listed as acceptable",
+   "The percentile bucket interpolation correctness (Test 3) depends on the solver not accidentally changing BUCKET_CONFIG while fixing aggregator.js \u2014 a minor risk of inadvertent breakage",
+   "Timing-dependent tests (Test 6 producer disconnect recovery, flush window timing) could be flaky if the container is under CPU load during the 10-second flush cycle"
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because all three bugs are plainly visible by reading source code in a single pass (~15 commands), and the claimed 'data-dependent invisibility' of the frame.js bug is incorrect \u2014 `payload.length` vs `Buffer.byteLength` is an obvious source-level error additionally confirmed by the logged runtime error; a competent agent will read all files before touching anything, completely neutralizing the intended bug-interaction masking mechanic. The average score is approximately 3.8 but the genuine_difficulty floor of 4 is not met. Additionally, Test 7 has an ambiguity between 'empty frame' and 'no frame' as acceptable outputs.",
+  "fixes": [
+   "Make at least one bug truly data-dependent and invisible from source: e.g., replace the obvious `payload.length` with a subtle off-by-one only triggered by specific bucket boundary conditions in percentile.js, or introduce a race condition in the flush timer that only manifests under concurrent producer connections",
+   "Remove the logged runtime error ('buf.write is not a function') or make it misleading \u2014 a logged error pointing directly at the broken line removes all difficulty from discovering bug 1",
+   "Increase the number of files to read and add plausible red-herring code paths (the monitoring.js and retry.js stubs are mentioned but should actually contain plausible-looking but incorrect implementations to cause the agent to waste time)",
+   "Make the bug-interaction masking mechanically effective: ensure a solver who reads only the logs (not all source files) would fix only the logged error and ship \u2014 this requires the frame.js bug to not be an obvious one-liner and the tag_limiter bug to not be in an obviously named file",
+   "Clarify Test 7: specify exactly whether a zero-series flush sends a 4-byte prefix of 0x00000000 followed by empty payload, sends nothing at all, or sends a special sentinel \u2014 this is a protocol detail that must be unambiguous for verifier correctness"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task fixes a single HTTP service with a simple binary frame codec bug; the candidate involves a multi-file Node.js TCP relay with aggregation, percentile computation, tag cardinality limiting, and producer/consumer lifecycle management."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about computing HMAC-SHA256 tags over WAL records with a refund resolver; the candidate is about fixing a metrics aggregation relay with length-prefixed JSON frames, t-digest percentiles, and cardinality limiting."
+    },
+    {
+     "ref_id": "terminal-bench-pro/automate-blind-graph-mapping",
+     "verdict": "distinct",
+     "reason": "That task is a graph exploration game; the candidate is a TCP service debugging and repair task."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about verifying HMAC chains in audit logs; the candidate is about fixing a TCP metrics relay with aggregation and framing bugs."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "distinct",
+     "reason": "That task fixes an EMA computation and throughput issue in a metrics pipeline writing to JSON files; the candidate fixes a TCP relay service with framing, percentile approximation, and cardinality limiting bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aac910462208",
+     0.144
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.127
+    ],
+    [
+     "terminal-bench-pro/automate-blind-graph-mapping",
+     0.102
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.097
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.089
+    ]
+   ],
+   "cost_usd": 0.016749
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057468000000000005
+}

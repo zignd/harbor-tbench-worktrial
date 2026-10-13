@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "geospatial-wheel-accuracy-repair",
+  "title": "Geospatial Projection Wheel Deployment",
+  "scenario": "Your team ships a Python geospatial library, geoproject, that wraps a vendor-compiled C extension (libgeocore.so) for coordinate reprojection. The last release engineer left a half-finished wheel build: the setup.py and wheel scaffolding exist but the published wheel fails accuracy checks on the CI farm. The library is used to reproject lat/lon points from WGS84 to a local UTM zone; accuracy is measured as mean absolute error (MAE) in meters against a trusted reference. The environment contains the shared library, build scripts, sample test points with reference answers, and a runner script that measures MAE on a batch of inputs.",
+  "instruction_draft": "The geospatial projection wheel at /app is broken \u2014 the built wheel either fails to install, installs but crashes, or produces reprojections with MAE above 0.5 meters on a standard 1000-point validation batch. Your job as release engineer is to produce a working, installable wheel at /app/dist/ and ensure that importing geoproject and calling geoproject.reproject(lat, lon, zone) returns UTM easting/northing pairs whose MAE against the reference implementation stays below 0.5 m across all validation inputs, including inputs with latitudes above 60\u00b0 and near zone boundaries. The wheel must be installable with pip install --no-index --find-links /app/dist/ geoproject and the installed package must pass python -c \"import geoproject; print(geoproject.reproject(51.5, -0.1, 30))\" without error.",
+  "requirements": [
+   "A wheel file exists under /app/dist/ that pip can install without internet access",
+   "After pip install, `import geoproject` succeeds",
+   "`geoproject.reproject(lat, lon, zone)` returns a (easting, northing) tuple",
+   "MAE across the hidden 1000-point validation batch (including latitudes >60\u00b0 and near zone boundaries) is strictly below 0.5 meters",
+   "The wheel installs cleanly (no import errors, no missing .so) in a fresh Python environment"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm; install build-essential, patchelf, wheel, setuptools, auditwheel, numpy",
+   "/app/libgeocore.so: a compiled C shared library (no source) exporting two symbol families: geocore_reproject_fast(lat,lon,zone,e_out,n_out) and geocore_reproject_precise(lat,lon,zone,e_out,n_out). The 'fast' variant uses a truncated Mercator series (accurate only for |lat|<60\u00b0 and well inside zone boundaries). The 'precise' variant uses the full Karney algorithm (accurate everywhere to <0.01 m). Both are callable via ctypes. There is no documentation distinguishing them; names are discoverable via nm/objdump.",
+   "/app/geoproject/__init__.py: a Python wrapper that currently hard-codes use of geocore_reproject_fast via ctypes, passing lat/lon as C doubles. It has a latent bug: it passes arguments in (lon, lat) order instead of (lat, lon) to the C function, which expects (lat, lon, zone, *e, *n).",
+   "/app/geoproject/_loader.py: loads libgeocore.so using ctypes.CDLL with a relative path './libgeocore.so' \u2014 this works when run from /app but breaks when the wheel is installed elsewhere because the .so is not bundled.",
+   "/app/setup.py: a distutils/setuptools script that declares the package but does not include the .so as package data, and sets the wrong python_requires ('>= 3.9') but does not declare the platform tag, so bdist_wheel produces a pure-python tag (py3-none-any) that doesn't bundle the shared library.",
+   "/app/sample_points.csv: 20 lat/lon/zone/easting_ref/northing_ref rows, all with |lat|<55\u00b0 and well inside zone centers \u2014 these all pass with the fast variant, masking the precision bug",
+   "/app/validate.py: loads sample_points.csv, calls geoproject.reproject for each, computes MAE, prints pass/fail against 0.5 m threshold",
+   "/app/reference_reproject.py: a pure-Python reference using the pyproj library (installed) that gives ground-truth reprojections \u2014 used by the verifier but also available to the solver for cross-checking",
+   "Hidden verification: a 1000-point batch generated at verify time, seeded deterministically, including 200 points with lat>60\u00b0, 100 points near zone boundaries (within 1\u00b0 of the 6\u00b0 meridian boundaries), and 700 general points"
+  ],
+  "internal_hint": "Three interacting problems, none visible by code inspection alone: (1) The argument order bug (lon,lat vs lat,lon) is in __init__.py and IS visible \u2014 but by itself it causes large errors the solver will notice immediately when validating against sample_points.csv. (2) The precision mode selection: the solver must probe both geocore_reproject_fast and geocore_reproject_precise experimentally (via ctypes) against the reference to discover that 'fast' fails for high latitudes and zone boundaries. This requires running experiments \u2014 the names alone don't reveal which is needed. (3) The .so bundling: _loader.py uses a relative path and setup.py does not include the .so as package_data, so the installed wheel cannot find the library. The solver must fix all three: correct argument order, switch to 'precise', and bundle the .so (via MANIFEST.in + package_data, or by copying it next to __init__.py and using os.path to load it). Characterizing the two symbols requires probing with ctypes on varied inputs and comparing to reference_reproject.py \u2014 only experiment reveals the accuracy difference. The shallow trap: fixing argument order + bundling the .so but keeping 'fast' passes all 20 sample points (|lat|<55\u00b0) but fails the hidden batch on high-latitude and zone-boundary inputs.",
+  "trap": "A solver who fixes the argument-order bug and the .so bundling, but keeps geocore_reproject_fast, will see MAE < 0.1 m on the provided 20 sample points (all low-latitude, well inside zones) and conclude the wheel is correct. The hidden 1000-point batch includes 200 points with lat>60\u00b0 and 100 near zone boundaries; the fast variant produces MAE of 3-8 m on those, pushing the batch MAE well above 0.5 m. The only way to discover the precision issue is to run both symbols experimentally against the reference on high-latitude inputs.",
+  "tests": [
+   "Install the wheel in a clean venv: pip install --no-index --find-links /app/dist/ geoproject -- must succeed",
+   "python -c 'import geoproject; print(geoproject.reproject(51.5, -0.1, 30))' -- must print a tuple near (699330, 5710000) without error",
+   "Run verifier with 1000 seeded points (numpy seed=42): generate lat uniform [10,80], lon from zone*6-180 \u00b1 15\u00b0, compute reference with pyproj, call geoproject.reproject, compute MAE -- must be < 0.5 m",
+   "Subset test: the 200 points with lat>60\u00b0 must individually have absolute error < 2 m (catches fast-mode failure at high latitudes)",
+   "Subset test: the 100 points within 0.5\u00b0 of zone meridian boundaries must have absolute error < 2 m (catches fast-mode failure near boundaries)",
+   "The .so must be present inside the installed wheel's package directory (not loaded from /app), verified by checking geoproject.__file__ parent for libgeocore.so"
+  ],
+  "verifier_knob": {
+   "name": "mae_threshold_meters",
+   "value": "0.5",
+   "effect": "Raising to 2.0 m allows the fast variant to pass most inputs (makes task easier); lowering to 0.1 m requires near-perfect use of precise mode with no argument bugs (harder); the 0.5 m value is set so that even one high-latitude input with fast mode causes failure"
+  },
+  "expected_failure_modes": [
+   "Agent fixes argument order and bundling but misses the precision mode issue \u2014 passes sample validation, fails hidden batch on high-latitude inputs",
+   "Agent discovers the two symbols by name but assumes 'fast' is sufficient without experimentally testing on high-latitude inputs",
+   "Agent fixes the mode but uses a relative path for the .so in the installed wheel, causing ImportError in the clean-venv test",
+   "Agent produces a pure-python tagged wheel that doesn't include the .so, so the installed package cannot load the shared library",
+   "Agent uses auditwheel repair but doesn't fix the argument order bug, causing systematic ~100 km errors on all points"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "wheel-packaging",
+   "ctypes",
+   "shared-library",
+   "numerical-accuracy",
+   "geospatial",
+   "opaque-binary"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/geoproject/__init__.py  # see argument order bug (lon,lat) and 'fast' symbol",
+   "cat /app/geoproject/_loader.py  # see relative path bug",
+   "cat /app/setup.py  # see missing package_data and wrong wheel tag",
+   "nm /app/libgeocore.so | grep geocore  # discover both fast and precise symbols",
+   "python3 -c \"import ctypes,ctypes.util; lib=ctypes.CDLL('/app/libgeocore.so'); # quick test both on lat=65 vs reference\"",
+   "cat /app/reference_reproject.py  # understand pyproj reference API",
+   "cp /app/libgeocore.so /app/geoproject/libgeocore.so  # bundle .so into package",
+   "# Edit /app/geoproject/_loader.py: replace './libgeocore.so' with os.path.join(os.path.dirname(__file__), 'libgeocore.so')",
+   "# Edit /app/geoproject/__init__.py: swap arg order lat,lon->lon,lat fix; switch to geocore_reproject_precise",
+   "# Edit /app/setup.py: add package_data={'geoproject': ['libgeocore.so']}, ensure platform wheel via Extension() stub or MANIFEST.in",
+   "cd /app && python setup.py bdist_wheel --python-tag cp313 --plat-name linux_x86_64",
+   "python -m pip install --no-index --find-links /app/dist/ geoproject --target /tmp/te --force-reinstall",
+   "python -c \"import sys; sys.path.insert(0,'/tmp/te'); import geoproject; print(geoproject.reproject(51.5,-0.1,30))\"",
+   "python -c \"import sys; sys.path.insert(0,'/tmp/te'); import geoproject; print(geoproject.reproject(65.0, 24.0, 35))\"  # test high-lat",
+   "python /app/validate.py  # confirm sample MAE < 0.5",
+   "# If wheel tag is py3-none-any and .so not included, try: python setup.py bdist_wheel with Extension dummy or use auditwheel",
+   "python -m auditwheel repair /app/dist/*.whl -w /app/dist/  # ensure .so bundled with correct tags"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'fast' vs 'precise' naming convention effectively defeats the 'opaque binary' characterization \u2014 a frontier agent reading nm output will intuit that 'precise' is needed without running experiments, making the difficulty lever weaker than designed.",
+   "Producing a platform-tagged wheel without a C extension declared in setup.py is non-trivial on python:3.13-slim: bdist_wheel defaults to pure-python tag (py3-none-any) unless a C extension is declared; the task doesn't clarify if setup.py already has a stub extension or if the agent must invent one, creating ambiguity about whether auditwheel or manual tagging is the intended path.",
+   "auditwheel repair may refuse to process a pure-python tagged wheel or a wheel where the .so is bundled as package_data rather than as a compiled extension, creating a potentially unsolvable situation depending on exact auditwheel version behavior.",
+   "The verifier generates lat in [10, 80] but zone is derived from lon (zone*6-180 \u00b1 15\u00b0) \u2014 for lat near 80\u00b0 and certain zones, pyproj may raise exceptions for out-of-bounds UTM coordinates (some UTM zones are undefined above 84\u00b0N), potentially causing flaky test failures.",
+   "The instruction says 'fresh Python environment' for the clean-venv test but the environment has numpy pre-installed; if the wheel lists numpy as a dependency and it's not in the venv, installation may fail, creating an ambiguous failure mode.",
+   "The sample_points.csv validation script (validate.py) uses the installed geoproject, but if the agent tests with the local /app version during development, they may not catch the bundling bug until the clean-venv test \u2014 this is fine by design but the instruction doesn't clearly distinguish 'installed' vs 'local' testing.",
+   "Argument order fix direction is ambiguous: the bug passes (lon, lat) but the C function wants (lat, lon, zone) \u2014 the fix is to pass (lat, lon, zone) \u2014 but the description says 'passes arguments in (lon, lat) order instead of (lat, lon)' which is clear. However, the zone argument handling is not mentioned as buggy, which could cause confusion if zone is also mishandled."
+  ],
+  "verdict": "reject",
+  "reasons": "The 'opaque binary requiring experimental characterization' difficulty lever is critically undermined by the symbol names: a skilled agent who runs `nm /app/libgeocore.so` sees `geocore_reproject_fast` and `geocore_reproject_precise` and will switch to precise without any experiment, collapsing the hardest sub-problem. The wheel packaging mechanics (making bdist_wheel produce a platform-tagged wheel that includes a .so without declaring a C extension) introduce genuine ambiguity about the intended solution path \u2014 auditwheel, manual tagging, and declaring a dummy extension are all viable but have different pitfalls that aren't clearly addressed. These two issues together bring genuine_difficulty below the required threshold of 4.",
+  "fixes": [
+   "Rename the precise symbol to something non-descriptive (e.g., geocore_reproject_v2 or geocore_reproject_alt) so the agent cannot infer its purpose from the name and must experimentally characterize accuracy differences to know which to use.",
+   "Pre-configure setup.py to already declare a dummy/stub C extension (so bdist_wheel produces a platform-tagged wheel) and make the actual bug purely about package_data not including libgeocore.so \u2014 this removes the wheel-tagging ambiguity and focuses difficulty on the three stated bugs.",
+   "Cap the latitude range in the hidden batch to [10, 75] to avoid UTM validity edge cases above 84\u00b0N that could cause pyproj exceptions and flaky verifier failures.",
+   "Add a note in the instruction that both `nm` and experimental testing are available tools, and make the validate.py script include at least 2-3 high-latitude sample points so the sample check itself traps the fast-mode failure \u2014 currently all 20 sample points are low-latitude, making the trap too easy to avoid once the agent reads the internal structure."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/restore-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task is about restoring a broken pip executable from backups; the candidate is about debugging and rebuilding a Python wheel with a C extension to meet numerical accuracy requirements."
+    },
+    {
+     "ref_id": "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task focuses on repairing pip infrastructure (SSL, symlinks, PATH); the candidate focuses on fixing a geospatial C extension wheel to meet sub-0.5m MAE accuracy criteria."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/pypi-server",
+     "verdict": "distinct",
+     "reason": "That task is about creating a pure Python package and hosting it on a local PyPI server; the candidate involves debugging a compiled C extension wheel with numerical accuracy requirements."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a binary's transformation and fixing a data pipeline; the candidate is about repairing a Python wheel wrapping a C extension to meet geospatial reprojection accuracy."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing AES-CTR encryption logic in a C library refactor; the candidate is about repairing a geospatial coordinate reprojection wheel to meet numerical accuracy thresholds."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/restore-broken-pip-installation",
+     0.13
+    ],
+    [
+     "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     0.128
+    ],
+    [
+     "terminal-bench-2-1/pypi-server",
+     0.08
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.069
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.053
+    ]
+   ],
+   "cost_usd": 0.01437
+  },
+  "novel": true
+ },
+ "cost_usd": 0.059202
+}

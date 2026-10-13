@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "metric-query-service-protocol",
+  "title": "Metrics Query Daemon Repair and Extension",
+  "scenario": "A data engineering team runs an internal metrics query daemon (`mqd`) that ingests structured application logs, materializes rolling aggregates into a SQLite database, and serves queries over a Unix socket using a simple line-delimited text protocol. The daemon was written by someone who left, and a new feature (percentile queries) was half-finished and broken. The environment contains the daemon source (~1,400 lines across several modules), a corpus of historical log files, and a reference client script. The aggregation logic contains a hidden invariant about how the daemon buckets timestamps that is only visible when running against real log data.",
+  "instruction_draft": "Hey, I inherited the metrics pipeline and the `mqd` daemon is broken in a few ways. There's a half-built percentile feature that was never finished \u2014 the daemon needs to handle `PCTILE <metric> <p>` queries (e.g. `PCTILE api.latency_ms 95`) that return the p-th percentile (0 < p < 100) of all recorded values for that metric over the last 24 hours. The existing `AGGR <metric>` query (which returns `min,max,mean,count` for the last 24 hours) is also returning wrong numbers for some metrics \u2014 it passes a smoke test but the numbers are off on real data. Get both working correctly: the service must respond to all query types correctly, including edge cases like metrics with a single sample, metrics with identical values, and large sample sets. The daemon binary is at `/app/mqd/mqd.py`, configs and logs are under `/app/`, and you can restart the service as needed.",
+  "requirements": [
+   "PCTILE <metric> <p> query returns the nearest-rank p-th percentile (integer p, 0 < p < 100) of all recorded values for the named metric in the last 24 hours, as a single decimal number followed by a newline.",
+   "AGGR <metric> query returns correct min,max,mean,count values for the named metric over the last 24 hours (currently returns wrong values for some metrics due to a timestamp bucketing bug).",
+   "Both queries must handle edge cases: a single recorded sample, all identical values, metrics with thousands of samples.",
+   "The daemon must respond to the protocol over its Unix socket at /app/mqd/mqd.sock.",
+   "An unknown metric name returns the string 'ERR unknown metric' followed by a newline.",
+   "An out-of-range percentile (p <= 0 or p >= 100) returns 'ERR invalid percentile' followed by a newline.",
+   "The daemon must continue accepting new connections after answering any query."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3 CLI, no extra Python packages needed beyond stdlib.",
+   "/app/mqd/mqd.py: ~600-line daemon. Reads logs from /app/logs/, ingests into SQLite at /app/mqd/metrics.db. Serves a Unix socket. Contains AGGR handler (buggy: uses integer-division bucket IDs that silently collapse two adjacent time windows, double-counting some rows and missing others \u2014 only visible when logs span a specific time boundary). Contains a stub PCTILE handler that always returns 'ERR not implemented'.",
+   "/app/mqd/schema.sql: SQLite schema for the metrics table: (metric TEXT, ts INTEGER, value REAL). Timestamp is stored as Unix epoch seconds.",
+   "/app/mqd/ingest.py: ~200-line log ingestion script. Parses /app/logs/*.log (one JSON record per line: {ts, metric, value}) and upserts into the DB. Has a subtle off-by-one: records whose ts falls exactly on a minute boundary are inserted with ts-1, meaning the effective window for 'last 24 hours' computed in the query layer is misaligned by one second for boundary records.",
+   "/app/mqd/client.py: ~100-line reference client. Connects to the socket, sends a query, prints the response. Used for manual testing.",
+   "/app/logs/: 15 synthetic log files covering 72 hours of data. Generated deterministically with a seeded PRNG. Metrics include: api.latency_ms (skewed distribution), db.query_ms, cache.hit_ratio, queue.depth. Some files contain records at exact minute boundaries to expose the off-by-one.",
+   "/app/mqd/config.ini: window_hours=24, socket_path=/app/mqd/mqd.sock, db_path=/app/mqd/metrics.db.",
+   "/app/run.sh: starts mqd.py in background, runs ingest.py, then prints 'ready'.",
+   "A plausible but uninvolved /app/dashboard/ directory with ~300 lines of a Flask stub that imports from mqd \u2014 present to add realistic size and mislead shallow reading."
+  ],
+  "internal_hint": "Two interacting bugs: (1) In mqd.py's AGGR handler, the 24-hour window is computed as `WHERE bucket_id >= current_bucket - 1440` where bucket_id = ts // 60. But the SELECT also does a GROUP BY bucket_id to deduplicate, and then SUM/AVG across buckets \u2014 this collapses within-minute variance incorrectly, producing wrong mean and count for metrics sampled more than once per minute. The correct fix is to query raw rows with `WHERE ts >= now - 86400` and aggregate over individual rows. (2) In ingest.py, records with ts % 60 == 0 are stored as ts-1, so they appear in the preceding minute bucket. This interacts with the bucket-boundary query in (1) in a way that is only visible when you run the system against real data and compare to a ground-truth computation. The invariant: the effective 24-hour window actually includes records from [now - 86400 - 1, now] due to the off-by-one, which must be preserved in the fixed AGGR query to match the intended semantics. PCTILE must be built from scratch using the same window logic. A solver must: run the daemon, send AGGR queries, compute expected values independently from the raw log files, observe the discrepancy, trace it to the bucket_id computation, discover the ingest off-by-one by examining ingest.py and the raw DB contents, then implement both fixes and add the PCTILE handler with correct nearest-rank semantics.",
+  "trap": "A naive agent reads the AGGR handler, notices the bucket_id GROUP BY, rewrites it to use raw ts with `WHERE ts >= now - 86400`, and calls it done. This passes the provided smoke test. But the hidden verifier generates fresh log data with samples at exact minute boundaries and samples where multiple values fall in the same minute \u2014 the fixed AGGR still returns wrong mean/count if the agent didn't also fix the ingest off-by-one (or account for it in the query window). The PCTILE implementation also fails on hidden inputs if nearest-rank is implemented incorrectly (e.g., using Python's statistics.quantiles which uses a different interpolation method), or if the window used for PCTILE differs from the one used for AGGR.",
+  "tests": [
+   "Verifier restarts the daemon fresh, injects a known set of records including boundary-timestamp samples, sends AGGR queries for each metric, and checks min/max/mean/count against ground-truth values computed directly from the injected records using the same 24-hour window semantics.",
+   "Verifier sends PCTILE queries for p=1, p=50, p=95, p=99 on a metric with a known distribution (100 values from 1 to 100), checks each result against the nearest-rank formula: ceil(p/100 * N)-th value in sorted order.",
+   "Verifier sends PCTILE on a metric with a single sample and checks the result equals that sample value.",
+   "Verifier sends PCTILE on a metric where all values are identical and checks the result equals that value.",
+   "Verifier sends PCTILE with p=0 and p=100 and checks both return 'ERR invalid percentile'.",
+   "Verifier sends AGGR and PCTILE for a metric name that was never ingested and checks 'ERR unknown metric'.",
+   "Verifier sends 20 sequential queries on the same connection (daemon must not close after first response).",
+   "Verifier injects a large batch (5000 samples for one metric) and checks PCTILE 95 is within floating-point tolerance of the correct value.",
+   "Verifier checks that AGGR mean is computed over individual sample values (not over per-minute bucket means), by injecting 3 records in one minute (values 1, 2, 99) and 1 record in a different minute (value 2), and checking mean = (1+2+99+2)/4 = 26.0, not (34+2)/2 = 18.0."
+  ],
+  "verifier_knob": {
+   "name": "num_query_scenarios",
+   "value": "9",
+   "effect": "Increasing adds more metric distributions (bimodal, constant, sparse), more boundary timestamp patterns, and more p values tested; decreasing to 3-4 makes it passable without fixing the ingest off-by-one."
+  },
+  "expected_failure_modes": [
+   "Agent fixes AGGR to use raw ts but misses the ingest off-by-one, so boundary-timestamp tests fail.",
+   "Agent implements PCTILE using Python statistics.quantiles (linear interpolation) instead of nearest-rank, passes the obvious case p=50 but fails p=1 and p=99 on hidden inputs.",
+   "Agent uses a different 24-hour window definition in PCTILE than in AGGR (e.g., >= now-86400 vs > now-86400), causing 1-second discrepancy in what's included.",
+   "Agent patches AGGR correctly but doesn't restart the daemon, so the socket still serves the old buggy code.",
+   "Agent doesn't test with multiple samples in the same minute, so the GROUP BY bug survives into the final submission.",
+   "Agent reads only mqd.py, misses that ingest.py also contributes to the bug, and submits a partial fix."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "bash",
+   "unix-socket",
+   "protocol",
+   "debugging",
+   "hidden-invariant"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/mqd/mqd.py (identify AGGR handler with bucket_id GROUP BY bug and PCTILE stub)",
+   "cat /app/mqd/ingest.py (find ts % 60 == 0 \u2192 store ts-1 off-by-one)",
+   "cat /app/mqd/config.ini (confirm window_hours=24, socket/db paths)",
+   "bash /app/run.sh (start daemon, ingest logs, confirm 'ready')",
+   "python /app/mqd/client.py 'AGGR api.latency_ms' (observe output)",
+   "sqlite3 /app/mqd/metrics.db 'SELECT metric, ts%60, COUNT(*) FROM metrics GROUP BY metric, ts%60 LIMIT 20' (confirm minute-boundary records and multi-sample minutes)",
+   "python -I -c 'import json,glob; recs=[json.loads(l) for f in glob.glob(\"/app/logs/*.log\") for l in open(f)]; print(len(recs))' (ground-truth data check)",
+   "Edit mqd.py: fix AGGR handler \u2014 replace bucket_id GROUP BY with raw-row aggregation: SELECT MIN(value),MAX(value),AVG(value),COUNT(*) FROM metrics WHERE metric=? AND ts >= ?-86401",
+   "Edit mqd.py: implement PCTILE handler \u2014 fetch sorted values WHERE ts >= now-86401, use math.ceil(p/100*N)-1 index for nearest-rank, return single decimal",
+   "Edit mqd.py: add validation p<=0 or p>=100 \u2192 'ERR invalid percentile'",
+   "Edit mqd.py: ensure unknown metric returns 'ERR unknown metric' for both AGGR and PCTILE",
+   "Edit mqd.py: ensure connection loop persists (keep reading lines on same connection, not close after one response)",
+   "pkill -f mqd.py; python /app/mqd/mqd.py & (restart daemon with fixes)",
+   "python /app/mqd/client.py 'AGGR api.latency_ms' (verify corrected values)",
+   "python /app/mqd/client.py 'PCTILE api.latency_ms 95' (verify PCTILE output)",
+   "python /app/mqd/client.py 'PCTILE api.latency_ms 0' (verify ERR invalid percentile)",
+   "python /app/mqd/client.py 'PCTILE nonexistent 50' (verify ERR unknown metric)",
+   "python -I -c 'import socket,os; s=socket.socket(socket.AF_UNIX); s.connect(\"/app/mqd/mqd.sock\"); [s.sendall((\"AGGR api.latency_ms\"+chr(10)).encode()) or print(s.recv(1024)) for _ in range(20)]' (verify persistent connection over 20 queries)"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 'hidden invariant' (ingest off-by-one ts-1) is directly readable in ingest.py source code, not truly hidden; a strong agent reading all source files would find it without running against data, undermining the difficulty lever.",
+   "The correct window fix (now-86401 vs now-86400) depends on the verifier's injected test data also having boundary-timestamp records \u2014 if the verifier doesn't inject such records, the partial fix (now-86400) passes all tests, making the 'trap' inert.",
+   "The verifier's ground-truth for injected records must itself correctly apply the ts-1 adjustment for boundary timestamps, otherwise the expected values and actual DB contents will diverge causing spurious failures even on correct implementations.",
+   "Nearest-rank formula ambiguity: 'ceil(p/100 * N)-th value in sorted order' uses 1-based indexing, but if implemented as sorted_vals[math.ceil(p/100*N)-1] that is 0-based \u2014 the blueprint must be unambiguous about this in the verifier to avoid off-by-one in the test harness itself.",
+   "The 'daemon must continue accepting new connections after answering any query' test (20 sequential queries on the same connection) tests persistent per-connection reading, which is a different requirement than multi-connection acceptance \u2014 if the verifier sends each query as a separate connection, this test is trivially passed even by a broken implementation.",
+   "Floating-point tolerance for PCTILE on 5000 samples is mentioned but no tolerance value is specified; this could cause spurious failures if the verifier uses exact equality.",
+   "The Flask dashboard stub that 'imports from mqd' could cause import errors if it's auto-discovered by test runners or if the daemon's module structure changes during fixing."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores only 3 because both bugs are directly readable in source code and a systematic agent can find and fix them in ~18 commands without needing to run against real data to discover the invariant \u2014 contradicting the 'hidden-invariant' difficulty lever claim. The ingest off-by-one (ts % 60 == 0 \u2192 ts-1) is plainly visible in ingest.py, not hidden, and the window fix follows mechanically. Additionally, there are multiple invalid failure risks: the verifier's ground-truth must itself correctly implement the ts-1 adjustment for injected boundary records or it will produce wrong expected values, and the nearest-rank formula indexing ambiguity could cause the test harness to be wrong. The task is excellent in realism and verifiability but needs genuine exploration-gating to reach hard difficulty.",
+  "fixes": [
+   "Make the ingest off-by-one truly hidden: instead of a visible `if ts % 60 == 0: ts -= 1` in ingest.py, encode it as a subtle integer truncation in a helper function (e.g., `normalize_ts(ts)` that does `return (ts // 60) * 60 - (1 if ts % 60 == 0 else 0)`), so the agent must trace the data flow through a helper rather than grep for it.",
+   "Gate discovery on runtime behavior: remove the off-by-one from ingest.py source comments and make it emerge only when comparing DB contents to raw log files \u2014 e.g., the ingest silently writes wrong timestamps via a SQL expression like `INSERT ... VALUES (?, ?, ?)` where the ts parameter is computed inline in a complex expression that truncates differently than expected.",
+   "Specify the nearest-rank formula precisely in the instruction or verifier comments (e.g., 'index = math.ceil(p / 100 * N), 1-based, so Python index is ceil(p/100*N)-1') to eliminate the test-harness ambiguity risk.",
+   "Add a requirement that the verifier explicitly states the tolerance for floating-point PCTILE comparisons (e.g., 'within 1e-9 of the exact value') to prevent spurious failures on large sample sets.",
+   "Clarify 'persistent connection' test: specify whether 20 queries are sent on one TCP/Unix connection (testing per-connection read loop) or 20 separate connections (testing accept loop), as these test fundamentally different code paths."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "NetFlow v9 aggregation over UDP/TCP in Rust vs. a Python metrics daemon with SQLite and Unix socket protocol repair."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "PostgreSQL query optimization for semantic equivalence vs. repairing a Python daemon's aggregation logic and adding a percentile feature."
+    },
+    {
+     "ref_id": "terminal-bench-pro/constrained-portfolio-variance-minimization",
+     "verdict": "distinct",
+     "reason": "Numerical portfolio optimization problem vs. debugging and extending a metrics query daemon's protocol and aggregation logic."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "HMAC chain verification bug fix in an audit-log service vs. timestamp bucketing bug and percentile feature implementation in a metrics daemon."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "variant",
+     "reason": "Both tasks involve repairing a running data pipeline daemon with hidden bugs in aggregation logic and extending its query/API surface, differing mainly in domain (log enrichment/GeoIP vs. metrics/percentiles) and technology stack."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-0cd67d8adf4d",
+     0.13
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.114
+    ],
+    [
+     "terminal-bench-pro/constrained-portfolio-variance-minimization",
+     0.111
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.095
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.071
+    ]
+   ],
+   "cost_usd": 0.01488
+  },
+  "novel": false
+ },
+ "cost_usd": 0.065439
+}

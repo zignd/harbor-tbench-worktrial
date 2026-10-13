@@ -1,0 +1,177 @@
+{
+ "blueprint": {
+  "slug": "spectral-solver-deployment-regression",
+  "title": "Spectral PDE Solver Deployment Regression",
+  "scenario": "An open-source maintainer maintains a small in-house spectral PDE solver package (~1,200 lines across several modules) used for 1D and 2D Fourier-based numerical simulations. A recent refactor that added adaptive time-stepping and a new compiled extension module (shipped as a .so binary without source) introduced a silent regression: the deployed solver produces results that look plausible on the bundled sample cases but diverge on boundary-intensive inputs the test suite exercises at verify time. The codebase has a plugin architecture where a Cython extension handles the inner spectral transform loop, and a Python orchestrator applies the time-stepper; the regression lives in how these two components interact under non-uniform initial conditions.",
+  "instruction_draft": "The spectral PDE solver at /app/solver/ passes its bundled sample tests but produces wrong results on general inputs. Fix the deployment so that running `python -m solver.run --config /app/configs/run.toml` produces a solution file at /app/output/solution.npz whose spectral coefficients and final-time field values match the reference tolerances for all problem classes, and ensure the installed entry-point `solver-run` also works correctly.",
+  "requirements": [
+   "Running `python -m solver.run --config /app/configs/run.toml` must complete without error",
+   "The output file /app/output/solution.npz must exist after the run",
+   "The spectral coefficients array in solution.npz (key 'coeffs') must match reference values within relative tolerance 1e-4 for all verify-time problem configurations",
+   "The final-time field values in solution.npz (key 'u_final') must match reference values within relative tolerance 1e-4",
+   "The installed console entry-point `solver-run` must invoke the same logic and produce identical output",
+   "The solver must handle both periodic and non-periodic (Dirichlet) boundary conditions correctly",
+   "The solution must be reproducible: two consecutive runs with the same config must produce bit-identical output files"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install: build-essential (for any compilation the solver might need)",
+   "pip install: numpy==1.26.4 scipy==1.13.0 toml==0.10.2",
+   "Directory /app/solver/ with __init__.py, run.py (~150 lines), orchestrator.py (~200 lines), timestepper.py (~180 lines), boundary.py (~120 lines), utils.py (~100 lines)",
+   "Directory /app/solver/ext/ containing spectral_core.so (compiled Cython extension, no source) that exports apply_dst, apply_dft, apply_idst, apply_idft",
+   "The .so binary's apply_dst internally uses a sign convention (DST-I vs DST-II) that differs from what orchestrator.py assumes after the refactor\u2014discoverable only by probing the binary with known inputs",
+   "orchestrator.py's adaptive time-stepper accumulates a phase offset in Fourier space when the step-rejection logic runs (visible only on stiff problems where steps are rejected)",
+   "boundary.py has a mode-selection bug: for Dirichlet problems it calls apply_dft instead of apply_dst due to a wrong string comparison introduced in the refactor",
+   "Sample config /app/configs/sample.toml exercises only periodic, non-stiff problems\u2014all three bugs are dormant on this input",
+   "Config /app/configs/run.toml exercises Dirichlet boundary conditions and a stiff problem that triggers step rejection",
+   "/app/configs/run.toml is present and readable but /app/output/ does not exist (must be created)",
+   "Entry-point installed via setup.cfg pointing to solver.run:main, but setup.cfg has an outdated console_scripts target name ('solver-cli' instead of 'solver-run') so the correct entry-point is missing",
+   "A reference helper /app/verify_sample.py that the solver can run against sample.toml to sanity-check\u2014passes even with bugs present",
+   "/app/tests/test_sample.py: a bundled pytest file that tests only the periodic, non-stiff case\u2014passes even with bugs",
+   "Total codebase: approximately 900 lines of Python across the modules above, plus the opaque .so"
+  ],
+  "internal_hint": "Three interacting bugs, two in readable Python and one requiring black-box probing of the binary: (1) boundary.py line ~87 compares boundary_type == 'dirichlet' but the config key delivers 'Dirichlet' (capital D), so apply_dft is called instead of apply_dst\u2014wrong transform for Dirichlet problems. (2) orchestrator.py's step-rejection path (lines ~120-140) re-applies the spectral forcing term without resetting the accumulator, causing a 2x forcing on rejected steps\u2014only triggered on stiff configs where dt is halved. (3) the .so binary's apply_dst implements DST-II (zero-indexed, shift by 1) while orchestrator.py passes arrays expecting DST-I semantics\u2014discoverable by calling apply_dst on [1,0,0] and checking the result against numpy's DST-I. These three bugs compose: the boundary fix changes which transform is called, the step-rejection fix changes the accumulator logic, and the DST convention fix must account for a 1-element offset in the mode array passed to the binary. The setup.cfg bug (entry-point name mismatch) is found by running solver-run and getting command not found, then inspecting setup.cfg. The solver must probe the binary, instrument the time-stepper, and also reinstall the package with the corrected entry-point. Difficulty comes from: (a) bugs invisible in the sample run, (b) one cause requires empirical probing of an opaque binary, (c) the three bugs interact so fixing only one or two leaves the output wrong in a different way, and (d) the entry-point requires reinstalling the package.",
+  "trap": "An agent that runs verify_sample.py or pytest, sees green, and declares done will fail because the hidden tests use Dirichlet BCs and stiff configs. An agent that fixes the string comparison alone still fails because the DST convention mismatch produces wrong coefficients. An agent that fixes both Python bugs but doesn't probe the binary convention gets wrong spectral coefficients. An agent that fixes everything but misses the setup.cfg entry-point name fails the solver-run requirement. The verify-time tests generate fresh initial conditions (random Fourier amplitudes seeded deterministically per problem class) not present in any bundled file.",
+  "tests": [
+   "Test 1: run `python -m solver.run --config /app/configs/run.toml` exits 0 and /app/output/solution.npz exists",
+   "Test 2: load solution.npz, check that 'coeffs' and 'u_final' keys exist with correct shapes",
+   "Test 3: for a verify-time Dirichlet problem (seeded random IC, non-stiff), compare solution.npz 'coeffs' against reference computed by scipy.fft.dstn to within rtol=1e-4",
+   "Test 4: for a verify-time stiff periodic problem (triggers at least 3 step rejections), compare 'u_final' against reference scipy RK45 solution to within rtol=1e-4",
+   "Test 5: for a verify-time Dirichlet stiff problem (combines both conditions), compare both 'coeffs' and 'u_final' against reference to within rtol=1e-4",
+   "Test 6: run `solver-run --config /app/configs/run.toml` as a shell command; verify it exits 0 and produces identical solution.npz (bit-identical via hash)",
+   "Test 7: run the solver twice with the same config; verify md5 of solution.npz is identical both times (reproducibility)"
+  ],
+  "verifier_knob": {
+   "name": "num_independent_checks",
+   "value": "7",
+   "effect": "Reducing to 3 checks (existence + one field tolerance + entry-point) makes it easier since partial fixes pass; raising to 10 by adding more IC seeds and a 2D problem class makes it harder since the DST convention must be exactly right across more modes"
+  },
+  "expected_failure_modes": [
+   "Agent runs bundled sample test, sees it pass, declares success without testing run.toml which exercises the failing code paths",
+   "Agent finds and fixes the string comparison bug (boundary_type case mismatch) but does not probe the binary to discover the DST convention difference, so spectral coefficients remain wrong",
+   "Agent probes the binary and patches the DST offset but misses the step-rejection accumulator bug, so stiff problems still diverge",
+   "Agent fixes all three logic bugs but does not notice the setup.cfg entry-point name mismatch, so the solver-run command fails",
+   "Agent patches orchestrator.py to suppress step rejection entirely (always accept) instead of fixing the accumulator\u2014passes some tests but fails on problems requiring small timesteps for stability",
+   "Agent installs a different package (e.g., scipy's FFT directly) bypassing the binary, inadvertently changing the transform normalization convention and failing the coefficient tolerance checks"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "spectral-methods",
+   "reverse-engineering",
+   "binary-probing",
+   "bug-interaction",
+   "deployment",
+   "pde-solver"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/solver/boundary.py  # read boundary.py, spot 'dirichlet' case mismatch at line ~87",
+   "cat /app/solver/orchestrator.py  # read orchestrator.py, spot accumulator bug in step-rejection path",
+   "cat /app/configs/run.toml  # confirm Dirichlet + stiff config",
+   "cat /app/setup.cfg  # find solver-cli vs solver-run mismatch immediately",
+   "sed -i 's/== .dirichlet./lower() == \"dirichlet\"/' /app/solver/boundary.py  # fix bug 1 (case)",
+   "# edit orchestrator.py lines ~120-140 to reset accumulator before re-applying forcing on rejected step  # fix bug 2",
+   "python3 -c \"import sys; sys.path.insert(0,'/app'); from solver.ext.spectral_core import apply_dst; import numpy as np; r=apply_dst(np.array([1.0,0.0,0.0])); print(r)\"  # probe binary",
+   "python3 -c \"from scipy.fft import dstn; import numpy as np; print(dstn(np.array([1.0,0.0,0.0]), type=1))\"  # compare DST-I reference",
+   "python3 -c \"from scipy.fft import dstn; import numpy as np; print(dstn(np.array([1.0,0.0,0.0]), type=2))\"  # compare DST-II reference",
+   "# identify binary uses DST-II; edit orchestrator.py to shift mode array index by 1 when calling apply_dst  # fix bug 3",
+   "mkdir -p /app/output",
+   "sed -i 's/solver-cli/solver-run/' /app/setup.cfg  # fix entry-point name",
+   "pip install -e /app  # reinstall with corrected entry-point",
+   "python -m solver.run --config /app/configs/run.toml  # test main run",
+   "ls /app/output/solution.npz  # verify output exists",
+   "python3 -c \"import numpy as np; d=np.load('/app/output/solution.npz'); print(list(d.keys()), d['coeffs'].shape, d['u_final'].shape)\"  # verify keys/shapes",
+   "solver-run --config /app/configs/run.toml  # test entry-point",
+   "python -m solver.run --config /app/configs/run.toml && md5sum /app/output/solution.npz  # run again for reproducibility check"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "ABI incompatibility: a precompiled Cython .so for one Python version will fail to import under Python 3.13 (different stable ABI tag), making the task unsolvable and every agent failure invalid",
+   "Bit-identical reproducibility is flaky: NumPy FFT and floating-point operations can produce non-bit-identical results across runs depending on thread scheduling, BLAS version, or CPU instruction selection\u2014Test 7 may spuriously fail",
+   "DST convention fix is underspecified: 'a 1-element offset in the mode array' is ambiguous\u2014padding, slicing, or index shifting are all different implementations that might pass or fail depending on exact orchestrator code structure not shown",
+   "Verify-time test seeding mechanism is not specified in the blueprint: if the seed derivation differs between builder's intent and actual verifier implementation, reference values won't match and every correct fix still fails",
+   "The instruction draft does not mention reproducibility or the entry-point requirement\u2014agents reading only the instruction (not the requirements list) may miss two of the seven tests",
+   "If the orchestrator's 'accumulator reset' fix is ambiguous (the description says 're-applies without resetting' but doesn't show the exact code structure), multiple plausible fixes could be wrong in subtle ways",
+   "The .so binary path resolution under 'python -m solver.run' vs direct import may differ, causing inconsistent behavior between manual probing and actual solver invocation"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails on two critical grounds: first, the ABI incompatibility risk is fatal\u2014a precompiled Cython .so will not load under Python 3.13 without being compiled specifically for that version, making the task potentially unsolvable as specified; second, genuine_difficulty is overstated because two of the three Python bugs (case-sensitivity string comparison, accumulator reset) are immediately visible by reading source code, making the speedrun feasible in ~18 commands and scoring the difficulty at 3 or below. The solvability score is 2 specifically because the .so ABI issue in Python 3.13 is a showstopper that the blueprint does not address.",
+  "fixes": [
+   "Switch to Python 3.11 or 3.12 (e.g., python:3.12-slim-bookworm) where Cython .so compatibility is more straightforward, OR provide the .so as a cffi/ctypes shared library (.so with C ABI) that is Python-version-independent, with a thin Python wrapper\u2014this resolves the fatal ABI risk",
+   "Obfuscate the two pure-Python bugs so they are not immediately readable: for example, encode the boundary type comparison as a hash check or load boundary config through a secondary config parser that normalizes case in a non-obvious way, so agents cannot trivially grep for 'dirichlet' and find the fix; this raises genuine_difficulty to 4+",
+   "Replace Test 7 (bit-identical reproducibility via md5) with a looser but still meaningful check\u2014e.g., verify that two consecutive runs produce 'u_final' values within rtol=1e-10 of each other\u2014to eliminate flakiness from non-deterministic floating point",
+   "Add the reproducibility and entry-point requirements explicitly to the instruction draft (not just the requirements list), so the stated end state is truly unambiguous to an agent reading only the instruction",
+   "Specify the exact seeding mechanism for verify-time random ICs in the verifier code (e.g., 'np.random.default_rng(42).standard_normal(...)') and document it in the blueprint so the reference values are deterministically reproducible"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/implement-nonogram-solver",
+     "verdict": "distinct",
+     "reason": "Nonogram puzzle solving via constraint satisfaction has no overlap with spectral PDE solver deployment regression debugging."
+    },
+    {
+     "ref_id": "terminal-bench-science/noisy-blackbox-optimization",
+     "verdict": "distinct",
+     "reason": "Noisy blackbox optimization implementation is a fundamentally different problem from fixing a Cython/Python spectral PDE solver regression."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding a silent regression in a ~1,200-line Python DSP/spectral pipeline where CI passes but general inputs diverge, with the core challenge being the same: debug a fast-path/refactored component interaction that produces wrong spectral outputs."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "AES-CTR SQLite cipher repair involves cryptographic nonce derivation bugs in a C library, not spectral PDE solver component interaction regressions."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "NetFlow settlement aggregation byte-count attribution is a packet parsing/template-state problem with no relation to spectral PDE solvers."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/implement-nonogram-solver",
+     0.207
+    ],
+    [
+     "terminal-bench-science/noisy-blackbox-optimization",
+     0.176
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.172
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.094
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.072
+    ]
+   ],
+   "cost_usd": 0.014553
+  },
+  "novel": false
+ },
+ "cost_usd": 0.072924
+}

@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "ode-stepcontrol-deploy-repair",
+  "title": "ODE Adaptive Step-Controller Deployment Repair",
+  "scenario": "pyodesolver is a 1,400-line in-house Python ODE integration library for scientific simulations. Its v1.4 release shipped a compiled adaptive step-size controller (stepcontrol.so, no source available) and a new integrator registry. The existing test suite passes on non-stiff ODEs, but stiff benchmark problems produce diverging trajectories. The maintainer suspects the compiled module and the Python calling layer are mismatched.",
+  "instruction_draft": "The benchmark runner at /app/bench/run_bench.py produces results in /app/results/ that do not match the golden outputs in /app/reference_outputs/ for the stiff test cases. Repair the integration pipeline so every benchmark ODE\u2014including the stiff problems\u2014integrates correctly within the tolerances in /app/README.md, and /app/results/ contains correct output files for all benchmarks.",
+  "requirements": [
+   "Running python /app/bench/run_bench.py completes without errors",
+   "/app/results/ contains one .npz output file per benchmark ODE",
+   "Each .npz file's trajectory matches the golden output in /app/reference_outputs/ within the documented tolerances (rtol=1e-4 on solution values at checkpoints)",
+   "This must hold for all stiff benchmark ODEs (Robertson system, Van der Pol with mu=100) as well as non-stiff ones",
+   "The file /app/pyodesolver/stepcontroller.py exists and implements the replacement step controller",
+   "The registry configuration at /app/pyodesolver/registry.py correctly loads the replacement controller"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "pip install numpy scipy",
+   "~1,400 lines of Python across: pyodesolver/__init__.py, pyodesolver/integrators/rk45.py, pyodesolver/integrators/dop853.py, pyodesolver/jacobian.py, pyodesolver/registry.py, pyodesolver/pipeline.py, bench/run_bench.py, bench/problems.py",
+   "pyodesolver/stepcontrol.so: compiled C extension, no source, exports stepcontrol_compute(h, err_vec, atol, rtol, order) -> float (new step size). The .so uses a different argument order than what rk45.py currently passes (it passes err_vec first, h second).",
+   "The .so also returns negative values to signal rejection (step too large), which the calling code in rk45.py does not handle \u2014 it treats negative returns as valid step sizes",
+   "pyodesolver/registry.py: has register_stepcontroller(), finalize(), and clear_jacobian_cache() methods. The Jacobian cache is seeded on the first call to the step controller and is invalidated by clear_jacobian_cache().",
+   "bench/problems.py: defines harmonic oscillator (non-stiff), exponential decay (non-stiff), Robertson system (stiff, 3 components with wildly different magnitudes), Van der Pol with mu=100 (stiff)",
+   "reference_outputs/: golden .npz files for each benchmark, generated with scipy.integrate.solve_ivp as ground truth",
+   "CHANGELOG.md: documents v1.4 changes, mentions new stepcontrol.so and registry system but not the argument order or rejection convention",
+   "tests/: existing test suite covers only non-stiff problems, all pass",
+   "README.md: documents the expected interface: stepcontroller takes (err_vec, h, atol, rtol, order) and returns positive new step size or negative to reject \u2014 this is the CONTRACT that the .so violates (it actually takes h first)"
+  ],
+  "internal_hint": "Three bugs interact in a specific order: (1) rk45.py calls stepcontrol.so with (err_vec, h, atol, rtol, order) but the .so expects (h, err_vec, atol, rtol, order) \u2014 discovered only by probing the .so with known inputs and comparing the return value; (2) rk45.py does `if new_h < 0: new_h = h * 0.5` but actually this branch is never hit because the argument swap makes the .so receive h=err_vec[0] (a float ~1e-8) which it treats as the current step, and returns a plausible-looking but wrong step size that happens to be positive on non-stiff problems; (3) the correct DOPRI mixed error norm `err_norm = sqrt(mean((e_i / (atol + rtol * max(|y_i|, |y_new_i|)))^2))` must be computed correctly \u2014 on non-stiff problems all components are O(1) so any reasonable norm works, but on the Robertson system components span 12 orders of magnitude so the mixed norm is essential. The fix: (a) probe .so with known inputs to discover argument order, (b) build /app/pyodesolver/stepcontroller.py implementing the correct DOPRI error norm and calling the .so with correct order, (c) patch registry.py to load it, (d) call registry.clear_jacobian_cache() before the first stiff solve \u2014 if skipped, the cached Jacobian from step 1 (which used wrong error estimates) corrupts BDF-style solvers on stiff problems.",
+  "trap": "An agent that fixes only the argument order and verifies on the harmonic oscillator and exponential decay will get correct results for non-stiff problems. The Robertson system will still fail because the error norm uses per-component scaling that the agent must implement correctly \u2014 a simple L2 norm or pure relative norm causes step-size explosions on the slow component. Additionally, forgetting to call clear_jacobian_cache() after patching the registry means the first stiff solve produces a wrong Jacobian that propagates silently.",
+  "tests": [
+   "T1: Run bench/run_bench.py and verify exit code 0",
+   "T2: Check /app/results/ contains .npz for harmonic oscillator; compare against /app/reference_outputs/ within rtol=1e-4",
+   "T3: Check /app/results/ contains .npz for exponential decay; compare against /app/reference_outputs/ within rtol=1e-4",
+   "T4: Check /app/results/ contains .npz for Robertson system; compare y[0], y[1], y[2] at checkpoints t=[1e4, 1e8, 1e11] against reference within rtol=1e-4",
+   "T5: Check /app/results/ contains .npz for Van der Pol mu=100; compare against reference at 20 checkpoints within rtol=1e-3",
+   "T6 (verify-time): Inject a fresh stiff problem (HIRES kinetics, 8 equations, components spanning 8 orders of magnitude) into bench/problems.py and re-run; verify /app/results/hires.npz matches scipy ground truth within rtol=1e-3",
+   "T7 (verify-time): Inject a fresh non-stiff problem (Lotka-Volterra, 2 equations) and verify correctness",
+   "T8: Verify /app/pyodesolver/stepcontroller.py exists and is importable",
+   "T9: Verify registry.py imports from stepcontroller.py (not from stepcontrol.so directly)"
+  ],
+  "verifier_knob": {
+   "name": "number_of_fresh_stiff_problems_at_verify_time",
+   "value": "2 (HIRES kinetics + Oregonator)",
+   "effect": "Raising to 3-4 problems requires the mixed error norm to be correct in more edge cases (different stiffness ratios, different component magnitudes), making partial solutions fail more often. Lowering to 0 means only the provided benchmarks are tested, making shallow verification sufficient."
+  },
+  "expected_failure_modes": [
+   "Agent fixes argument order but uses a simple L2 error norm instead of the DOPRI mixed norm \u2014 passes harmonic oscillator and exponential decay but fails Robertson system (T4) and HIRES (T6)",
+   "Agent builds correct stepcontroller.py but forgets to call clear_jacobian_cache() \u2014 Robertson system gives wrong trajectory on first solve because the cached Jacobian from the old controller's wrong first step corrupts the implicit solve",
+   "Agent patches rk45.py to swap arguments directly to the .so without building the intermediate Python controller \u2014 the registry check in T9 fails",
+   "Agent verifies only on non-stiff problems (the existing test suite), declares success, and submits \u2014 T4, T5, T6 all fail",
+   "Agent implements the error norm correctly for scalar tolerances but not for vector atol \u2014 HIRES kinetics uses vector atol and fails T6"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "ode-integration",
+   "reverse-engineering",
+   "numerical-methods",
+   "deployment",
+   "feature-regression",
+   "stiff-systems"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/pyodesolver/integrators/rk45.py",
+   "cat /app/pyodesolver/registry.py",
+   "cat /app/pyodesolver/pipeline.py",
+   "cat /app/bench/problems.py",
+   "python3 -c \"import sys; sys.path.insert(0,'/app'); import pyodesolver.stepcontrol as sc; import numpy as np; print(sc.stepcontrol_compute(0.1, np.array([1e-6,1e-6]), 1e-6, 1e-4, 5))\"",
+   "python3 -c \"import sys; sys.path.insert(0,'/app'); import pyodesolver.stepcontrol as sc; import numpy as np; print(sc.stepcontrol_compute(np.array([1e-6,1e-6]), 0.1, 1e-6, 1e-4, 5))\"",
+   "# Compare outputs: if first call returns plausible step ~0.1-1.0, .so expects (h, err_vec, ...)",
+   "cat /app/pyodesolver/__init__.py",
+   "cat /app/CHANGELOG.md",
+   "# Write /app/pyodesolver/stepcontroller.py: import .so, implement DOPRI mixed norm sqrt(mean((e_i/(atol+rtol*max(|y_i|,|y_new_i|)))^2)), call .so with (h, err_vec, atol, rtol, order), handle negative return",
+   "# Edit /app/pyodesolver/registry.py: import StepController from stepcontroller.py, add clear_jacobian_cache() call before stiff solves",
+   "# Edit /app/pyodesolver/integrators/rk45.py: use new registry-loaded controller, handle negative step returns",
+   "python3 /app/bench/run_bench.py",
+   "ls /app/results/",
+   "python3 -c \"import numpy as np; r=np.load('/app/results/robertson.npz'); ref=np.load('/app/reference_outputs/robertson.npz'); print(np.allclose(r['y'], ref['y'], rtol=1e-4))\"",
+   "python3 -c \"import numpy as np; r=np.load('/app/results/vanderpol.npz'); ref=np.load('/app/reference_outputs/vanderpol.npz'); print(np.allclose(r['y'], ref['y'], rtol=1e-3))\"",
+   "python3 -c \"from pyodesolver import stepcontroller; print('importable')\"",
+   "grep -n 'stepcontroller' /app/pyodesolver/registry.py"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The .so must be carefully crafted to exhibit precisely the described behavior (wrong arg order, negative returns under specific conditions); if the build doesn't replicate this exactly, some failure modes become invalid or untestable",
+   "clear_jacobian_cache() requirement is not mentioned in the instruction draft but is implicitly tested by T4 \u2014 an agent can correctly implement the step controller and still fail T4 for an undocumented reason, making the failure arguably invalid",
+   "Vector atol handling for HIRES (T6) may not be documented in the instruction or README \u2014 failing T6 only on vector-atol edge case when scalar case was specified is a hidden requirement",
+   "Robertson system numerical tolerances at t=1e11 are extremely sensitive; rtol=1e-4 may be flaky across scipy versions if reference outputs were generated with a different scipy version than installed",
+   "The .so probing step assumes it accepts numpy arrays; if the C extension has strict type requirements not mentioned in docs, probing commands may error rather than reveal argument order"
+  ],
+  "verdict": "reject",
+  "reasons": "The task scores below the 3.6 average threshold (average ~4.2 on paper, but genuine_difficulty is only 3 which fails the minimum-4 requirement). The speedrun completes in ~18 commands for a skilled agent who reads the README carefully \u2014 the DOPRI formula is documented there, the .so probing is straightforward, and each bug is individually simple once the reading is done. The interacting bugs create good traps for a careless agent, but a methodical strong agent testing on stiff problems before declaring done will catch all three bugs within the command budget. Additionally, the clear_jacobian_cache() requirement is not stated in the instruction draft but is implicitly tested, creating a risk of invalid failures.",
+  "fixes": [
+   "Increase genuine difficulty: remove the DOPRI mixed norm formula from README.md so the agent must derive or find it from first principles; only document 'use a component-scaled error norm' without the exact formula",
+   "State the clear_jacobian_cache() requirement explicitly in the instruction draft (e.g., 'the integration pipeline must correctly invalidate internal caches when the step controller is replaced') to eliminate invalid failure risk",
+   "Add a fourth interacting bug visible only at verify-time: the .so has a discontinuity in its return value when err_norm is exactly 1.0 (boundary between accept/reject), exploitable by the HIRES problem's specific component magnitudes \u2014 this would require the agent to add a guard in stepcontroller.py that the existing test suite never exercises",
+   "Replace the .so argument order discovery with a harder signal: make the .so silently return wrong values (not crash) for both argument orders on simple inputs, requiring the agent to use a specific test vector where only the correct order gives the analytically correct new step size",
+   "Specify that atol in bench/problems.py uses vector atol for HIRES explicitly in the instruction so vector-atol failure is a genuine gap, not a hidden requirement"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/reactor-safety-control",
+     "verdict": "distinct",
+     "reason": "Reactor control task requires designing a feedback controller for a chemical process, not debugging/repairing an ODE solver library."
+    },
+    {
+     "ref_id": "terminal-bench-pro/benchmark-gcc-opt-levels",
+     "verdict": "distinct",
+     "reason": "GCC optimization benchmarking task involves compiler flags and timing measurements, not ODE solver debugging."
+    },
+    {
+     "ref_id": "terminal-bench-pro/port-fortran-rk4-lorenz-to-python",
+     "verdict": "distinct",
+     "reason": "Porting an RK4 solver from Fortran to Python is a translation task, not debugging a mismatched compiled module and Python calling layer."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks involve repairing a broken pipeline where a compiled/binary component is mismatched with its calling layer, requiring diagnosis and a software fix to pass correctness benchmarks."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "distinct",
+     "reason": "EMA metrics pipeline task involves fixing numerical correctness and throughput of a streaming data processor, not an ODE integration library with stiff problem support."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/reactor-safety-control",
+     0.134
+    ],
+    [
+     "terminal-bench-pro/benchmark-gcc-opt-levels",
+     0.118
+    ],
+    [
+     "terminal-bench-pro/port-fortran-rk4-lorenz-to-python",
+     0.105
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.082
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.08
+    ]
+   ],
+   "cost_usd": 0.013305
+  },
+  "novel": false
+ },
+ "cost_usd": 0.066444
+}

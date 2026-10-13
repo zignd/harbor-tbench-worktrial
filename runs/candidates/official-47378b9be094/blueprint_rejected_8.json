@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "spectral-solver-plugin-regression",
+  "title": "Spectral Solver Plugin Regression",
+  "scenario": "You maintain `spectralsim`, a ~1,400-line Python scientific computing library for solving PDEs on irregular grids. The library ships a plugin system: solver backends are discovered at import time from a `plugins/` directory. A recent refactor of the plugin loader (v0.4.2) introduced a silent regression: results from the compiled backend `backends/_fast_solver.so` now diverge from the pure-Python reference on certain grid topologies, but only after the plugin has been used to mutate shared state across multiple calls. The environment contains the library source, the compiled `.so` (no source), a test harness, a changelog, and a corpus of reference results.",
+  "instruction_draft": "The spectral solver at `/app/spectralsim` produces incorrect numerical results since v0.4.2. Restore correct output: every result written to `/app/results/` by `python -I /app/run_batch.py` must match the reference values in `/app/reference/` to within a relative tolerance of 1e-6, and the plugin registry written to `/app/results/registry.json` must list exactly the backends that were active during the batch run.",
+  "requirements": [
+   "Running `python -I /app/run_batch.py` completes without error.",
+   "Each `.npy` file written to `/app/results/` matches the corresponding file in `/app/reference/` element-wise to within relative tolerance 1e-6.",
+   "The file `/app/results/registry.json` exists and lists exactly the set of backend names that were active during the run (neither more nor fewer than the correct set).",
+   "The fix must work on the hidden batch inputs generated at verify time (different grid topologies from the sample inputs)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt install: gcc, build-essential (for any tooling the solver might use; the .so is precompiled)",
+   "pip install: numpy==1.26.4, scipy==1.13.0",
+   "Directory /app/spectralsim/ with ~1,400 lines across: __init__.py, loader.py, grid.py, solver.py, utils.py, plugins/__init__.py, plugins/registry.py, backends/_fast_solver.so (compiled, no source), backends/reference.py",
+   "The regression is in loader.py: the plugin loader caches a mutable numpy array as a module-level default argument to a function (the classic Python mutable-default-argument bug), causing state bleed between successive solver calls when the fast backend is active.",
+   "Additionally, registry.py has a subtle ordering bug introduced in v0.4.2: it deregisters then re-registers backends on each import cycle, but after the loader refactor, one backend ends up registered twice in the internal list; the dedup logic runs before registration not after, so the second registration sticks and the registry.json ends up with a duplicate that fails the exact-set check.",
+   "The .so backend itself is correct; the bugs are purely in the Python plugin infrastructure.",
+   "A CHANGELOG.md documents v0.4.2 changes at a high level: 'Refactored plugin loader for lazy initialization and improved registry deduplication.' This is the main breadcrumb.",
+   "/app/run_batch.py: iterates over grid topologies in /app/inputs/*.npz, calls the solver, writes results to /app/results/",
+   "/app/reference/: precomputed correct .npy files for the sample inputs",
+   "/app/inputs/: 4 sample .npz grid files (the verifier generates fresh ones at check time)",
+   "The mutable-default-argument bug only manifests on the third or later call to the solver within a single process \u2014 so running against a single input passes, but the batch (4+ inputs) fails, and the hidden inputs always include 6+ cases."
+  ],
+  "internal_hint": "Difficulty comes from two interacting runtime-only bugs, not statically visible defects: (1) a mutable numpy array cached as a default argument in loader.py means the 3rd+ solver call gets corrupted initial state \u2014 this only shows when running \u22653 inputs sequentially and inspecting divergence; (2) a registry dedup logic ordering bug causes one backend to appear twice in registry.json. The solver must: run the batch, observe that early results pass but later ones diverge (experiment/instrument), trace divergence to loader.py's default argument, fix it, then separately notice registry.json has a duplicate entry (verify the registry requirement), trace that to registry.py's dedup-before-register ordering, and fix it. Both bugs interact: fixing only the numerical one leaves registry.json wrong, and the test checks both independently. The .so is a black box \u2014 the solver cannot read its source and must accept it is correct.",
+  "trap": "A naive agent runs one input, sees it pass, concludes the solver is fixed, and submits. The hidden verifier runs 6+ inputs sequentially in one process: the mutable-default-argument bug corrupts results from the 3rd call onward. Separately, an agent that fixes the numerical bug but doesn't audit registry.json fails the registry check. An agent that spots the registry bug first and deduplicates the output by patching the JSON-write step (rather than the root cause in registry.py) will fail on verify-time inputs where the backend set differs.",
+  "tests": [
+   "Run `python -I /app/run_batch.py` with 4 sample inputs; assert exit code 0.",
+   "For each of the 4 sample .npy outputs: assert np.allclose(result, reference, rtol=1e-6).",
+   "Assert /app/results/registry.json is valid JSON, is a list, has no duplicates, and equals exactly the expected backend names.",
+   "Verifier generates 6 fresh grid topology .npz files (different sizes and connectivity from samples), runs run_batch.py against them, asserts all 6 outputs match freshly computed reference values (rtol=1e-6). This catches the mutable-default bug which only manifests on call 3+.",
+   "Verifier generates a grid topology that exercises a code path in the .so only reached by non-square grids; asserts the result matches reference (catches any workaround that hard-codes grid shapes).",
+   "Assert registry.json lists the same backend names regardless of input count (1 input vs 6 inputs), catching any stateful registry corruption."
+  ],
+  "verifier_knob": {
+   "name": "number of sequential solver calls in hidden batch",
+   "value": "6 (default)",
+   "effect": "Raising to 8+ makes the mutable-default-argument bug corrupt more results and harder to miss. Lowering to 2 lets agents who fix only the registry bug pass the numerical check accidentally, reducing difficulty."
+  },
+  "expected_failure_modes": [
+   "Agent runs a single input, sees it pass, declares victory without running the full batch.",
+   "Agent fixes the numerical divergence (mutable default arg) but never checks registry.json, failing the registry requirement.",
+   "Agent patches registry.json output to deduplicate at write time rather than fixing the root cause in registry.py; hidden inputs with a different backend set produce wrong registry content.",
+   "Agent attempts to read the .so source or disassemble it, wastes time, concludes the .so is broken and tries to replace it; the .so is correct and the workaround breaks on hidden inputs.",
+   "Agent instruments a single call and sees correct output, incorrectly concludes the bug is in the inputs rather than accumulated state."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "python",
+   "plugin-system",
+   "state-mutation",
+   "reverse-engineering",
+   "numerical-computing",
+   "feature-iteration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/CHANGELOG.md",
+   "cat /app/spectralsim/loader.py",
+   "cat /app/spectralsim/plugins/registry.py",
+   "cat /app/run_batch.py",
+   "python -I /app/run_batch.py  # triggers 3rd-call bug on 4 inputs",
+   "# In loader.py: identify mutable numpy array default arg, replace with None sentinel",
+   "sed/edit loader.py to fix default arg",
+   "# In registry.py: identify dedup runs before registration, move dedup after registration",
+   "sed/edit registry.py to fix ordering",
+   "python -I /app/run_batch.py  # verify all 4 pass",
+   "python -c \"import json,sys; d=json.load(open('/app/results/registry.json')); assert len(d)==len(set(d)), 'dup'\"",
+   "# Done \u2014 both bugs fixed"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The precompiled .so must match Python 3.13 + numpy 1.26.4 ABI exactly; any mismatch makes the task unsolvable regardless of Python fixes, and agents cannot rebuild it.",
+   "The 4-sample batch already triggers the 3rd-call mutable-default-arg bug, so the 'trap' of running only 1 input is not a real trap for an agent who simply runs run_batch.py as instructed \u2014 the difficulty claim about needing 6+ inputs is overstated.",
+   "Both bugs are in readable Python source and the CHANGELOG directly names the two changed files, making them statically visible rather than runtime-only as claimed; a frontier LLM will spot both within the first two file reads.",
+   "If the verifier computes reference values using the same codebase without applying the fix, reference generation could itself be subtly wrong depending on implementation.",
+   "np.allclose rtol=1e-6 without explicit atol=0 may pass solutions that are actually wrong for near-zero elements due to the default atol=1e-8 floor."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because both bugs are statically visible in readable Python files, the CHANGELOG explicitly names the two changed components, and the standard 4-sample batch already triggers the 3rd-call corruption \u2014 making the task a ~12-command speedrun for any frontier agent. The 'runtime-only' framing in the blueprint is inaccurate: the mutable default argument is immediately visible by reading loader.py, and the dedup ordering bug is equally apparent in registry.py. The task also carries a hard build risk: the precompiled .so must have an exact ABI match for Python 3.13 + numpy 1.26.4, and any mismatch produces an unsolvable task.",
+  "fixes": [
+   "Remove the CHANGELOG breadcrumb that names the two changed files, or make it generic ('performance and stability improvements in v0.4.2') so agents must explore rather than being directed.",
+   "Obfuscate the mutable default arg: instead of a bare numpy array literal, bury it inside a class attribute, a decorator, or a closure \u2014 making it non-obvious from static inspection and requiring the agent to instrument and observe diverging numerical output to locate the source.",
+   "Add a third interacting bug (e.g., a subtle numerical issue in a pure-Python path that only manifests on non-convex grid topologies) so fixing the two obvious bugs still leaves one hidden failure mode requiring deeper experimentation.",
+   "Increase the number of sample inputs to 6 and require the agent to notice that inputs 1-2 pass but 3-6 diverge, then trace divergence to accumulated state \u2014 this forces the runtime-inspection path rather than the static-read path.",
+   "Validate that the .so ABI compatibility is tested in CI before publishing the task, or provide a build script that compiles a thin Python-extension wrapper so the task is not blocked by binary compatibility."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/port-fortran-rk4-lorenz-to-python",
+     "verdict": "distinct",
+     "reason": "That task is about porting a FORTRAN RK4 solver to Python; the candidate is about debugging a silent regression in a plugin loader causing numerical divergence in a PDE solver."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-nonogram-solver",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a constraint-satisfaction puzzle solver; the candidate is about diagnosing and fixing a shared-state mutation bug in a plugin system."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a refactor that introduced a silent regression producing wrong numerical results despite passing existing tests, with a compiled artifact and a reference, requiring the agent to find and fix the bug so outputs match a reference within tolerance."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "variant",
+     "reason": "Both tasks involve a 'fast path' or recent refactor that silently diverges from reference results on certain inputs while CI still passes, requiring finding and fixing the regression to meet a numerical accuracy threshold."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a compiled binary's transformation function to repair a data pipeline; the candidate is about fixing shared-state mutation in a plugin loader."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/port-fortran-rk4-lorenz-to-python",
+     0.119
+    ],
+    [
+     "terminal-bench-pro/implement-nonogram-solver",
+     0.115
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.105
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.096
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.075
+    ]
+   ],
+   "cost_usd": 0.015183000000000002
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056199
+}

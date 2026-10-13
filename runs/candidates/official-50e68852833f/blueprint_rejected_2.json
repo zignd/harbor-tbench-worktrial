@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "fixed-point-varint-codec-repair",
+  "title": "Fixed-Point VarInt Codec Repair",
+  "scenario": "You maintain a small embedded telemetry codebase (~1,200 lines across 6 files) that encodes sensor readings as a stream of fixed-point decimal values packed into a custom variable-length integer format (similar to Protocol Buffers varint but with a proprietary zigzag + scale-factor twist). A firmware update six weeks ago silently broke the encoder; field devices have been logging bad data ever since, but unit tests still pass because they only exercise small values. The decoder is shipped as a compiled binary (`/app/bin/telem_decode`) with no source; the encoder, framing, and batch-aggregator are in Python.",
+  "instruction_draft": "Hey \u2014 the telemetry pipeline at /app is producing corrupted archives in production but all the sample tests pass. The decoder binary at /app/bin/telem_decode is the ground truth; whatever it expects is correct. Fix the encoder (and anything downstream that depends on it) so that round-tripping any sensor frame through encode \u2192 archive \u2192 decode produces the exact original readings. The hidden test suite will throw a corpus of frames at your fixed encoder, decode them with the binary, and compare. Pay attention to negative values, values near encoding boundaries, and multi-channel frames with mixed scales.",
+  "requirements": [
+   "Round-tripping any sensor reading through the fixed encoder then telem_decode reproduces the exact original fixed-point value (no rounding error, no sign flip).",
+   "Multi-channel frames with heterogeneous scale factors encode and decode correctly.",
+   "Negative values and zero encode without sign errors.",
+   "Values at varint byte-boundary edges (e.g., 127, 128, 16383, 16384) encode correctly.",
+   "Batch archive files produced by the aggregator contain only correctly encoded frames.",
+   "The encoder accepts and correctly handles the full int32 range of raw fixed-point integers."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base image.",
+   "/app/src/encoder.py \u2014 the broken encoder (~180 lines). The bug is in the zigzag mapping: the formula `(n << 1) ^ (n >> 31)` was accidentally changed to `(n << 1) ^ (n >> 32)` in Python (where >> 32 on a negative int is -1, not 0, causing wrong results only for negative values); a second bug in the scale-factor packing shifts the exponent field by 3 bits instead of 4, corrupting values whose scale != 1.",
+   "/app/src/framer.py \u2014 assembles multi-channel frames (~120 lines), correct but depends on encoder output.",
+   "/app/src/aggregator.py \u2014 batches frames into .tarch archive files (~200 lines). Contains a third latent bug: it writes the frame count as a uint16 little-endian but the decoder expects big-endian, only observable when a batch has > 255 frames (never triggered by the small sample data).",
+   "/app/src/decoder_wrapper.py \u2014 thin Python wrapper that shells out to telem_decode (~60 lines).",
+   "/app/src/utils.py \u2014 shared helpers, correct (~100 lines).",
+   "/app/tests/test_roundtrip.py \u2014 existing tests using only small positive values and scale=1; all pass with bugs present.",
+   "/app/bin/telem_decode \u2014 compiled C binary, stripped, no source. Implements the correct zigzag decode, correct scale-factor unpack, and expects big-endian frame count. Acts as ground truth.",
+   "/app/samples/ \u2014 3 sample .tarch files with small positive values only (do not expose the bugs).",
+   "/app/run_pipeline.sh \u2014 runs encode \u2192 archive \u2192 decode on samples/; exits 0 with current buggy code because sample values are all small and positive.",
+   "Dockerfile installs: python:3.13-slim-bookworm, gcc (to have compiled the binary), no internet access.",
+   "The telem_decode binary is compiled from hidden source during image build and then the source is deleted."
+  ],
+  "internal_hint": "Three bugs interact: (1) zigzag encoding uses `n >> 32` instead of `n >> 31` in Python \u2014 since Python integers are arbitrary precision, `(-1) >> 32` is `-1` not `0`, so negative values get zigzag'd to wrong codes; this is INVISIBLE when reading the code quickly because the formula looks plausible and only fails on negative inputs. (2) The scale-factor exponent field is shifted by 3 bits instead of 4, corrupting all non-unity scales \u2014 only visible when running mixed-scale frames. (3) aggregator.py writes the frame count in little-endian but telem_decode expects big-endian, only triggered for batches of >256 frames \u2014 the sample data never has more than 10 frames per batch. The solver must: (a) probe telem_decode with crafted binary inputs or run experiments to reverse-engineer the expected byte layout; (b) find the zigzag bug by testing negative values; (c) find the scale-field bug by testing scale != 1; (d) find the endianness bug by testing large batches. The difficulty is that all three bugs are only observable at runtime with specific inputs, not by code inspection alone, and each fix looks obvious once found but finding the third (endianness, large batch count) requires deliberately generating a corpus larger than the samples show.",
+  "trap": "A naive agent fixes the zigzag sign bug (most visible when experimenting with negatives) and possibly the scale bug, then re-runs the sample tests, sees them pass, and submits. The hidden corpus includes batches of 300+ frames, which fail with a corrupted frame-count header due to the endianness bug in aggregator.py \u2014 a bug that is structurally unrelated to the encoder and only manifests above a size threshold the samples never reach. The agent that doesn't specifically test large batches will miss this entirely.",
+  "tests": [
+   "For each frame in a hidden corpus of 500 frames: encode with the fixed encoder, write a single-frame archive, decode with telem_decode, assert decoded value == original value. Corpus includes: (a) all-negative channels, (b) mixed-sign channels, (c) scale factors 1, 10, 100, 1000, (d) values 127, 128, 16383, 16384, -1, -128, INT32_MIN/2.",
+   "Generate a batch of 300 frames with random values; encode and archive with fixed aggregator.py; decode all 300 with telem_decode; assert all 300 decoded values match originals (catches endianness bug).",
+   "Generate a batch of exactly 256 frames (boundary); assert all decode correctly.",
+   "Generate frames with scale=100, values ranging from -50000 to 50000; decode and assert values match to within the scale resolution.",
+   "Run the original /app/run_pipeline.sh on the existing samples and assert it still exits 0 (regression guard).",
+   "Assert that telem_decode applied to a freshly encoded archive of the provided samples matches the values in the sample manifest file."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "500 frames covering edge cases + 300-frame batch test",
+   "effect": "Lowering to <256 frames and omitting large-batch test makes it passable with only zigzag fix; raising adds more scale/boundary combinations and raises the minimum batch size to stress test further edge cases in the varint encoding boundaries."
+  },
+  "expected_failure_modes": [
+   "Agent fixes zigzag and scale bugs, reruns sample tests (pass), submits without testing large batches \u2014 fails the 300-frame batch test due to endianness bug.",
+   "Agent probes telem_decode with small positive values only, infers the format, fixes zigzag, but doesn't notice scale-field shift because sample values all use scale=1.",
+   "Agent reverse-engineers telem_decode partially (zigzag shape) but gets the scale-field bit layout wrong (off by one bit), causing all non-unity scale values to still decode incorrectly.",
+   "Agent notices the endianness bug but applies the fix to the wrong struct.pack call (e.g., fixes the channel count instead of the frame count), causing partial failures on multi-channel large batches.",
+   "Agent uses Python's struct.pack with '<H' correctly for small cases but the aggregator has a second write path for 'overflow' batches that also has the endianness bug and the agent misses it."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "binary-format",
+   "codec",
+   "embedded",
+   "reverse-engineering",
+   "edge-cases",
+   "observe-not-read"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/encoder.py",
+   "cat /app/src/aggregator.py",
+   "cat /app/src/framer.py",
+   "cat /app/src/decoder_wrapper.py",
+   "Identify n>>32 bug (visible in source) and <<3 scale-shift bug (visible in source)",
+   "Identify struct.pack('<H') endianness bug in aggregator (visible in source)",
+   "sed -i 's/n >> 32/n >> 31/' /app/src/encoder.py",
+   "sed -i 's/<< 3/<< 4/' /app/src/encoder.py  # fix scale exponent shift",
+   "sed -i \"s/struct.pack('<H'/struct.pack('>H'/\" /app/src/aggregator.py",
+   "python3 /app/tests/test_roundtrip.py",
+   "bash /app/run_pipeline.sh",
+   "python3 -c \"# quick test: encode negative, non-unity scale, 300-frame batch via decoder_wrapper\"",
+   "python3 quick_test.py  # write and run 300-frame batch test",
+   "verify all pass"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The compiled telem_decode binary must be correctly built during image construction and actually implement the claimed zigzag+scale format; if build scripts have errors, the ground truth is broken and all tests fail regardless of solver's fixes.",
+   "The blueprint states bugs are 'invisible when reading the code quickly' and tags the task 'observe_not_read', but all three bugs (n>>32, <<3, struct '<H') are directly visible by reading the source \u2014 a frontier agent will find them without any runtime experimentation, invalidating the difficulty framing.",
+   "The 'overflow batch' second write path mentioned in failure modes (agent fixes wrong struct.pack call) is not described in the environment spec \u2014 if it doesn't exist, that failure mode is impossible and tests may overreach.",
+   "Python version sensitivity: n>>32 behavior on negative integers depends on Python's arbitrary precision \u2014 the blueprint is correct about this behavior but it should be verified in the exact python:3.13-slim-bookworm environment.",
+   "The aggregator endianness fix location ('fixes channel count instead of frame count') implies multiple struct.pack calls exist; if the file layout differs from description, solver's fix may be correct but test may still fail."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold (scores 2/5) because all three bugs are directly readable in source code \u2014 the 'observe_not_read' framing is factually incorrect. A frontier agent reading encoder.py will immediately spot 'n >> 32' vs 'n >> 31' (one character difference) and '<< 3' vs '<< 4', and reading aggregator.py will spot '<H' vs '>H'; no runtime experimentation is needed. The speedrun reaches a complete solution in ~14 commands by pure code reading. The blueprint's own internal hint section tells the agent exactly where each bug is and what it looks like, further undermining difficulty.",
+  "fixes": [
+   "Replace the source-visible bugs with bugs that genuinely require runtime probing: e.g., make the zigzag formula syntactically plausible and numerically wrong only for specific integer ranges that require binary search against telem_decode to discover, rather than a simple n>>32 typo.",
+   "Remove the 'Internal hint' section from the blueprint or make it truly internal (not in the task spec given to reviewers) \u2014 as written it describes exactly where every bug is, defeating the difficulty claim.",
+   "To make endianness truly a 'must observe at runtime' bug, remove the struct.pack call from plain sight (e.g., hide it in a utility function called via an abstraction layer, or make it conditional on a flag set at runtime), so the agent cannot find it by grep alone.",
+   "Add a truly observe-not-read element: e.g., the binary's behavior on specific inputs can only be learned by probing (format is documented only as 'similar to protobuf but proprietary'), requiring the agent to fuzz telem_decode to reconstruct the expected byte layout before fixing the encoder.",
+   "Change the 'overflow batch second write path' failure mode to actually exist in the environment spec if it is to appear in expected failure modes \u2014 currently it is mentioned in failure modes but not in the environment file list."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "DNA storage codec design is a completely different problem domain involving error-correction over a deletion channel, not debugging a broken varint encoder."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve a compiled binary as ground truth and require fixing a broken encoder/pipeline so that round-tripping through the binary produces correct results, differing mainly in the codec details."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "AES-CTR cipher repair is a cryptographic nonce/key derivation bug, not a variable-length integer encoding problem."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks center on fixing a broken codec so that encode\u2192decode roundtrips are byte-perfect, with edge cases at boundary values; the main differences are language (Rust vs Python) and performance requirements."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "framecodec is a simple fixed-format binary framing service over HTTP, not a variable-length integer encoder with zigzag/scale-factor semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.234
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.128
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.117
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.116
+    ],
+    [
+     "ours/official-aac910462208",
+     0.095
+    ]
+   ],
+   "cost_usd": 0.013833
+  },
+  "novel": false
+ },
+ "cost_usd": 0.053385
+}

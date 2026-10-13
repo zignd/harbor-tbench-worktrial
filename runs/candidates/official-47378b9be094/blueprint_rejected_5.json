@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "spectral-solver-regression-deploy",
+  "title": "Sparse Eigenvalue Solver Regression",
+  "scenario": "An open-source scientific computing library (`eigenpkg`) ships a pure-Python Lanczos-based sparse eigenvalue solver used by downstream HPC workflows. A recent 'feature iteration' refactored the restart logic and the distributed-IO layer; a regression was introduced that produces silently wrong eigenvalues on certain matrix classes. The maintainer has tagged the broken commit and left logs showing downstream test failures, but the root cause spans the restart accumulation, a preconditioning scale factor buried in a compiled C extension (shipped as a `.so` without source), and a serialization format change in the checkpoint writer. The codebase is ~1,400 lines across seven Python modules plus the opaque extension, with plausible surrounding infrastructure (benchmarking harness, CI scripts, example notebooks) that is not involved in the bug.",
+  "instruction_draft": "The eigenpkg library at /app/eigenpkg is producing wrong eigenvalues after the latest refactor. Repair it so that `python -m eigenpkg.verify` exits 0 and all eigenvalue estimates written to /app/results/eigenvalues.json are within 1e-6 relative error of the true values for every matrix in /app/testcases/.",
+  "requirements": [
+   "`python -m eigenpkg.verify` exits with code 0",
+   "All eigenvalue estimates in /app/results/eigenvalues.json are within 1e-6 relative error of ground-truth values",
+   "The verify script accepts fresh matrix inputs generated at verify time (not just the shipped testcases)",
+   "The checkpoint/restart file written to /app/results/checkpoint.pkl correctly encodes the Krylov basis so a resumed solve converges to the same answer",
+   "The preconditioning scale factor applied by the C extension is correctly inverted when post-processing Ritz values"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get: build-essential (for any C tooling the solver might want to probe the .so)",
+   "pip: numpy==1.26.4, scipy==1.13.1, pytest==8.2.2",
+   "The .so file /app/eigenpkg/_lanczos_ext.so is a compiled C extension (no source) exporting apply_precond(A, v, scale) and restart_accumulate(Q, H, k); it contains a deliberate scale inversion bug introduced in the refactor that is only observable when scale != 1.0",
+   "/app/eigenpkg/ contains: __init__.py, lanczos.py (Lanczos iteration, calls _lanczos_ext), restart.py (thick-restart logic, has an off-by-one in the retained-vector slice), checkpoint.py (serializes/deserializes Krylov basis; dtype cast bug silently downcasts complex128 to float64), verify.py (runs solver on all matrices in /app/testcases/, compares to reference, writes /app/results/eigenvalues.json), utils.py, bench.py, examples/ (not involved)",
+   "Three planted bugs: (1) restart.py slices Q[:,: k] instead of Q[:, :k+1] causing the restart to lose the last Ritz vector -- visible only when restart is triggered (matrices larger than block size); (2) checkpoint.py casts Krylov vectors to float32 on save then reloads them as float64, silently losing precision -- only observable on complex Hermitian matrices; (3) _lanczos_ext.so applies the preconditioner with scale factor inverted (divides instead of multiplies) -- discoverable only by probing the extension's behavior on known vectors, since source is absent",
+   "/app/testcases/ contains five .npz files with sparse matrices (real symmetric, complex Hermitian, ill-conditioned) and their true eigenvalues computed offline",
+   "/app/results/ is an empty directory the solver must populate",
+   "The verify script at verify time generates three additional matrices not in testcases/ and checks /app/results/eigenvalues.json for them too -- the solver must ensure the library is fixed, not the JSON patched by hand",
+   "A /app/logs/ci_failure.log shows the downstream test output: wrong eigenvalue magnitudes, NaN on one complex matrix, and a checkpoint resume that diverges"
+  ],
+  "internal_hint": "Root causes and discovery path: (1) Run the verify script; it fails on matrices that trigger restart (block size 30, matrices of dim>30). Read restart.py -- the slice `Q[:, :k]` drops the last retained vector; fix to `Q[:, :k+1]`. This is NOT visible by reading a small file: only matrices that actually trigger a restart exhibit the bug, and the slice looks plausible. (2) The complex Hermitian case produces NaN or wildly wrong results even after (1). Checkpoint.py has `vecs.astype(np.float32)` instead of preserving dtype; fix the cast. This is only observable by running on a complex matrix and comparing pre/post checkpoint results -- the dtype loss is a data-dependent path (real matrices are unaffected). (3) After both fixes, real-symmetric eigenvalues are still wrong by a scale factor that depends on the conditioning of the preconditioner. The solver must probe _lanczos_ext.so: call apply_precond with a known vector and known scale, observe the output is scale**-1 * v instead of scale * v, then compensate by passing 1/scale or wrapping the call with the reciprocal. This requires black-box experimentation -- no source exists. The three bugs interact: (1) and (2) must both be fixed before the preconditioner issue is isolated, because prior failures mask it. An agent that fixes (1) and (2) and calls verify will see that real-symmetric tests still fail by a characteristic multiplicative factor, prompting investigation of the extension.",
+  "trap": "A naive agent fixes the visible slice bug in restart.py (which it can find by reading the file), patches the one provided test case's JSON by hand or by running scipy.linalg.eigh on the sample matrices, and calls it done. The hidden verify-time matrices include: a large real-symmetric matrix that stresses the scale factor (fails), a complex Hermitian matrix that needs the checkpoint dtype fix (fails), and a matrix requiring both restart and preconditioning together (fails). Any agent that doesn't probe the .so's behavior on synthetic vectors will miss the scale inversion entirely, and any agent that doesn't test the checkpoint roundtrip on complex inputs will miss the dtype cast.",
+  "tests": [
+   "T1: Run `python -m eigenpkg.verify` after solver modifications; check exit code is 0",
+   "T2: For each of 8 matrices (5 shipped + 3 generated at verify time), load /app/results/eigenvalues.json and assert max relative error < 1e-6 vs ground truth computed via scipy.linalg.eigh",
+   "T3: Verify-time matrix set includes: (a) dim=200 real symmetric with condition number 1e4 requiring restart AND non-trivial preconditioning scale, (b) dim=100 complex Hermitian requiring checkpoint roundtrip, (c) dim=300 sparse real symmetric that triggers multiple restarts",
+   "T4: Check checkpoint integrity: load /app/results/checkpoint.pkl, verify Q matrix is float64 or complex128 (not float32), verify shape matches expected Krylov dimension",
+   "T5: Probe _lanczos_ext directly: call apply_precond(I, v, 2.0) on a random vector v; assert output is 2.0*v within 1e-10 (fails before fix, passes after the wrapper or invocation is corrected)",
+   "T6: Confirm /app/results/eigenvalues.json is a valid JSON dict mapping matrix names to lists of eigenvalues (not hand-patched for only the shipped testcases)"
+  ],
+  "verifier_knob": {
+   "name": "number_of_hidden_matrices",
+   "value": "3",
+   "effect": "Increasing from 3 to 6 adds more stress cases (larger dimensions, higher condition numbers, mixed real/complex) making it harder to have a partial fix that passes all checks; decreasing to 1 lets a lucky partial fix pass"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the restart slice (T1 passes on shipped tests, T2 fails on hidden real-symmetric preconditioned matrix)",
+   "Agent fixes restart and checkpoint dtype but never probes the .so, leaving the scale inversion; T2 fails for any matrix with preconditioner scale != 1.0",
+   "Agent patches /app/results/eigenvalues.json by running scipy on the shipped matrices, skipping library repair entirely; T2 fails on verify-time generated matrices not in testcases/",
+   "Agent guesses at the .so behavior by reading extension call sites in lanczos.py, but the inversion is subtle enough that they compensate with the wrong reciprocal or compensate in the wrong direction on non-symmetric inputs",
+   "Agent fixes all three bugs but in wrong order (fixes checkpoint before restart), causing the complex tests to appear fixed while the real-symmetric scale issue is masked; they submit before running the full suite"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "eigenvalue-solver",
+   "reverse-engineering",
+   "opaque-binary",
+   "regression",
+   "numerical-precision",
+   "deployment"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/eigenpkg/restart.py  # immediately spot Q[:, :k] instead of Q[:, :k+1]",
+   "sed -i 's/Q[:, :k]/Q[:, :k+1]/g' /app/eigenpkg/restart.py  # fix off-by-one",
+   "cat /app/eigenpkg/checkpoint.py  # spot astype(np.float32) bug",
+   "sed -i 's/astype(np.float32)/astype(vecs.dtype)/g' /app/eigenpkg/checkpoint.py  # fix dtype cast",
+   "python -c \"import numpy as np; from eigenpkg._lanczos_ext import apply_precond; v=np.ones(5); r=apply_precond(np.eye(5),v,2.0); print(r)\"  # probe .so: observe 0.5*v",
+   "cat /app/eigenpkg/lanczos.py  # find apply_precond call site to understand how scale is passed",
+   "# edit lanczos.py: change apply_precond(A, v, scale) to apply_precond(A, v, 1.0/scale) at the call site",
+   "python -m eigenpkg.verify  # run full verify, should exit 0",
+   "echo $?  # confirm exit code 0",
+   "cat /app/results/eigenvalues.json  # confirm output populated"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The verify script generates hidden matrices 'at verify time' using randomness -- if not seeded, T2 ground truth computed via scipy.linalg.eigh may be inconsistent between runs, making the 1e-6 threshold flaky for ill-conditioned matrices",
+   "The instruction says the .so has a 'scale inversion bug' but the fix is in the Python call site (passing 1/scale); the instruction could be read as requiring the .so itself to be fixed, which is impossible without source -- this ambiguity could confuse test T5 which checks apply_precond(I,v,2.0) outputs 2.0*v, but if the .so is broken and unfixable, T5 cannot pass as stated unless it tests the wrapper behavior",
+   "T5 asserts apply_precond(I, v, 2.0) returns 2.0*v 'after fix' -- but if the fix is a wrapper in lanczos.py and T5 calls the extension directly, the extension still returns 0.5*v; the test as written is self-contradictory (the .so cannot be fixed without source)",
+   "The interaction ordering trap described in 'expected valid failure modes' (fixing checkpoint before restart masks issues) suggests the test suite may have order-dependent behavior, which is a reliability concern",
+   "Three hidden matrices generated at verify time without fixed seeds create reproducibility issues for the blueprint builder to validate the task"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score is 2 because a skilled agent can solve all three bugs in ~10 commands: two bugs are directly visible in readable source files, and the third requires exactly one synthetic probe of the .so. Additionally, T5 is self-contradictory -- it asserts the .so returns scale*v after fix, but the .so has no source and cannot be modified, so the only fix is a wrapper in lanczos.py; this makes T5 untestable as specified. The verify-time hidden matrices with no fixed random seed also risk flakiness on the 1e-6 threshold.",
+  "fixes": [
+   "To raise genuine_difficulty: make the restart bug non-obvious by hiding it in a helper function called indirectly, or make the slice expression look correct (e.g., `Q[:, 1:k+1]` instead of `Q[:, :k+1]`) so reading the file doesn't immediately reveal it",
+   "Fix T5 to test the wrapper/integration behavior (call the Lanczos iteration with known inputs) rather than the raw .so function, since the .so cannot be fixed without source; alternatively, make the .so replaceable (provide a build script) so the agent can actually fix the extension",
+   "Seed the verify-time matrix generation with a deterministic seed so T2 and T3 are reproducible across runs and the 1e-6 threshold can be validated offline",
+   "Increase opaqueness of the checkpoint bug by using a less obvious pattern than `astype(np.float32)` -- e.g., an intermediate JSON serialization that silently drops imaginary parts, requiring the agent to trace the data flow rather than grep for dtype keywords"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/compute-symbolic-eigenpairs-3x3-matrix",
+     "verdict": "distinct",
+     "reason": "That task requires symbolic computation of exact eigenpairs for a fixed 3x3 matrix using sympy, while the candidate involves debugging a regression in a Lanczos-based iterative sparse solver with C extension, restart logic, and checkpoint serialization issues."
+    },
+    {
+     "ref_id": "terminal-bench-pro/python-jacobi-eigen-solver-conversion",
+     "verdict": "distinct",
+     "reason": "That task requires porting a Fortran Jacobi solver to Python with matching numerical output, while the candidate involves finding and fixing a silent bug in an existing Python/C hybrid sparse eigenvalue package across multiple interacting subsystems."
+    },
+    {
+     "ref_id": "terminal-bench-science/cmb-cross-inference",
+     "verdict": "distinct",
+     "reason": "That task is about CMB polarization analysis and Bayesian posterior sampling, sharing only the broad domain of scientific computing with no overlap in the core problem of debugging a sparse eigensolver regression."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks follow the same template: a refactored library introduces a silent correctness regression (passing existing tests but failing on broader inputs), with the fix spanning multiple interacting components including a compiled binary artifact without source, and a verify script that tests on fresh inputs at evaluation time."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a black-box binary's numeric transformation to fix a data pipeline, whereas the candidate centers on debugging algorithmic logic across a sparse linear algebra library's restart, preconditioning, and serialization layers."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/compute-symbolic-eigenpairs-3x3-matrix",
+     0.287
+    ],
+    [
+     "terminal-bench-pro/python-jacobi-eigen-solver-conversion",
+     0.274
+    ],
+    [
+     "terminal-bench-science/cmb-cross-inference",
+     0.1
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.086
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.068
+    ]
+   ],
+   "cost_usd": 0.016031999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051228
+}

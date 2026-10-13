@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "Streaming K-Way Merge Sort Refactor",
+  "scenario": "The release pipeline for a data-processing service ships a compiled Go binary (`/app/bin/ksort`) that performs a k-way merge of sorted input streams and emits a globally sorted output stream. The binary was built from source code in `/app/src/` (~1,400 lines across several packages), but a large-scale refactoring three weeks ago broke the merge logic in subtle, data-dependent ways. The CI suite only tests three handcrafted sample inputs, all of which pass \u2014 but production runs on arbitrarily large, arbitrarily-distributed integer streams and the release is blocked.",
+  "instruction_draft": "You are the release engineer for the `ksort` service. The binary at `/app/bin/ksort` reads a newline-delimited list of already-sorted integer streams from stdin (streams are separated by the sentinel line `---`) and writes the globally sorted merge to stdout. The binary currently passes the three sample inputs in `/app/testdata/`, but integration tests against production-shaped data are failing and the release is blocked.\n\nInvestigate, then fix the source in `/app/src/` and rebuild the binary in place so that `ksort` correctly merges any number of sorted input streams (including streams of length zero, streams containing duplicate values, and mixed-sign integers) into a single globally sorted output. The merged output must contain exactly the same multiset of integers as the union of all input streams \u2014 no values added, dropped, or reordered. Rebuild with `go build -o /app/bin/ksort ./cmd/ksort` from `/app/src`.",
+  "requirements": [
+   "The rebuilt binary at `/app/bin/ksort` reads sorted integer streams separated by `---` sentinel lines from stdin and writes a single globally sorted stream to stdout.",
+   "The output multiset equals the union of the input multisets: no integers are added, dropped, or duplicated beyond their input multiplicity.",
+   "The output is in non-decreasing order for all inputs, including streams containing negative integers, zeros, and duplicates.",
+   "Empty streams (zero integers between two consecutive `---` sentinels, or an empty leading/trailing section) are handled without error and contribute nothing to the output.",
+   "The binary is rebuilt from source under `/app/src/` using `go build -o /app/bin/ksort ./cmd/ksort`."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with Go 1.22 installed via apt/tarball (pinned version).",
+   "`/app/src/` contains ~1,400 lines of Go across packages: `cmd/ksort/main.go`, `internal/merge/heap.go`, `internal/merge/merge.go`, `internal/parse/reader.go`, `internal/parse/scanner.go`, and `internal/util/util.go`. The code is plausibly structured (not toy).",
+   "Bug 1 (data-dependent, not visible by reading alone): `internal/merge/heap.go` implements a min-heap for the k-way merge. After the refactor, the heap's `Less` comparison uses `>=` instead of `>` for tie-breaking between equal elements from different streams, causing the heap invariant to be violated only when two streams produce equal values simultaneously \u2014 this manifests as an unsorted run in the output, but only when duplicates appear across streams.",
+   "Bug 2 (build-component, adversarial): `internal/parse/scanner.go` was refactored to buffer entire streams in memory before returning them, but the sentinel detection logic uses `strings.TrimSpace` and then checks `== '---'` (a rune comparison that always evaluates false because `TrimSpace` returns a string). This means the scanner never splits on `---`, treating all input as one giant stream and silently dropping all integers after the first newline that would have been a sentinel. The three sample inputs each have only one stream (no `---` needed), so they all pass. Any multi-stream input fails completely.",
+   "`/app/testdata/` contains three sample inputs, each a single sorted stream with no `---` sentinel, and their expected outputs \u2014 all three pass with the broken binary.",
+   "The Dockerfile builds the binary during image construction: `RUN cd /app/src && go build -o /app/bin/ksort ./cmd/ksort`.",
+   "No network access; all Go dependencies are vendored under `/app/src/vendor/`."
+  ],
+  "internal_hint": "Difficulty comes from two sources that interact: (1) the sentinel-splitting bug is data-dependent \u2014 all sample inputs are single-stream so the scanner never needs to split, and the bug is in a string comparison that looks syntactically plausible (`== '---'` compares a string to a rune literal, which is a legal Go expression that always evaluates false). The agent must run the binary on a multi-stream input to observe that nothing after the first stream appears in the output. (2) The heap invariant violation only triggers when two streams have equal values at the top simultaneously; the three samples have no cross-stream duplicates. Resolution path: (a) construct a two-stream test input with `---` and observe the binary drops the second stream entirely; (b) read `scanner.go`, find the rune-vs-string comparison, fix to `trimmed == \"---\"`; (c) construct a two-stream test with duplicate values across streams, observe out-of-order output; (d) read `heap.go`, find `>=` in `Less`, fix to `>`; (e) rebuild and verify. The agent must locate both bugs \u2014 fixing only one produces a binary that fails half the hidden tests.",
+  "trap": "A solver who only tests single-stream inputs (matching the three samples) will conclude the binary is correct and stop. A solver who fixes only the sentinel bug will pass multi-stream inputs with no duplicates but fail hidden cases with cross-stream duplicates. A solver who fixes only the heap bug will never exercise multi-stream paths and fail all hidden multi-stream cases. The verifier generates fresh inputs at test time including: multi-stream inputs with no duplicates, single-stream inputs with duplicates, multi-stream inputs with heavy cross-stream duplicates, inputs with empty streams, and inputs with negative integers \u2014 covering all four quadrants of the bug matrix.",
+  "tests": [
+   "Test 1 (sanity): single stream, positive integers, no duplicates \u2014 verifies the basic pipeline still works after the fix.",
+   "Test 2 (sentinel splitting): two streams separated by `---`, disjoint value ranges \u2014 verifies the scanner correctly splits and both streams appear in output.",
+   "Test 3 (empty stream): three `---`-separated sections where the middle one is empty \u2014 verifies empty-stream handling.",
+   "Test 4 (cross-stream duplicates): two streams each containing the integer 42 and other values \u2014 verifies the heap invariant fix; output must be sorted and contain 42 exactly twice.",
+   "Test 5 (negative integers): streams with negative, zero, and positive integers \u2014 verifies sign handling.",
+   "Test 6 (stress, generated at verify time): k=7 streams, each of length 500-2000, drawn from a seeded PRNG with overlapping value ranges and heavy duplicates \u2014 compares `ksort` output against Python's `heapq.merge` reference.",
+   "Test 7 (stress, generated at verify time): k=15 streams including several empty ones, seeded differently \u2014 same reference comparison.",
+   "Test 8 (multiset integrity): for all stress tests, verify `sorted(output) == sorted(all_input_values)` using a Python reference script that independently parses the input."
+  ],
+  "verifier_knob": {
+   "name": "num_stress_inputs",
+   "value": "6",
+   "effect": "Raising this generates more fresh (k, length, seed) combinations at verify time, increasing the probability that edge cases in the heap invariant and scanner are exercised. Lowering it to 2-3 makes the test faster but easier to get lucky on."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the sentinel bug, tests with multi-stream disjoint inputs, observes correct output, and submits \u2014 fails the cross-stream duplicate stress tests.",
+   "Agent fixes only the heap bug, tests with single-stream duplicate inputs, observes correct output, and submits \u2014 fails all multi-stream tests.",
+   "Agent finds the rune-vs-string comparison in the scanner but misreads it as correct (the expression compiles and is syntactically valid Go), moves on, and never discovers the sentinel bug.",
+   "Agent constructs a two-stream test, sees both streams in the output after the sentinel fix, concludes the binary is correct, and doesn't notice the subtle heap ordering issue that only surfaces with cross-stream equal values.",
+   "Agent attempts to rewrite the merge algorithm from scratch but introduces a different subtle off-by-one in the heap, passing most tests but failing on streams of length 1."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithms",
+   "merge-sort",
+   "heap",
+   "refactoring",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/internal/parse/scanner.go",
+   "cat /app/src/internal/merge/heap.go",
+   "cat /app/src/cmd/ksort/main.go",
+   "echo -e '1\\n2\\n---\\n3\\n4' | /app/bin/ksort  # confirm sentinel bug",
+   "grep -n \"'---'\\|TrimSpace\" /app/src/internal/parse/scanner.go",
+   "sed -i \"s/== '---'/== \\\"---\\\"/\" /app/src/internal/parse/scanner.go",
+   "grep -n '>=' /app/src/internal/merge/heap.go",
+   "sed -i 's/\\.Less.*>=/Less: func returns false on >=/' ... # fix >= to > in Less",
+   "cd /app/src && go build -o /app/bin/ksort ./cmd/ksort",
+   "echo -e '1\\n42\\n100\\n---\\n10\\n42\\n200' | /app/bin/ksort  # verify both fixes",
+   "cat /app/testdata/sample1.txt | /app/bin/ksort  # existing tests pass"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 5,
+   "solvability": 5,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The rune literal '---' in Go is actually a multi-character rune literal which is a compile error in standard Go \u2014 Go rune literals must be single characters. This means the code as described may not compile at all, making the entire premise flawed. A rune literal like '---' is invalid Go syntax and would cause a build error, not silently evaluate false.",
+   "If the blueprint's Bug 2 is syntactically invalid Go (rune literals cannot be multi-character strings), the Dockerfile build step 'RUN cd /app/src && go build ...' would fail, making the image unbuildable as described.",
+   "The stress tests generate inputs at verify time using a seeded PRNG \u2014 if the seed or generation logic has an off-by-one or platform dependency, results could be flaky across environments.",
+   "The sed fix for the rune comparison may be fragile if the actual source uses different quoting or whitespace than assumed.",
+   "Both bugs are immediately visible from reading source code, so a frontier agent would solve this in ~11 commands \u2014 well under the genuine_difficulty threshold of 20+ commands."
+  ],
+  "verdict": "reject",
+  "reasons": "The two bugs are directly visible by reading the source files \u2014 the rune-vs-string comparison in scanner.go and the >= in heap.go's Less method are both findable in under 5 minutes of source review, placing this firmly in the <=2 genuine_difficulty category per the calibration rule. Additionally, the core premise of Bug 2 has a critical technical flaw: '---' is not a valid Go rune literal (rune literals must be single characters), so the described code would fail to compile rather than silently misbehave, making the container unbuildable as described. The task needs both a harder-to-locate bug mechanism (e.g., runtime behavioral bugs requiring dynamic observation, not static source reading) and a correction to the technically invalid rune literal premise.",
+  "fixes": [
+   "Replace the rune-literal bug with a syntactically valid but semantically wrong Go expression \u2014 e.g., the sentinel check uses bytes.Equal(line, []byte(\"---\")) but compares against a []byte constructed with an off-by-one trim that removes the last dash, which compiles and runs but silently fails only on lines with trailing whitespace that production inputs have but test inputs don't.",
+   "Make at least one bug require dynamic observation rather than static reading \u2014 e.g., an integer overflow that only triggers for values >2^31, or a race condition in concurrent stream reading that only manifests with k>4 streams, so the agent must construct a test input and observe unexpected output before knowing where to look.",
+   "Increase the number of source files and interleave the bugs across more layers of abstraction so that grep/sed cannot trivially locate and fix both bugs in 2-3 commands \u2014 e.g., the heap invariant violation is in an interface method implemented in a separate file that's only called through a function pointer set up in a third file.",
+   "Add a third subtle bug (e.g., integer parsing that silently drops leading zeros or mishandles INT_MIN) to prevent quick convergence after fixing the two obvious ones."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/sglang-qwen-burst",
+     "verdict": "distinct",
+     "reason": "That task involves fixing ordering of streamed LLM responses with speculative decoding, not debugging a k-way merge sort algorithm in Go."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves building a TCP audit service with HMAC-SHA256 computation and database lookups, unrelated to k-way merge sort."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a sensor normalization binary and fixing a SQL pipeline, not debugging a k-way merge algorithm."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task involves fixing SQL window functions and GROUP BY aggregations, not a k-way merge sort implementation."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a spectral entropy computation pipeline for cryptographic RNG auditing, unrelated to k-way merge sort."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/sglang-qwen-burst",
+     0.143
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.117
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.11
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.094
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.089
+    ]
+   ],
+   "cost_usd": 0.013583999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.049344
+}

@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "fixed-point-delta-encoder-repair",
+  "title": "Fixed-Point Delta Encoder Repair",
+  "scenario": "You maintain a small in-house telemetry logger for an embedded sensor array. The codebase encodes 16-bit signed sensor readings as variable-length delta frames using a fixed-point arithmetic scheme documented in an internal spec file. A recent refactor of the numeric pipeline broke something subtle \u2014 the encoder and decoder disagree on round-trips for certain value ranges, but only when you run it against the actual historical sensor dumps, not the toy unit tests that ship with the repo.",
+  "instruction_draft": "Hey, the telemetry codec in /app is producing corrupt frames in production. The encoder at encoder.py and decoder at decoder.py are supposed to be perfectly lossless round-trips for any signed 16-bit integer sequence: decode(encode(seq)) must equal seq exactly for all valid inputs. The spec in /app/spec.md defines the frame format and the fixed-point delta arithmetic. Right now something's off \u2014 the round-trip fails on real data but the included tests pass. Fix the codec so it's correct for every possible signed 16-bit delta value including the edge cases, and make sure it still produces the compact variable-length encoding the spec calls for. Don't change the on-disk frame format.",
+  "requirements": [
+   "decode(encode(seq)) == seq for every sequence of signed 16-bit integers (values in [-32768, 32767])",
+   "The encoder produces variable-length delta frames as specified in /app/spec.md",
+   "The on-disk binary frame format (magic bytes, header layout, payload layout) is unchanged",
+   "The codec handles all signed 16-bit delta edge cases: overflow wrap, min/max transitions, runs of identical values",
+   "The fixed-point scaling arithmetic matches the spec exactly (no floating-point substitution)"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "/app/spec.md: internal spec defining the frame format \u2014 magic bytes 0xDE 0x1F, 2-byte little-endian sample count, then variable-length delta records; each delta record is a 1-byte tag byte encoding sign+magnitude class, followed by 0, 1, or 2 payload bytes; deltas are computed in fixed-point Q8.8 scaled space (multiply raw int16 by 256 before differencing, then encode the scaled delta); the tag byte encodes: bits[7:6]=00 means delta fits in 6-bit signed ([-32,31] scaled), bits[7:6]=10 means delta fits in 14-bit signed (2-byte payload), bits[7:6]=11 means full 24-bit signed delta (3-byte payload)",
+   "/app/encoder.py: ~180 lines; the bug is in the Q8.8 scaling step \u2014 when computing the scaled delta it does `scaled_delta = (new_val - prev_val) << 8` but for negative deltas this silently overflows Python's arbitrary-precision int into a range that the tag-byte classifier then misclassifies into the wrong width bucket, causing the decoder to mis-parse subsequent bytes; the overflow happens only when |delta| > 127 and the value crosses zero (sign change), which the toy tests never exercise",
+   "/app/decoder.py: ~140 lines; the decoder is correct per spec but relies on the encoder emitting valid tag bytes; it will silently produce wrong values when fed encoder output with misclassified tag bytes",
+   "/app/tests/test_roundtrip.py: ~60 lines of unit tests using only small positive deltas and same-sign sequences \u2014 all pass even with the bug",
+   "/app/data/sensor_dump_1.bin through sensor_dump_4.bin: real historical recordings totaling ~40k samples, containing sign-crossing sequences that trigger the bug",
+   "/app/run_check.py: a script that encodes each sensor dump and checks round-trip equality, reports first mismatch with index and values",
+   "pip install: nothing extra needed (stdlib only)",
+   "The planted bug: in encoder.py, the scaled delta is computed as `(cur - prev) << 8` which for Python ints never overflows numerically, but the sign-extension step that follows does `scaled_delta & 0xFFFFFF` before classifying, stripping the sign bit for large negative values and turning them positive, causing them to land in the wrong width class; the fix requires computing the signed 24-bit delta correctly using two's complement masking with subsequent sign extension: `sd = (cur - prev) << 8; sd = (sd & 0xFFFFFF); sd = sd - 0x1000000 if sd >= 0x800000 else sd`"
+  ],
+  "internal_hint": "Difficulty comes from observe_not_read and edge_case_inputs. The bug is NOT visible by reading encoder.py casually \u2014 the expression `(cur - prev) << 8` looks correct for Python (no overflow), and the `& 0xFFFFFF` mask looks like innocent field extraction. The sign-extension step that converts the masked value back to a signed 24-bit integer is missing, so large negative deltas (those where the raw delta is < -128, meaning the scaled delta should be < -32768) get their sign stripped by the mask and are classified as positive large-magnitude values, landing in the wrong width bucket. This only surfaces on sign-crossing sequences. The solver must: (1) run run_check.py against the sensor dumps to see failures, (2) instrument the encoder to log scaled_delta values around failures, (3) notice that negative scaled deltas after masking appear positive, (4) identify the missing sign-extension, (5) fix it and verify all four dumps pass. The fix is ~3 lines but requires understanding two's complement sign extension. The hidden verifier then generates fresh sequences including: all delta values from -32768 to 32767, long runs near INT16_MIN/MAX, alternating min/max sequences, and zero-crossing runs.",
+  "trap": "A naive agent reads encoder.py, sees the arithmetic looks like Python (no overflow), decides the bug must be in the decoder or in the tag-byte boundary constants, and patches those. This fixes some cases but not the sign-extension issue. The provided sensor dumps may partially pass after such a patch (if the agent picks thresholds that cover the dump data), but the verifier generates sign-crossing sequences with delta = -32768 (INT16_MIN step) and delta = 32767 (INT16_MAX step) which the patched encoder still mis-tags. The agent also risks changing the frame format if it modifies the payload byte count logic to 'fix' what it thinks is an off-by-one.",
+  "tests": [
+   "Round-trip test on all 65536 single-step sequences [(0, v)] for v in range(-32768, 32768): encode then decode must recover exactly",
+   "Round-trip test on alternating sequences [INT16_MIN, INT16_MAX] repeated 512 times",
+   "Round-trip test on long runs of zero deltas (constant signal)",
+   "Round-trip test on the four provided sensor dumps via run_check.py",
+   "Round-trip test on 1000 random sequences of length 500 seeded deterministically, covering all delta magnitude classes",
+   "Frame format check: magic bytes 0xDE 0x1F present at offset 0 of every encoded output",
+   "Frame format check: 2-byte little-endian sample count at offset 2 matches sequence length",
+   "Compactness check: encoding a constant sequence (all-zero deltas) uses only 1-byte tag records (no payload bytes after the first sample)",
+   "Tag-byte classification check: a delta of exactly -32768 scaled (= -8388608 Q8.8) must produce a 3-byte-payload record (tag bits 11), not a 2-byte-payload record",
+   "Cross-decode check: encoder output for a known test vector matches a reference byte sequence computed from the spec"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "65536 exhaustive + 1000 random sequences",
+   "effect": "Reducing to only the 4 sensor dumps makes it easy to patch thresholds to fit; raising to full exhaustive coverage forces correct sign-extension logic. Lowering the random seed count to 10 lets a partially-correct fix pass most cases."
+  },
+  "expected_failure_modes": [
+   "Agent reads encoder.py, sees no obvious integer overflow (Python), concludes bug is in decoder boundary conditions and patches wrong code",
+   "Agent runs the unit tests, they pass, agent declares the codec correct without running against sensor dumps",
+   "Agent correctly identifies sign-extension missing but implements it as `sd = sd if sd < 2**23 else sd - 2**24` (off-by-one on boundary: should be `>= 2**23` not `> 2**23`), causing delta = -2**23 exactly to be mis-signed",
+   "Agent changes the tag-byte boundary thresholds to empirically fit the sensor dump data, which passes the visible data but fails on fresh generated sequences with extreme deltas",
+   "Agent introduces floating-point arithmetic to avoid the sign issue, which fails on exact edge cases due to float rounding"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "binary-format",
+   "fixed-point-arithmetic",
+   "sign-extension",
+   "codec",
+   "embedded-systems",
+   "edge-cases"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/spec.md",
+   "cat /app/encoder.py \u2014 spot `(cur - prev) << 8; sd = sd & 0xFFFFFF` with no sign-extension after mask",
+   "cat /app/decoder.py \u2014 confirm decoder is correct",
+   "python /app/run_check.py \u2014 observe failures on sensor dumps",
+   "Edit encoder.py: after `sd = sd & 0xFFFFFF`, add `sd = sd - 0x1000000 if sd >= 0x800000 else sd`",
+   "python /app/run_check.py \u2014 verify all four dumps pass",
+   "python /app/tests/test_roundtrip.py \u2014 verify unit tests still pass"
+  ],
+  "speedrun_commands": 7,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The bug is visually identifiable by reading encoder.py \u2014 `& 0xFFFFFF` without subsequent sign-extension is a well-known Python two's-complement anti-pattern, so the 'observe_not_read' framing doesn't hold and a skilled agent solves it in ~7 commands without needing the sensor dumps at all.",
+   "The off-by-one boundary trap (`> 2**23` vs `>= 2**23`) is seeded as an expected failure mode but whether it manifests depends on whether the random corpus happens to hit sd == -2^23 exactly; if the seed is chosen poorly, this failure mode is never exercised and the trap is toothless.",
+   "The cross-decode reference byte sequence must be pre-computed and baked into the verifier correctly; any error in the environment build step that produces this vector would cause spurious failures.",
+   "The four sensor dump binary files must be generated to reliably contain sign-crossing sequences with |delta| > 127; if generation is off, the dumps may not trigger the bug and the agent could pass run_check.py without fixing anything."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2, failing the minimum threshold of 4. The bug \u2014 a missing two's-complement sign-extension after `& 0xFFFFFF` \u2014 is immediately recognizable to any engineer familiar with Python fixed-point or bitmask code, making the 'observe_not_read' framing false; the speedrun resolves in ~7 commands purely by code reading. To reach genuine difficulty \u2265 4, the bug should be hidden in a way that code reading alone is insufficient, such as an interaction between two files or a data-dependent branch that requires running against the real corpus to even identify which function is wrong.",
+  "fixes": [
+   "Move the bug to an interaction between encoder.py and a separate fixed-point math library (e.g., fixedpoint.py) so neither file alone looks wrong \u2014 the error only emerges from how the two compose, requiring the agent to instrument runtime values rather than spot a single-line anti-pattern.",
+   "Replace the obvious `& 0xFFFFFF` mask with a subtly wrong scaling constant (e.g., `256` replaced by `255` or `257`) that produces near-correct output for most inputs but fails on values near INT16_MIN boundaries \u2014 making the bug arithmetically subtle rather than a recognizable bit-manipulation anti-pattern.",
+   "Ensure the sensor dumps exercise the exact boundary value (scaled_delta == -8388608) so the off-by-one trap is reliably triggered, and document that the verifier seeds include this value, removing ambiguity about whether the trap is active.",
+   "Strengthen the 'observe_not_read' property by splitting the logic across encoder.py and a C extension or struct-pack call, so the sign issue only manifests in the serialized bytes and not in any intermediate Python variable a reader would naturally print."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "DNA storage encoding with deletion-channel error correction is a fundamentally different problem from fixed-point delta encoding of sensor data."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about a simple fixed-width binary frame format (type/seq/payload) served over HTTP, not variable-length delta encoding with fixed-point arithmetic."
+    },
+    {
+     "ref_id": "terminal-bench-science/reactor-safety-control",
+     "verdict": "distinct",
+     "reason": "A reactor safety controller is a control-systems problem with no overlap with codec repair."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "AES-CTR nonce derivation repair in a C library is a cryptographic correctness problem, not a fixed-point delta codec problem."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks require fixing a broken encode/decode round-trip codec (lossless correctness for all inputs) with edge-case failures not caught by existing tests, differing mainly in language (Rust vs Python) and domain details (packet vs delta frames)."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.208
+    ],
+    [
+     "ours/official-aac910462208",
+     0.204
+    ],
+    [
+     "terminal-bench-science/reactor-safety-control",
+     0.119
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.107
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.098
+    ]
+   ],
+   "cost_usd": 0.013572
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051105000000000005
+}

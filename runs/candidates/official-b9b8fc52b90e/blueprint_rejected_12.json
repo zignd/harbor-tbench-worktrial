@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "sensor-rollup-codec-repair",
+  "title": "Sensor Rollup Binary Codec Repair",
+  "scenario": "A small manufacturing plant runs a C rollup daemon (rollupd) that converts raw hourly sensor CSV logs into a compact binary rollup store via a pre-compiled builder binary, then answers MIN/MAX/AVG queries over a line-oriented TCP protocol on port 7722. After a backend upgrade, an analyst noticed that high-temperature sensors return wrong averages and that results change depending on which time window is queried. The codebase is ~1400 lines across five C source files plus a shell startup script; the rollup-builder binary ships without source.",
+  "instruction_draft": "The daemon started by /app/start.sh serves sensor statistics on port 7722. Fix it so every MIN, MAX, and AVG response is correct for all sensor IDs and time ranges. The raw CSV logs under /app/data/raw/ are the ground truth; regenerate the rollup store after any fix.",
+  "requirements": [
+   "MIN response matches the true minimum of raw log values for the queried sensor and time window",
+   "MAX response matches the true maximum of raw log values for the queried sensor and time window",
+   "AVG response matches the arithmetic mean of raw log values for the queried sensor and time window, within 0.5 of the true value",
+   "Daemon listens on port 7722 and responds to well-formed queries",
+   "Rollup store is regenerated from raw CSV logs using the existing builder binary before the daemon is started"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with build-essential, netcat-openbsd installed via apt",
+   "src/server.c: ~300 lines, main TCP server loop, parses QUERY <sensor_id> <start_ts> <end_ts> <STAT> requests, calls query.c handlers",
+   "src/query.c: ~250 lines, orchestrates store lookup and stat computation",
+   "src/store_reader.c: ~300 lines, reads binary rollup store \u2014 BUG B: window boundary uses strict '>' instead of '>=' on start timestamp, dropping first sample of each window",
+   "src/window.c: ~150 lines, innocent helper for timestamp rounding and range iteration",
+   "src/utils.c: ~120 lines, CRC32, logging, string utilities \u2014 all correct",
+   "bin/rollup-builder: pre-compiled x86-64 ELF binary (compiled in Dockerfile from hidden source) \u2014 BUG A: writes records for sensor values > 5000 in big-endian byte order for the 'value' field, while all other records are little-endian; this is a silent portability fork in the undocumented binary",
+   "start.sh: runs './bin/rollup-builder /app/data/raw/ /app/data/store.bin && ./rollupd 7722'",
+   "Makefile: builds all .c sources into rollupd",
+   "data/raw/sensors_2024_*.csv: hourly readings for 40 sensors over 90 days; sensors 1-30 have values 100-4000 (low-range, safe); sensors 31-40 have values 5500-9000 (high-range, triggers Bug A); samples appear exactly on the hour (integer epoch timestamps aligned to hour boundaries, so window-start samples exist and are dropped by Bug B)",
+   "data/raw/ structure ensures the first sample of each hourly window is always present and is often the min or max for that window (so Bug B causes real errors even without Bug A)",
+   "Protocol: QUERY <sensor_id> <start_epoch> <end_epoch> <MIN|MAX|AVG>\\n \u2192 answer as decimal number or ERROR\\n",
+   "Sample query file at /app/examples/sample_queries.sh with a few low-range sensor queries that return correct results when only Bug B is fixed (providing false confidence)",
+   "Verifier generates fresh queries at runtime covering both low-range and high-range sensors, and queries with window boundaries exactly on sample timestamps"
+  ],
+  "internal_hint": "Bug A is in the pre-compiled rollup-builder binary (no source available): it writes the 16-bit sensor value in big-endian for records where value > 5000, but store_reader.c always reads little-endian. The solver must empirically discover this by hexdumping store.bin and correlating with raw CSV values \u2014 the byte-swap pattern is visible in the binary dump but not in any source file. Bug B is in store_reader.c: the window filter uses 'ts > window_start' instead of 'ts >= window_start', dropping the boundary sample. These interact because for high-range sensors, the byte-swapped value lands at a seemingly random large number, and for sensors where the boundary sample is the min/max, Bug B's exclusion of that sample changes which (wrong) value 'wins', sometimes producing an answer that looks plausible. The correct fix sequence: (1) patch store_reader.c to fix the window boundary AND to byte-swap values when the high-range flag is set in the record header, (2) rerun rollup-builder to regenerate the store, (3) restart the daemon. If the solver fixes only Bug B and regenerates, high-range sensors now show obviously wrong (large negative or huge positive) numbers \u2014 but the provided sample queries don't cover high-range sensors, so a shallow verification passes. The verifier uses fresh high-range sensor queries that expose this.",
+  "trap": "The sample_queries.sh file only queries sensors 1-10 (all low-range). An agent that fixes only the window boundary bug (Bug B), regenerates the store, and tests with the provided samples will see correct results and stop. The verifier's hidden tests query sensors 31-40 (high-range) and will get byte-swapped garbage values. Additionally, an agent that correctly identifies both bugs but forgets to regenerate the rollup store after patching will still serve the old corrupted data.",
+  "tests": [
+   "Test 1: Query MIN/MAX/AVG for a low-range sensor (1-30) over a window that starts exactly on a sample timestamp \u2014 verifies Bug B is fixed (boundary sample included)",
+   "Test 2: Query MIN/MAX/AVG for a high-range sensor (31-40) \u2014 verifies Bug A handling (byte-swap in reader is correct)",
+   "Test 3: Query AVG for a high-range sensor over multiple windows \u2014 verifies both bugs fixed and store was regenerated correctly",
+   "Test 4: Query MIN for a sensor where the boundary sample IS the minimum \u2014 verifies Bug B fix matters",
+   "Test 5: Query MAX for sensor 35 over the full dataset \u2014 verifies high-range byte-swap and window boundary are both correctly handled together",
+   "Test 6: Protocol correctness \u2014 QUERY for a nonexistent sensor returns ERROR, not a crash",
+   "All test inputs (sensor IDs, timestamps, stat types) are generated fresh at verify time by the verifier script using the raw CSV data as ground truth"
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "6",
+   "effect": "Increasing to 10+ adds multi-window range queries and edge cases (single-sample windows, windows with no data) that require the fix to be complete and robust; decreasing to 3 makes it possible to pass with only one bug fixed if high-range sensors aren't in the short test list"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only Bug B (readable in source), tests with provided samples, declares done \u2014 fails all high-range sensor tests",
+   "Agent identifies both bugs but fixes Bug A incorrectly (e.g., always swaps instead of checking the record flag) \u2014 some low-range queries break",
+   "Agent fixes both bugs in source but forgets to regenerate the rollup store \u2014 daemon serves stale corrupted data",
+   "Agent tries to replace the pre-compiled builder with a Python re-implementation but gets the binary format wrong, producing an incompatible store",
+   "Agent patches the reader to always byte-swap (removing the range check), fixing high-range but breaking all low-range sensors",
+   "Agent regenerates the store before fixing both bugs in the reader, then the second fix isn't applied to the regenerated data"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "binary-format",
+   "c",
+   "interacting-bugs",
+   "protocol",
+   "shell-scripting",
+   "data-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/start.sh",
+   "cat src/store_reader.c  # find Bug B: ts > window_start instead of >=",
+   "cat src/query.c",
+   "head -20 /app/data/raw/sensors_2024_01.csv  # understand CSV format",
+   "bash /app/examples/sample_queries.sh  # baseline \u2014 all pass (sensors 1-10 only)",
+   "# Notice sample queries only cover sensors 1-10; manually test sensor 35",
+   "python3 -c \"import csv; ...\" # compute expected MAX for sensor 35 from raw CSV",
+   "echo 'QUERY 35 <start_ts> <end_ts> MAX' | nc localhost 7722  # get wrong answer",
+   "hexdump -C /app/data/store.bin | head -200  # examine binary record format",
+   "# Correlate hex bytes with raw CSV values for sensor 35",
+   "# Identify big-endian byte swap pattern for values > 5000",
+   "# Locate high_range flag in record header structure",
+   "sed -i 's/ts > window_start/ts >= window_start/' src/store_reader.c  # fix Bug B",
+   "# Edit store_reader.c to bswap16() value field when high_range flag is set in record header",
+   "nano src/store_reader.c  # add: if (record.flags & HIGH_RANGE_FLAG) value = bswap16(value);",
+   "make  # rebuild rollupd",
+   "/app/start.sh  # regenerates store.bin AND starts daemon",
+   "echo 'QUERY 5 <boundary_ts> <end_ts> MIN' | nc localhost 7722  # verify Bug B fix",
+   "echo 'QUERY 35 <start_ts> <end_ts> MAX' | nc localhost 7722  # verify Bug A fix",
+   "echo 'QUERY 99 0 9999999999 AVG' | nc localhost 7722  # verify ERROR for nonexistent sensor"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 'high_range flag' in the record header is central to Bug A fix but is never documented in any source the solver can read \u2014 if the hex dump pattern is ambiguous or the flag position is not clearly identifiable, a correct conceptual fix may be implemented incorrectly, causing a valid-effort failure",
+   "If the rollup-builder encodes the high-range condition purely by value magnitude (no explicit flag), the store_reader fix must threshold on value > 5000, but that value is undocumented \u2014 solver might pick wrong threshold",
+   "Port 7722 may already be bound by a previous daemon invocation if start.sh is run multiple times; no kill/cleanup step is specified, potentially causing startup failures unrelated to the fix",
+   "The AVG tolerance of 0.5 is in the requirements list but not in the solver-facing instruction text \u2014 if the verifier is strict about this tolerance and floating-point accumulation differs, edge cases near the boundary could produce ambiguous pass/fail outcomes",
+   "Timestamp alignment: if any CSV row has a timestamp that is off by even 1 second from an exact hour boundary, Tests 1 and 4 (which depend on boundary samples existing) could be flaky"
+  ],
+  "verdict": "reject",
+  "reasons": "The task has excellent bones \u2014 two interacting bugs, one in a pre-compiled binary requiring hex analysis, a well-designed trap in the sample queries, and strong verifiability. However, it fails on clarity (score 3, borderline): the instruction never hints that the pre-compiled builder could be buggy, and the undocumented 'high_range flag' in the record header is the linchpin of the correct fix but is discoverable only through hex analysis of an opaque binary without any format specification \u2014 creating a significant invalid failure risk where a solver correctly understands the bug but implements the fix incorrectly due to format ambiguity. The average score is 4.2 which meets the bar, but genuine_difficulty scores 4 (borderline given ~20 speedrun commands) and clarity scores 3 (minimum threshold), and the invalid failure risk around the undocumented flag format is substantial enough to cause unfair rejections.",
+  "fixes": [
+   "Add a minimal binary format specification comment in store_reader.c (e.g., 'Record format: [4B timestamp][2B sensor_id][1B flags][1B padding][4B value_raw]') so the solver can write the correct reader fix without guessing field offsets \u2014 this keeps Bug A hidden but makes the fix implementable once discovered",
+   "Ensure the record header flag (HIGH_RANGE_FLAG) is used consistently and its bit position is at least inferable from the existing store_reader.c source (e.g., a defined constant HIGH_RANGE_FLAG = 0x01 already exists but the reader ignores it), giving the solver a foothold",
+   "Add a daemon restart wrapper or document in start.sh that it kills any existing rollupd before starting, preventing port-binding failures when the solver runs start.sh multiple times",
+   "Move the AVG tolerance (within 0.5) into the solver-facing instruction text explicitly, since it affects whether a partially-correct fix passes or fails",
+   "In the sample_queries.sh, add a comment like '# Note: these queries cover only sensors 1-30' to make it slightly more explicit that coverage is incomplete without directly hinting at the high-range issue"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both involve a sensor data pipeline with a pre-compiled binary that must be characterized/fixed, and correctness is verified against statistical aggregates (MIN/MAX/AVG vs p90/sum), but the specific bugs, codec, and query protocol differ enough to require different approaches."
+    },
+    {
+     "ref_id": "terminal-bench-science/sparse-network-assimilation",
+     "verdict": "distinct",
+     "reason": "Lorenz-96 data assimilation with uncalibrated asynchronous sensors is a numerical inverse problem with no overlap in artifacts, protocol, or debugging approach."
+    },
+    {
+     "ref_id": "terminal-bench-science/guided-wave-localization",
+     "verdict": "distinct",
+     "reason": "Structural health monitoring via guided acoustic waves is a signal-processing/machine-learning problem with no relation to TCP daemons or binary codec repair."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The log enrichment task involves a GeoIP binary, SQLite, and Flask API endpoints, sharing only the general pattern of a pipeline with a compiled binary, but the bugs, domain, and query mechanism are entirely different."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "NetFlow v9 UDP/TCP aggregation in Rust is a different protocol, language, and problem domain with no overlap in the core debugging challenge."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.178
+    ],
+    [
+     "terminal-bench-science/sparse-network-assimilation",
+     0.131
+    ],
+    [
+     "terminal-bench-science/guided-wave-localization",
+     0.096
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.088
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.082
+    ]
+   ],
+   "cost_usd": 0.015132
+  },
+  "novel": false
+ },
+ "cost_usd": 0.06765
+}

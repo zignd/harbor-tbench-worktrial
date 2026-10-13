@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "sql-window-agg-binary-regression",
+  "title": "SQL Window Aggregation Regression",
+  "scenario": "An open-source time-series analytics library ships a compiled query-rewriter binary (`/usr/local/bin/qrewrite`) that transforms user SQL into an optimized form before execution against a DuckDB database. A regression was filed after the v2.3 release: queries involving window functions over partitioned aggregates return wrong totals for certain input distributions. The environment contains roughly 1,400 lines across the rewriter harness, a DuckDB-backed runner, test fixtures, and an adversarial validator binary that checks outputs against a reference engine.",
+  "instruction_draft": "The query rewriter at `/usr/local/bin/qrewrite` produces incorrect results for some SQL queries involving window functions over partitioned aggregates. Fix the pipeline (harness, runner, schemas, or any wrapper you write) so that for every query in `/app/queries/`, the result written to `/app/results/<query_id>.csv` exactly matches what the reference validator `/usr/local/bin/refcheck` reports for the same query and input data. All sample queries currently pass; the regression only surfaces on the hidden corpus.",
+  "requirements": [
+   "For every query file in /app/queries/, running the pipeline produces /app/results/<query_id>.csv",
+   "Each result CSV exactly matches the row-set (order-insensitive, type-exact) that /usr/local/bin/refcheck produces for the same query_id and its associated input data",
+   "The fix must work for the hidden corpus of queries, not just the provided sample set",
+   "No external network access is permitted; all computation is local"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with duckdb==1.1.3, pyarrow, pandas pinned via pip",
+   "Compiled binary /usr/local/bin/qrewrite (no source): accepts SQL on stdin, rewrites it, prints transformed SQL to stdout; has two interacting bugs in its window-function rewriter",
+   "Compiled binary /usr/local/bin/refcheck (no source): accepts --query-id and --data-dir flags, runs the original un-rewritten query against fresh DuckDB, prints CSV to stdout; serves as the oracle",
+   "/app/runner.py (~300 lines): reads each .sql from /app/queries/, pipes through qrewrite, executes against DuckDB, writes results; has one additional Python-level bug that interacts with the binary's output",
+   "/app/schema.sql (~80 lines): DDL for the partitioned sales/events tables loaded into DuckDB at startup",
+   "/app/data/ (~20 CSV files): input data loaded by the runner; distributions chosen to hide the bug in naive test cases",
+   "/app/queries/ (6 sample .sql files): simple window queries that happen to avoid the buggy code path in qrewrite",
+   "/app/tests/test_sample.py: runs the pipeline on the 6 sample queries and diffs against refcheck output; all pass on the broken system",
+   "/app/loader.py (~150 lines): data ingestion helpers with a subtle dtype-coercion path that is only triggered by certain column distributions",
+   "/app/utils/ (~400 lines): logging, CSV serialization, schema validation utilities",
+   "BUG 1 (in qrewrite binary): when a window function uses PARTITION BY on a column whose name contains an underscore followed by a digit (e.g. region_1, bucket_2), the rewriter silently drops the PARTITION BY clause, collapsing all partitions into one; this only manifests on data with multi-partition distributions",
+   "BUG 2 (in runner.py): the runner sorts result rows using Python's default string sort on the first column before writing CSV, which gives wrong order for numeric strings (e.g. '10' < '2'), and refcheck uses integer sort; these interact because BUG 1 causes wrong aggregates AND wrong sort keys, so fixing only the sort still fails on BUG 1 partitioning, and fixing only the partition passthrough still fails sort comparison",
+   "The 6 sample queries all use column names without the underscore-digit pattern, so BUG 1 never fires; the 6 sample queries also have single-partition data so sort order is trivially correct"
+  ],
+  "internal_hint": "Difficulty comes from an opaque compiled component (qrewrite) whose bug is not visible by reading source, and from two interacting causes. The agent must: (1) discover that qrewrite is transforming SQL by diffing its output against its input for various column-name patterns; (2) deduce by black-box experimentation that column names matching /[a-z]+_\\d+/ cause PARTITION BY to be stripped \u2014 this requires generating and testing probe queries; (3) separately discover the Python string-sort bug in runner.py by reading runner.py; (4) understand that fixing only the sort order still fails hidden corpus queries because the aggregates are wrong, and fixing only the PARTITION BY passthrough still fails because CSVs are mis-sorted. The fix is: write a Python wrapper that post-processes qrewrite output to restore any PARTITION BY clauses that were dropped (detectable by comparing input and output SQL), AND fix the sort in runner.py to use numeric-aware sorting on the first column. The agent must instrument qrewrite experimentally since no source is available.",
+  "trap": "The 6 sample queries pass whether or not either bug is fixed, because their column names lack the underscore-digit pattern and their data is single-partition. A naive agent fixes the visible Python sort bug in runner.py, re-runs the sample tests, sees all pass, and stops. The hidden corpus includes queries with column names like `region_2`, `bucket_10`, multi-partition data, and mixed-type first columns \u2014 these fail both on wrong aggregates (BUG 1) and wrong sort (BUG 2 interacting with wrong aggregate keys).",
+  "tests": [
+   "Hidden corpus test 1: query using SUM(...) OVER (PARTITION BY region_2 ORDER BY ts) on a table with 5 distinct region_2 values and 1000 rows; result must match refcheck exactly (aggregate values and row order)",
+   "Hidden corpus test 2: query using AVG(...) OVER (PARTITION BY bucket_10) with 12 partitions; checks that each partition's average is correct, not the global average",
+   "Hidden corpus test 3: query combining two window functions, one on a normal column and one on an underscore-digit column, in a single SELECT; tests that only the affected PARTITION BY is broken/fixed",
+   "Hidden corpus test 4: result CSV sort order when the first column contains numeric strings '1' through '20'; verifies integer-aware sort matches refcheck's output ordering",
+   "Hidden corpus test 5: query where BUG 1 produces a single aggregate row (all partitions merged) and BUG 2 would reorder it; after fix, must produce 8 rows, one per partition, correctly sorted",
+   "Hidden corpus test 6: benign query with column name `region_a` (letter suffix, not digit) to verify the fix doesn't over-eagerly modify queries that qrewrite handles correctly",
+   "All 6 original sample queries must still pass after the fix"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "30 hidden queries",
+   "effect": "Increasing corpus size adds more column-name patterns (multi-underscore, mixed case, longer names) and more data distributions (skewed partitions, ties in sort keys), making it harder to cover all cases with a regex-based workaround; decreasing it to 10 makes a targeted regex fix viable"
+  },
+  "expected_failure_modes": [
+   "Agent fixes runner.py sort bug, sample tests pass, agent stops without testing on hidden column-name patterns",
+   "Agent discovers qrewrite strips PARTITION BY but writes a brittle regex that only matches single-digit suffixes (_1 through _9), missing _10, _20, etc.",
+   "Agent writes a wrapper that re-adds PARTITION BY from the original SQL but fails to handle queries where qrewrite correctly rewrites an equivalent expression, causing double-application",
+   "Agent correctly fixes the binary passthrough but forgets the sort fix in runner.py, failing hidden test 4",
+   "Agent uses DuckDB directly without going through qrewrite to bypass the binary, but refcheck is also calling DuckDB directly so results match \u2014 agent may accidentally pass this way, but the task only requires correct output so this is a valid solution path"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "window-functions",
+   "two-interacting-bugs",
+   "black-box",
+   "duckdb"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/runner.py  # understand full pipeline",
+   "cat /app/queries/sample_1.sql  # see what queries look like",
+   "python /app/tests/test_sample.py  # confirm baseline: all 6 pass",
+   "echo 'SELECT SUM(v) OVER (PARTITION BY region_1) FROM t' | /usr/local/bin/qrewrite  # probe binary with underscore-digit column",
+   "echo 'SELECT SUM(v) OVER (PARTITION BY region_a) FROM t' | /usr/local/bin/qrewrite  # control probe with letter suffix",
+   "# Observe: PARTITION BY dropped for region_1 but preserved for region_a",
+   "grep -n 'sort' /app/runner.py  # find the sort bug",
+   "# Option A (bypass): edit runner.py to skip qrewrite entirely and run SQL directly on DuckDB \u2014 blueprint says this is a valid solution",
+   "# Edit runner.py: remove qrewrite pipe, execute original SQL directly via duckdb",
+   "# Also fix sort: change string sort to numeric-aware sort in runner.py",
+   "python /app/tests/test_sample.py  # all 6 still pass",
+   "# Manually test underscore-digit query: echo 'SELECT ...' | python runner_test.py  # verify fix works"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'order-insensitive' language in the requirements directly contradicts hidden corpus test 4 which checks sort order \u2014 an agent following the stated spec (order-insensitive CSV match) might implement correct aggregation but wrong order and be penalized despite following the written instructions",
+   "The blueprint explicitly accepts bypassing qrewrite entirely as a valid solution path, which trivializes the entire two-bug design and means the main difficulty levers (black-box binary, interacting bugs) can be completely circumvented in ~5 commands",
+   "The refcheck binary's behavior with numeric-string sort order is not specified in the instruction \u2014 an agent must infer this from hidden test 4, but the instruction says 'order-insensitive' which could reasonably mean sort order doesn't matter",
+   "loader.py's dtype-coercion path is mentioned in the environment but never connected to a test \u2014 it may be dead weight or could cause flaky behavior on certain data distributions",
+   "The fix for BUG 1 using SQL comparison between input and output of qrewrite is fragile: if qrewrite does other valid rewrites (whitespace, aliasing, comment stripping), a naive diff-based PARTITION BY restoration could incorrectly trigger or fail to trigger"
+  ],
+  "verdict": "reject",
+  "reasons": "The bypass path (skipping qrewrite entirely and running SQL directly on DuckDB) is explicitly acknowledged as a valid solution and reduces the task to ~5-10 commands, making genuine_difficulty at most 2. The 'order-insensitive' requirement language directly contradicts hidden corpus test 4 which validates sort order, creating an ambiguity that risks invalid failures. The two-interacting-bugs design \u2014 which is the core difficulty mechanism \u2014 is entirely bypassed by the valid shortcut, so the elaborate qrewrite black-box investigation the task is built around is optional.",
+  "fixes": [
+   "Remove the bypass path as a valid solution: require qrewrite to be called for every query (e.g., add a mandatory audit log checked by the verifier, or make refcheck internally verify that qrewrite was invoked by checking a side-effect file written by qrewrite)",
+   "Fix the order-sensitivity contradiction: either change all tests to be order-insensitive (remove test 4) or change the instruction to explicitly state 'row order must match refcheck output exactly'",
+   "Increase the binary's opacity by adding a second non-trivial transformation qrewrite does correctly (e.g., it rewrites some aggregates in a useful way), so bypassing it entirely causes some sample queries to fail \u2014 this forces agents to understand and work with the binary rather than skip it",
+   "Add a sample query that uses an underscore-digit column name but with single-partition data, so agents can observe qrewrite's behavior without immediately seeing wrong aggregates \u2014 this teaches the pattern while keeping the multi-partition failure hidden, raising the exploration bar"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task asks for query optimization while preserving semantics; this task asks for debugging a buggy query-rewriter binary by fixing surrounding pipeline code to produce correct outputs."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is purely about SQL query optimization in SQLite; this task is about diagnosing and fixing a regression in a compiled binary's rewriting pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/migrate-fortran-mcsim-to-gfortran",
+     "verdict": "distinct",
+     "reason": "That task is about porting a Fortran build system; this task is about fixing correctness bugs in a SQL window-function rewriting pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve a compiled black-box binary producing wrong outputs that must be worked around by fixing the surrounding pipeline to pass correctness checks on hidden inputs, with the same overall structure of characterize-then-repair."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing row-count and deduplication bugs in a CSV chunking pipeline; this task is about SQL window-function correctness in a query-rewriter pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.231
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.188
+    ],
+    [
+     "terminal-bench-pro/migrate-fortran-mcsim-to-gfortran",
+     0.153
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.135
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.12
+    ]
+   ],
+   "cost_usd": 0.013701000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055371000000000004
+}

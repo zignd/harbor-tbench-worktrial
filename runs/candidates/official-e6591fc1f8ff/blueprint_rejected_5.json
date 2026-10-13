@@ -1,0 +1,159 @@
+{
+ "blueprint": {
+  "slug": "wheel-codec-binary-threshold",
+  "title": "Wheel Codec Throughput Recovery",
+  "scenario": "A release engineer is preparing the v3.2 deployment of `packforge`, an in-house Python packaging pipeline that bundles analytics data files into distributable wheels. The pipeline uses a compiled C extension (`_packcodec.so`) that encodes data records into a custom frame format before embedding them in the wheel. Since an undocumented upstream update replaced the extension binary two weeks ago, the emitted wheels decode correctly on the sample fixture but the throughput measured by the CI harness has dropped below the contractual SLA of 85,000 records/second on a 1-CPU host. The repository (~1,400 lines) contains the Python orchestration layer, the codec wrapper, a regression test suite, and a directory of real data files the wheel builder ingests.",
+  "instruction_draft": "You are the release engineer. The `packforge` pipeline at `/app` must be deployed as a Python wheel that passes the acceptance gate: when the verifier feeds it a stream of 500,000 records drawn from the production schema, the wheel's `decode_all` entry point must emit the correct records at a sustained rate of at least 85,000 records/second measured wall-clock over the full run, with zero decoding errors (every output record must round-trip to the input byte-for-byte). The pipeline currently builds and installs via `python -m build` followed by `pip install dist/*.whl`. Fix whatever is preventing the deployed wheel from meeting the throughput threshold, and ensure the fix survives a fresh `pip install` from the built wheel. Do not modify the compiled extension `/app/src/packforge/_packcodec.so` or any file under `/app/tests/fixtures/`.",
+  "requirements": [
+   "The wheel must be buildable with `python -m build` from `/app` and installable with `pip install dist/*.whl` without error.",
+   "After installation, `packforge.decode_all(stream)` must decode every record correctly: each output record must be byte-for-byte identical to the original input record.",
+   "The sustained throughput over 500,000 records drawn from the production schema must be at least 85,000 records/second measured wall-clock.",
+   "The compiled extension `_packcodec.so` must not be modified.",
+   "The files under `/app/tests/fixtures/` must not be modified."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with build-essential, python3-dev, pip install build wheel pytest",
+   "Directory `/app` with ~1,400 lines across: `pyproject.toml`, `src/packforge/__init__.py`, `src/packforge/_codec_wrapper.py`, `src/packforge/pipeline.py`, `src/packforge/schema.py`, `src/packforge/frame.py`, `tests/`, `tests/fixtures/sample_100.bin` (100 correct records)",
+   "Pre-compiled `src/packforge/_packcodec.so` (no source): exposes `encode_batch(list[bytes]) -> bytes` and `decode_batch(bytes) -> list[bytes]`; the binary has an undocumented internal buffer cap of 4096 bytes per call \u2014 any batch call whose combined payload exceeds 4096 bytes silently returns a truncated result (no exception raised), causing missing records",
+   "The wrapper `_codec_wrapper.py` calls `decode_batch` with arbitrarily large buffers (the old binary had no cap); the sample fixture is 100 short records totalling ~1200 bytes so it never triggers the cap",
+   "Pipeline `pipeline.py` contains a correct but single-threaded Python loop that calls `decode_batch` once per full-file read, emitting wrong results on large inputs; it also has a redundant per-record checksum re-computation in pure Python that can be skipped by reading the pre-computed checksum field from the frame header",
+   "Schema module `schema.py` contains the record format definition including a 4-byte CRC field already computed by the codec; the pure-Python code redundantly recomputes it",
+   "The `pyproject.toml` declares the package correctly; the MANIFEST is correct; the package installs cleanly",
+   "A helper script `/app/probe_codec.py` that the solver may run to characterize the extension experimentally",
+   "The fixture directory contains only the 100-record sample; hidden test generates 500,000 records at verify time using the production schema"
+  ],
+  "internal_hint": "Root cause is two-part and both parts must be found by experimentation, not by reading: (1) The opaque `_packcodec.so` silently truncates `decode_batch` calls when combined payload exceeds 4096 bytes \u2014 discoverable only by running the extension on payloads of increasing size and observing missing records. The fix is to chunk `decode_batch` calls so each chunk's combined byte size stays under 4096. (2) Even with correct chunking, the pure-Python per-record CRC re-computation in `pipeline.py` is the bottleneck at ~40k records/sec; the frame header already contains the pre-computed CRC from the codec, so removing the redundant Python CRC loop and trusting the header value pushes throughput above 85k records/sec. The shallow-check trap: fixing only the buffer cap (chunking) produces correct output on small inputs and even on the 500k-record test, but throughput stays at ~40k records/sec \u2014 below the threshold \u2014 because the CRC bottleneck remains. Fixing only the CRC loop without chunking produces fast but incorrect output (truncated/missing records on large batches). Both fixes are required simultaneously.",
+  "trap": "A solver that notices the buffer-cap truncation, adds chunking, and verifies correctness on the 100-record fixture or even runs a quick timing test on a small batch will see 'correct output' and may not measure throughput on the full 500k-record production load. Similarly, a solver who only profiles and removes the CRC recomputation will hit 85k+ records/sec on the sample fixture (which fits in one chunk) but silently drop records on the hidden large input, failing the zero-error correctness check. Both fixes are independently discoverable but must coexist.",
+  "tests": [
+   "Build test: `python -m build` in `/app` exits 0 and produces a `.whl` in `dist/`",
+   "Install test: `pip install dist/*.whl` exits 0 in a clean venv",
+   "Correctness test: verifier generates 500,000 records from the production schema (record sizes drawn from a seeded distribution spanning 20\u2013180 bytes), encodes them with the reference encoder, runs `packforge.decode_all` on the result, and asserts every output record equals the corresponding input record byte-for-byte; zero mismatches allowed",
+   "Throughput test: same 500,000-record run is timed wall-clock; assert elapsed < 5.88 seconds (\u224885,000 records/sec threshold)",
+   "No-modification test: SHA-256 of `_packcodec.so` and all files under `tests/fixtures/` must match pre-recorded values"
+  ],
+  "verifier_knob": {
+   "name": "throughput_threshold_rps",
+   "value": "85000",
+   "effect": "Raising the threshold (e.g. to 110,000 rps) requires a more aggressive optimization such as using ctypes directly or a tighter chunk size; lowering it (e.g. to 60,000 rps) makes the task easier because the CRC bottleneck fix alone suffices without also needing chunking to be correct \u2014 though correctness still requires chunking."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the buffer-cap chunking (correctness fix) and verifies on the sample fixture, never measuring throughput \u2014 passes correctness but fails throughput.",
+   "Agent profiles on a small input, removes the CRC loop for speed, but never discovers the 4096-byte buffer cap because it only tests small payloads \u2014 fails correctness on large hidden input.",
+   "Agent discovers one bug by reading code, patches it, re-runs the 100-record fixture, sees it pass, and submits \u2014 misses the second bug entirely.",
+   "Agent characterizes the buffer cap correctly but chooses a chunk size by guessing (e.g. 100 records) rather than by byte-sum, causing failures when records are large \u2014 intermittently passes or fails depending on record-size distribution in hidden test.",
+   "Agent modifies `_packcodec.so` (forbidden) in an attempt to remove the cap."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "build-packaging",
+  "tags": [
+   "opaque-binary",
+   "throughput-threshold",
+   "python-packaging",
+   "systems-programming",
+   "deployment",
+   "data-files"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/packforge/pipeline.py  # immediately see CRC recomputation loop",
+   "cat /app/src/packforge/_codec_wrapper.py  # see decode_batch called with large buffers",
+   "cat /app/src/packforge/schema.py  # understand CRC field in frame header",
+   "cat /app/src/packforge/frame.py",
+   "cat /app/probe_codec.py",
+   "python /app/probe_codec.py  # characterize .so: observe truncation at >4096 byte payload",
+   "python -c \"import sys; sys.path.insert(0,'/app/src'); from packforge import _packcodec; data=b'x'*50; r=_packcodec.decode_batch(_packcodec.encode_batch([data]*100)); print(len(r))\"  # confirm truncation threshold",
+   "# Fix 1: edit _codec_wrapper.py to chunk decode_batch calls by byte sum < 4096",
+   "# Fix 2: edit pipeline.py to remove per-record CRC recomputation, read from frame header",
+   "python -m build  # from /app",
+   "pip install dist/*.whl",
+   "python -c \"import packforge, time; # generate 500k records, measure throughput\"",
+   "# Verify correctness and timing both pass",
+   "# Done"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Wall-clock timing threshold (85k rec/s) is hardware-sensitive: on a slower or loaded CI host the 5.88-second threshold may be unachievable even with correct fixes, causing flaky results.",
+   "The CRC bottleneck is directly visible in source code (pipeline.py comment describes it as 'redundant per-record checksum re-computation in pure Python'), undermining the 'discoverable only by experiment' design intent and making the task easier than intended.",
+   "The 4096-byte buffer cap is described as a hard boundary, but if the seeded record-size distribution (20-180 bytes) produces average sizes near the boundary, chunk-size choices made by byte-sum vs record-count could produce intermittent pass/fail on the same code, making the no-modification SHA check irrelevant if the chunking logic is slightly off.",
+   "If python-m-build produces a platform-specific wheel tag that pip install rejects in the clean venv (e.g., ABI mismatch), the build test passes but install test fails for environmental reasons unrelated to the solver's work.",
+   "The probe_codec.py helper script may not actually expose the truncation behavior in a way that makes it obvious \u2014 if it only tests small payloads by default, the agent must know to test larger ones, which requires knowing what to look for."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 3 falls below the required minimum of 4. The CRC recomputation bottleneck \u2014 described in the hints as discoverable 'only by experimentation' \u2014 is directly visible in the source code of pipeline.py, meaning a strong agent reading the code will find both bugs within the first few file reads rather than needing experimental characterization for both. The speedrun reaches a solution in ~14 commands, and the rubric specifies tasks whose bugs are visible by reading source score at most 2 on genuine_difficulty. The wall-clock throughput threshold also introduces hardware-sensitivity risk that could cause invalid failures in slower CI environments.",
+  "fixes": [
+   "Make the CRC bottleneck non-obvious from source: instead of a visible Python CRC loop, implement the slowdown as a call to a second opaque binary helper or through an indirect dispatch table that requires profiling to identify as the bottleneck \u2014 do not name it 'checksum' or 'CRC' in the source.",
+   "Add a third subtle issue (e.g., the wrapper inadvertently copies byte buffers unnecessarily, or the chunk reassembly has an off-by-one that only manifests on record counts divisible by a specific number) to raise difficulty and reduce the chance of a complete fix in under 20 commands.",
+   "Make the throughput threshold environment-independent by expressing it as a ratio: measure baseline throughput of a reference no-op function and require decode_all to achieve at least 60% of that baseline, avoiding hardware-flakiness in the wall-clock check.",
+   "Remove or neuter probe_codec.py so it does not directly guide the solver to the buffer-cap discovery \u2014 force true black-box experimentation by requiring the agent to write its own probing code."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a correctness bug in AES-CTR encryption/decryption logic; the candidate is about recovering throughput performance in a Python wheel packaging pipeline."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a pipeline that fails a throughput SLA while also ensuring correctness of output records, differing mainly in language (Node.js vs Python) and domain (log ingestion vs wheel codec)."
+    },
+    {
+     "ref_id": "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a broken pip installation tool; the candidate is about fixing throughput performance of a Python packaging pipeline."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks require fixing a codec pipeline that has both a correctness requirement (byte-for-byte round-trip) and a throughput/latency SLA, differing mainly in language (Rust vs Python) and the specific constraint (latency per packet vs records/second)."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing correct HMAC-SHA256 tagging over a binary WAL record format with TCP handling; the candidate is about recovering throughput in a Python wheel codec pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.169
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.151
+    ],
+    [
+     "terminal-bench-pro/diagnose-and-repair-broken-pip-installation",
+     0.148
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.133
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.132
+    ]
+   ],
+   "cost_usd": 0.014433000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.053970000000000004
+}

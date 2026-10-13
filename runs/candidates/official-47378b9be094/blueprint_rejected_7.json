@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "spectral-solver-deployment-regression",
+  "title": "Spectral Solver Deployment Regression",
+  "scenario": "A small scientific computing library, `specsolve`, provides a Python-based iterative eigenvalue solver used in a quantum chemistry workflow. After a recent 'performance' refactor that introduced a compiled Cython extension (`_accel.so`, shipped without source) for the hot inner loop, the solver began producing silently wrong eigenvalues on certain problem classes. The maintainer has received a regression report: the integration tests pass on the sample problem but a downstream user's Hamiltonian produces eigenvalues that differ from the reference LAPACK result by more than tolerance. The codebase is ~1,200 lines across several modules including I/O, preprocessing, the solver core, and a deployment script that serialises results to a checkpoint file consumed by the chemistry pipeline.",
+  "instruction_draft": "The spectral solver at `/app/specsolve` produces wrong eigenvalues for certain input matrices after the recent refactor; the deployed checkpoint at `/app/deploy/checkpoint.npz` must contain eigenvalues and eigenvectors that match the reference LAPACK result to within absolute tolerance 1e-6 for every matrix in the test suite. Re-deploy the solver so the checkpoint is regenerated correctly and the deployment script exits 0.",
+  "requirements": [
+   "Every eigenvalue in the deployed checkpoint matches the scipy.linalg.eigh reference to within absolute tolerance 1e-6.",
+   "Corresponding eigenvectors satisfy A @ v = lambda * v to within 1e-8 (residual norm per vector).",
+   "The checkpoint file `/app/deploy/checkpoint.npz` exists and was produced by running the deployment script `/app/specsolve/deploy.py`.",
+   "The deployment script `/app/specsolve/deploy.py` exits with code 0.",
+   "Eigenvalues are stored in ascending sorted order in the checkpoint.",
+   "The checkpoint contains results for all problem matrices in the test suite, including non-trivial structured matrices (banded, near-degenerate, ill-conditioned) generated at verify time."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install numpy, scipy, cython, pytest via pip at pinned versions.",
+   "Directory `/app/specsolve/` containing: `__init__.py`, `io_utils.py` (matrix loaders, ~150 lines), `preprocess.py` (symmetrisation, shift-invert setup, ~200 lines), `solver.py` (Lanczos iteration calling into `_accel.so` for the orthogonalisation step, ~300 lines), `deploy.py` (loads matrices from `/app/data/`, calls solver, writes checkpoint, ~120 lines), `tests/test_basic.py` (passes on sample 4x4 matrix).",
+   "`_accel.so`: a compiled Cython extension (no `.pyx` source provided) that exports one function `orthogonalise(Q, v)` \u2014 it projects vector v against the columns of Q. The bug: when the internal gram-schmidt pass detects near-zero residual it silently returns the un-orthogonalised v instead of raising; this only manifests when a Krylov vector is nearly linearly dependent (happens on near-degenerate spectra after ~20 iterations).",
+   "Directory `/app/data/` with 6 `.npy` matrix files: `random_sym_32.npy` (passes sample test), `banded_64.npy`, `near_degen_48.npy`, `ill_cond_80.npy`, `hydrogen_h2o_96.npy`, `toeplitz_sym_56.npy`. The last four trigger the bug.",
+   "Deploy script reads all `.npy` files from `/app/data/`, runs the solver, and writes `/app/deploy/checkpoint.npz` with keys `eigenvalues_{stem}` and `eigenvectors_{stem}` for each file.",
+   "A `README.md` in `/app/specsolve/` describes the architecture and notes that `_accel.so` 'provides optimised Gram-Schmidt orthogonalisation' \u2014 no other documentation of its internals.",
+   "The existing integration test `test_basic.py` uses `random_sym_32.npy` and passes, misleading a shallow checker.",
+   "No `.pyx` or `.c` source for `_accel.so` is present anywhere in the container.",
+   "A `reference.py` helper script at `/app/specsolve/reference.py` that solves with `scipy.linalg.eigh` is present, giving the solver the ability to verify correctness independently.",
+   "The deploy directory `/app/deploy/` exists but `checkpoint.npz` is either absent or contains the buggy pre-existing results."
+  ],
+  "internal_hint": "Difficulty comes from two sources that interact: (1) NOT VISIBLE BY READING \u2014 the bug lives inside the compiled `_accel.so` binary; reading `solver.py` shows it calls `_accel.orthogonalise` but the defect (silent fallback to non-orthogonalised vector on near-zero residual) is only observable by running the solver on matrices with near-degenerate spectra and comparing output to a reference. The agent must instrument or probe the solver, compare to scipy.linalg.eigh, observe the discrepancy, and deduce the faulty component. (2) ORDERED PROCEDURE \u2014 the fix requires: (a) diagnose which matrices fail and confirm it's the orthogonalisation step, (b) replace the faulty `_accel.orthogonalise` call in `solver.py` with a pure-Python Gram-Schmidt that handles the near-zero residual case correctly (re-orthogonalise twice, as per the classical DGKS correction), (c) ensure the replacement integrates correctly with the Lanczos restart logic in `solver.py` (the restart bookkeeping uses a convergence flag that must be preserved), (d) re-run `deploy.py` to regenerate the checkpoint. An agent that fixes the orthogonaliser but breaks the restart flag produces wrong eigenvalue COUNT. An agent that replaces only the buggy path but not the double re-orthogonalisation fails on ill-conditioned inputs at verify time.",
+  "trap": "The sample test (`test_basic.py` with `random_sym_32.npy`) passes with both the buggy and fixed solver, so an agent that runs only the provided test and then re-deploys will produce a checkpoint that still contains wrong eigenvalues for the four structured matrices. The verifier generates fresh structured matrices at verify time (different sizes/seeds but same problem classes) and checks all of them, so the shallow-check failure is not visible until verification. Additionally, a naive replacement of `_accel.orthogonalise` with a single-pass Gram-Schmidt (without the DGKS double-correction) fails the ill-conditioned case, where the residual after one pass is still non-negligible but not large enough to trigger a detectable error on the sample.",
+  "tests": [
+   "Check that `/app/deploy/checkpoint.npz` exists.",
+   "Check that `deploy.py` exits 0 when re-run (idempotent).",
+   "For each of the 6 original matrices: load checkpoint eigenvalues, compare to `scipy.linalg.eigh` result, assert max absolute difference < 1e-6.",
+   "For each of the 6 original matrices: load checkpoint eigenvectors, compute residual `||A @ v - lam * v||` per vector, assert all < 1e-8.",
+   "Assert eigenvalues for each problem are in ascending sorted order in checkpoint.",
+   "Verifier generates 4 fresh structured matrices at verify time (new random seeds, different sizes within same classes: banded, near-degenerate, ill-conditioned, Toeplitz) and runs the INSTALLED solver (imports specsolve) on them directly, comparing to scipy.linalg.eigh \u2014 this tests the fix is real, not just a hardcoded checkpoint.",
+   "Verify that the fixed solver's orthogonalisation component is pure Python (not calling `_accel.so`) by checking `solver.py` imports at runtime \u2014 done indirectly by confirming correct results on the fresh matrices where `_accel.so` would silently corrupt.",
+   "Count of eigenvalues per problem in checkpoint matches matrix dimension (no missing or duplicate eigenvalues from broken restart logic)."
+  ],
+  "verifier_knob": {
+   "name": "number_of_fresh_matrices_at_verify_time",
+   "value": "4",
+   "effect": "Increasing to 8-12 with more extreme conditioning numbers (e.g. condition number 1e10) makes the DGKS double-correction mandatory and raises difficulty; decreasing to 0 makes the task easier (only pre-planted matrices checked, agent could hardcode answers)."
+  },
+  "expected_failure_modes": [
+   "Agent runs only the existing test suite, sees it pass, re-runs deploy.py without fixing anything, and submits a checkpoint that still has buggy eigenvalues for the near-degenerate and ill-conditioned cases.",
+   "Agent correctly identifies `_accel.so` as suspect and replaces `orthogonalise` with a single-pass Gram-Schmidt; this passes the banded and near-degenerate cases but fails the ill-conditioned matrix because the single pass leaves residual orthogonality error above 1e-6.",
+   "Agent implements correct double-reorthogonalisation but inadvertently breaks the convergence flag bookkeeping in the Lanczos restart, causing the solver to return fewer eigenvalues than requested (wrong count in checkpoint).",
+   "Agent replaces the orthogonaliser correctly but forgets to re-run deploy.py after the fix, leaving the stale buggy checkpoint in place.",
+   "Agent does not discover that four of the six matrices are affected (only tests on the first two), fixes those, but the checkpoint is still wrong for the remaining two structured cases."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "eigenvalue-solver",
+   "compiled-extension",
+   "reverse-engineering",
+   "deployment",
+   "numerical-methods",
+   "regression"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/specsolve/solver.py",
+   "cat /app/specsolve/deploy.py",
+   "cat /app/specsolve/reference.py",
+   "cat /app/specsolve/README.md",
+   "python3 /app/specsolve/deploy.py  # run buggy deploy",
+   "python3 -c \"import numpy as np; from scipy.linalg import eigh; d=np.load('/app/deploy/checkpoint.npz'); A=np.load('/app/data/near_degen_48.npy'); print(np.max(np.abs(d['eigenvalues_near_degen_48'] - eigh(A)[0])))\"  # confirm bug on near_degen",
+   "python3 -c \"import numpy as np; from scipy.linalg import eigh; d=np.load('/app/deploy/checkpoint.npz'); A=np.load('/app/data/ill_cond_80.npy'); print(np.max(np.abs(d['eigenvalues_ill_cond_80'] - eigh(A)[0])))\"  # confirm ill_cond",
+   "grep -n '_accel\\|orthogon\\|import' /app/specsolve/solver.py  # find all _accel usages",
+   "# Edit solver.py: remove _accel import, add pure-Python DGKS double-reorthogonalisation function",
+   "# Implement: def orthogonalise(Q, v): for two passes: for each col q in Q: v -= (q@v)*q; if norm(v)<tol: v = random; normalize; return v",
+   "# Replace call site: _accel.orthogonalise(Q, v) -> orthogonalise(Q, v)",
+   "python3 -c \"from specsolve import solver; import numpy as np; A=np.load('/app/data/near_degen_48.npy'); print(solver.solve(A, k=48))\"  # test fix",
+   "python3 -c \"from specsolve import solver; import numpy as np; A=np.load('/app/data/ill_cond_80.npy'); print(solver.solve(A, k=80))\"  # test ill_cond",
+   "python3 /app/specsolve/deploy.py  # regenerate checkpoint",
+   "python3 -c \"import numpy as np; from scipy.linalg import eigh; d=np.load('/app/deploy/checkpoint.npz'); [print(k, np.max(np.abs(d[k] - eigh(np.load(f'/app/data/{k[12:]}.npy'))[0]))) for k in d.files if k.startswith('eigenvalues')]\"  # verify all"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Building _accel.so with precisely the described silent-fallback bug requires careful implementation; if the bug manifests differently than specified (e.g., on different matrix classes or at different iteration counts), the task environment may be inconsistent with the description.",
+   "Python 3.13 Cython ABI compatibility is relatively new; building a pre-compiled .so without source for Python 3.13-slim-bookworm may have undocumented compatibility issues causing spurious import errors unrelated to the task.",
+   "Verifier-generated 'fresh structured matrices' must reliably trigger the near-zero residual condition in the Lanczos iteration; if the random seed/size choices produce matrices that don't reach near-linear-dependence in ~20 iterations, the verify-time tests could be flaky or fail to distinguish buggy from fixed solver.",
+   "The README pointing directly to _accel.so as the Gram-Schmidt orthogonaliser, combined with solver.py showing the call site, makes diagnosis too linear \u2014 the 'reverse-engineering' tag implies more opaque investigation but the path is guided enough that a capable agent completes it in ~15 commands.",
+   "Lanczos restart bookkeeping complexity is mentioned but solver.py details are not specified in the blueprint; if the restart logic is subtle, agents may encounter a valid trap not fully described in the failure modes."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 3 (below required 4) because the speedrun completes in ~15 commands: the README directly names _accel.so as the orthogonaliser, solver.py exposes the call site, and replacing it with DGKS is a well-known technique that a knowledgeable agent applies directly. The 'reverse-engineering' framing overstates opacity since the component and its role are documented. The average score (4+4+5+3+5)/5 = 4.2 meets the threshold but genuine_difficulty fails the hard floor of 4.",
+  "fixes": [
+   "Remove the README's mention of '_accel.so provides optimised Gram-Schmidt orthogonalisation' \u2014 make solver.py import _accel without documentation of what it does, forcing the agent to probe the binary's behavior empirically rather than reading what to fix.",
+   "Add a second interacting bug: a subtle off-by-one in the Lanczos restart window in solver.py (visible in source but easy to miss) that also contributes to wrong eigenvalues on banded matrices, so the agent must fix two separate issues and cannot attribute everything to orthogonalisation.",
+   "Increase the orthogonaliser's interface complexity: have _accel export multiple functions (orthogonalise, project, reorthogonalise_block) where only one combination is correct for the solver's use, making it harder to know which to replace and with what signature."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/python-jacobi-eigen-solver-conversion",
+     "verdict": "distinct",
+     "reason": "That task is about converting a Fortran Jacobi solver to Python and writing output files in a specific format; the candidate task is about debugging a regression in a deployed scientific library with a compiled Cython extension and regenerating a checkpoint file."
+    },
+    {
+     "ref_id": "terminal-bench-pro/compute-symbolic-eigenpairs-3x3-matrix",
+     "verdict": "distinct",
+     "reason": "That task is purely about symbolic eigenvalue computation with sympy on a fixed 3x3 matrix; the candidate task involves debugging a silent numerical regression in a deployed solver with a binary extension and redeploying a checkpoint."
+    },
+    {
+     "ref_id": "terminal-bench/lake-temp-glm",
+     "verdict": "distinct",
+     "reason": "That task is about training an LSTM model to predict lake temperatures and saving a PyTorch checkpoint; the candidate task is about diagnosing a numerical regression in an eigenvalue solver and redeploying a .npz checkpoint."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "variant",
+     "reason": "Both tasks follow the same narrative structure: a 'fast path' refactor silently introduces a numerical regression that passes existing CI, and the agent must find the bug in a ~1200-line codebase and redeploy a corrected pipeline meeting a stated accuracy threshold\u2014only the domain (eigenvalue solver vs. spectral entropy pipeline) differs."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a WAF classifier and ensuring a state database matches deployed rule checksums; the candidate task is about debugging a numerical regression in a scientific eigenvalue solver."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/python-jacobi-eigen-solver-conversion",
+     0.278
+    ],
+    [
+     "terminal-bench-pro/compute-symbolic-eigenpairs-3x3-matrix",
+     0.263
+    ],
+    [
+     "terminal-bench/lake-temp-glm",
+     0.188
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.106
+    ],
+    [
+     "ours/official-10912a593843",
+     0.075
+    ]
+   ],
+   "cost_usd": 0.015993
+  },
+  "novel": false
+ },
+ "cost_usd": 0.071466
+}

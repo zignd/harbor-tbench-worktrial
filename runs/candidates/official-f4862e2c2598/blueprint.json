@@ -1,0 +1,68 @@
+{
+ "slug": "sql-logbin-query-engine",
+ "title": "Inherit and Extend the Log Binning Query Engine",
+ "scenario": "A data pipeline team ships logs from ~15 microservices into a time-series store. At its core is a compiled shared library (`logbin_engine.so`) that performs fast columnar windowed aggregations \u2014 the original author left the company and took the source. The library is exposed via a thin Python wrapper (`engine_wrapper.py`). Your job is to inherit this pipeline and build a new HTTP query service on top of it that answers structured metric queries from downstream dashboards. The environment includes ~1,800 lines of pipeline code, 30 days of log data across multiple services, a protocol spec (`QUERY_PROTOCOL.md`), and a partial integration test suite that currently fails.",
+ "instruction_draft": "Hey, so Marcus left and the dashboard team is blocked \u2014 they need the query service running by EOD. The engine wrapper (`engine_wrapper.py`) talks to `logbin_engine.so` and there's a protocol spec in `QUERY_PROTOCOL.md` describing the HTTP API we promised them. The partial integration tests in `tests/` are failing and there are some known issues logged in `KNOWN_ISSUES.txt`. Build the HTTP query service at `query_service.py` so it passes those tests and correctly handles the query protocol. The service must stay up after you start it \u2014 we'll be hitting it with fresh queries. One thing: the engine has some quirks we documented incompletely, so you'll probably need to run some experiments against it with real log data to understand how it actually behaves before you trust its output.",
+ "requirements": [
+  "A file `query_service.py` exists and runs as an HTTP service on port 7432",
+  "The service implements the query protocol described in QUERY_PROTOCOL.md: POST /query accepts JSON with fields {service, metric, start_ts, end_ts, window_secs, agg} and returns {buckets: [{ts, value}]}",
+  "Supported aggregations: sum, mean, p50, p95, p99",
+  "The service correctly handles queries where the time window boundary falls mid-bucket (partial buckets at both ends)",
+  "Results are numerically correct to within 0.5% for all aggregation types across all services and window sizes",
+  "The service returns HTTP 400 with {error: <message>} for malformed requests (missing fields, invalid agg type, end_ts <= start_ts)",
+  "The service returns HTTP 404 with {error: 'service not found'} for unknown service names",
+  "The service handles concurrent requests without returning stale or mixed results",
+  "Log data is read from /data/logs/ and kept current \u2014 the service must reflect log entries written after startup"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; installs gcc, flask, numpy, sqlite3; compiles logbin_engine.so from C source (but the C source is deleted after compilation, leaving only the .so)",
+  "logbin_engine.so: a compiled C shared library that accepts pre-bucketed columnar arrays and returns aggregated values. Hidden behavioral quirks: (1) window intervals are LEFT-EXCLUSIVE, RIGHT-INCLUSIVE \u2014 i.e., a bucket covers (start, end], so a log entry AT exactly the bucket start timestamp belongs to the PREVIOUS bucket; (2) when fewer than 4 raw entries fall into any single bucket, the engine returns NaN for that bucket rather than a partial result \u2014 this threshold is hardcoded and undocumented",
+  "engine_wrapper.py: ~200-line Python ctypes wrapper exposing three functions: load_series(service, metric, timestamps, values), compute_window(handle, window_secs, agg_type) -> list of (bucket_start, value), release_handle(handle). The wrapper documentation says windows are 'aligned to epoch' and 'inclusive on both ends' \u2014 this is wrong for the left boundary",
+  "QUERY_PROTOCOL.md: 3-page spec describing the HTTP API, JSON schema, error codes, and a note that 'bucket timestamps in responses represent the START of each window interval'",
+  "KNOWN_ISSUES.txt: mentions 'some queries return NaN intermittently for low-traffic services' and 'boundary alignment may differ from docs' \u2014 both are vague and don't explain the actual rules",
+  "ingestor.py: ~400 lines, reads raw logs from /data/logs/*.jsonl, normalizes them, and writes to /data/processed/metrics.sqlite. Has a correct implementation except it stores timestamps as float seconds since epoch",
+  "log_rotator.py: ~150 lines, rotates logs and runs ingestor.py periodically",
+  "schema.sql: SQLite schema for metrics.sqlite, with tables: raw_metrics(service TEXT, metric TEXT, ts REAL, value REAL) and service_registry(service TEXT, display_name TEXT)",
+  "tests/test_integration.py: ~300 lines of pytest tests that send HTTP queries and check responses. Currently fails because query_service.py does not exist. Tests include edge cases: a window that starts at exactly a log entry timestamp, a low-traffic service with only 2 entries in a bucket, queries spanning midnight boundaries",
+  "/data/logs/: 30 days of JSONL log files across 8 services (auth, api-gateway, worker, cache, db-proxy, mailer, scheduler, billing), ~50MB total, with realistic timestamp distributions including some bursts and quiet periods",
+  "generate_logs.py: deterministic log generator script (used by Dockerfile, not useful to solver as a shortcut since it was already run)",
+  "README.md: high-level architecture description, mentions the engine quirks are 'fully documented in engine_wrapper.py docstrings' (incorrect \u2014 the docstrings have the wrong boundary description)",
+  "A second compiled binary /usr/local/bin/logbin_probe: a CLI tool that calls the same .so directly, accepts --service --metric --start --end --window --agg and prints results; useful for manual experimentation"
+ ],
+ "internal_hint": "Two interlocking hidden invariants live in the compiled binary and are NOT visible in any source file the solver can read: (1) The window interval is left-exclusive (a record timestamped exactly at bucket start falls in the prior bucket) \u2014 the wrapper docstrings and README both incorrectly say 'inclusive on both ends'. The solver discovers this by running logbin_probe on data where they know exact timestamps and seeing one entry shift to the wrong bucket. (2) Buckets with fewer than 4 entries return NaN, not a partial result \u2014 meaning low-traffic services silently drop data. The solver discovers this by querying a known-sparse window and getting NaN. Both bugs interact: a correct implementation must (a) use (start, end] inclusive semantics when binning raw_metrics rows for the engine, and (b) handle NaN returns by falling back to direct SQLite computation for sparse buckets rather than trusting the engine. The 'build component' difficulty is the query_service.py itself, which must correctly bridge SQLite \u2192 engine \u2192 HTTP, handling both quirks. The trap is that sample tests pass with approximate data (where no entry lands exactly on a boundary and no bucket has < 4 entries), but hidden tests specifically probe both edge cases.",
+ "trap": "A naive implementation reads the wrapper docs (which say 'inclusive on both ends'), bins data with `ts >= start AND ts < end` (Python-natural half-open), and passes integration tests because the provided sample data happens to have no entries at exact bucket boundaries. Hidden tests inject log entries timestamped precisely at bucket-start boundaries and at exact window-end timestamps, and also query a low-traffic service window with exactly 3 entries. The boundary-wrong implementation shifts those boundary entries one bucket early/late; the NaN-unhandled implementation returns null/0 instead of the correct partial aggregate.",
+ "tests": [
+  "Smoke test: start query_service.py, POST /query with valid params for 'auth' service, assert HTTP 200 and non-empty buckets list",
+  "Boundary test (generated at verify time): insert synthetic log entries timestamped at T, T+3600, T+7200 (exactly on hour boundaries); query with window_secs=3600; assert the entry AT T belongs to the bucket [T-3600, T] not [T, T+3600] \u2014 i.e., left-exclusive semantics",
+  "Sparse bucket test (generated at verify time): insert only 2 entries into a 1-hour window for a low-traffic service; assert the response returns a numeric value (direct SQLite fallback) not null or NaN",
+  "p95 accuracy test: query billing service for a 6-hour window with 5-minute buckets; compare p95 values to ground truth computed directly from raw SQLite data; assert all within 0.5%",
+  "Concurrent request test: fire 20 simultaneous POST /query requests for different services; assert all return 200 with correct structure and no mixed/stale data",
+  "Error handling: POST /query with missing 'metric' field \u2192 HTTP 400; unknown service 'nonexistent' \u2192 HTTP 404; end_ts == start_ts \u2192 HTTP 400",
+  "Live data test: write new log entries to /data/logs/ after service startup; query for those entries' time range; assert they appear in results (service reflects post-startup data)",
+  "Multi-window-size test (generated at verify time): same data queried with window_secs=60, 300, 3600; assert sum aggregation results are consistent (sum of 60-sec buckets equals sum of 5-min buckets equals total in 1-hr bucket within floating point tolerance)",
+  "Partial-window edge test: query with start_ts and end_ts that don't align to window_secs boundaries; assert only complete-window buckets appear in response (no fractional-window garbage at ends)"
+ ],
+ "verifier_knob": {
+  "name": "number of boundary-injection scenarios",
+  "value": "8 distinct test scenarios with fresh synthetic data",
+  "effect": "Reducing to 2-3 scenarios makes it easier to get lucky with a partially correct implementation; raising to 12+ with more exotic boundary conditions (leap-second timestamps, windows crossing DST, service with exactly 4 entries) makes it harder"
+ },
+ "expected_failure_modes": [
+  "Agent reads engine_wrapper.py docs, implements standard half-open [start, end) binning, passes sample tests, misses all hidden boundary-injection tests",
+  "Agent discovers the left-exclusive quirk but misses the sparse-bucket NaN fallback, causing failures on low-traffic service queries",
+  "Agent implements both quirks correctly but query_service.py doesn't re-read new log entries after startup, failing the live data test",
+  "Agent implements the service but gets the partial-window handling wrong (includes fractional buckets at query boundaries instead of truncating), causing numeric mismatches",
+  "Agent skips running logbin_probe experiments and guesses at the engine's behavior based on the (incorrect) docs, leading to systematically wrong bucket assignment"
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "data-querying",
+ "tags": [
+  "sql",
+  "systems",
+  "binary-reverse",
+  "http-service",
+  "log-pipeline",
+  "constraint-satisfaction"
+ ]
+}

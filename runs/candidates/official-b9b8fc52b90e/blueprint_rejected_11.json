@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "timeseries-rollup-service-repair",
+  "title": "Time-Series Rollup Aggregation Service Repair",
+  "scenario": "A small analytics team built an in-house C daemon (`rollupd`) that accepts metric samples over a Unix socket, aggregates them into fixed-width time buckets (minute, hour, day), and answers range-query requests using a memory-mapped ring buffer as its working set. The analyst's dashboards started showing impossible totals \u2014 hourly sums that don't match the minute-level detail \u2014 but only after the service has been running long enough to wrap the ring buffer. A checkpoint file on disk persists partial state between restarts. The codebase is ~1,400 lines across six files: the main daemon, the ring-buffer manager, the epoch-boundary logic, a protocol codec, a checkpoint writer/reader, and a test harness that replays a recorded session.",
+  "instruction_draft": "The `rollupd` service at `/app` answers range-query requests incorrectly: minute-granularity totals are inconsistent with hour-granularity totals for the same time range. Fix the service so that for any contiguous range of samples, `SUM(minute buckets) == SUM(hour buckets) == SUM(day buckets)`, and range queries return the correct aggregate regardless of how many samples have been ingested or whether the service was restarted mid-session.",
+  "requirements": [
+   "For any contiguous time range, the sum of all minute-level bucket values equals the sum of all hour-level bucket values equals the sum of all day-level bucket values covering that range.",
+   "Range queries return the correct aggregate value after ring-buffer wraparound (more samples ingested than the ring can hold without overwriting).",
+   "Range queries return the correct aggregate after a service restart from checkpoint (no double-counting or lost samples at the checkpoint boundary).",
+   "The service continues to accept and respond to the wire protocol correctly after the fixes."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, socat, python3; no internet access.",
+   "/app/src/rollupd.c \u2014 main daemon: accepts connections on /tmp/rollupd.sock, dispatches PUSH and QUERY commands, calls into ring and epoch modules. ~300 lines.",
+   "/app/src/ring.c + ring.h \u2014 ring buffer manager: fixed-size mmap'd array of bucket structs (ts, granularity, value). Bug 1 lives here: when the write pointer wraps, it resets `ring->epoch_base` to the timestamp of the overwritten slot rather than the slot being written, causing the oldest-slot pointer to point one position too early. This means QUERY scans include one stale (already-overwritten) bucket that belongs to a previous epoch, silently inflating results. This bug is NOT visible by reading \u2014 it only manifests when total ingested > ring capacity, and the inflation is small enough that short sessions look correct.",
+   "/app/src/epoch.c + epoch.h \u2014 epoch boundary logic: splits wall-clock time into minute/hour/day buckets. Bug 2 lives here: when a new hour boundary is crossed, the function that 'closes' the current minute bucket and 'opens' the next hour bucket applies the boundary sample's value to BOTH the closing minute bucket AND the opening hour bucket (double-counts the boundary sample). This bug is hidden by Bug 1 in short runs: the ring overflow inflation approximately cancels the boundary double-count for the test data provided, so the provided test harness passes even with both bugs present. Fixing only Bug 1 causes boundary double-counts to become visible; fixing only Bug 2 causes ring overflow inflation to appear.",
+   "/app/src/codec.c + codec.h \u2014 wire protocol: length-prefixed binary frames. PUSH frame: [u8 cmd=0x01][u64be timestamp][u32be value]. QUERY frame: [u8 cmd=0x02][u64be ts_start][u64be ts_end][u8 granularity]. Response: [u32be status][u64be aggregate_value]. Correct and has no bugs.",
+   "/app/src/checkpoint.c \u2014 writes ring state to /tmp/rollupd.ckpt on SIGTERM, reads on startup. Bug: writes `ring->write_pos` but on restore reads it into `ring->read_pos` by mistake (swapped variable assignment), causing the service after restart to scan from the wrong position. This bug interacts with Bug 1 because after a restart the already-inflated epoch_base is restored correctly but the scan pointer is wrong, producing a different (larger) inflation than pre-restart runs. The ordered-procedure difficulty: if the solver patches Bug 1 and Bug 2 first and then restarts the service, the checkpoint file on disk still contains a state written by the buggy service; restoring from it seeds the fixed service with corrupted ring metadata, making post-restart queries wrong until the solver also either deletes the stale checkpoint or patches the restore path AND replays from a clean state.",
+   "/app/src/harness.py \u2014 Python test harness: pushes a fixed 90-minute synthetic session (5,400 one-second samples at value=1) and queries minute, hour, and day aggregates for three sub-ranges. With both bugs present, the harness passes by coincidence. At verify time the verifier uses a different session length (chosen to force ring wraparound at a different phase) and different sample values, so the cancellation does not occur.",
+   "/app/Makefile \u2014 builds rollupd from src/.",
+   "/app/data/session_short.bin \u2014 pre-recorded 30-minute push session (binary frames), used by harness.py for the 'smoke' scenario.",
+   "The ring buffer capacity is hardcoded to 3600 slots (one per second for one hour). The synthetic verify session is 7200 seconds (two hours), forcing a full wraparound.",
+   "Planted bugs summary: (A) ring.c wraparound sets epoch_base to wrong slot; (B) epoch.c double-counts boundary samples; (C) checkpoint.c swaps write_pos/read_pos on restore. A and B interact to hide each other in short sessions. C interacts with A to corrupt post-restart state differently than pre-restart state."
+  ],
+  "internal_hint": "Difficulty comes from runtime-only observability: Bug A only manifests after >3600 samples; Bug B's double-count is masked by Bug A's inflation in the provided test session length (90 min of 1-sample/sec = 5400 samples, ring wraps once, inflation = 1 slot = 1 count, boundary double-count = 1 per hour = 1 count over 90 min, net error = 0 for the specific test values). The solver must: (1) experimentally vary session length to observe the interaction; (2) instrument ring.c to log epoch_base updates and discover the off-by-one; (3) fix A, observe B emerge; (4) fix B; (5) discover that deleting or regenerating the checkpoint is required before restart tests pass (ordered procedure). The checkpoint variable-swap (Bug C) means a naive restart after fixing A+B still fails because the restored read_pos is wrong. The solver must either patch checkpoint.c restore path AND clear the stale checkpoint file in the right order.",
+  "trap": "A solver that fixes Bug A and Bug B and rebuilds, then runs the provided harness, sees it pass \u2014 because the harness uses the 90-minute session where cancellation holds with the fixed A but the test values still produce a zero net error for the particular sub-range queries. The verifier uses a 120-minute session with non-unit sample values and different query ranges, exposing both the residual Bug C (post-restart) and any partial fix. A solver that clears the checkpoint before fixing the code corrupts nothing but misses that the restore path has the variable swap, failing post-restart tests. A solver that patches the restore path but doesn't clear the stale checkpoint also fails because the corrupted checkpoint is loaded first.",
+  "tests": [
+   "Test 1 (pre-restart, no wraparound): Push 1800 one-second samples at value=3, query minute/hour aggregates for the full range. Both must equal 5400. Fails if Bug B is present (boundary double-count) or Bug A is present at this scale (no wraparound, so A is dormant \u2014 this test passes even with A present, establishing a baseline).",
+   "Test 2 (pre-restart, with wraparound): Push 7200 one-second samples at value=2, query minute/hour/day aggregates for seconds [3601, 7200]. Minute sum must equal hour sum must equal day sum = 7198. Fails if Bug A is present (ring inflation adds stale slot) or Bug B is present (boundary counts wrong) or both.",
+   "Test 3 (post-restart consistency): Push 3000 samples at value=5, send SIGTERM (checkpoint written), restart daemon, push 3000 more samples at value=5, query aggregate for full [0, 6000] range. Expected: 30000. Fails if Bug C is present (checkpoint variable swap causes wrong scan start) or if solver cleared checkpoint without also patching restore path (or vice versa in wrong order).",
+   "Test 4 (wraparound + restart interaction): Push 4000 samples (value=7) causing wraparound, SIGTERM, restart, push 1000 more (value=7), query [3601, 5000]. Expected: 9800. This test requires all three bugs fixed AND the checkpoint cleared/regenerated after the fix, because a stale checkpoint from the buggy service will seed wrong epoch_base even with patched code.",
+   "Test 5 (protocol correctness): Send a malformed QUERY frame (ts_start > ts_end). Service must respond with status=0xFFFFFFFF and not crash. Verifies the codec path still works after all patches.",
+   "Test 6 (generated at verify time): The verifier generates a random session with a random number of samples between 5000 and 8000, random per-sample values in [1, 100], queries three randomly chosen sub-ranges at each granularity, and checks SUM(minutes) == SUM(hours) == SUM(days) for each range. This catches any partial fix that happens to pass the fixed test cases by coincidence."
+  ],
+  "verifier_knob": {
+   "name": "ring_capacity_multiplier",
+   "value": "1 (3600 slots)",
+   "effect": "Increasing to 2 (7200 slots) means the verify session never wraps, making Bug A dormant and reducing difficulty to a two-bug problem. Decreasing to 0.5 (1800 slots) forces two full wraps, making Bug A's effect larger and easier to observe but also making the A-B cancellation break at shorter session lengths, reducing the hiding effect and making the interaction easier to spot."
+  },
+  "expected_failure_modes": [
+   "Solver reads all source, identifies the variable-name confusion in checkpoint.c (most textually obvious), fixes only Bug C, passes Test 3 with stale data but fails Tests 2 and 4.",
+   "Solver instruments ring.c, finds and fixes Bug A, rebuilds, runs the provided harness (which passes due to B-C residual cancellation at 90-min scale), declares done \u2014 fails verify-time Test 2 and Test 6.",
+   "Solver fixes A and B but does not clear the stale checkpoint file before restarting; the fixed restore path loads a checkpoint written by the buggy service with wrong epoch_base, poisoning Test 4.",
+   "Solver fixes all three bugs in source but performs the ordered steps wrong: patches checkpoint.c, restarts service (which loads old stale .ckpt into fixed restore path, but .ckpt has swapped values already baked in as data), so the restored ring is corrupt \u2014 fails Test 3 and Test 4.",
+   "Solver discovers A-B interaction only through the provided session (5400 samples) which shows zero net error, concludes there is only one bug (C), misses A and B entirely."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "shell-scripting",
+   "c",
+   "runtime-only-bugs",
+   "ordered-recovery",
+   "interacting-bugs",
+   "service-protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/ring.c  # look for wraparound logic",
+   "cat /app/src/epoch.c  # look for boundary handling",
+   "cat /app/src/checkpoint.c  # look for save/restore logic",
+   "# Spot Bug C immediately: write_pos saved, restored into read_pos",
+   "# Spot Bug B: boundary sample applied to both closing and opening bucket",
+   "# Spot Bug A: epoch_base = overwritten_slot->ts instead of new_slot->ts",
+   "sed -i 's/ring->read_pos = write_pos_from_file/ring->write_pos = write_pos_from_file/' /app/src/checkpoint.c",
+   "# Fix epoch.c boundary double-count: apply sample to new bucket only",
+   "# Fix ring.c epoch_base: use write pointer slot, not overwritten slot",
+   "make -C /app clean && make -C /app",
+   "kill $(pidof rollupd) 2>/dev/null; rm -f /tmp/rollupd.ckpt /tmp/rollupd.sock",
+   "/app/rollupd &",
+   "python3 /app/src/harness.py",
+   "kill -TERM $(pidof rollupd)",
+   "sleep 1 && /app/rollupd &",
+   "python3 /app/src/harness.py  # post-restart verification"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The blueprint states all three bugs are visible in source code by reading \u2014 the 'runtime-only' label for Bug A is misleading since the off-by-one is structurally apparent from the code description. A skilled agent reading the source spots all three bugs without needing to run anything.",
+   "The A-B cancellation trap only works if the solver trusts the provided harness; an agent that reads source first and fixes all bugs textually bypasses the trap entirely, reducing genuine difficulty.",
+   "Test 1 is stated to pass even with Bug A present (no wraparound at 1800 samples) \u2014 this means the test baseline is weaker than described and a partial fix could pass Test 1 while failing others, but this is expected behavior, not invalid.",
+   "The ordered-procedure requirement (clear stale checkpoint after fixing code) is only triggered if the solver patches and restarts before clearing \u2014 an agent that clears checkpoint first (a natural step after stopping a service) avoids the trap without understanding it.",
+   "Test 6 uses randomly generated session parameters \u2014 if the random seed is not fixed, there is a small but nonzero risk of coincidental cancellation for specific random values, making verification slightly non-deterministic.",
+   "The interaction between Bug A and Bug B canceling in the 90-minute test session depends on specific arithmetic coincidence (1 stale slot = 1 boundary double-count for unit-value samples). With non-unit values in the verifier session this breaks, but the solver using the provided harness only sees the cancellation \u2014 this is intentional but could be perceived as ambiguous by the solver."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are structurally visible by reading the source \u2014 the 'runtime-only' characterization of Bug A is undermined by the blueprint's own detailed description of the exact off-by-one pattern, making a ~16-command textual-read-and-fix speedrun plausible. The A-B cancellation trap only catches solvers who trust the provided harness over source reading, which a strong agent is unlikely to do. The ordered-procedure trap (stale checkpoint) is avoided by the natural habit of clearing service state before restart.",
+  "fixes": [
+   "Make Bug A genuinely runtime-only by hiding it in a more subtle data-dependent condition (e.g., an off-by-one that only triggers when write_pos % capacity == 0 AND the previous epoch spans exactly N seconds) rather than a straightforward wrong-variable assignment that is visible in source.",
+   "Increase the number of interacting variables and files so that source reading alone is insufficient \u2014 e.g., the epoch_base calculation spans ring.c and epoch.c with a shared static variable, making the off-by-one only apparent when tracing cross-file call sequences.",
+   "Replace the checkpoint variable-swap (Bug C) with a more subtle semantic bug, such as an off-by-one in the serialized ring size that only causes corruption when the ring is exactly full at checkpoint time, requiring experimentation to discover.",
+   "Add a correctness invariant that the provided harness explicitly checks so solvers cannot bypass the A-B cancellation trap by skipping the harness \u2014 e.g., the harness should fail with a clear error when bugs are present, forcing the solver to diagnose why it passes before and fails after partial fixes.",
+   "Fix Test 6 to use a fixed seed for reproducibility, or document the seed explicitly, to eliminate any flakiness risk."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted sales aggregation with a config file and SQLite database, not a C daemon with ring-buffer wraparound and checkpoint-based persistence."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC chain verification in an audit log service, not time-series rollup aggregation with ring-buffer and checkpoint bugs."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about NetFlow v9 UDP/TCP aggregation with template ordering issues, not a C daemon with time-bucketed ring-buffer wraparound and checkpoint boundary bugs."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a binary normalizer and fixing SQL rollup queries, not repairing a C ring-buffer daemon with multi-granularity time-bucket consistency bugs."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a binary frame codec (encode/decode wire format), not a time-series aggregation daemon with ring-buffer wraparound and checkpoint correctness issues."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.144
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.107
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.102
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.087
+    ],
+    [
+     "ours/official-aac910462208",
+     0.08
+    ]
+   ],
+   "cost_usd": 0.014064
+  },
+  "novel": true
+ },
+ "cost_usd": 0.052308
+}

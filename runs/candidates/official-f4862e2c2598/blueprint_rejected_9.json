@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "log-bucket-query-engine",
+  "title": "Opaque-Bucketed Log Metrics Query Engine",
+  "scenario": "A data engineer inherits a log ingestion pipeline where a compiled C extension (`libmetrics.so`, no source available) pre-aggregates service error logs into SQLite using an undisclosed bucketing scheme. The pipeline has been running for months and the SQLite database contains `events` (raw, 2-hour retention) and `buckets` (aggregated, indefinite retention) tables. A new feature request requires building a query engine that answers batch metric queries from files: for a given service, time range, and metric type, return the correct aggregated value. Correctness depends on understanding how the binary maps timestamps to bucket_ids.",
+  "instruction_draft": "Hey \u2014 I need you to build a query engine for the metrics pipeline at /opt/pipeline. It should read query files from /queries/incoming/*.json, answer each one, and write results to /queries/results/<query_id>.json. Each query asks for the total event count, error count, or error rate for a specific service over a time range [start_ts, end_ts] (Unix seconds). When the full precise answer is in the aggregated buckets table, use it; when a time range straddles a bucket boundary or falls in the last 2 hours, fall back to raw events. The system's been storing data for months so make sure your bucketing math is right for old data too. There's a daemon running that keeps ingesting, so the engine needs to handle live data too. Put the engine at /opt/pipeline/query_engine.py and make it runnable as a service (looping, processes new .json files as they arrive, deletes them after answering).",
+  "requirements": [
+   "Query engine at /opt/pipeline/query_engine.py runs as a persistent service",
+   "Reads query files from /queries/incoming/*.json and writes results to /queries/results/<query_id>.json",
+   "Returns correct total_events, error_events, and error_rate for each query",
+   "Uses aggregated buckets table for queries fully covered by complete buckets",
+   "Falls back to raw events table for queries in the last 2-hour retention window",
+   "Correctly handles queries that span bucket boundaries (partial buckets)",
+   "Handles all services and arbitrary time ranges in the historical data"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, builds libmetrics.so from undisclosed C source and installs it, pip-installs cffi",
+   "libmetrics.so exports one function: int64_t assign_bucket(int64_t unix_ts) \u2014 returns a bucket_id integer encoding hour and sub-hour bin using exponential (power-of-2) boundaries: bin 0=[0,1)min, 1=[1,2)min, 2=[2,4)min, 3=[4,8)min, 4=[8,16)min, 5=[16,32)min, 6=[32,60)min; bucket_id = (unix_ts // 3600) * 7 + bin_index",
+   "Python wrapper /opt/pipeline/ingestor.py reads /var/log/services/*.log, calls libmetrics.assign_bucket() per event, writes to SQLite /opt/pipeline/metrics.db with tables: events(id, service, ts, is_error, raw_msg) and buckets(bucket_id, service, total, errors, bucket_start, bucket_end)",
+   "Ingestor runs as a systemd-like background loop every 30 seconds, has been running 'for months' so metrics.db contains 3 months of synthetic history across 8 services",
+   "The events table only retains last 2 hours (DELETE WHERE ts < NOW()-7200 runs each cycle)",
+   "3 months of synthetic log data pre-generated during Docker build and ingested into buckets; recent 2 hours also in events",
+   "Sample query files in /queries/examples/ showing the format; /queries/incoming/ is the live drop directory",
+   "No source for libmetrics.so \u2014 only the .so file and a one-line comment in ingestor.py saying 'bucket assignment via libmetrics'",
+   "A README at /opt/pipeline/README.md describes the tables and the query format but says nothing about the bucketing scheme",
+   "The log files /var/log/services/*.log are actively being written by a background generator script"
+  ],
+  "internal_hint": "The hidden invariant is the exponential (power-of-2) bucket boundary scheme inside libmetrics.so: within each hour, sub-hour bins double in width (1, 1, 2, 4, 8, 16, 28 minutes). The bucket_id formula is (unix_ts // 3600) * 7 + bin_index. An agent cannot discover this by reading any file \u2014 they must call the binary with probe timestamps and observe returned bucket_ids. For example, probing ts=3600 (0 min past hour) returns 0, ts=3660 (1 min) returns 1, ts=3720 (2 min) returns 2, ts=3840 (4 min) returns 3, ts=4080 (8 min) returns 4, ts=4560 (16 min) returns 5, ts=5520 (32 min) returns 6. The correct bucket_start and bucket_end for each bucket_id is derivable from this. The construction difficulty: for a query [t1, t2], the engine must enumerate which bucket_ids fully overlap the range (use buckets table) vs. partially overlap (must use raw events for that bucket's time range, but raw events only exist for last 2 hours \u2014 so for old partial buckets, the engine must use the bucket's stored total/errors scaled by the fraction of the bucket's time range that falls within [t1, t2], which is an approximation documented nowhere but the only viable approach for historical data). The correct fallback hierarchy is: (1) if fully in last 2 hours: use events; (2) if fully in old data and bucket-aligned: sum buckets; (3) boundary cases: use buckets for full buckets + events for partial if within 2 hours, or proportional interpolation for old partial buckets.",
+  "trap": "An agent that assumes uniform 5-minute or 1-minute buckets will implement query math that passes visible sample queries (which often align with round timestamps) but fails hidden queries at bucket boundaries \u2014 e.g., a query from t=3660 to t=3900 (1-min to 5-min mark within an hour) crosses bins 1 (ending at 2 min) and 2 (ending at 4 min) and 3 (starting at 4 min), so with wrong boundaries they'll either double-count or miss events. Similarly, agents who always fall back to raw events will fail queries on data older than 2 hours. Agents who correctly read bucket_start/bucket_end from the buckets table will succeed for complete coverage cases but must still implement proportional interpolation for historical partial-bucket boundaries.",
+  "tests": [
+   "Verifier drops 10 fresh query files covering: fully-aligned old queries (should use only buckets table), queries in the last 2-hour window (should use events table), queries that straddle a single bucket boundary in old data (proportional interpolation), queries spanning multiple hours, and queries that mix old and recent data; checks each result JSON has correct total_events \u00b11% and error_rate \u00b10.005",
+   "Verifier checks that queries for time ranges fully covered by known complete buckets return exact integer counts (no approximation drift)",
+   "Verifier checks that the engine processes new query files within 60 seconds of drop (service is running)",
+   "Verifier checks that a query for an impossible service name returns an empty result with zero counts rather than an error",
+   "Verifier seeds known log events into /var/log/services/test_svc.log, waits for ingestor to process, then queries that time range and checks the returned count matches the seeded count exactly"
+  ],
+  "verifier_knob": {
+   "name": "boundary_scenario_count",
+   "value": "10",
+   "effect": "Increasing adds more partial-bucket-boundary and multi-bucket-span queries; at 20 it also includes queries that span the exact 2-hour retention cutoff; at 5 it only tests fully-aligned cases, making the task much easier"
+  },
+  "expected_failure_modes": [
+   "Agent assumes uniform bucket widths and implements wrong bucket boundary math \u2014 passes visible aligned queries but fails boundary scenarios",
+   "Agent always uses raw events table, correctly handling recent data but returning zeros for queries on data older than 2 hours",
+   "Agent discovers the bucketing scheme but implements partial-bucket handling incorrectly \u2014 e.g., always excluding partial buckets rather than interpolating",
+   "Agent builds the service but doesn't make it persistent (runs once instead of looping), failing when the verifier drops query files after startup",
+   "Agent reads bucket_start/bucket_end from the buckets table and uses them for range comparisons, which works for full coverage but still gets boundary interpolation wrong for historical data"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "binary-reverse-engineering",
+   "logs-metrics",
+   "systems",
+   "new-feature",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/pipeline/README.md",
+   "cat /opt/pipeline/ingestor.py",
+   "cat /queries/examples/*.json",
+   "sqlite3 /opt/pipeline/metrics.db '.schema'",
+   "sqlite3 /opt/pipeline/metrics.db 'SELECT * FROM buckets LIMIT 10'",
+   "# Observe bucket_start and bucket_end are stored in the table \u2014 no reverse-engineering needed",
+   "# Write /opt/pipeline/query_engine.py: loop watching /queries/incoming/*.json",
+   "# SQL logic: full buckets WHERE bucket_start>=t1 AND bucket_end<=t2; partial buckets with proportional scaling; events for last 2 hours",
+   "# Handle edge: empty result for unknown service",
+   "python3 /opt/pipeline/query_engine.py &",
+   "cp /queries/examples/sample.json /queries/incoming/test1.json",
+   "sleep 10 && cat /queries/results/test1.json",
+   "# Verify result; adjust if needed",
+   "# Done \u2014 ~13 commands"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The bucket_start and bucket_end columns in the buckets table completely undermine the 'hidden invariant' about the exponential bucketing scheme \u2014 an agent never needs to probe libmetrics.so at all, making the binary reverse-engineering difficulty lever inert",
+   "Proportional interpolation for historical partial buckets is not documented anywhere (per the blueprint) and the \u00b11% tolerance on total_events may be too tight for interpolation-based answers, causing valid implementations to fail",
+   "The 'seeded log events' test (seed known events, wait for ingestor, query) is timing-sensitive and may be flaky if the ingestor's 30-second cycle doesn't align with test timing",
+   "The instruction says 'falls back to raw events' for the 2-hour window but doesn't specify what to return when a query spans both old bucket data AND a live partial bucket at the boundary \u2014 agents may implement this differently and both be reasonable",
+   "The instruction never mentions proportional interpolation for historical partial buckets, yet the verifier tests this case \u2014 this is a hidden requirement that's not stated in the instruction draft, violating the clarity contract",
+   "Running libmetrics.so via cffi requires knowing the exact CDECL signature \u2014 if the .so uses a non-standard calling convention or the cffi setup is non-obvious, this could be an environment friction point"
+  ],
+  "verdict": "reject",
+  "reasons": "The core difficulty lever (reverse-engineering the exponential bucketing scheme from the binary) is neutralized by the buckets table storing bucket_start and bucket_end explicitly \u2014 a skilled agent can solve this with basic SQL range queries in ~13 commands without ever touching libmetrics.so. Additionally, the most critical test requirement (proportional interpolation for historical partial buckets) is explicitly documented as 'nowhere documented' yet tested, creating an unstated requirement that constitutes a clarity violation. The \u00b11% tolerance paired with an undocumented approximation method risks invalid failures.",
+  "fixes": [
+   "Remove bucket_start and bucket_end columns from the buckets table \u2014 store only bucket_id, service, total, errors; force the agent to call assign_bucket() to derive time boundaries, making binary probing mandatory",
+   "Add a sentence to the instruction stating that for historical data where raw events are unavailable, proportional time-based interpolation should be used for partial buckets \u2014 this is a tested requirement and must be stated",
+   "Tighten the fallback hierarchy specification in the instruction to explicitly describe the three-tier logic (events for recent, exact buckets for aligned historical, proportional for partial historical) so the tested behavior is fully stated",
+   "Consider loosening the \u00b11% tolerance for partial-bucket queries to \u00b15% since proportional interpolation is inherently approximate, or make the test queries bucket-aligned to avoid interpolation entirely for the exactness checks",
+   "Add a step to the environment where the only way to know bucket boundaries is to call assign_bucket() with probe timestamps \u2014 e.g., have ingestor.py use bucket_id only as a key without storing start/end, and have the engine derive boundaries by binary-probing the library"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "NetFlow v9 aggregation repair is a network protocol debugging task, not a log metrics query engine with opaque bucketing scheme reverse-engineering."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Log enrichment pipeline repair with GeoIP binary and Flask API is a different debugging/repair task, not building a bucketing-aware query engine."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "SQL query optimization for performance is a different problem from reverse-engineering an opaque bucketing scheme to build a correct query engine."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "HMAC chain verification is a cryptographic integrity problem, not a time-bucketed metrics aggregation query engine."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "Reverse-engineering a sensor normalization binary transformation is a different black-box characterization task from reverse-engineering a timestamp-to-bucket-id mapping scheme."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-0cd67d8adf4d",
+     0.194
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.15
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.148
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.123
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.117
+    ]
+   ],
+   "cost_usd": 0.014319
+  },
+  "novel": true
+ },
+ "cost_usd": 0.052446
+}

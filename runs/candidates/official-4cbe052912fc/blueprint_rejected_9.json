@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "kdf-oracle-interop-refactor",
+  "title": "Dataset Key Derivation Oracle Interop",
+  "scenario": "A scientific data platform derives per-dataset AES-256 encryption keys by calling a legacy C binary (`/usr/local/bin/kdf-oracle`) that implements a proprietary key derivation protocol. A platform engineer refactored the Go service (`/app/keysvc/`) to derive keys natively \u2014 eliminating the binary dependency \u2014 but the new implementation has diverged from the oracle on a subset of inputs. The service is ~1,400 lines across eight Go files. The binary ships without source.",
+  "instruction_draft": "Hey, the key derivation service at /app/keysvc/ is broken after the refactor. It should produce the same 32-byte hex key as /usr/local/bin/kdf-oracle for every valid dataset descriptor, but it doesn't match on some inputs. The oracle takes args: kdf-oracle <project_id> <dataset_name> <schema_version> <record_count>. The service exposes POST /derive with a JSON body {project_id, dataset_name, schema_version, record_count} and returns {\"key\": \"<hex>\"}. Fix the service so its output matches the oracle exactly on all valid inputs. Build the service with `cd /app/keysvc && go build -o /app/bin/keysvc .` and run it on port 8080.",
+  "requirements": [
+   "The running service at port 8080 must respond to POST /derive with the same 32-byte hex key as the oracle binary for every valid input combination",
+   "Matching must hold for all project_id strings including those with slashes, colons, Unicode, and empty components (e.g. 'org//proj')",
+   "Matching must hold for all dataset_name strings including those with null-adjacent byte values, leading/trailing whitespace, and names longer than 255 bytes",
+   "Matching must hold for schema_version values including 0, negative values, and values above 2^31",
+   "Matching must hold for record_count values including 0 and values above 2^32",
+   "The service must return HTTP 400 for inputs where the oracle exits nonzero",
+   "The service must build cleanly with `go build` and run stably under concurrent load"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, gcc, and curl",
+   "A compiled C binary /usr/local/bin/kdf-oracle (built during Docker build, source deleted after) implements: HKDF-SHA256 with a hardcoded 32-byte master secret, info string assembled as length-prefixed fields in a specific order with a specific length encoding, integer fields encoded big-endian 8 bytes, string fields prefixed with their length as a 2-byte big-endian uint16, a domain separator prepended to the info string, and edge-case rejection rules (empty project_id after stripping, record_count overflow uint48)",
+   "The Go service /app/keysvc/ has ~1400 lines across: main.go (HTTP server), handler.go (request parsing and validation), derive.go (key derivation \u2014 the refactored logic with bugs), util.go (encoding helpers with subtle bugs), config.go (master secret loading), types.go, middleware.go, metrics.go",
+   "Bug 1 in derive.go: the info string assembles fields in wrong order (dataset_name before project_id instead of project_id before dataset_name) \u2014 only detectable by probing since the sample test uses symmetric-looking IDs",
+   "Bug 2 in util.go encodeString(): uses len(s) as int cast to uint16 without checking truncation, silently wrapping for strings >65535 bytes \u2014 this is a subtle edge case",
+   "Bug 3 in derive.go: integer fields encoded as 4-byte big-endian instead of 8-byte \u2014 schema_version and record_count both wrong, but sample data uses small values where both agree",
+   "Bug 4 in handler.go: validation rejects record_count > 2^32 but oracle rejects record_count > 2^48 \u2014 the sample never exceeds 10000 so this passes locally",
+   "The domain separator in the binary is '\\x00SCIDATA\\x01' (9 bytes) but derive.go uses 'SCIDATA' (7 bytes, missing null prefix and version byte)",
+   "A sample test script /app/test_sample.sh tests 5 benign inputs that all pass even with the bugs (chosen to be symmetric, small values, short ASCII names)",
+   "The master secret is loaded from /etc/keysvc/master.key (32 random bytes, same for both binary and service)",
+   "A /app/README.md describes the service API and mentions the oracle is the ground truth",
+   "Plausible non-buggy files: config.go, types.go, middleware.go, metrics.go are correct and add realistic bulk"
+  ],
+  "internal_hint": "Difficulty comes from observe_not_read and edge_case_inputs: the five bugs are spread across field ordering, length encoding, integer width, validation bounds, and domain separator format. None are visible by casual reading because (a) the domain separator bug requires knowing the binary's exact byte sequence, (b) the field order bug only shows when project_id != dataset_name, (c) the integer width bug only shows for values >0xFFFFFFFF, (d) the string truncation only shows for strings >64KB, (e) the validation bound difference only shows for record_count in range [2^32+1, 2^48]. A solver must systematically probe the binary with crafted inputs \u2014 asymmetric IDs, large integers, long strings, boundary values \u2014 observe the discrepancies, then map each discrepancy back to a specific code path. The binary can be probed with strings/strace/ltrace to discover the domain separator bytes. The resolution requires fixing all five independently; missing any one causes hidden corpus failures.",
+  "trap": "A naive agent fixes the most obvious bug (field order, visible by diffing two asymmetric inputs) and verifies it passes a few self-crafted tests. They miss: (1) the 4-byte vs 8-byte integer encoding because their test values fit in 4 bytes, (2) the domain separator mismatch because it shifts all outputs uniformly and looks like a master-secret difference until probed carefully, (3) the string truncation because no short string triggers it, (4) the validation bound because they test record_count=0 and record_count=1000000 but not record_count=2^33. The hidden corpus exercises all five bugs independently with inputs that isolate each failure mode.",
+  "tests": [
+   "For 200 verify-time generated inputs with random ASCII project_id != dataset_name: service key must match oracle key (catches field order bug)",
+   "For 50 inputs with schema_version in [2^32, 2^48]: service key must match oracle (catches 4-byte integer encoding bug)",
+   "For 50 inputs with record_count in [2^32, 2^48]: service key must match oracle (catches 4-byte encoding on record_count)",
+   "For 20 inputs with record_count in [2^48+1, 2^64-1]: service must return 400 and oracle must exit nonzero (catches validation bound bug)",
+   "For 10 inputs with dataset_name of length 70000 bytes (all 'a'): service key must match oracle (catches uint16 truncation \u2014 both should truncate identically)",
+   "For 5 inputs with project_id containing slashes and colons: service key must match oracle (stresses length-prefix encoding)",
+   "For 5 inputs with record_count=0 and schema_version=0: service key must match oracle (baseline sanity)",
+   "For 10 inputs with empty string components (project_id='a//b'): service must match oracle or both return 400 consistently",
+   "Concurrent load test: 20 parallel requests must all return correct keys without race conditions",
+   "Service must start within 5 seconds and respond within 500ms per request under single-threaded load"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "335 total test cases across 9 categories",
+   "effect": "Reducing to 50 cases (only field-order and integer-width tests) makes it easier \u2014 a solver fixing 3/5 bugs passes. Raising to 500+ cases with more boundary-value combinations and Unicode stress tests makes it harder \u2014 requires finding all five bugs."
+  },
+  "expected_failure_modes": [
+   "Agent fixes field order only (most visible from probing asymmetric IDs) and stops after local tests pass \u2014 fails integer encoding and domain separator tests",
+   "Agent discovers domain separator by running 'strings' on binary but guesses the wrong byte sequence ('SCIDATA\\x01' vs '\\x00SCIDATA\\x01') \u2014 all keys are wrong",
+   "Agent fixes integer encoding to 8 bytes but uses little-endian instead of big-endian \u2014 fails all schema_version and record_count tests",
+   "Agent misses the validation bound discrepancy because they only test record_count up to 2^32, not in the range (2^32, 2^48] \u2014 hidden corpus returns 400 where service returns a key",
+   "Agent implements HKDF correctly for normal inputs but uses the wrong Go HKDF API call (e.g. wrong hash, or reads wrong number of bytes) \u2014 passes sample but fails corpus"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "binary-probing",
+   "kdf",
+   "scientific-computing",
+   "refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/keysvc/derive.go",
+   "cat /app/keysvc/util.go",
+   "cat /app/keysvc/handler.go",
+   "cat /app/keysvc/config.go types.go middleware.go metrics.go main.go",
+   "strings /usr/local/bin/kdf-oracle | grep -A2 -B2 SCIDATA",
+   "xxd /usr/local/bin/kdf-oracle | grep -A1 534349",
+   "/usr/local/bin/kdf-oracle projA datasetB 1 100",
+   "/usr/local/bin/kdf-oracle datasetB projA 1 100",
+   "cd /app/keysvc && go build -o /app/bin/keysvc . && /app/bin/keysvc &",
+   "curl -s -XPOST localhost:8080/derive -d '{\"project_id\":\"projA\",\"dataset_name\":\"datasetB\",\"schema_version\":1,\"record_count\":100}'",
+   "# Observe field order mismatch; fix derive.go to put project_id before dataset_name",
+   "# Test with schema_version=8589934592 (2^33): oracle vs service differ \u2192 fix 4-byte to 8-byte encoding",
+   "# Test with record_count=5000000000 (>2^32): oracle accepts, service returns 400 \u2192 fix validation to 2^48",
+   "# Extract domain separator bytes from binary: xxd kdf-oracle | grep -B5 -A5 'SCIDATA context'",
+   "ltrace /usr/local/bin/kdf-oracle proj1 data1 1 100 2>&1 | head -50",
+   "# Discover \\x00SCIDATA\\x01 vs 'SCIDATA' discrepancy; fix derive.go domain separator",
+   "# Test dataset_name of 70000 bytes: both truncate uint16 identically \u2014 verify util.go truncation matches",
+   "# Rebuild: go build -o /app/bin/keysvc . && kill old service && /app/bin/keysvc &",
+   "# Run /app/test_sample.sh to confirm baseline",
+   "# Run systematic comparison across asymmetric IDs, large integers, long strings"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "ltrace/strace may not be installed in the container (only gcc and curl are listed), making domain separator byte-exact discovery potentially impossible or requiring binary disassembly tools not present",
+   "strings command shows 'SCIDATA' as printable but hides \\x00 prefix and \\x01 suffix \u2014 an agent may guess 'SCIDATA\\x01' or '\\x00SCIDATA' rather than '\\x00SCIDATA\\x01', causing systematic key mismatch with no clear diagnostic",
+   "The instruction draft does not mention that schema_version > 2^31 or record_count > 2^32 are valid inputs \u2014 agents following only the instruction may never probe these ranges and miss bugs 3 and 4",
+   "4 of 5 bugs are directly visible by careful source reading (field order in derive.go, 4-byte integers in derive.go, uint16 truncation in util.go, validation bound in handler.go), weakening the observe_not_read difficulty lever \u2014 a strong code-reading agent could fix most bugs without any binary probing",
+   "The test for 70000-byte dataset_name expects both oracle and service to truncate uint16 identically \u2014 but if the oracle uses a different truncation behavior (e.g., rejects or caps), this test premise could be wrong and cause invalid failures",
+   "Concurrent load test correctness depends on the service being stateless per-request; if there are shared HKDF state issues in Go's crypto library usage, flaky race failures unrelated to the bugs could occur"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails genuine_difficulty: 4 of 5 bugs are directly readable from source (wrong field order, 4-byte vs 8-byte integers, validation bound, uint16 truncation), so a careful code-reading agent without binary probing can fix the majority. The domain separator is the only true observe_not_read bug, but clarity also suffers because the instruction draft omits the edge-case input ranges (schema_version > 2^31, record_count > 2^32, strings > 255 bytes) that the tests actually exercise. The missing tooling risk (ltrace/strace not confirmed present) could make the domain separator bug unsolvable within time constraints, creating an invalid failure mode.",
+  "fixes": [
+   "Ensure 3+ bugs require binary probing rather than source reading \u2014 for example, move the integer encoding bug to a compiled helper library or make the field ordering only discoverable via runtime behavior, not a simple code diff",
+   "Add the edge-case input ranges explicitly to the instruction (e.g., 'schema_version and record_count may exceed 2^32; dataset_name may exceed 64KB') so agents know to probe these ranges \u2014 this removes ambiguity without giving away bug locations",
+   "Confirm and document that ltrace and a hex viewer (xxd/hexdump) are installed in the container, or provide an alternative discovery path (e.g., a /app/probe.sh that exercises the binary with known inputs and logs raw HKDF info bytes to a file) so the domain separator can be discovered without relying on host tools that may be absent"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 over WAL records with binary serialization and DB lookups; the candidate is about reverse-engineering a proprietary KDF binary and matching its output in Go."
+    },
+    {
+     "ref_id": "terminal-bench/ks-solver-cpp",
+     "verdict": "distinct",
+     "reason": "That task is a PDE solver using oracle callbacks; the candidate is a binary reverse-engineering/interop task for key derivation."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation logic in a sales service; the candidate is about matching a proprietary KDF oracle binary's output exactly."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a binary frame codec (encode/decode correctness); the candidate is about reverse-engineering a KDF oracle and replicating it in Go."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve reverse-engineering a reference binary (oracle/reference .so) to fix a reimplementation that diverges on a subset of inputs, with the same core challenge of matching cryptographic output exactly across edge-case inputs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.152
+    ],
+    [
+     "terminal-bench/ks-solver-cpp",
+     0.145
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.145
+    ],
+    [
+     "ours/official-aac910462208",
+     0.136
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.111
+    ]
+   ],
+   "cost_usd": 0.015222000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.069666
+}

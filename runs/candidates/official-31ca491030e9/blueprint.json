@@ -1,0 +1,55 @@
+{
+ "slug": "sql-window-agg-binary-regression",
+ "title": "SQL Aggregation Engine Silent Regression",
+ "scenario": "An open-source maintainer is triaging a regression in a compiled SQL query executor (shipped as a binary at /app/bin/qexec) that evaluates window functions and GROUP BY aggregations over partitioned event tables. The binary reads a SQLite database, executes queries from a .sql file, and writes results to stdout. A recent release broke something: the CI sample passes, but downstream users are reporting wrong totals and incorrect window rankings on their production data.",
+ "instruction_draft": "The binary /app/bin/qexec runs SQL queries against /app/data/events.db and writes results to stdout. Fix the query file /app/queries/report.sql so that for every partition key, (1) the running total column equals the exact cumulative sum of amount ordered by ts within that partition, and (2) the rank column assigns 1 to the row with the highest amount in the partition with no gaps or ties broken by ts ascending. The provided sample output in /app/expected_sample.txt matches only a small subset of partitions; all partitions in the database must be correct.",
+ "requirements": [
+  "For every partition_key value in events.db, the running_total column must equal the exact cumulative sum of the amount column ordered by ts ascending within that partition.",
+  "For every partition_key value, the rank column must assign integer rank 1 to the highest amount row, with ties broken by ts ascending (earlier ts = lower rank number), with no gaps in rank sequence.",
+  "The output rows must be ordered by partition_key ascending, then ts ascending.",
+  "No partition may be silently dropped or duplicated in the output."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm base image.",
+  "Install: sqlite3, gcc, build-essential, python3-pip. Pip: pandas, numpy (for data generation scripts only).",
+  "Compile a C program /app/src/qexec.c into /app/bin/qexec. The C program opens the SQLite database path from argv[1], reads and executes every semicolon-delimited statement from the SQL file at argv[2], and prints results as tab-separated rows to stdout. Source is NOT shipped \u2014 only the binary.",
+  "The C source has two deliberate bugs: (a) when computing running totals it resets the accumulator when partition_key changes but uses a string comparison that fails on numeric partition_key values cast as TEXT with leading zeros (so partitions '01' through '09' get wrong running totals), and (b) the ORDER BY inside the window frame uses DESC for ts instead of ASC, causing the rank to be inverted (row with lowest amount gets rank 1).",
+  "Create /app/data/events.db with a schema: CREATE TABLE events (id INTEGER PRIMARY KEY, partition_key TEXT, ts INTEGER, amount REAL). Populate with ~600 rows: 20 partitions, partition keys '01'..'20' (zero-padded), each with 25-35 rows, with deliberate ties in amount within some partitions.",
+  "Create /app/queries/report.sql with an initial broken query that uses: SELECT partition_key, ts, amount, SUM(amount) OVER (PARTITION BY partition_key ORDER BY ts DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as running_total, RANK() OVER (PARTITION BY partition_key ORDER BY amount ASC) as rank FROM events ORDER BY partition_key, ts;",
+  "Create /app/expected_sample.txt with correct output for only partitions '10', '15', '20' (which happen to not have leading-zero issues and whose sample ranks look plausible by accident).",
+  "The binary is compiled at Docker build time with the source deleted afterward, leaving only /app/bin/qexec.",
+  "A README at /app/README.md explains the CLI usage: ./bin/qexec data/events.db queries/report.sql"
+ ],
+ "internal_hint": "Two interacting bugs, both non-visible (binary-only): (1) The binary's window frame ORDER uses DESC for ts, so SUM() OVER accumulates in reverse order, giving wrong running totals for all partitions \u2014 but for small partitions with uniform ts spacing, the error is subtle. (2) RANK() OVER uses amount ASC, so rank=1 goes to the minimum amount, not the maximum. The sample partitions '10','15','20' have amounts that are coincidentally monotone, so the rank looks correct there. The solver must experiment: run qexec, diff output against hand-computed expectations, notice the rank inversion and the wrong running totals. Both bugs are fixable purely in report.sql by correcting the OVER clauses: change ORDER BY ts DESC to ORDER BY ts ASC in the SUM window, and change ORDER BY amount ASC to ORDER BY amount DESC in the RANK window. The leading-zero string comparison bug in the binary causes partitions '01'-'09' to produce wrong running totals even after the SQL fix \u2014 the solver must discover this by running against the full database, not just the sample partitions. The fix for this is to CAST(partition_key AS INTEGER) in the PARTITION BY and ORDER BY, or use a subquery that normalizes partition_key. The two bugs interact: fixing only the ORDER BY direction makes the sample pass, but partitions '01'-'09' still fail on running totals due to the binary's string comparison reset bug, which only triggers when the SQL passes partition_key as TEXT in the window frame \u2014 casting it forces the binary's strcmp path to see identical numeric values and accumulate correctly.",
+ "trap": "A naive fix changes only one of the two OVER clauses (e.g., fixes rank direction but leaves running total order wrong, or vice versa). The sample partitions '10','15','20' pass because their data is monotone or the error cancels. Hidden tests use partitions '01'-'09' (which expose the string comparison reset bug) and partitions with non-monotone amounts and ties (which expose the rank direction bug). A solver who only checks against expected_sample.txt ships a fix that passes 3 partitions but fails 17.",
+ "tests": [
+  "Run qexec against the full events.db with the solver's report.sql. For each of 20 partitions, independently compute correct running_total and rank from the raw events table using Python/pandas. Assert all 600+ output rows match within floating-point epsilon.",
+  "At verify time, generate 5 additional synthetic partition_key values ('03', '07', '11', '17', '19') with fresh random amounts and ts values including deliberate ties. Insert them into a copy of events.db. Run solver's report.sql. Verify running_total resets correctly at partition boundaries and rank=1 is the maximum-amount row with ties broken by ts ASC.",
+  "Verify no partition is dropped: output must contain exactly the same set of partition_key values as the database.",
+  "Verify row ordering: output must be sorted by partition_key ASC (lexicographic on the TEXT field, which equals numeric order for zero-padded keys 01-20), then ts ASC within each partition.",
+  "Stress test: a partition with 10 rows all having the same amount (ties). Verify rank is assigned by ts ASC with no gaps (1,2,3,...,10)."
+ ],
+ "verifier_knob": {
+  "name": "corpus_partition_count",
+  "value": "20 partitions, 5 adversarial verify-time partitions",
+  "effect": "Increasing to 50 partitions with more tie patterns and more zero-padded keys increases coverage of the string-comparison bug and rank-inversion edge cases, making shallow fixes fail more reliably."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the rank direction (ORDER BY amount DESC) but misses the running total ORDER BY direction, passes sample, fails hidden partitions.",
+  "Agent fixes both ORDER BY directions but never discovers the binary's string comparison reset bug affecting partitions '01'-'09', because they only verify against the sample which uses '10','15','20'.",
+  "Agent discovers one bug by running the binary but assumes the other is also a SQL issue and doesn't experiment with partition keys that have leading zeros.",
+  "Agent casts partition_key to INTEGER in ORDER BY but not in PARTITION BY, causing incorrect partition boundaries in the binary's internal grouping logic.",
+  "Agent generates a script that recomputes expected values from the broken query output itself, failing to notice the systematic direction errors."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "debugging",
+ "tags": [
+  "sql",
+  "window-functions",
+  "compiled-binary",
+  "two-interacting-bugs",
+  "shallow-check-trap",
+  "systems"
+ ]
+}

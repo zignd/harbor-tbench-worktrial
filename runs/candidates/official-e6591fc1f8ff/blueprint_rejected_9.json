@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "sensor-normalizer-wheel-deploy",
+  "title": "Sensor Normalizer Wheel Deployment",
+  "scenario": "Your team ships a Python distribution package (wheel) for an in-house telemetry pipeline. A pre-compiled C extension, libsensor_norm.so, performs proprietary sensor calibration that was written by a contractor who has since left; its source is unavailable. The wheel build system and Python wrapper have just been refactored, and the nightly integration suite is now failing on the staging server. The environment contains the build system (~1,200 lines across setup files, the Python wrapper package, test fixtures, and a small corpus of sample sensor CSV files), plus the opaque libsensor_norm.so binary.",
+  "instruction_draft": "The sensor normalizer wheel at /app fails its integration tests when deployed to the staging server. Your job is to produce a correctly built and installed wheel (at /dist/sensor_norm-2.4.0-*.whl) such that when the verifier installs it in a fresh virtualenv and runs the validation suite against hidden sensor CSV inputs, every normalized output value matches the reference normalizer's output within an absolute tolerance of 1e-4, and at least 98% of rows across all hidden input files pass this check.\n\nThe wheel must install cleanly (no missing symbols, no import errors) and the installed package must expose a `sensor_norm.normalize(csv_path, out_path)` function that reads raw sensor readings from a CSV (columns: timestamp, channel, raw_value) and writes a CSV with the same columns plus a normalized_value column. The normalizer's behavior on out-of-range and edge-case raw_value inputs is not documented; you must characterize it experimentally before writing the wrapper logic.",
+  "requirements": [
+   "A wheel file exists at /dist/sensor_norm-2.4.0-*.whl",
+   "The wheel installs without errors in a fresh virtualenv (pip install)",
+   "The installed package exposes sensor_norm.normalize(csv_path, out_path) callable",
+   "normalize() reads a CSV with columns [timestamp, channel, raw_value] and writes a CSV with [timestamp, channel, raw_value, normalized_value]",
+   "On hidden sensor CSV inputs, at least 98% of rows have normalized_value within 1e-4 absolute tolerance of the reference libsensor_norm.so output",
+   "The wrapper correctly handles the full domain of raw_value inputs, including out-of-range and boundary values, as characterized by experiment with the provided libsensor_norm.so"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with build-essential, python3-dev, wheel, setuptools, pip pinned",
+   "/app/libsensor_norm.so: a compiled C shared library (no source) exporting two symbols: sn_init(int channel) -> void, sn_normalize(int channel, double raw) -> double. It implements per-channel affine calibration PLUS a hard clamp: output = clamp(a[channel]*raw + b[channel], lo[channel], hi[channel]). Clamp bounds and per-channel coefficients are baked in for channels 0-7; channel values outside 0-7 return NaN. The clamp behavior is NOT documented anywhere.",
+   "/app/sensor_norm/: Python package directory with __init__.py (broken: uses wrong ctypes signature, missing restype/argtypes declarations, wrong argument order), normalize.py (the public API, currently calls the ctypes wrapper incorrectly), conftest.py",
+   "/app/setup.py and /app/pyproject.toml: wheel build config, currently missing the package_data entry for libsensor_norm.so, so the .so is not bundled into the wheel",
+   "/app/tests/: pytest suite with 3 sample CSVs (channels 0-2 only, raw_values all in [0.0, 100.0], no boundary cases), a test_normalize.py that passes locally because it imports directly from /app rather than the installed wheel",
+   "/app/samples/: 5 small CSV files with sensor readings, all in-range (used during development, not edge cases)",
+   "/app/docs/sensor_norm_api.txt: documents sn_init and sn_normalize signatures in C but says nothing about clamping behavior or channel limits",
+   "/app/pipeline/: ~400 lines of plausible but uninvolved ETL code that reads normalized output and forwards to a message queue",
+   "/app/monitor/: ~300 lines of alerting/dashboard code, not involved in normalization",
+   "The verifier generates fresh CSV files at verify time: channels 0-7, raw_values sampled across [-200.0, 500.0] including values that trigger the per-channel clamps, and channel=9 (out-of-range, should produce NaN in normalized_value)"
+  ],
+  "internal_hint": "Three problems must all be fixed for the 98% threshold: (1) The ctypes wrapper in __init__.py has wrong argtypes/restype (raw is declared as c_int instead of c_double, and sn_init takes a c_int but return type is unset), causing garbage output or crashes on non-integer raw values \u2014 visible only when running on non-integer inputs since integer-valued test data accidentally works. (2) The .so is not included in the wheel (missing package_data / MANIFEST) so pip install in a fresh environment silently fails to find the library at import time. (3) The clamp behavior of sn_normalize must be characterized by experiment: probe the .so directly via ctypes across each channel with extreme raw values to find each channel's clamp bounds (lo, hi). The wrapper's output must pass these through faithfully (which it does automatically once ctypes types are correct), but without understanding the clamp, the solver may try to 'fix' unexpected outputs in the wrapper logic and break them. The shallow trap: the provided test CSVs use integer raw_values in [0,100], so the wrong c_int argtypes accidentally work for those inputs. The missing .so in the wheel appears to work in local tests because tests import from /app directly. Both bugs are invisible without running on real hidden inputs (fractional values, out-of-range values, fresh virtualenv install).",
+  "trap": "A naive solver sees the tests pass locally, fixes the obvious missing package_data entry for the .so, rebuilds the wheel, installs it, runs the sample tests \u2014 all green. But the hidden test CSVs contain fractional raw_values (e.g., 47.3, -12.8) which, with the wrong c_int argtypes, get truncated to integers before being passed to sn_normalize, producing wrong outputs. Additionally, any hidden CSV row with raw_value outside the undocumented per-channel clamp range will produce a clipped output; if the solver 'corrects' these in Python thinking the .so is wrong, they double-clip or corrupt the values. The 98% threshold means even a partially wrong solution (e.g., one wrong channel's clamp or wrong argtype for one call path) fails.",
+  "tests": [
+   "Install the wheel in a fresh virtualenv (no /app on PYTHONPATH) and verify `import sensor_norm; sensor_norm.normalize` is callable without ImportError or OSError",
+   "Run normalize() on a generated CSV with fractional raw_values for channels 0-7 and verify normalized_value matches ctypes-direct call to /app/libsensor_norm.so within 1e-4 for >=98% of rows",
+   "Run normalize() on a CSV with raw_values in [-200, -50] (below all channel clamp lows) and verify clamped outputs match .so reference",
+   "Run normalize() on a CSV with raw_values in [300, 500] (above all channel clamp highs) and verify clamped outputs match .so reference",
+   "Run normalize() on a CSV with channel=9 (out-of-range) and verify normalized_value is NaN or a clearly invalid sentinel matching .so behavior",
+   "Run normalize() on mixed CSV (channels 0-7, raw_values uniformly sampled across full domain including boundary transitions) and compute overall per-row pass rate >= 0.98",
+   "Verify wheel filename matches sensor_norm-2.4.0-*.whl pattern and wheel metadata is valid (pip show after install)"
+  ],
+  "verifier_knob": {
+   "name": "pass_rate_threshold",
+   "value": "0.98",
+   "effect": "Lowering to 0.90 makes it easier (allows partial argtype fix or one channel's clamp to be wrong); raising to 1.00 makes it nearly impossible since any residual float truncation or missed NaN handling fails; 0.98 is calibrated so that fixing ctypes types AND the .so bundling is necessary but characterizing clamp is not strictly required (the wrapper passes clamp through automatically once types are right), keeping difficulty at the right level"
+  },
+  "expected_failure_modes": [
+   "Solver fixes package_data and runs local tests (all pass because integer raw_values), ships wheel without fixing ctypes argtypes \u2014 fails on fractional inputs in hidden tests",
+   "Solver fixes ctypes argtypes but misses the missing .so in wheel \u2014 install succeeds but ImportError at runtime in fresh virtualenv",
+   "Solver sees unexpected clamped outputs while probing, adds Python-side clamping with wrong bounds (estimated rather than measured per channel), double-clips values near the boundary \u2014 fails boundary rows",
+   "Solver fixes both bugs but doesn't probe channel 8+ behavior, writes code that raises exception instead of returning NaN for out-of-range channels \u2014 crashes on hidden channel=9 rows and fails the install test",
+   "Solver probes .so but only tests channels 0-2 (matching sample data), assumes channels 3-7 have same coefficients \u2014 fails on hidden data for those channels"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "ctypes",
+   "wheel-packaging",
+   "black-box-characterization",
+   "systems-programming",
+   "deployment",
+   "sensor-data"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/sensor_norm/__init__.py",
+   "cat /app/setup.py && cat /app/pyproject.toml",
+   "cat /app/sensor_norm/normalize.py",
+   "cat /app/tests/test_normalize.py",
+   "python3 probe_basic.py # probe sn_normalize with correct types for channels 0-7, get baseline outputs",
+   "python3 probe_clamps.py # probe with raw=-1000 and raw=1000 per channel to find clamp bounds",
+   "python3 probe_oob.py # probe channel=9 to confirm NaN behavior",
+   "edit /app/sensor_norm/__init__.py: fix argtypes (c_int->c_double for raw), set restype=c_double for sn_normalize, set argtypes=[c_int] for sn_init",
+   "edit /app/setup.py or pyproject.toml: add package_data={'sensor_norm': ['libsensor_norm.so']} or equivalent MANIFEST entry",
+   "cd /app && pip wheel . -w /dist/",
+   "python3 -m venv /tmp/testenv && /tmp/testenv/bin/pip install /dist/sensor_norm-2.4.0-*.whl",
+   "/tmp/testenv/bin/python -c \"import sensor_norm; sensor_norm.normalize('/app/samples/s1.csv','/tmp/out.csv'); print('ok')\"",
+   "python3 verify_fractional.py # generate CSV with fractional values, compare wrapper output vs direct .so call",
+   "cat /tmp/out.csv # verify schema has normalized_value column"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The wheel filename glob sensor_norm-2.4.0-*.whl is platform-specific; if the build system generates a different version tag or ABI tag that doesn't match, a solver's technically correct wheel could be missed by the verifier glob \u2014 ambiguity in how the verifier matches the filename",
+   "sn_init must be called before sn_normalize per channel \u2014 if the verifier doesn't call sn_init before running reference outputs, or if the wrapper doesn't call it, behavior may differ; the instruction doesn't specify whether normalize() must call sn_init per channel internally",
+   "The 'clamp characterization' task is presented as a key difficulty lever, but because the wrapper just passes values through ctypes faithfully (once argtypes are correct), no Python-side clamp logic is needed \u2014 a solver who fixes argtypes and package_data automatically passes the clamp tests without ever explicitly characterizing the clamps, making that difficulty lever mostly a red herring",
+   "If libsensor_norm.so has architecture-specific behavior (e.g., Linux x86-64 only) and the reviewer's container differs, build environment assumptions may not hold",
+   "The instruction says 'wrong argument order' is also a bug in normalize.py, but the internal hints don't mention argument order as a distinct bug \u2014 potential inconsistency between stated bugs and actual bugs in the environment"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because both primary bugs (wrong c_int argtypes and missing package_data) are immediately visible by reading the source files, and a strong agent finds and fixes them in ~14 commands without needing special insight. The 'clamp characterization' difficulty lever is effectively a red herring \u2014 once ctypes types are correct, the wrapper passes clamp outputs through faithfully without any Python-side logic, so probing clamps yields no actionable changes. The shallow_check_trap is well-designed but doesn't raise difficulty enough because the fix path is straightforward source reading rather than genuine exploration.",
+  "fixes": [
+   "Make the clamp characterization genuinely necessary: require the Python wrapper to validate or transform values (e.g., normalize() must return a specific sentinel like None or 'CLIPPED' for out-of-range inputs rather than the raw .so NaN), forcing the solver to characterize bounds and implement logic \u2014 not just fix ctypes types",
+   "Obscure the ctypes bug: instead of a clearly wrong c_int declaration in argtypes, make the wrapper use a more subtle error like calling ctypes.CDLL with the wrong loading flag (RTLD_LOCAL vs RTLD_GLOBAL) that causes symbol resolution failures only in the wheel context, or use a struct-based calling convention error that's not obvious from a quick read",
+   "Add a genuine black-box characterization requirement that affects the wrapper logic: e.g., different channels use different normalization functions (some affine, some log-scale) that must be detected experimentally and dispatched in Python, making clamp/behavior probing actually change the code written",
+   "Raise the threshold of invisible bugs: add a third ctypes bug that only manifests with multi-threaded access (the .so is not thread-safe) visible only when the verifier runs parallel normalize() calls, making it impossible to spot from source reading alone"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks require experimentally characterizing an opaque binary normalizer and building a pipeline around it, but the candidate adds wheel/packaging mechanics and the reference focuses on SQL rollup correctness."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The reference is about fixing chunk-processing row-count and deduplication bugs in a CSV pipeline, with no opaque binary or wheel packaging involved."
+    },
+    {
+     "ref_id": "terminal-bench-science/guided-wave-localization",
+     "verdict": "distinct",
+     "reason": "The reference is a numerical signal-processing / damage-localization ML problem with no relation to wheel packaging or opaque C extensions."
+    },
+    {
+     "ref_id": "ours/official-3bbd19e55510",
+     "verdict": "distinct",
+     "reason": "The reference is about fixing a numerically incorrect EMA implementation and meeting a throughput benchmark, unrelated to wheel packaging or opaque shared libraries."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "The reference is a spectral-entropy regression audit in a cryptographic pipeline, sharing only a vague sensor/pipeline theme with the candidate."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.21
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.137
+    ],
+    [
+     "terminal-bench-science/guided-wave-localization",
+     0.111
+    ],
+    [
+     "ours/official-3bbd19e55510",
+     0.084
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.051
+    ]
+   ],
+   "cost_usd": 0.014799
+  },
+  "novel": false
+ },
+ "cost_usd": 0.057648
+}

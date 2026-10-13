@@ -87,3 +87,20 @@ def test_render_marks_the_current_node():
     text = pg.render_graph(got, SECS, repair, attempts, 900.0, NOW).plain
     assert "you are here" in text and "estimate: ~15m left" in text
     assert "in parallel" in text
+
+
+def test_watch_list_hides_candidates_that_are_not_in_the_pipeline():
+    from scripts.watch_tui import candidate_visible as vis
+
+    def rec(status, label="m", active=False, idle=None):
+        return {"status": status, "label": label, "active": active, "idle": idle}
+
+    live = rec("building", active=True, idle=2)
+    stale = rec("building", label="old", active=False, idle=500)
+    recent_done = rec("gated", idle=30)
+    old_done = rec("rejected", idle=900)
+    got = [vis(r, "active", False, "m") for r in (live, stale, recent_done, old_done)]
+    assert got == [True, False, True, False]
+    assert vis(rec("building", label="m", idle=500), "run", False, "m")
+    assert not vis(rec("held", label="m"), "run", False, "m")
+    assert vis(stale, "all", False, "m") and not vis(rec("held"), "all", False, "m")

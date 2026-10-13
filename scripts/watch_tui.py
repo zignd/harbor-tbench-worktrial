@@ -24,7 +24,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widget import Widget
 from textual.widgets import DataTable, DirectoryTree, Footer, Static, TabbedContent, TabPane
 
-from generator.config import JOBS_DIR, LEDGER_PATH
+from generator.config import JOBS_DIR, LEDGER_PATH, MODEL_LABEL
 from scripts import pipeline_graph as pg
 from scripts import status as st
 
@@ -67,6 +67,19 @@ def ledger_events(cand_id: str) -> list[dict]:
         if e["task"] == cand_id or e["task"].startswith(cand_id + "-t"):
             out.append(e)
     return out
+
+
+def candidate_visible(r: dict, view: str, show_held: bool, label: str) -> bool:
+    """Which candidates the list shows. The default view ("active") hides everything that is
+    not really in the pipeline right now: stale `building` rows from earlier runs and other
+    model pairs. "run" shows every candidate of this model pair, "all" everything."""
+    if view == "all":
+        return show_held or r["status"] != "held"
+    mine = r["label"] == label
+    if view == "run":
+        return mine and (show_held or r["status"] != "held")
+    recent = r["idle"] is not None and r["idle"] < 60
+    return r["active"] or (mine and (recent or r["status"] in ("shipped", "gated", "learnable")))
 
 
 def events_by_candidate() -> dict[str, list[dict]]:
@@ -179,6 +192,7 @@ class WatchApp(App):
     BINDINGS: ClassVar = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
+        ("v", "cycle_view", "View: active/run/all"),
         ("h", "toggle_held", "Show/hide held"),
         ("1", "tab('graph')", "Graph"),
         ("2", "tab('timeline')", "Timeline"),
@@ -194,6 +208,9 @@ class WatchApp(App):
         super().__init__()
         self.every = every
         self.show_held = False
+        self.view = (
+            "active"  # active: being worked on now (+ recent results); run: this model pair; all
+        )
         self.records: list[dict] = []
         self.changed: dict[str, float] = {}
         self.prev: dict[str, tuple] = {}
@@ -247,6 +264,14 @@ class WatchApp(App):
     def action_tab(self, name: str) -> None:
         self.query_one("#tabs", TabbedContent).active = name
 
+    def visible(self, r: dict) -> bool:
+        return candidate_visible(r, self.view, self.show_held, MODEL_LABEL)
+
+    def action_cycle_view(self) -> None:
+        self.view = {"active": "run", "run": "all", "all": "active"}[self.view]
+        self.draw_candidates()
+        self.action_refresh()
+
     def action_toggle_held(self) -> None:
         self.show_held = not self.show_held
         self.draw_candidates()
@@ -263,8 +288,11 @@ class WatchApp(App):
             ).splitlines()  # fmt: skip
             self.spend = "  ".join(x.strip() for x in usage[:2])
             self.spend_at = time.time()
+        shown = sum(self.visible(r) for r in records)
+        active = sum(r["active"] for r in records)
         head = (
-            ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
+            f"VIEW {self.view} ({shown}/{len(records)}, {active} active; v switches) | "
+            + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
             + f" | shipped {shipped} | procs {len(st.processes())}"
             + f" | containers {len(st.containers())} | {self.spend}"
         )
@@ -299,8 +327,8 @@ class WatchApp(App):
 
     def draw_candidates(self) -> None:
         table = self.query_one("#cands", DataTable)
-        rows = [r for r in self.records if self.show_held or r["status"] != "held"]
-        rows.sort(key=lambda r: (r["status"] != "building", r["id"]))
+        rows = [r for r in self.records if self.visible(r)]
+        rows.sort(key=lambda r: (not r["active"], r["status"] != "building", r["id"]))
         now = time.time()
         keys = [r["id"] for r in rows]
         rebuild = keys != [k.value for k in table.rows]

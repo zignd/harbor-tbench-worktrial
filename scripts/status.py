@@ -6,6 +6,7 @@ live spend. Read-only: it never starts or stops anything.
 """
 
 import json
+import os
 import re
 import subprocess
 from datetime import UTC, datetime
@@ -88,8 +89,26 @@ def _live_authoring(cand_id: str) -> tuple[str, str] | None:
     return None
 
 
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError):
+        return True
+    return True
+
+
 def candidate_records() -> tuple[dict[str, int], int, list[dict]]:
-    """(status counts, shipped count, one record per candidate incl. held)."""
+    """(status counts, shipped count, one record per candidate incl. held).
+
+    Each record also says whether the candidate is really being worked on (`active`: its
+    batch process is alive, or its last ledger event is recent), which models produced it
+    (`label`), and how long it has been idle in minutes (`idle`).
+    """
+    from generator.config import LEGACY_MODEL_LABEL
     from generator.pipeline import CANDIDATES_DIR
 
     last: dict[str, dict] = {}
@@ -102,17 +121,23 @@ def candidate_records() -> tuple[dict[str, int], int, list[dict]]:
     counts: dict[str, int] = {}
     records = []
     for d in sorted(CANDIDATES_DIR.glob("official-*")):
-        status = (
-            json.loads((d / "status.json").read_text())["status"]
-            if (d / "status.json").exists()
-            else "new"
+        status_file = (
+            json.loads((d / "status.json").read_text()) if (d / "status.json").exists() else {}
+        )
+        status = status_file.get("status", "new")
+        label = (
+            json.loads((d / "models.json").read_text()).get("label", LEGACY_MODEL_LABEL)
+            if (d / "models.json").exists()
+            else LEGACY_MODEL_LABEL
         )
         counts[status] = counts.get(status, 0) + 1
         e = last.get(d.name)
         attempt = (e or {}).get("result", {}).get("attempt", "")
         age = ""
+        idle = None
         if e:
             mins = (now - datetime.fromisoformat(e["ts"])).total_seconds() / 60
+            idle = mins
             age = f"{mins:.0f}m ago" if mins < 120 else f"{mins / 60:.0f}h ago"
         cal = (
             json.loads((d / "calibration.json").read_text())
@@ -140,6 +165,10 @@ def candidate_records() -> tuple[dict[str, int], int, list[dict]]:
                 "attempt": str(attempt),
                 "age": age,
                 "verdict": verdict,
+                "label": label,
+                "idle": idle,
+                "active": status == "building"
+                and (_pid_alive(status_file.get("pid")) or (idle is not None and idle < 20)),
             }
         )
     shipped = (

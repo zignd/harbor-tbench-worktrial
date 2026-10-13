@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 20:40 -03:00 · HTML deck navigation tested in a real browser
+- Loaded `docs/result/presentation.html` from `file://` in Chrome and drove it with the keyboard: `ArrowRight` advanced the counter `1/11 -> 11/11` in order, `ArrowLeft` and `Space` work, and the deck clamps at both ends (verified by overshooting in both directions).
+- The page loads **zero external resources** (`link`, `script[src]`, `img`, `iframe` all absent), so the offline requirement is met rather than assumed.
+- Caught and corrected my own error: the first screenshot was saved as `html-deck-slide8.png` while the deck was still on slide 1, because a scripted navigation call had not taken effect. Re-captured only after asserting the counter read `8 / 11` and the heading `Verification discipline`, so the evidence file matches what it claims.
+- `presentation_qa` added to `verification.json`.
+
 ### 20:25 -03:00 · Stretch A, B and D accounted from evidence; rubric overfitting found
 - **Stretch A (cost-efficient evaluation), completed** (`evidence/stretchA-curtailment.json`): on this run's pair, 31 calibrated tasks used **114 trials against a naive 155 — 26.5% of trials and ~$3.78 saved**; 20.9% / $30.78 across all pairs. The dollar figure is stated as an estimate at constant per-trial cost. Crucially, **early stops on invalid or hacked runs are reported separately and save nothing** — the trial was paid for and must be repeated — so curtailment savings are no longer conflated with them.
 - **Stretch B (tuning), completed** (`evidence/stretchB-tuning.json`): **13 tuning experiments** with hash-bound before/after package hashes, 1-3 rounds each, **0 reached a learnable calibration**, $0.07 total. Successful difficulty adjustment is labelled **not demonstrated**.

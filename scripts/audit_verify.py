@@ -21,6 +21,10 @@ EVIDENCE = ROOT / "docs" / "result" / "evidence"
 OUT = ROOT / "docs" / "result" / "verification.json"
 
 
+def _read_json(path: Path):
+    return json.loads(path.read_text()) if path.exists() else None
+
+
 def _spend(name: str) -> float | None:
     p = EVIDENCE / name
     if not p.exists():
@@ -202,6 +206,7 @@ def main() -> int:
         },
         "requirements": requirements,
         "tests": {"log": "tests-final.log", "passed": tests_ok},
+        "presentation_qa": _read_json(EVIDENCE / "presentation-qa.json"),
         "spend": {
             "conservative_first_snapshot": _first_spend(),
             "conservative_last_snapshot": _last_spend(),

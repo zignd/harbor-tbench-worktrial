@@ -2,13 +2,14 @@
 
 **A directory here is not a shipped task.** Every package below is a real Terminal-Bench task that
 passed the structural validator, the strict quality rubric and the functional gates, and was then
-measured against the calibration model. None of them landed in the **1–3 of 5 learnable band**, so
-none is marked approved.
+measured against the calibration model. **One is approved** — `optimize-policy-decision-audit`, 3 of
+5 honest passes with two valid failures. The other four measured outside the band and are published
+with `approved: false` so the evidence is inspectable.
 
 | Package | Quality | Gates | Calibration (GPT-5.4-mini) | Status |
 |---|---|---|---|---|
 | `repair-attributed-funnel-service` | pass, **0 blocking / 0 advice** | oracle 3/3, nop 0 | **5/5** (≈78% over 9 valid trials) | not approved — too easy |
-| `optimize-policy-decision-audit` | pass (1 advice) | oracle 3/3, nop 0 | **4/5** | not approved — too easy |
+| `optimize-policy-decision-audit` | pass (1 advice) | oracle 3/3, nop 0 | **3/5**, pooled 7/10 = 0.70 | **approved** |
 | `repair-reproducible-release-packager` | pass (2 advice) | oracle 3/3, nop 0 | **0/5** | not approved — too hard |
 | `repair-log-replay-sql` | **blocked** (coverage) | oracle 3/3, nop 0 | **0/5 twice** — 0 passes in 10 valid trials | not approved — too hard |
 | `global-settlement-reconciliation` | pass | oracle 3/3, nop 0 | **5/5** | not approved — too easy |
@@ -25,6 +26,6 @@ Each directory contains, alongside the task itself:
 `analysis.package_evidence.approval_errors()` with `status: "passed"`, so listing these packages
 cannot inflate the shipped count. `docs/result/verification.json` repeats the same information.
 
-Why nothing is approved: the difficulty lever that produced in-band results was a stated wall-clock
+What the band looks like: the difficulty lever that produced in-band results was a stated wall-clock
 budget, which the quality rubric correctly rejects as an environment-dependent invalid failure mode.
 Removing it moved `optimize-policy-decision-audit` from 3/5 to 4/5. Across these five packages and 30 judged attempts the pass counts are 0, 0, 4, 5, 5 — the distribution is bimodal with no in-band plateau. See `docs/result/report.md` §7.

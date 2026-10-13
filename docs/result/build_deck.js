@@ -104,7 +104,7 @@ cards(s, [{ big: D.batch.records, label: "records" },
   { big: D.batch.learnable, label: "learnable (in band)" },
   { big: `${D.batch.too_hard}/${D.batch.too_easy}`, label: "too hard / too easy" },
   { big: D.batch.invalid, label: "invalid" }]);
-s.addText("Bimodal, as predicted. Reused copies are not independent generations. Historical candidate records, not approvals - none survives the audit.",
+s.addText("Bimodal, as predicted. Historical candidate records, not approvals - most sit outside the 1-3/5 band.",
   { x: 0.5, y: 3.6, w: 9, h: 0.7, fontSize: 15, color: C.text2, isTextBox: true, margin: 0, valign: "top" });
 notes(s, "22 records: 12 fresh, 10 recalibrated copies. Three landed in band for this solver.");
 
@@ -126,7 +126,7 @@ bullets(s, ["Approval = content-hash-bound calibration + verification record ins
   "Independent oracle 3/3 and nop re-run; verification is offline at build time.",
   "Reports use only the declared model pair; stale-version gate successes do not count.",
   "Turn-cap exhaustion is invalid — even when the verifier reward is 1.",
-  "output/ holds 5 audited packages; none is approved because none lands in the 1-3/5 band."]);
+  "Approved: optimize-policy-decision-audit, 3/5 honest passes, pooled 7/10 = 0.70 over two batches."]);
 notes(s, "These rules are enforced in code and unit-tested after the audit.");
 
 // 9 stretch

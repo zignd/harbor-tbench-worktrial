@@ -68,7 +68,7 @@ def build() -> dict:
             "examples_code": _mean(examples, "instruction_code_spans"),
             "generated_code": _mean(generated, "instruction_code_spans"),
         },
-        "spend": {"conservative": 215.96, "remaining": 284.04, "this_run_ledger": 16.47},
+        "spend": {"conservative": 219.64, "remaining": 280.36, "this_run_ledger": 16.47},
         "approved_tasks": verification.get("approved_tasks", []),
         "output_packages": verification.get("output_packages", []),
         "requirements": verification.get("requirements", {}),

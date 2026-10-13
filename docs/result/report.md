@@ -406,7 +406,59 @@ Summed stage time (110.5 h across all modes) is an upper bound, not elapsed time
 
 ---
 
-## 13. Reproduction commands
+## 13. Implications for training and benchmark use
+
+The trial's deliverable is a *pipeline*, so the useful question is what these results mean for
+consuming the tasks it produces.
+
+### For benchmark curation
+
+- **A pass count is meaningless without its solver and settings.** The approved task is "3/5" only for
+  `openrouter/openai/gpt-5.4-mini` under terminus-2 with a 100-turn cap. The same package measured 5/5
+  in one batch and 3/5 in another. Quote the solver, the agent and the cap alongside any band, or the
+  number is not reproducible evidence. The same applies to the models: the historical Sonnet→Opus
+  pairing produced 0 of 9 in band, and mixing that with this run's numbers would be meaningless.
+- **Most of the pool is unusable without curation.** Across the five published packages the per-batch
+  outcomes are 0, 0, 4, 5, 5 — a 5/5 task gives a model nothing to learn from, and a 0/5 task gives a
+  benchmark nothing to measure. Only 1 of 5 cleared the gate, and only after a second independent
+  batch. Anyone planning to publish a set from this pipeline should budget for curation, not assume a
+  yield.
+- **Do not use our quality rubric to rank tasks.** It was optimized against by this very generator:
+  the same 16-criterion rubric, model and settings passes 3/4 of our packages and **0/6** of the
+  human-written reference tasks. It caught three real defects, and it is a useful internal gate — but
+  quoting it as evidence of general task quality would be wrong.
+- **Fresh-clone verification is cheap insurance.** Every published package was rebuilt and re-verified
+  from a clone of the committed revision (oracle 3/3, nop 0). That check found a real packaging defect
+  class — nested `.git` fixtures committed as gitlinks, which a clone cannot materialise — that local
+  checks had missed entirely.
+
+### For training data
+
+- **The measured failure modes are the actionable part.** Across calibration runs the dominant labels
+  were `partial_implementation` (the solver implements part of a stated contract) and
+  `weak_verification` (it checks its own work too shallowly). Those are training targets: completing
+  an entire stated contract, and verifying against the specification rather than against a self-made
+  example. They are also what the difficulty levers here were designed to provoke, which is why the
+  band is the right filter — an in-band task is one where the model *almost* satisfies the contract.
+- **Reject tasks whose failures are not the model's fault.** The audit's most consequential finding is
+  that a wall-clock performance gate produces failures caused by host load rather than by the model.
+  Training on such outcomes teaches the wrong lesson, and the rubric correctly refuses them. The same
+  applies to `test_overreach` failures — in the two too-hard packages, several failures were tests
+  being stricter than the instruction, so the task's difficulty was partly unfair.
+- **Curriculum value is highest near p ≈ 0.35, not at the band edge.** The simulation (§9.1) shows
+  P(in band) peaks at 0.83 around a true pass rate of 0.35 and falls to 0.26 by p = 0.8. If a set is
+  built for gradient signal rather than for measurement, that is the target difficulty — and it is
+  also the region this pipeline currently *misses* most often, which is the clearest single
+  improvement to make next.
+- **Self-judging is a real limitation for anything learned from this pipeline.** The author model also
+  judges, red-teams and rates quality, so quality scores carry that bias. The blind discrimination
+  experiment (§9.4) could not distinguish generated from human-written instructions from chance
+  (0.375, 95% CI [0.212, 0.573]), which is neither evidence of human-likeness nor of its absence —
+  but it does mean no claim about naturalness should be made from these packages.
+
+---
+
+## 14. Reproduction commands
 
 ```bash
 uv sync
@@ -420,13 +472,13 @@ uv run --env-file .env python -m analysis.report
 
 ---
 
-## 14. References
+## 15. References
 
 The eight papers behind the design are indexed in `docs/research/README.md` (Bercovich 2604.28093; Terminal Wrench 2604.17596; HVTB 2608.22103; CLI-Universe 2606.22883; Meta-Task 2607.27929; Tmax 2606.23321; SkillSynth 2604.25727; Foster & Foerster 2502.12272).
 
 ---
 
-## 15. Appendices
+## 16. Appendices
 
 - `runs/candidates/README.md` — browsable candidate index.
 - `docs/result/evidence/` — frozen inventories, spend snapshots, quality checks, blind experiment, stylometrics, historical data.

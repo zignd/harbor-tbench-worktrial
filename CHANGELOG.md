@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:50 -03:00 · Report was missing a required section: training and benchmark implications
+- Mechanically checked `docs/result/report.md` against every element item 9 of the finish plan enumerates. **One required element was missing**: implications for training and benchmark use. Added as section 13, with the tail renumbered (14 reproduction, 15 references, 16 appendices).
+- The section is grounded in measured results rather than generic advice: a pass count is meaningless without its solver and settings (the approved task measured 5/5 and 3/5 in different batches); most of the pool is unusable without curation (0, 0, 4, 5, 5); our rubric must not be used to rank tasks (3/4 generated vs 0/6 human-written); the measured failure labels (`partial_implementation`, `weak_verification`) are the actual training targets; curriculum value peaks near p~0.35, which is also where this pipeline misses most; and self-judging means no naturalness claim should be made from these packages.
+- Report is now 5,178 words across all 16 required sections.
+
 ### 21:35 -03:00 · The one stretch-A item still marked skipped is now done
 - The plan's simulation over the observed per-task pass rate was struck through as skipped, but the goal's stretch-A description explicitly asks for it. Rather than leave a gap hidden behind a strike-through, I produced it (`evidence/stretchA-simulation.json`, report §9.1) and un-struck the item with a note that it was previously skipped.
 - Three results worth stating: **P(in band) peaks at 0.83 around p≈0.35**, giving a concrete difficulty target; **exact curtailment saves 17-23% of trials in the band-relevant region**, which brackets the 26.5% actually measured over 31 tasks (the figure runs high because a pool of very easy and very hard tasks curtails less); and the **aggressive 0/3 early reject would save a further 18-37% but discards 7-28% of genuinely learnable tasks**, which is exactly why shipping uses five full judged attempts.

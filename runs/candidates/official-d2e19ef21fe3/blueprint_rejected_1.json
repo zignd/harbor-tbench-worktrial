@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "repair-replicate-summary-rebuild",
+  "title": "Repair Replicate Summary Rebuild",
+  "scenario": "A research scientist is reproducing a published assay analysis from an internal Python package that rebuilds scientific summaries from an append-only SQLite journal. The package contains import, replay, checkpoint, quarantine, and summary modules, along with a several-thousand-event seed database; a recent refactor made the reproduced figures differ intermittently from the lab's reference implementation.",
+  "instruction_draft": "Repair the package so that `python -m assaypipe rebuild PATH_TO_DB` deterministically reconstructs the database's derived state from `raw_events`, without relying on existing derived tables or checkpoints. Process accepted events in increasing `event_id`; quarantine malformed or semantically invalid events, apply upserts, patches, and deletes according to the documented journal rules, and make repeated or interrupted rebuilds produce the same result as a clean rebuild.\n\nFor every surviving record whose `included` field is true, write one row per `(study, cohort)` to `summaries`, with exact decimal-string values for `n`, `mean`, `median`, `q05`, and `q95`. Sort values numerically for the quantiles, use nearest-rank indices for q05 and q95, average the two middle values for an even-sized median, emit canonical decimal strings, preserve unrelated database tables, and ensure the command succeeds on large journals containing invalid rows, event-id gaps, duplicate logical records, patches after replacement, and deletes.",
+  "requirements": [
+   "The command `python -m assaypipe rebuild PATH_TO_DB` must be the supported entry point.",
+   "A rebuild must reconstruct derived state from `raw_events` rather than trusting pre-existing summaries, checkpoints, or other derived tables.",
+   "Events must be processed in increasing numeric `event_id`, including when event IDs have gaps or SQLite row order differs.",
+   "Malformed JSON, unknown operations, missing required fields, invalid decimal values, invalid patch targets, and patches with no current record must be quarantined and must not affect the surviving state.",
+   "A valid upsert must create or replace the logical record identified by its record key.",
+   "A valid patch must change only the fields it supplies on the current logical record, and a valid delete must remove that record from the surviving state.",
+   "Records with `included` equal to true must be grouped by `(study, cohort)` and records with any other value must be excluded from summaries.",
+   "Summary arithmetic must use exact decimal values rather than binary floating point.",
+   "Each summary must contain `n`, `mean`, `median`, `q05`, and `q95` as canonical decimal strings.",
+   "Quantiles must use numerically sorted values and nearest-rank indices; an even-sized median must be the exact average of the two middle values.",
+   "Repeated rebuilds and rebuilds after an interrupted or stale-checkpoint run must be idempotent and equal to a clean rebuild.",
+   "The rebuild must preserve unrelated tables and rows in the SQLite database.",
+   "The implementation must handle the supplied multi-thousand-event database and larger generated journals without sampling or silently dropping records."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm` with pinned Python dependencies and no network requirement.",
+   "The repository contains roughly 1,500 lines of Python across `assaypipe/cli.py`, `journal.py`, `replay.py`, `checkpoint.py`, `quarantine.py`, `summaries.py`, import helpers, and unrelated reporting utilities.",
+   "A README documents the SQLite schema, logical record key, accepted event shapes, decimal-string rules, quarantine categories, and summary definitions without identifying the planted defects.",
+   "The seed SQLite database contains `raw_events`, partially populated `quarantine`, `summaries`, `rebuild_checkpoints`, and unrelated `experiment_notes` tables, with several thousand events and deliberately stale derived state.",
+   "Raw events include valid upserts, replacements, partial patches, deletes, invalid JSON, unknown operations, missing fields, invalid decimal strings, event-id gaps, duplicate logical record keys, and records whose final included status is false.",
+   "The existing implementation has defects spread across replay, checkpoint recovery, quarantine insertion, and summary calculation: some paths depend on rowid or insertion order, a batch cursor can skip rows after quarantine writes, patches mutate shared dictionaries, stale checkpoints can omit earlier events, and summary calculations coerce decimals to floats.",
+   "Several modules and sample reports are intentionally unrelated to rebuilding and provide realistic code-navigation noise.",
+   "The package includes a command that can simulate an interruption after a configurable event batch, allowing verification of recovery and idempotence.",
+   "The verifier creates fresh SQLite databases from a hidden seed generator at verify time, rather than relying only on the supplied seed database."
+  ],
+  "internal_hint": "First inspect the CLI, schema README, and call graph, then run clean, repeated, and forced-interruption rebuilds while comparing raw_events, checkpoints, quarantine, and summaries. The main failures are state-dependent: replay uses unstable row ordering and a cursor whose result set changes when invalid rows are quarantined; checkpoint recovery trusts a checkpoint that may describe only a partially committed batch; patch code aliases the current record and mishandles replacement/delete history; and aggregation converts Decimal strings to floats, making ordering and exact output diverge on adversarial values. Refactor replay into a deterministic ordered state machine with atomic batch/checkpoint/quarantine transactions, reset or validate derived state before replay, copy records before patches, and calculate all summary values with Decimal using the specified nearest-rank rules. Exercise generated cases containing late patches, repeated keys, invalid rows between valid rows, stale checkpoints, and values near decimal ordering ties before considering the repair complete.",
+  "trap": "A shallow fix that merely adds an ORDER BY, clears summaries once, or replaces float means with Decimal will pass the visible seed and simple reruns but fail when quarantine writes alter a cursor, when a checkpoint is stale or lands inside a batch, when a patch follows a replacement or delete, or when decimal strings sort differently from their floating-point approximations. Computing quantiles from insertion order or using a conventional interpolated percentile also produces plausible-looking reports while failing fresh hidden instances.",
+  "tests": [
+   "The verifier invokes the documented CLI on multiple freshly generated databases and checks that final summaries exactly equal an independent reference replay over `raw_events`, covering event-id gaps, reordered SQLite rowids, replacements, patches, deletes, and duplicate logical keys.",
+   "The verifier generates malformed JSON, unknown operations, missing fields, invalid decimal strings, invalid patch targets, and patches without a current record, then checks that these events are absent from state and are represented in quarantine without duplicate quarantine rows.",
+   "The verifier checks that replay follows increasing `event_id` rather than rowid or insertion order and that a patch changes only explicitly supplied fields after prior replacements.",
+   "The verifier checks exact decimal `n`, `mean`, `median`, `q05`, and `q95` strings on generated values with many decimal places, negative values, repeated values, values that are numerically close, and both odd and even group sizes.",
+   "The verifier checks nearest-rank q05 and q95 and exact even-cardinality median behavior against its reference computation.",
+   "The verifier pre-populates summaries and checkpoints with plausible but stale or inconsistent data, runs rebuild, and checks that no stale derived state survives.",
+   "The verifier kills or simulates interruption during several replay batches, resumes with the normal command, and compares the result and quarantine contents with a clean rebuild.",
+   "The verifier runs rebuild twice and checks byte-equivalent logical contents, no duplicate quarantine records, and unchanged unrelated `experiment_notes` rows.",
+   "The verifier generates large journals with thousands of events and rare invalid or history-dependent cases, checking that all expected records are processed rather than a sampled subset."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "12 generated databases, 3,000-25,000 raw events each, with 20-35% invalid or history-dependent events",
+   "effect": "Increasing the number and variety of fresh instances makes memorized fixes and visible-seed overfitting less effective; lowering it makes a solution tailored to the supplied database more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent inspects the obvious aggregation bug but does not run interrupted or stale-checkpoint experiments.",
+   "The agent uses SQLite row order, OFFSET pagination, or a mutable cursor while quarantine writes are occurring.",
+   "The agent treats patches as independent upserts, loses fields during partial updates, or applies patches after a delete.",
+   "The agent rebuilds summaries but leaves old quarantine or checkpoint rows that change later results.",
+   "The agent uses Decimal for the mean but converts to float for sorting, quantiles, or canonical formatting.",
+   "The agent implements interpolated percentiles instead of the specified nearest-rank quantiles.",
+   "The agent clears all tables, accidentally deletes unrelated experiment notes, or makes the command non-idempotent.",
+   "The agent tests only the supplied database and misses rare invalid events positioned between valid events in large generated journals."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "python",
+   "sqlite",
+   "event-replay",
+   "decimal-arithmetic",
+   "checkpoint-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd && find . -maxdepth 2 -type f | sort",
+   "sed -n '1,240p' README*",
+   "sed -n '1,240p' assaypipe/cli.py && grep -R \"rebuild\\|checkpoint\\|quarantine\" -n assaypipe",
+   "sed -n '1,300p' assaypipe/replay.py",
+   "sed -n '1,260p' assaypipe/journal.py",
+   "sed -n '1,240p' assaypipe/checkpoint.py && sed -n '1,220p' assaypipe/quarantine.py",
+   "sed -n '1,260p' assaypipe/summaries.py",
+   "Inspect the SQLite schema and identify raw_events, derived tables, keys, and quarantine uniqueness rules",
+   "Run a clean rebuild on the supplied database and dump logical contents of all relevant tables",
+   "Run rebuild twice and run the interruption simulator, then compare summaries, checkpoints, quarantine, and surviving records",
+   "Refactor replay to read raw_events in numeric event_id order from a stable snapshot rather than a mutable cursor",
+   "Make invalid-event quarantine and replay state updates atomic per batch, with checkpoint advancement in the same transaction",
+   "Reset or validate derived replay state and checkpoints before a rebuild so stale checkpoints cannot omit events",
+   "Copy current records before applying patches; enforce current-record targets, replacement semantics, and delete behavior",
+   "Rewrite summary aggregation to use Decimal throughout, numeric sorting, nearest-rank quantiles, and canonical strings",
+   "Run syntax checks and the package test suite",
+   "Generate focused SQLite cases for reordered rowids, event gaps, invalid rows between valid rows, replacement-plus-patch, delete-plus-patch, and stale checkpoints",
+   "Run clean, repeated, and interrupted rebuilds on those cases and compare logical SQLite contents",
+   "Review the diff for unrelated-table changes and rerun the large supplied journal"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The quarantine category names, logical record key, accepted event shapes, and exact canonical-decimal formatting are delegated to the README; if that documentation is incomplete or inconsistent with the hidden reference, failures would be ambiguous rather than agent errors.",
+   "The requirement for interruption recovery depends on the simulator killing the process at well-defined transaction boundaries; an uncontrolled kill or filesystem-dependent SQLite behavior could make the test flaky.",
+   "A claim of byte-equivalent results would be invalid if interpreted as byte-identical SQLite files, since SQLite page layout and metadata can differ even when logical contents are identical; tests should compare normalized logical rows.",
+   "The expected handling of duplicate quarantine rows must define the deduplication key explicitly, especially across repeated rebuilds and malformed events with identical payloads.",
+   "If hidden generators create event shapes or decimal spellings outside the documented schema, rejecting those inputs would be an invalid failure."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is clear, realistic, and strongly verifiable, but its genuine_difficulty score is only 2 under the stated rubric: the planted defects are directly discoverable in source and the described Opus speedrun reaches a likely solution in about 20 commands. Because acceptance requires every score to be at least 3, this blueprint should be rejected despite its high-quality tests.",
+  "fixes": [
+   "Increase genuine difficulty through less obvious, interacting defects that are not directly labeled by the module structure or scenario, while keeping the reference semantics documented.",
+   "Require investigation of a subtle invariant or performance constraint whose failure appears only across generated histories, rather than making the main fixes predictable from the internal hint.",
+   "Reduce the internal hint's diagnosis of the exact defects if it is exposed to builders or otherwise ensure the implementation cannot be reconstructed from the task description alone.",
+   "Add explicit schema-level definitions for quarantine deduplication identity, checkpoint validity, and canonical decimal formatting to eliminate the listed ambiguity risks."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "variant",
+     "reason": "Both are deterministic event-log replay repairs that validate and order events, apply corrections and deletions, and rebuild derived state idempotently, though the candidate targets record summaries rather than incident workflows."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The candidate reconstructs database state from semantic journal operations and computes exact grouped statistics, whereas this task reconciles filesystem artifacts against an authoritative scanner."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "Although both require idempotence, checkpoints, and exact quantile-related behavior, this task is a streaming metric service with lateness and weighted queries rather than a journal replay and summary rebuild."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938",
+     "verdict": "distinct",
+     "reason": "This task rebuilds summaries from upsert, patch, and delete journal semantics, while the reference imports JSONL deliveries with revision selection, signature validation, endpoint classification, and archival rejection handling."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The reference verifies cryptographic audit chains and emits authoritative events, whereas the candidate performs semantic SQLite journal replay and exact statistical aggregation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9cbb677d2a2f",
+     0.174
+    ],
+    [
+     "ours/official-982469e29790",
+     0.172
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.164
+    ],
+    [
+     "ours/official-1112cdbd9938",
+     0.157
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.143
+    ]
+   ],
+   "cost_usd": 0.0014252
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0034834
+}

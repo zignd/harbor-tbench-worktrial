@@ -1,0 +1,188 @@
+{
+ "blueprint": {
+  "slug": "repair-feature-catalog-publish",
+  "title": "Repair the Feature Catalog Publisher",
+  "scenario": "A data engineer has inherited a Bash-driven deployment pipeline that turns feature-flag event files into the catalog consumed by several services. The container contains roughly 1,300 lines of shell and Python support code, configuration files, thousands of small event files, a compiled canonicalization utility with no source, and a partially populated publication directory; the current deployment appears healthy for its small sample but different consumers disagree after a rebuild.",
+  "instruction_draft": "Make `/opt/featurecat/bin/rebuild.sh` produce a deterministic, idempotent publication from every valid `*.jsonl` and `*.jsonl.gz` file below `/srv/featurecat/incoming`, ignoring malformed records while recording their file and line number in the audit table. For each `(tenant, flag)` retain the record with the greatest integer `revision` (ties go to the lexicographically smallest relative pathname and then lowest line number), apply `delete` records as removals, and publish exactly the same surviving records and rollout decisions in `/srv/featurecat/live/catalog.json`, `/srv/featurecat/live/flags.map`, and `/srv/featurecat/live/catalog.db`; the catalog must include a canonical SHA-256 manifest, counts, rejected-record audit rows, and an atomic `CURRENT` generation pointer, and repeated runs plus verify-time-generated inputs must give the same state.",
+  "requirements": [
+   "The executable entry point must be `/opt/featurecat/bin/rebuild.sh`.",
+   "The rebuild must recursively consume every file below `/srv/featurecat/incoming` whose name ends in `.jsonl` or `.jsonl.gz`.",
+   "Records that are not valid JSON objects with the required fields must be excluded from the catalog and recorded with their relative pathname and one-based line number in the audit table.",
+   "The record identity is the pair `(tenant, flag)`.",
+   "For each identity, the retained record is the one with the greatest integer `revision`; equal revisions are resolved by lexicographically smallest relative pathname and then lowest one-based line number.",
+   "A winning record whose `action` is `delete` removes that identity from the published catalog.",
+   "The generated `catalog.json` must contain exactly the surviving records in deterministic tenant-then-flag order.",
+   "The generated `flags.map` must represent the same surviving identities and values as `catalog.json`, with one deterministic line per identity.",
+   "The generated `catalog.db` must contain the same surviving identities and values as the two file artifacts and must contain audit rows for every rejected record.",
+   "The publication must include a canonical SHA-256 manifest and counts for surviving records and rejected records.",
+   "Publication must use a new generation and an atomic `/srv/featurecat/live/CURRENT` pointer rather than exposing a partially written generation.",
+   "A second rebuild without input changes must not alter the logical contents, manifest, or generation artifacts.",
+   "Verify-time-generated inputs, including compressed files, nested paths, duplicate revisions, deletions, malformed JSON, Unicode strings, large revisions, and records whose rollout percentages fall on bucket boundaries, must be handled by the same rules."
+  ],
+  "environment": [
+   "The Docker image is built from `python:3.13-slim-bookworm`, with pinned Debian packages including bash, coreutils, gzip, sqlite3, jq, and a compiler used only during image construction; no network access is needed at runtime.",
+   "`/opt/featurecat/bin/rebuild.sh` is a Bash orchestrator calling several plausible stages under `/opt/featurecat/lib/`, with substantial unrelated logging, cleanup, retry, and metrics code so the defect is not localized to one short file.",
+   "`/etc/featurecat/reader.conf`, `/etc/featurecat/selector.conf`, `/etc/featurecat/publisher.conf`, and `/etc/featurecat/schema.json` are intended to be the shared configuration, but the shipped stages currently use inconsistent defaults for recursive discovery, relative paths, compression handling, sort locale, and output generation.",
+   "`/opt/featurecat/bin/flagpack` is a stripped compiled executable with no source in the image. It canonicalizes a winning record and computes rollout membership; it accepts a documented command-line protocol but has data-dependent behavior around Unicode normalization, unsigned revisions, and percentage boundary values that is only observable by running it.",
+   "`/srv/featurecat/incoming` contains several thousand event files, including nested paths, gzip members, malformed lines, duplicate identities, delete records, revisions above 2^31, non-ASCII tenant and flag names, and a few rollout percentages deliberately near bucket boundaries.",
+   "`/srv/featurecat/live` contains stale generations, a database with rows from an earlier run, a misleading sample catalog, and a dangling or outdated `CURRENT` pointer.",
+   "The database schema, map format, JSON schema, stage logs, and a small operator README are present in the environment, but no failing reproduction or expected final output is supplied.",
+   "The image includes a deterministic reference fixture generator used only by verification; it can create fresh input trees with the same documented record schema and adversarial cases, without modifying the solver's files."
+  ],
+  "internal_hint": "The intended resolution requires an investigation rather than a source-only patch. First inventory the orchestrator, all configuration consumers, stage logs, schemas, and existing publication generations; run the pipeline and compare the JSON, map, and SQLite projections by identity. Then characterize the opaque flagpack utility with small crafted records and inspect its protocol/output, especially high revisions, Unicode, deletion records, and rollout values at 0, 1, 50, 99, and 100 percent. The shipped failures are distributed across configuration and stage boundaries: one discovery path misses nested compressed inputs, one selector parses revisions with signed arithmetic and uses unstable locale-dependent ordering, the database updater leaves superseded rows after deletes, and the publisher hashes a noncanonical intermediate while emitting a map from a different record ordering. Correctness requires fixing the shared configuration and/or stage implementations so all three projections consume one canonical winning set, preserving audit rows and using a temporary generation plus atomic pointer replacement; the reference solution should demonstrate this by inspecting data and comparing independent projections before editing.",
+  "trap": "A shallow solution that runs successfully on the visible sample or merely changes the glob will miss high-revision records, nested gzip inputs, tie ordering, stale deleted rows, or Unicode and rollout-boundary behavior. Another plausible solution can make `catalog.json` look correct while leaving `flags.map`, SQLite, or the manifest derived from a different ordering or old generation; hidden checks compare all components on freshly generated trees and run the rebuild twice.",
+  "tests": [
+   "The verifier checks that `/opt/featurecat/bin/rebuild.sh` exists, is executable, exits successfully, and consumes all recursive `.jsonl` and `.jsonl.gz` inputs.",
+   "It generates a fresh tree containing valid, malformed, nested, compressed, duplicate, deleted, Unicode, and very-large-revision records, runs the rebuild, and compares surviving `(tenant, flag)` records against an independent reference implementing the stated revision and tie rules.",
+   "It checks that every malformed record has exactly one audit row with the expected relative path and one-based line number, and that valid records do not appear in the rejection audit.",
+   "It independently recomputes rollout decisions, including percentage boundary cases, and checks that catalog JSON, map lines, and SQLite rows agree.",
+   "It checks deterministic tenant-then-flag ordering, canonical JSON/manifest content, surviving and rejected counts, and the reported SHA-256 digest.",
+   "It checks that delete winners remove identities from all three artifacts while preserving their audit or historical metadata where required by the documented schema.",
+   "It checks SQLite contents and uniqueness constraints against the file artifacts, including absence of stale rows from the preexisting database.",
+   "It runs two rebuilds without changing inputs and verifies identical logical state, manifest, and generation contents.",
+   "It checks that `CURRENT` resolves to a complete generation and that no partially written artifact is visible during a rebuild using a filesystem observation harness.",
+   "It repeats the state checks against multiple hidden seeds containing different path orderings, compressed-file mixes, ties, Unicode normalization forms, and rollout percentages."
+  ],
+  "verifier_knob": {
+   "name": "independent_catalog_state_properties",
+   "value": "10",
+   "effect": "Raising the value adds more independently checked properties and adversarial generated cases across discovery, winner selection, canonicalization, rollout decisions, audit rows, SQLite consistency, manifest hashing, idempotence, and atomic publication; lowering it to only compare catalog.json makes shallow fixes much more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent inspects only the visible sample and never constructs a case that exercises compressed nested inputs, tie-breaking, or large revisions.",
+   "The agent fixes one configuration file while another stage silently overrides the same setting.",
+   "The agent replaces the opaque utility with an approximate hash or rollout implementation that differs at Unicode or percentage boundaries.",
+   "The agent produces a correct JSON catalog but fails to rebuild stale SQLite rows or emits a map from a different record set.",
+   "The agent uses shell globbing, locale-sensitive sort, or signed integer parsing that works on ordinary records but fails on hidden data.",
+   "The agent writes directly into the live generation, leaving a stale or partially populated CURRENT target.",
+   "The agent records malformed lines but loses relative paths after changing working directories.",
+   "The agent validates only a single run and misses nondeterminism caused by filesystem traversal order or unstable tie resolution.",
+   "The agent rewrites too much of the pipeline without preserving the documented database schema and operator-facing artifact formats."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "bash",
+   "configuration",
+   "data-pipeline",
+   "cross-component-consistency",
+   "opaque-binary",
+   "state-reconciliation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the filesystem, entry point, and incoming/live trees with `find`, `ls`, and `stat`.",
+   "Read `rebuild.sh` and every stage under `/opt/featurecat/lib/`.",
+   "Read all configuration files, schema, database schema, map format, and operator README.",
+   "Inspect stage logs, existing generations, `CURRENT`, and current SQLite contents.",
+   "Run the existing rebuild once and compare catalog JSON, map, and SQLite rows by identity.",
+   "Inspect `flagpack --help` or its documented protocol and capture sample output.",
+   "Create a small temporary fixture covering high revisions, Unicode, deletes, and rollout percentages 0, 1, 50, 99, and 100.",
+   "Run `flagpack` on those records and record canonicalization and rollout behavior.",
+   "Trace every configuration key and determine which stages override discovery, sorting, compression, and output settings.",
+   "Implement or repair one canonical reader that recursively enumerates `.jsonl` and `.jsonl.gz` files using stable relative paths.",
+   "Parse lines with one-based locations, validate against the schema, and emit rejected-record audit entries.",
+   "Select winners using arbitrary-precision integer revisions, deterministic pathname and line-number tie breaks, and delete handling.",
+   "Feed winning records through the observed `flagpack` protocol for canonical values and rollout decisions.",
+   "Generate all three projections from the same in-memory winning set and audit set.",
+   "Rebuild SQLite from the canonical set so superseded and deleted rows cannot remain stale.",
+   "Emit deterministic tenant-then-flag JSON and map output using the documented formats.",
+   "Compute counts and the documented canonical SHA-256 manifest from finalized artifacts.",
+   "Write a complete temporary generation, validate it, and atomically replace `CURRENT`.",
+   "Make repeated identical inputs reuse or deterministically reproduce the same logical generation contents.",
+   "Update the Bash entry point and shared configuration so all stages invoke the canonical implementation consistently.",
+   "Generate a fresh adversarial fixture and run the repaired rebuild.",
+   "Independently compare JSON, map, and SQLite identities, values, rollout decisions, audit rows, counts, and manifest.",
+   "Run the rebuild twice and compare all generation files, database contents, and manifest values.",
+   "Use the filesystem observation harness during a rebuild to verify `CURRENT` never resolves to an incomplete generation.",
+   "Run additional fixtures with reordered paths, compressed mixes, Unicode normalization forms, ties, and boundary percentages.",
+   "Clean up temporary fixtures and verify the executable entry point and final live pointer."
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact canonical JSON, flags.map line format, manifest input, audit schema, and delete-history semantics are delegated to environment documentation; if those documents are incomplete or inconsistent, failures are ambiguous.",
+   "The required rollout behavior is not stated directly and depends on reverse-engineering the opaque utility; a mismatch between the utility's actual behavior and the verifier's independent reference would make a correct integration fail.",
+   "The requirement for a new generation conflicts somewhat with the requirement that a second unchanged rebuild not alter generation artifacts unless generation reuse or identity semantics are explicitly defined.",
+   "A filesystem observation test for atomic publication can be timing-sensitive unless it checks only pointer resolution and generation completeness rather than relying on catching a narrow write window.",
+   "The definition of a malformed record and the required-field types should be identical in the schema, implementation, and verifier; otherwise valid edge cases could be rejected inconsistently."
+  ],
+  "verdict": "accept",
+  "reasons": "The task is realistic and strongly verifiable because it requires independent cross-artifact checks, fresh adversarial inputs, idempotence, and atomic publication. It is genuinely difficult due to distributed configuration defects, opaque utility behavior, stale state reconciliation, and deterministic multi-format publication, although the exact artifact and rollout contracts need tighter specification to keep failures valid.",
+  "fixes": [
+   "State explicitly that the schema, README, and verifier use one authoritative definition of valid fields and types, including integer revision bounds and action values.",
+   "Define the canonical JSON serialization, map line grammar, manifest contents and ordering, count fields, and SQLite tables/columns directly in the task contract or require the referenced files to be authoritative.",
+   "Document the exact `flagpack` invocation and which outputs must be preserved, while retaining hidden tests for integration rather than requiring behavioral guesswork.",
+   "Clarify whether unchanged rebuilds reuse the existing generation or create a new generation with byte-identical contents, and define the expected `CURRENT` behavior.",
+   "Specify that atomicity is judged by observing `CURRENT` resolve only to complete immutable generations, avoiding timing-dependent assumptions about individual file writes."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "This task rebuilds a feature catalog from standalone JSONL records, whereas the reference recovers transactional state from segments and serves a persistent replay protocol."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This task has no transaction, shard, checksum, or protocol-level replay semantics and instead resolves feature revisions into catalog artifacts."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938",
+     "verdict": "variant",
+     "reason": "Both are deterministic, idempotent JSONL rebuilds that validate records, resolve identities by revision, record rejects, and atomically publish SQLite-backed results, despite different schemas and feature-specific rollout and deletion behavior."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "distinct",
+     "reason": "Although both recursively process JSONL and require deterministic deduplication, this task publishes a revisioned feature catalog while the reference derives session and event analytics under different validity and grouping rules."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "This task is an offline catalog rebuild and publication pipeline, not a stateful TCP HMAC service for canonical binary WAL records."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.26
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.153
+    ],
+    [
+     "ours/official-1112cdbd9938",
+     0.15
+    ],
+    [
+     "ours/official-37d13d3e2124",
+     0.133
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.123
+    ]
+   ],
+   "cost_usd": 0.0014402
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0041458
+}

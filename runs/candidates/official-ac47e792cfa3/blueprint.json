@@ -1,0 +1,74 @@
+{
+ "slug": "repair-fill-quality-rollups",
+ "title": "Repair and speed up fill-quality rollups",
+ "scenario": "The execution-quality team is adding venue-rebate and late-correction support to a small finance-ops pipeline that reconciles broker fill records with our internal order history. The container contains an existing Python orchestrator, a SQLite state store, sample inbox files, and an opaque compiled `fillscan` helper used to process large append-only batches. It currently produces plausible daily VWAP and slippage reports, but recovery after a damaged batch and a few high-volume correction patterns leave the stored state and published report inconsistent.",
+ "instruction_draft": "Can you get `/opt/fillqa/bin/reconcile` into shape for the next broker drop? It must read every valid record from `/opt/fillqa/inbox`, recover from truncated or malformed batch chunks without losing later records, and apply fills, corrections, cancels, and venue rebates in event-sequence order to produce exact integer-microunit results in `/opt/fillqa/state.db` and the matching `/opt/fillqa/report.json`. Please keep reruns and resumed runs idempotent, leave a verified checkpoint at `/opt/fillqa/checkpoint.json`, enable the new rebate feature in `/opt/fillqa/config.toml`, and make the generated `metrics.json` show at least 25,000 input records per second on the supplied corpus; the same behavior must work for fresh inboxes placed there by the checker.",
+ "requirements": [
+  "The executable `/opt/fillqa/bin/reconcile` must read all valid records under `/opt/fillqa/inbox`.",
+  "The pipeline must recover from truncated or malformed batch chunks and continue processing later records without losing valid records.",
+  "Fills, corrections, cancels, and venue rebates must be applied in event-sequence order.",
+  "The resulting calculations must use exact integer microunit arithmetic rather than floating-point rounding.",
+  "The final SQLite state must be written to `/opt/fillqa/state.db`.",
+  "The published result must be written to `/opt/fillqa/report.json` and match the SQLite state.",
+  "Rerunning the pipeline on the same inbox must be idempotent.",
+  "A resumed run after interruption must be equivalent to a clean run.",
+  "A verified recovery checkpoint must exist at `/opt/fillqa/checkpoint.json`.",
+  "The rebate feature must be enabled in `/opt/fillqa/config.toml`.",
+  "The pipeline must write `/opt/fillqa/metrics.json`.",
+  "The metrics must report at least 25,000 input records per second on the supplied corpus.",
+  "The implementation must also handle fresh checker-generated inboxes with the documented record format and event rules."
+ ],
+ "environment": [
+  "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt and pip dependencies, one CPU, and 2 GB RAM, with no network required at task time.",
+  "The image contains roughly 1,500 lines of Python, SQL, and configuration spread over `/opt/fillqa/app`, `/opt/fillqa/tests_support`, and `/opt/fillqa/config.toml`; much of it is unrelated reporting and CLI code.",
+  "The main entry point is `/opt/fillqa/bin/reconcile`, which invokes an opaque ELF helper `/opt/fillqa/bin/fillscan` for streaming batch decoding and checkpoint framing.",
+  "`fillscan` is compiled during the Docker build from a temporary C build context and its source is removed from the final image; no source or debug symbols for the helper are available to the solver.",
+  "The inbox contains several large newline-delimited batch files with fills, corrections, cancels, venue rebates, sequence numbers, order IDs, fill IDs, prices, quantities, and deliberately damaged chunk boundaries.",
+  "The repository includes a short format and business-rule document, a small visible sample, an initial SQLite database, and a benchmark corpus, but no failing reproduction.",
+  "The planted failures are data-dependent: a decoder recovery marker can collide with a legitimate frame after a malformed chunk, a long-running sequence counter crosses a binary boundary, and the orchestrator commits a checkpoint before atomically publishing the corresponding aggregate update.",
+  "The feature branch has partial rebate support and a slow per-record SQLite update path; unrelated modules include a report formatter, audit logger, and CLI argument handling.",
+  "The checker can replace the inbox with deterministic hidden corpora containing different orderings, duplicate deliveries, multiple corrections, sequence gaps, malformed chunks, counter-boundary values, and zero-net-quantity orders."
+ ],
+ "internal_hint": "The reference shell script first runs the unmodified command on the visible corpus twice, compares the database, report, and checkpoint, and uses a small deterministic generator plus strace/timing to isolate decoder output around malformed chunks and the sequence-counter boundary. It then probes `fillscan` with records whose payloads differ only in frame length, recovery position, and high sequence bits; this exposes that the helper's recovery scan accepts an unvalidated marker and truncates a 64-bit sequence to 32 bits. The orchestrator separately reveals a commit-before-publish ordering bug by killing it between the checkpoint write and aggregate transaction. The repair is to validate frame length and record checksum while resynchronizing, preserve the full sequence as a decimal/string-safe integer, define a deterministic event key `(account, order_id, sequence, record_index)`, materialize a durable staging table before applying events, and make checkpoint plus aggregate publication transactional. Rebate amounts belong in the same signed microunit numerator as execution value, while VWAP is `sum(price_microunits * quantity) / sum(quantity)` with a documented integer round-half-away-from-zero policy; canceled or corrected quantity is removed by fill ID, and duplicate event IDs are ignored. A batched SQLite transaction and temporary aggregate tables provide the required throughput. The script verifies clean, repeated, interrupted, malformed, counter-boundary, and generated cases before installing the fix.",
+ "trap": "A shallow solution can patch the visible malformed sample, recompute the report from the database, and appear correct on a clean rerun. Hidden inputs place a valid frame whose bytes resemble the recovery marker, use sequence values above 2^32, deliver a correction after a duplicate, and interrupt immediately after checkpoint creation; such a solution either silently drops records, applies events out of order, double-counts rebates, or leaves a checkpoint that claims progress not represented in SQLite. Floating-point VWAP or a per-row UPDATE implementation also passes the sample but fails exact hidden rows or the throughput check.",
+ "tests": [
+  "A clean-run state check compares every expected row in `/opt/fillqa/state.db`, including order identity, net quantity, signed rebate, execution value, integer VWAP, slippage, event count, and last sequence, against a deterministic reference over the supplied corpus.",
+  "A report consistency check parses `/opt/fillqa/report.json` and verifies that its rows, totals, microunit rounding, and aggregate hashes exactly match the SQLite state.",
+  "A recovery test inserts malformed and truncated chunks before valid later frames and checks that all valid later events are present and that the recovered checkpoint identifies the correct last accepted event.",
+  "A decoder-boundary test includes legitimate payload bytes equal to the recovery marker and sequence values crossing the helper's former 32-bit boundary, then checks exact event ordering and totals.",
+  "A feature test generates fills followed by multiple corrections, cancels, duplicate deliveries, and venue rebates, including zero-net-quantity orders, and checks signed microunit arithmetic and event-sequence semantics.",
+  "An interruption test deterministically kills the process at several commit boundaries, resumes from `/opt/fillqa/checkpoint.json`, and compares the final state with a fresh clean run.",
+  "An idempotence test runs the command twice on the same inbox and requires byte-equivalent report, checkpoint, metrics, and equivalent SQLite contents with no duplicate staging or audit rows.",
+  "A cross-component check requires `/opt/fillqa/config.toml` to enable rebates, the database feature metadata to agree with that setting, and the report metadata to contain the same configuration hash.",
+  "A performance check runs the supplied corpus on the one-CPU container and requires `metrics.json` to report at least 25,000 processed input records per second while retaining all required output rows.",
+  "A verify-time generator creates fresh inboxes with hidden seeds, varying file order, batch sizes, malformed-frame locations, duplicate events, corrections, rebates, large sequence values, and exact tie-rounding cases; it compares database rows, report, checkpoint, idempotence, and recovery behavior to the reference."
+ ],
+ "verifier_knob": {
+  "name": "hidden_event_and_recovery_cases",
+  "value": "8 generated corpora, each containing 40,000-120,000 records and 3-7 adversarial recovery or ordering cases",
+  "effect": "Lowering it makes visible examples and basic state comparison dominate, so a local patch can pass. Raising it adds more independent malformed-frame positions, sequence-boundary values, interruptions, duplicate/correction histories, and cross-artifact metadata checks, making partial fixes and assumptions about the opaque decoder fail."
+ },
+ "expected_failure_modes": [
+  "The solver reads the Python code and patches only the obvious rebate calculation without probing the compiled decoder.",
+  "The solver treats a malformed chunk as end-of-file and loses valid records in later frames.",
+  "The solver stores sequence numbers in a signed 32-bit SQLite or Python-adapter path and misorders high-sequence events.",
+  "The solver applies corrections by order ID instead of fill ID, or processes input-file order rather than the documented event sequence.",
+  "The solver uses floating-point arithmetic and gets rare half-unit rounding cases wrong.",
+  "The solver writes a checkpoint independently of the SQLite transaction, leaving resumptions different from clean runs.",
+  "The solver recomputes a correct report from a corrupted database, satisfying a superficial report check but failing state and recovery checks.",
+  "The solver optimizes by dropping audit or staging rows and fails hidden idempotence and cross-component checks.",
+  "The solver makes a correct but per-record SQLite implementation that misses the stated throughput bar.",
+  "The solver tests only the supplied corpus and never discovers the marker collision or counter-boundary behavior."
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "data-processing",
+  "opaque-binary",
+  "checkpoint-recovery",
+  "exact-arithmetic",
+  "sqlite",
+  "finance-ops"
+ ]
+}

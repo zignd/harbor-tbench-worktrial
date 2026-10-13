@@ -1,0 +1,7 @@
+Repair the service in /opt/replay so that /opt/replay/bin/replayd starts with the documented command line and communicates only through the newline-delimited JSON protocol in /opt/replay/PROTOCOL.md. Do not change that protocol.
+
+Recovery must reconstruct authoritative state from every file in /var/lib/replay/segments and the SQLite catalog. Apply only valid committed records in deterministic total order, tolerate empty files and truncated final frames, and stop safely at malformed frames. Preserve deletes, later recreation, supersession, explicit empty values, Unicode, separator-containing keys, multiple tenants, duplicate local sequence numbers, and records or frames of any size. Aborted and incomplete transactions must have no observable effect.
+
+Point reads, prefix listings, tenant statistics, the SQLite catalog, manifest/checksum responses, and audit responses must describe one identical recovered state. Listings and audit records must be deterministic. Tombstones remain in audit history while removing live objects, and absent keys must remain distinct from empty values. Repeating recovery over unchanged files must not duplicate events or change responses, catalog rows, generations, watermarks, or checksums. State must remain unchanged across restart.
+
+PUT and DELETE requests must atomically update the persistent catalog and event history and remain correct after restart. Implement recover, get, list, put, delete, stats, manifest, and audit, including documented error responses. Do not write logs to stdout.

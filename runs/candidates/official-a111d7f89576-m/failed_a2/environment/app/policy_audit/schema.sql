@@ -1,0 +1,10 @@
+PRAGMA foreign_keys=OFF;
+CREATE TABLE IF NOT EXISTS tenants (tenant_id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS policies (policy_id INTEGER PRIMARY KEY, tenant_id INTEGER NOT NULL, resource_prefix TEXT NOT NULL, action TEXT NOT NULL, effect TEXT NOT NULL, priority INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS policy_revisions (revision_id INTEGER PRIMARY KEY, policy_id INTEGER NOT NULL, revision_timestamp INTEGER NOT NULL, revision_sequence INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS policy_bindings (binding_id INTEGER PRIMARY KEY, revision_id INTEGER NOT NULL, valid_from INTEGER NOT NULL, valid_until INTEGER);
+CREATE TABLE IF NOT EXISTS access_requests (request_row_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, ingestion_sequence INTEGER NOT NULL, tenant_id INTEGER NOT NULL, resource TEXT NOT NULL, action TEXT NOT NULL, requested_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS access_requests_order ON access_requests(ingestion_sequence, request_row_id);
+CREATE INDEX IF NOT EXISTS policy_match ON policies(tenant_id, action, resource_prefix);
+CREATE INDEX IF NOT EXISTS revision_policy ON policy_revisions(policy_id, revision_timestamp, revision_sequence);
+CREATE INDEX IF NOT EXISTS binding_revision_validity ON policy_bindings(revision_id, valid_from, valid_until);

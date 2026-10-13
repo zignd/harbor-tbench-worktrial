@@ -1,0 +1,177 @@
+{
+ "blueprint": {
+  "slug": "atlas-pipeline-consistency",
+  "title": "Repair Atlas Pipeline Configuration",
+  "scenario": "A data engineer has inherited Atlas, a bash-orchestrated event materialization pipeline that converts newline-delimited event files into partitioned published data and a SQLite catalog. The container includes several cooperating command-line components, configuration files, sample data, and an existing but silently inconsistent deployment; some components are opaque executables, so the failure must be diagnosed by running the pipeline against realistic data.",
+  "instruction_draft": "Configure Atlas so `bash /opt/atlas/bin/run_pipeline.sh --input /workspace/incoming --state /workspace/state --output /workspace/published` produces a deterministic, canonical result for every valid NDJSON event: preserve each logical event exactly once, normalize its schema and timestamp, partition it by UTC business date and region, and write the matching SQLite catalog and manifest. Invalid events must be quarantined with their original bytes and reason, and the same configuration must continue to satisfy these properties for newly generated inputs containing duplicates, shuffled files, offset timestamps, null optional fields, Unicode, and boundary dates.",
+  "requirements": [
+   "The pipeline must be runnable with `bash /opt/atlas/bin/run_pipeline.sh --input /workspace/incoming --state /workspace/state --output /workspace/published`.",
+   "Every valid input event must appear exactly once in the published NDJSON data, independent of input file order and repeated delivery.",
+   "Published records must use the canonical fields `event_id`, `event_type`, `occurred_at`, `business_date`, `region`, `amount_cents`, and `attributes`, with the documented types and canonical JSON representation.",
+   "Timestamp offsets must be interpreted correctly and `business_date` must be derived from the instant in UTC, including events on UTC date boundaries.",
+   "Published data must be partitioned under `date=YYYY-MM-DD/region=<region>/` using the canonical region value.",
+   "The SQLite catalog at `/workspace/state/catalog.sqlite` must contain one row per published logical event and must agree with the published record's event ID, business date, region, byte count, and content digest.",
+   "The manifest at `/workspace/published/manifest.json` must enumerate exactly the published partitions and totals, with deterministic ordering and digests matching the files.",
+   "Invalid events must not be published or cataloged; they must be written with their original bytes and a deterministic validation reason under `/workspace/state/quarantine/`.",
+   "The result must be deterministic for shuffled input files, duplicate deliveries, null optional fields, Unicode values, and newly generated verify-time datasets."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, installs pinned SQLite and shell utilities, and contains no network-dependent runtime behavior.",
+   "The deployment occupies approximately 1,300 lines across bash orchestration, Python helper programs, SQL schema/migration files, configuration loaders, logging, and test fixtures.",
+   "`/opt/atlas/bin/run_pipeline.sh` invokes four stages: discovery, normalization, materialization, and catalog publication; it reads configuration rather than embedding the deployment contract.",
+   "`/opt/atlas/bin/atlas-normalize` is a compiled opaque executable with `--help` and structured diagnostics but no source in the container; it handles timestamp parsing, alias resolution, type coercion, validation, and event identity.",
+   "`/opt/atlas/bin/atlas-partition` and `/opt/atlas/bin/atlas-catalog` are separate opaque command-line components whose behavior is controlled by configuration files and whose outputs feed later stages.",
+   "Configuration is distributed across `/etc/atlas/pipeline.env`, `/etc/atlas/normalize.toml`, `/etc/atlas/partition.toml`, `/etc/atlas/catalog.toml`, and `/etc/atlas/schema.json`; the files contain plausible defaults that disagree on timezone, deduplication identity, region normalization, shard naming, and optional-field handling.",
+   "`/opt/atlas/CONTRACT.md`, component `--help` output, logs, and the supplied fixtures document the intended canonical schema and file formats without identifying the planted inconsistency.",
+   "`/workspace/incoming` contains several NDJSON files totaling roughly 1,500 events, including repeated deliveries, records split across files, offset timestamps near midnight, aliases for canonical fields, malformed records, Unicode attributes, and a small number of duplicate-looking events with distinct logical identities.",
+   "The initial `/workspace/state` and `/workspace/published` directories contain stale outputs from a previous run, so a correct deployment must establish its own consistent final state rather than relying on those artifacts.",
+   "The verifier replaces the input directory with deterministic fresh datasets generated from hidden seeds and invokes the documented command from a clean output/state directory."
+  ],
+  "internal_hint": "Investigate the contract, configuration loaders, help text, and stage logs, then run the unmodified pipeline on the supplied data while comparing normalized records, partition files, manifest entries, and catalog rows. The planted failures are cross-component configuration mismatches: the normalizer and catalog use different event identity fields, one stage interprets offset timestamps in local time instead of UTC, region aliases are normalized only after partition selection, and the manifest/catalog disagree about shard naming and digest scope; a separate null-handling setting causes valid optional fields to be rejected. Correct the shared configuration and any required cleanup/initialization settings, then rerun from empty state and test reordered and repeated inputs. The reference solution is a deterministic shell script that inspects diagnostics and state after each stage, identifies these mismatches through targeted generated fixtures, edits the configuration, and verifies catalog-to-file and manifest-to-file consistency.",
+  "trap": "A shallow solution can make the visible sample look correct by selecting the apparent timezone and schema defaults, but hidden data places events across UTC midnight, uses an alias whose region changes after normalization, and repeats the same event with a different ingestion timestamp. Solutions that deduplicate on the wrong field, count pre-normalized records, trust stale catalog rows, or only compare totals will fail exact hidden state checks; independently rerunning the pipeline can also expose nondeterministic partition ordering or digest mismatches.",
+  "tests": [
+   "Run the pipeline on the supplied fixture and verify that every valid logical event appears exactly once in published NDJSON, while malformed events appear only in quarantine with original bytes and stable reasons.",
+   "Generate fresh seeded NDJSON inputs with shuffled file order and duplicate deliveries, then verify the exact canonical record set, including deduplication by the documented logical identity rather than ingestion metadata.",
+   "Generate records with positive and negative timestamp offsets around UTC midnight and verify the exact `business_date` and `date=YYYY-MM-DD` partition.",
+   "Generate region aliases, Unicode attributes, null optional fields, and amount representations, then verify canonical field names, types, JSON serialization, and region partition paths.",
+   "Inspect `/workspace/state/catalog.sqlite` and verify one exact catalog row per published logical event, including event ID, UTC business date, region, byte count, and content digest.",
+   "Recompute every published file digest and verify that `manifest.json` has the exact partition list, deterministic ordering, record totals, byte totals, and matching digests.",
+   "Run twice with equivalent input content in different file and record orders and verify byte-for-byte identical published files, manifest, quarantine contents, and SQLite logical state.",
+   "Verify that no invalid record is present in published files or the catalog and that quarantine filenames and reasons are deterministic for the same input."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "8",
+   "effect": "Raising this adds independently checked catalog columns, partition/digest relationships, malformed-record classes, and deterministic ordering cases, making partial fixes less likely to pass; lowering it to 3 or 4 permits solutions that only produce plausible published records while leaving cross-component state inconsistent."
+  },
+  "expected_failure_modes": [
+   "The agent reads configuration but does not run enough targeted data experiments to discover the offset-timestamp and alias-order interactions.",
+   "The agent fixes the normalizer but misses the catalog's separate identity or digest configuration.",
+   "The agent validates record counts without checking exact catalog rows, partition paths, quarantine bytes, or manifest digests.",
+   "The agent deduplicates on an ingestion timestamp or whole raw line, causing repeated logical events to survive hidden tests.",
+   "The agent makes output correct for the visible fixture but leaves nondeterministic ordering or stale-state behavior that fails repeated clean runs.",
+   "The agent treats null optional fields as invalid or changes their representation inconsistently between published files and SQLite.",
+   "The agent assumes local timezone behavior is harmless because the visible data lacks a UTC boundary case.",
+   "The agent edits generated output artifacts instead of repairing the configuration, so verify-time generated inputs fail."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "devops-configuration",
+  "tags": [
+   "bash",
+   "data-pipeline",
+   "configuration",
+   "sqlite",
+   "determinism",
+   "state-consistency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. List the deployment, workspace, and existing state files.",
+   "2. Read `/opt/atlas/CONTRACT.md` and the supplied fixture documentation.",
+   "3. Run `atlas-normalize --help` and capture its diagnostics/schema options.",
+   "4. Run `atlas-partition --help` and capture partition and digest semantics.",
+   "5. Run `atlas-catalog --help` and capture identity, byte-count, and digest semantics.",
+   "6. Read all five configuration files and the schema definition.",
+   "7. Inspect stage logs, loaders, and SQL schema for effective configuration values.",
+   "8. Run the unmodified pipeline on the supplied input.",
+   "9. Inspect normalization diagnostics, published files, quarantine, and manifest.",
+   "10. Query the catalog schema and representative rows with SQLite.",
+   "11. Compare normalized records, partition paths, manifest entries, and catalog rows against the contract.",
+   "12. Create a small targeted fixture covering duplicate identity, UTC-midnight offsets, region aliases, null optionals, and Unicode.",
+   "13. Run the pipeline on that fixture and inspect each stage\u2019s output.",
+   "14. Identify mismatched identity, timezone, alias-order, null-handling, shard, and digest settings.",
+   "15. Edit the environment, TOML, and schema configuration atomically to use the documented canonical values.",
+   "16. Restore the supplied input and clear state, published output, logs, and quarantine as required by the contract.",
+   "17. Rerun the pipeline from empty state.",
+   "18. Validate canonical records, quarantine bytes/reasons, partition paths, and deterministic ordering.",
+   "19. Recompute file digests and totals and compare them with the manifest and catalog using SQLite and a short script.",
+   "20. Repeat with shuffled files and duplicate deliveries, then compare published output, manifest, quarantine, and logical catalog state byte-for-byte or semantically as specified."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact canonical JSON key ordering, newline convention, digest scope, and SQLite byte-count definition must be explicit in CONTRACT.md; otherwise exact manifest and catalog checks could reject valid implementations.",
+   "The definition of logical event identity and the precedence rules for aliases, duplicate deliveries, and repeated events with different ingestion metadata must be machine-readable and unambiguous.",
+   "If quarantine filenames are derived from content, the contract must define collision handling for identical invalid bytes and deterministic ordering of multiple invalid records.",
+   "The verifier should compare SQLite logical state rather than raw database-file bytes unless SQLite serialization, insertion order, and vacuum behavior are fully controlled.",
+   "The build description should ensure pinned packages and any required fixture-generation tools are available during image construction, rather than relying on network access at runtime."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic, cross-component, and largely deterministic, but a strong agent can likely solve it in about 20 commands by reading the contract, help text, configurations, and stage diagnostics, so genuine difficulty is at most 2 under the stated rubric. Several exact-output requirements also depend on documentation that is only referenced rather than summarized, creating avoidable ambiguity around identity, serialization, and digest scope. Because genuine_difficulty is below 3, the acceptance rule requires rejection.",
+  "fixes": [
+   "Make the canonical identity, alias precedence, JSON serialization, byte-count encoding, digest scope, shard naming, and quarantine collision rules explicit in a machine-readable contract and test fixture.",
+   "Add a required targeted hidden interaction that cannot be inferred solely from static configuration or help text, while retaining a clear diagnostic path for discovering it.",
+   "Specify whether clean-state initialization must be implemented by configuration, the runner, or the solver\u2019s one-time setup, and define the exact permitted modification surface.",
+   "Ensure tests compare semantic SQLite contents and normalized file bytes rather than incidental SQLite database-file layout.",
+   "Add a verifier case for identical invalid records and multiple invalid records with the same validation reason to establish deterministic quarantine naming and ordering."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "This task repairs a canonical event normalization, partitioning, catalog, manifest, and quarantine pipeline, rather than computing aggregate revenue and distinct-user summaries in SQLite."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both require deterministic event processing and catalog materialization, this task concerns NDJSON-to-partitioned-data ETL with validation and deduplication, not incident replay with actor resolution, dependencies, and policy-aware state reconstruction."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "This task produces published partitioned event files and a validation catalog, whereas the reference restores a persistent replay service from segments with transactional CRUD, recovery, and protocol behavior."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "The candidate is an offline file-based ETL configuration problem, not a network relay deployment requiring framed TCP ingestion, HTTP serving, throughput, and restart-safe service management."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The candidate materializes normalized partitioned events from NDJSON, while the reference restores an HTTP campaign-funnel service with sessionization, attribution, refunds, and reporting semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-93f5bab9f568",
+     0.196
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.174
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.164
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.139
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.137
+    ]
+   ],
+   "cost_usd": 0.0009292
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0039844
+}

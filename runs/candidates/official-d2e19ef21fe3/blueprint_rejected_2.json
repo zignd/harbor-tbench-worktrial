@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "repair-trajectory-replay",
+  "title": "Repair Trajectory Replay",
+  "scenario": "A research scientist is reproducing a longitudinal experiment whose analysis results are produced by a small Python package backed by SQLite. The package imports fragmented instrument journal rows, recovers each subject's latest usable state from checkpoints and corrections, and emits the summarized trajectories used in the published figures; a recent refactor has made results drift on some archived runs.",
+  "instruction_draft": "Make the trajectory replay tool produce the deterministic result specified by the database contract. Run it as `python -m trajectory.cli replay --db PATH --out PATH`; it must process every stream independently, recover valid checkpoint state, replay valid corrections in journal order, tolerate malformed or duplicated input, and never discard a valid later correction merely because an earlier row is bad.\n\nThe output must be canonical UTF-8 JSON with one object per stream, streams sorted by `stream_id`, and each stream's state keys sorted lexicographically. For every generated database, preserve the exact integer and string values defined by the journal, apply each event at most once, use the greatest valid checkpoint followed by later valid corrections, and report the recovered state plus count, sum, minimum, maximum, and arithmetic mean of its numeric values; an empty state has count 0, sum 0, and null minimum, maximum, and mean.",
+  "requirements": [
+   "The command `python -m trajectory.cli replay --db PATH --out PATH` must succeed for the supplied and generated SQLite databases.",
+   "Every stream must be processed independently, including streams with malformed, duplicated, out-of-order, or missing journal rows.",
+   "Only rows whose recorded checksum matches the database checksum contract may affect recovered state.",
+   "The greatest valid checkpoint for a stream must be selected, and valid corrections after that checkpoint must be replayed in journal order.",
+   "A bad row, a duplicate event, or a missing offset must not prevent later valid corrections from being applied.",
+   "Each event must affect state at most once, including when the same event is encountered through duplicate rows or retry records.",
+   "State operations must preserve the documented integer and string values exactly: set replaces a key, add changes an integer value, and remove deletes a key.",
+   "The output must be canonical UTF-8 JSON containing one object per stream, with streams sorted by `stream_id` and state keys sorted lexicographically.",
+   "Each stream result must include the recovered state and count, sum, minimum, maximum, and arithmetic mean of its numeric values.",
+   "For an empty recovered state, count and sum must be 0 and minimum, maximum, and mean must be JSON null.",
+   "The implementation must handle the full generated scale without sampling rows or relying on a fixed set of stream IDs."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm` with pinned standard-library-only runtime dependencies and SQLite available through Python.",
+   "The repository contains roughly 1,400 lines of Python across `trajectory/cli.py`, `trajectory/importer.py`, `trajectory/replay.py`, `trajectory/aggregate.py`, `trajectory/storage.py`, and unrelated reporting and plotting helpers.",
+   "The normal input database contains `journal_rows`, `payload_parts`, and `run_metadata` tables. Journal payloads are UTF-8 JSON assembled from ordered payload fragments; rows contain stream ID, journal offset, event ID, kind, fragment metadata, and CRC32.",
+   "A checkpoint payload contains a complete key/value state and its covered offset. A correction payload contains ordered `set`, `add`, and `remove` operations over string keys; `add` is valid only for integer values.",
+   "The checksum is CRC32 over the canonical UTF-8 bytes of `stream_id + '\\0' + offset + '\\0' + event_id + '\\0' + kind + '\\0' + assembled_payload`, represented as an unsigned decimal integer.",
+   "The fixture includes a small visible database and a large archive with thousands of rows across hundreds of streams, including duplicate retries, corrupt fragments, invalid JSON, checksum failures, offset gaps, duplicate offsets, late-arriving rows, empty states, and interleaved streams.",
+   "The planted regression spans importer, replay, and aggregation: fragment assembly can reuse a mutable buffer across rows, replay uses an unstable SQL ordering and an incorrect checkpoint candidate, and aggregation mutates a shared recovered-state object during batching.",
+   "The repository includes a README describing the schema and command interface, but does not include the hidden generator or reference implementation."
+  ],
+  "internal_hint": "First run the CLI against the visible database, inspect its JSON and SQLite row counts, then generate targeted miniature databases to isolate fragment corruption, duplicate event IDs, equal-offset events, and multiple checkpoints. Trace a stream through importer, replay, and aggregation rather than fixing only the final SQL query. The intended repair is to assemble fragments independently and reject incomplete or malformed payloads, validate the CRC against the exact canonical byte sequence, deduplicate by event ID while retaining deterministic `(offset, event_id)` order, choose the highest-offset valid checkpoint with deterministic tie handling, replay only later valid corrections, and snapshot state before each aggregate batch so no stream shares mutable state. Finally compare the command output against an independently written Python reference on many seeded databases and verify that output ordering and null handling are stable.",
+  "trap": "A shallow fix that sorts rows by offset or chooses the newest database row passes the visible example but fails when a corrupt high-offset checkpoint, a retry with an earlier receipt time, equal offsets, or a fragmented payload occurs. Another plausible implementation deduplicates by offset rather than event ID, treats a bad row as a stream terminator, or computes aggregates while mutating the replay dictionary; these errors appear only after long histories and especially when batches contain interleaved streams.",
+  "tests": [
+   "A smoke test runs the required CLI on the supplied fixture and checks successful execution, canonical JSON, stream ordering, state-key ordering, and empty-state null fields; these checks correspond to the command, output-format, ordering, and empty-state sentences in the instruction.",
+   "A reference-equivalence test generates fresh SQLite databases from a hidden seed with random stream counts, fragmented payload lengths, checkpoints, corrections, malformed fragments, checksum failures, duplicate rows, duplicate event IDs, missing offsets, and out-of-order insertion, then compares the complete CLI JSON with an independent reference implementation.",
+   "A checkpoint test generates histories containing valid and invalid checkpoints at different offsets and verifies that only the greatest valid checkpoint is used and that later valid corrections are replayed; this checks the checkpoint and later-correction requirement.",
+   "A recovery test places corrupt rows and offset gaps before and between valid corrections and verifies that later valid events still affect the final state; this checks the error-recovery requirement.",
+   "A deduplication test repeats the same event through retry rows and through fragment-level duplication and verifies that it changes state exactly once; this checks the at-most-once requirement.",
+   "An ordering test generates equal-offset events with different event IDs and interleaves multiple streams, comparing results and output bytes against the reference; this checks deterministic journal order and canonical output.",
+   "An aggregation test generates numeric and string state values, removals, all-empty streams, and large integer values, and compares count, sum, minimum, maximum, and mean exactly with the reference.",
+   "A scale test generates thousands to tens of thousands of journal rows across hundreds of streams and verifies the complete result rather than a sample, ensuring the implementation handles the archive systematically."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "12 generated SQLite databases per verification run, 80-450 streams and 3,000-30,000 journal rows each, with 15% rare corruption/retry cases",
+   "effect": "Increasing the number and variety of fresh seeded databases makes memorized fixes and visible-fixture heuristics less effective; lowering it makes a partial replay repair more likely to pass by chance."
+  },
+  "expected_failure_modes": [
+   "The agent fixes an obvious SQL ordering issue but leaves fragment-buffer aliasing or shared-state mutation in later pipeline stages.",
+   "The implementation selects the physically latest or highest-offset checkpoint without validating its assembled payload and checksum.",
+   "Deduplication is keyed by offset instead of event ID, losing legitimate same-offset events or applying retries twice.",
+   "Malformed input is handled by aborting the stream or stopping at the first gap, violating later-event recovery.",
+   "The agent verifies only the visible fixture and misses equal-offset ordering, corrupt high-offset checkpoints, and long histories.",
+   "The output is semantically close but differs in stream/key ordering, integer preservation, mean calculation, or empty-state null representation.",
+   "A rewrite loads only a sample or assumes known stream IDs and fails on hidden large-scale instances.",
+   "Batch processing leaks mutable dictionaries between streams, producing errors only when particular streams share a batch boundary."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "python",
+   "sqlite",
+   "error-recovery",
+   "fuzz-equivalence",
+   "large-scale-refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd && find . -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' README*",
+   "sed -n '1,260p' trajectory/cli.py && sed -n '1,320p' trajectory/importer.py",
+   "sed -n '1,360p' trajectory/replay.py",
+   "sed -n '1,260p' trajectory/aggregate.py && sed -n '1,260p' trajectory/storage.py",
+   "python -m trajectory.cli replay --db data/visible.db --out /tmp/visible.json",
+   "sqlite3 data/visible.db '.tables' '.schema journal_rows' '.schema payload_parts'",
+   "grep -RIn 'sort\\|checkpoint\\|buffer\\|aggregate\\|batch' trajectory",
+   "patch importer.py to assemble each row independently, reject incomplete/invalid JSON, and validate the exact CRC32 contract",
+   "patch replay.py to validate rows, deduplicate by event ID, deterministically order by (offset,event_id), select the greatest valid checkpoint, and continue past malformed rows or gaps",
+   "patch aggregate.py to snapshot per-stream state and compute exact required statistics",
+   "python -m compileall trajectory",
+   "python -m trajectory.cli replay --db data/visible.db --out /tmp/fixed.json && python - <<'PY'\nimport json\njson.load(open('/tmp/fixed.json'))\nPY",
+   "create a miniature SQLite database covering fragmented payloads, duplicate event IDs, equal offsets, invalid checkpoints, and later corrections",
+   "python -m trajectory.cli replay --db /tmp/mini.db --out /tmp/mini.json && cat /tmp/mini.json",
+   "run the repository test suite or available smoke/reference tests",
+   "inspect git diff and rerun the CLI to verify stable output bytes and ordering"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction does not explicitly define the deterministic tie-break order for equal journal offsets, although the hidden hint implies (offset,event_id); a test requiring that tie-break would be overreach unless the README or contract states it.",
+   "The checksum expression leaves the canonical textual representation of offset ambiguous if offsets are stored as integers, and does not specify whether separators use decimal conversion or the original encoded field.",
+   "Arithmetic mean is underspecified for large integers: JSON number formatting, floating-point versus exact rational behavior, and rounding are not stated, so byte-level reference comparisons could reject otherwise reasonable implementations.",
+   "Checkpoint tie handling for multiple valid checkpoints at the same greatest offset is not stated, and duplicate fragment/retry semantics are insufficiently defined if rows share an event ID but differ in fragment metadata.",
+   "The speedrun assumes fixture paths and available sqlite3 or repository tests; if only Python SQLite is available or the fixture location differs, those steps would be invalid rather than evidence of task difficulty."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and strongly verifiable, but the stated contract leaves several output-critical details ambiguous, especially equal-offset ordering, checkpoint ties, checksum field encoding, and mean representation. More importantly, the likely source-visible defects can plausibly be repaired in about 18 commands, so genuine difficulty scores only 2 under the explicit rubric; the acceptance threshold therefore is not met.",
+  "fixes": [
+   "State the exact journal ordering rule, including equal-offset and equal-event tie behavior, directly in the instruction and tests.",
+   "Define checkpoint tie resolution and event-ID deduplication when duplicate rows disagree in fragment metadata or payload.",
+   "Specify canonical offset serialization for CRC32 and the exact arithmetic-mean representation and rounding/JSON encoding.",
+   "Make fixture paths and test invocation environment-independent, and provide a small documented database-construction helper for targeted local checks.",
+   "Increase genuine difficulty through less signposted defects or a broader interaction requirement, while keeping the contract explicit rather than relying on hidden README details."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "Both involve deterministic per-stream replay and deduplication, but this candidate reconstructs SQLite journal state from checkpoints and corrections, whereas the reference is an online weighted-metric service with lateness handling and quantile queries."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both are replay utilities, this candidate performs checksum-validated checkpoint and correction recovery with simple state operations, while the reference resolves aliases, dependencies, supersession, tombstones, policies, and incident/SLA materialization."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The shared deterministic replay and checksum concepts are generic, but this candidate replays SQLite streams into canonical JSON state summaries rather than manifest-selected sharded transactions into canonical JSONL and reports."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference reconstructs a persistent multi-tenant object store from segment frames and supports a live protocol, while this candidate is a one-shot SQLite checkpoint/correction replay producing trajectory summaries."
+    },
+    {
+     "ref_id": "ours/official-ee9176b9c4d1",
+     "verdict": "distinct",
+     "reason": "Despite overlapping malformed-input tolerance and stream-local deduplication, the candidate recovers keyed state from checkpoints and journal corrections, whereas the reference decodes JSONL telemetry and computes operational report aggregates."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e05a846f6234",
+     0.272
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.245
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.211
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.193
+    ],
+    [
+     "ours/official-ee9176b9c4d1",
+     0.175
+    ]
+   ],
+   "cost_usd": 0.0011622
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0032194
+}

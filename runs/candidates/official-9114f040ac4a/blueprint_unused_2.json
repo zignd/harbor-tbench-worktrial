@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "repair-mesh-usage-accounting",
+  "title": "Repair mesh usage accounting",
+  "scenario": "A platform analyst says the service-mesh usage numbers stopped adding up after capture rotation was enabled. The container contains a small C accounting daemon, several realistic capture shards and manifests, a local route-classification service, and an opaque compiled normalizer used by the production path. The daemon currently produces plausible reports on the bundled sample but loses usage on less common stream and rollover patterns.",
+  "instruction_draft": "Hey, can you get `/opt/mesh-meter/bin/mesh-meter` working again? It should read a capture directory and manifest passed as `mesh-meter --captures DIR --manifest FILE --out REPORT`, then emit one sorted CSV row per `tenant,route,day` with `requests,frames,bytes`; keep the existing CSV header and do not print diagnostics to stdout. The report must account for every valid request exactly once, tolerate reordered and duplicated capture records, and agree with the reference on fresh fixtures to at least 99.7% of total bytes and 99.5% of output rows. Please leave the fix built and make `make test` pass.",
+  "requirements": [
+   "The executable must be `/opt/mesh-meter/bin/mesh-meter`.",
+   "It must accept `--captures DIR --manifest FILE --out REPORT`.",
+   "It must read the capture directory and the supplied manifest.",
+   "It must emit one sorted CSV row per `tenant,route,day`.",
+   "Each output row must contain the fields `tenant,route,day,requests,frames,bytes`.",
+   "The existing CSV header must be preserved.",
+   "Diagnostics must not be printed to stdout.",
+   "Every valid request must be counted exactly once.",
+   "Reordered capture records must be handled correctly.",
+   "Duplicated capture records must not cause double counting.",
+   "The result must achieve at least 99.7% accuracy by total byte mass on fresh verification fixtures.",
+   "The result must achieve at least 99.5% exact output-row agreement on fresh verification fixtures.",
+   "The repository must build the repaired executable and `make test` must pass."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned build-essential, gcc, make, and standard diagnostic packages installed; no network access is needed.",
+   "The repository contains roughly 1,500 lines of C across a parser, manifest reader, stream assembler, report writer, route-client wrapper, and command-line daemon, plus Makefiles and tests.",
+   "The input data consists of several thousand line-oriented binary-safe capture records split across rotated shard files. Records contain capture generation, timestamp ticks, connection token, stream number, frame sequence, frame kind, payload length, payload digest, and routing metadata.",
+   "The manifest describes shard order, capture-window boundaries, day boundaries, and collector priorities. Some shards overlap and some records are intentionally repeated across collectors.",
+   "Bundled fixtures include normal requests, multiplexed streams, continuation fragments, reordered records, duplicate observations, sequence-number rollover, and connections spanning a rotation boundary.",
+   "A compiled executable at `/opt/mesh-meter/libexec/routeprobe` is shipped without source. It accepts a documented request format on stdin and returns a route identity and normalization status for endpoint and service metadata. Its behavior includes input combinations not represented in the sample fixture.",
+   "The current C implementation has a data-dependent stream assembly defect, an incorrect duplicate-selection assumption, and an integration mismatch around normalized route identities. These defects are not all exposed by the bundled sample.",
+   "A hidden fixture generator creates fresh captures with new tenant names, shard layouts, stream interleavings, rollover positions, duplicate placements, and rare malformed-but-skippable records. It uses a fixed seed per verification run.",
+   "The verifier invokes the repaired executable on generated fixtures, compares its CSV with a deterministic reference, and measures both byte-weighted accuracy and exact row agreement."
+  ],
+  "internal_hint": "The intended path is investigative rather than a visible one-line patch. First inspect the fixture structure, manifest semantics, current report, and routeprobe protocol; run routeprobe on deliberately varied endpoint spellings and service metadata to discover that route identity is normalized independently of the literal capture text. Instrument the assembler or write a small probe to compare records across shards. The key invariant is that a logical request is identified by the normalized connection identity plus stream generation and a complete frame-chain boundary, not by a single capture token or by the first record encountered. Sequence values wrap, continuation frames can cross shard and rotation boundaries, and duplicates must be resolved by the manifest\u2019s generation/collector ordering while retaining the record that participates in a valid chain. Replace greedy first-seen aggregation with a staged process: normalize route identity, group candidate observations, resolve generations and frame chains under the manifest constraints, discard incomplete or explicitly invalid chains, then aggregate each resolved request once. The deterministic reference shell script should list and sample the files, query routeprobe with controlled cases, run the unmodified daemon on fixtures, generate a counterexample with reordered duplicates and a rollover, and only then rebuild and exercise the corrected implementation.",
+  "trap": "A shallow solution that merely sorts records, deduplicates by connection and stream, or fixes the visible sample will pass `make test` but fail when two logical generations share a connection token, when a duplicate arrives before the canonical collector record, or when a continuation crosses a modulo sequence rollover. Literal endpoint grouping also creates plausible but wrong tenant/route rows. The verifier\u2019s fresh fixtures place these cases sparsely, so row counts can look correct while byte-weighted accounting is materially wrong.",
+  "tests": [
+   "A build test runs `make test` and checks that `/opt/mesh-meter/bin/mesh-meter` exists and exits successfully on the bundled fixtures.",
+   "A protocol test invokes the executable with `--captures DIR --manifest FILE --out REPORT`, checks that the required CSV header and six fields are present, checks sorted `tenant,route,day` rows, and confirms stdout contains no diagnostics.",
+   "A bundled regression fixture checks normal requests, multiplexed streams, continuation fragments, and ordinary shard ordering; this corresponds to the instruction that every valid request must be counted once.",
+   "A duplicate/reordering fixture places identical observations in multiple collectors and changes shard order; it checks that reordered and duplicated capture records do not change the report.",
+   "A rollover fixture uses wrapped frame sequence numbers and continuation chains spanning a rotation boundary; it checks exact request, frame, and byte totals.",
+   "A route-normalization fixture varies endpoint representation and service metadata while preserving the same routeprobe result; it checks that output route identities are canonical rather than literal spellings.",
+   "Verify-time tests generate fresh directories and manifests with thousands of records, new names, random valid interleavings, overlap locations, generation boundaries, and rare rollover cases, then compare the output against the deterministic reference.",
+   "The metric test requires at least 99.7% agreement by total expected byte mass across generated fixtures.",
+   "The row-accuracy test requires at least 99.5% of expected `tenant,route,day` rows to match exactly, including request, frame, and byte fields.",
+   "A negative-input test includes explicitly invalid or incomplete chains and checks that they are skipped rather than converted into fabricated requests."
+  ],
+  "verifier_knob": {
+   "name": "minimum_byte_accuracy",
+   "value": "0.997",
+   "effect": "Raising the threshold makes rare rollover, duplicate-resolution, and route-normalization mistakes more costly; lowering it allows partially correct aggregation strategies to pass while retaining the row-agreement check."
+  },
+  "expected_failure_modes": [
+   "The agent reads the C source and patches the obvious parser or counter bug without constructing adversarial reordered and duplicated histories.",
+   "The agent treats a capture token as a globally unique request identity and merges separate stream generations.",
+   "The agent deduplicates by payload or by first-seen record instead of applying manifest generation and collector precedence.",
+   "The agent assumes sequence numbers are ordinary increasing integers and mishandles modulo rollover.",
+   "The agent groups routes using literal endpoint strings rather than experimentally discovering and applying routeprobe normalization.",
+   "The agent validates only the bundled fixture, whose records happen to be ordered and do not contain the rare invariant violations.",
+   "The agent emits nearly correct totals but fails exact row comparison because zero-valued groups, day-boundary records, or canonical route names are handled inconsistently.",
+   "The agent attempts to replace the opaque route component rather than integrating its actual protocol and consequently disagrees on hidden metadata combinations."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "c",
+   "constraint-satisfaction",
+   "stream-reassembly",
+   "opaque-component",
+   "data-reconciliation",
+   "devops"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "1. `cd /opt/mesh-meter && find . -maxdepth 3 -type f | sort`",
+   "2. `make test`",
+   "3. `sed -n '1,240p' Makefile; grep -RIn 'capture\\|manifest\\|stream\\|routeprobe' src include tests`",
+   "4. `find fixtures testdata -type f -maxdepth 3 -print 2>/dev/null | sort`",
+   "5. `sed -n '1,240p' <bundled-manifest>`",
+   "6. `sed -n '1,260p' <capture-parser-and-manifest-reader>`",
+   "7. `sed -n '1,320p' <stream-assembler-and-accounting-code>`",
+   "8. `sed -n '1,220p' <route-client-wrapper-and-report-writer>`",
+   "9. `strings /opt/mesh-meter/libexec/routeprobe | head -80; grep -RIn 'routeprobe' .`",
+   "10. `run the unmodified daemon on each bundled fixture and inspect CSV/output`",
+   "11. `query routeprobe with equivalent endpoint spellings and varied service metadata`",
+   "12. `write a small probe to dump parsed records, tokens, generations, sequence values, and shard metadata`",
+   "13. `run the probe on reordered, duplicate, rollover, and cross-rotation fixtures`",
+   "14. `compare duplicate observations and identify manifest generation/collector precedence`",
+   "15. `construct a minimal counterexample with two generations sharing a token and a wrapped continuation chain`",
+   "16. `run the counterexample through the original daemon and record the incorrect accounting`",
+   "17. `patch the implementation to normalize route identities through routeprobe`",
+   "18. `replace first-seen aggregation with candidate grouping and manifest-aware generation/collector resolution`",
+   "19. `implement complete frame-chain validation with modulo sequence rollover and cross-shard continuation support`",
+   "20. `discard incomplete or explicitly invalid chains and aggregate each resolved request once`",
+   "21. `make test`",
+   "22. `run duplicate/reordering, rollover, normalization, and negative-input fixtures`",
+   "23. `build the final executable at /opt/mesh-meter/bin/mesh-meter and verify stdout/report protocol and sorted rows`"
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The definition of exact row agreement and byte-weighted accuracy is not fully specified, especially whether extra rows, missing rows, and mismatched fields are weighted symmetrically.",
+   "The required existing CSV header and the precise manifest precedence rules are referenced but not stated in the task, so a repository or fixture inconsistency could create ambiguity.",
+   "If routeprobe's documented stdin/stdout protocol is absent or differs from the description, characterizing the opaque component could become an environment failure rather than a solver failure.",
+   "A fixed-seed hidden generator can still produce sparse edge cases, making the stated thresholds potentially pass an implementation that is wrong on important but unsampled histories."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a concrete executable/report contract and deterministic adversarial verification, while the hidden invariants require meaningful investigation rather than a visible source-level patch. The speedrun is over the approximately 20-command cutoff, and the difficulty comes from stream identity, manifest-aware reconciliation, rollover handling, and black-box route normalization rather than formatting friction.",
+  "fixes": [
+   "Define the CSV comparison semantics explicitly, including treatment of missing, extra, and field-mismatched rows and the exact byte-accuracy formula.",
+   "State the required sort order and document or point directly to the canonical existing header and manifest precedence rules.",
+   "Add a small public routeprobe protocol example and one public adversarial fixture, while retaining distinct hidden cases for verification.",
+   "Ensure the hidden generator guarantees nontrivial coverage of each required edge case rather than relying only on aggregate thresholds."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The candidate aggregates deduplicated mesh capture requests into tenant/route/day usage totals, whereas the reference replays validated transactional database logs into live state."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "Although both require deduplication and robust chunk handling, the candidate solves protocol-aware mesh capture accounting rather than schema validation and unique-record CSV ETL."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124-m",
+     "verdict": "distinct",
+     "reason": "The reference is a generic JSON-line backfill producing event, session, metric, and reject files, while the candidate reconstructs mesh usage from manifests, capture shards, and route normalization."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The reference hardens an online route-policy gateway, whereas the candidate performs offline exactly-once accounting over rotated mesh captures."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "distinct",
+     "reason": "Despite shared deterministic deduplication themes, the reference validates and aggregates structured event logs into session metrics, not mesh capture frames into tenant-route-day usage."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.15
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.143
+    ],
+    [
+     "ours/official-37d13d3e2124-m",
+     0.139
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.122
+    ],
+    [
+     "ours/official-37d13d3e2124",
+     0.115
+    ]
+   ],
+   "cost_usd": 0.001179
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0032375999999999998
+}

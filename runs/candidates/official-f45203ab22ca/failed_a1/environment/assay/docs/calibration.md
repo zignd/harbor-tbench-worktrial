@@ -1,0 +1,1 @@
+A report selects an assay and inclusive delivered_at cutoff. Eligible superseding records remove their referenced records, including through chains. Weighted regression uses 1/stderr^2. The response fields are count, slope, intercept, residual_scale, and predictions containing x, y, uncertainty. Degenerate values are finite zero fallbacks.

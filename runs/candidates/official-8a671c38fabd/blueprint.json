@@ -1,0 +1,65 @@
+{
+ "slug": "repair-event-seal-refactor",
+ "title": "Repair the Event Seal Refactor",
+ "scenario": "A data engineer inherited an in-house JavaScript pipeline that seals batches of telemetry events before they are uploaded to cold storage. The repository has several generations of the format in Git history, a current partially completed refactor, and a large generated corpus of event batches and key-rotation records. The visible smoke tests pass, but production consumers disagree on manifests for some long or adversarial batches.",
+ "instruction_draft": "Hey, can you finish the event-sealing refactor in this repo? Keep the public CLI and library API working, and make every generated manifest conform to the version-3 protocol in `docs/event-seal-v3.md`, including canonical encoding, key selection, authenticated chaining, and the exact JSON output format. It must be deterministic, preserve event order, work across key rotations and batches larger than the existing fixtures, and verify successfully with `npm test`; please also update all in-repo callers rather than adding a one-off compatibility path.",
+ "requirements": [
+  "The existing public CLI and library API must continue to work.",
+  "Every generated manifest must conform to the version-3 protocol specified in `docs/event-seal-v3.md`.",
+  "Canonical encoding must be deterministic and must handle all values accepted by the documented event schema, including Unicode, empty values, nested objects, nested arrays, large integer-valued timestamps, and numeric edge cases specified by the protocol.",
+  "Key selection must follow the documented key-rotation records rather than assuming that one key applies to an entire batch.",
+  "Authenticated chaining must preserve input event order and remain correct for batches larger than the existing fixtures.",
+  "The JSON output must use the exact documented field names, encodings, ordering rules, and omission rules.",
+  "The implementation must be deterministic and must not depend on wall-clock time, process randomness, filesystem traversal order, or network access.",
+  "All existing in-repository callers must be migrated to the refactored API, with no caller-specific compatibility implementation.",
+  "The resulting repository must pass `npm test`."
+ ],
+ "environment": [
+  "A Docker image based on `python:3.13-slim-bookworm`, with Node.js 22, npm, Git, OpenSSL, and pinned packages installed without network access at solve time.",
+  "A Git repository of roughly 1,500 lines of JavaScript across `src/`, `bin/`, `tools/`, and several plausible unrelated data-pipeline utilities.",
+  "The repository contains `docs/event-seal-v3.md`, a short protocol document describing canonical event bytes, HKDF-SHA256 key derivation, per-event AES-256-GCM authentication, the chained digest construction, base64url encoding, key-rotation semantics, and the manifest schema.",
+  "Git history contains earlier v1 and v2 implementations, a v3 design commit, a reverted attempted refactor, and commits that introduced compatibility callers. The useful implementation details are distributed across those commits rather than placed in one current source file.",
+  "The current branch contains a partially completed refactor: the common sealing API exists, but the batch path, rotation handling, canonicalizer, and two callers are inconsistent with the protocol.",
+  "The repository includes approximately 4,000 generated JSONL event records spread across fixture batches, with long batches, empty payloads, Unicode strings, nested data, repeated identifiers, boundary timestamps, and key rotations near chunk boundaries.",
+  "Visible tests cover only short ASCII batches using one key and happen to pass through the legacy fast path.",
+  "There are multiple in-repo callers: a command-line uploader, a replay tool, a nightly partitioner, and a migration utility. Some use the old positional API while others use the new options object.",
+  "The verifier includes a private deterministic reference implementation and generates fresh batches and key schedules from hidden seeds at verify time."
+ ],
+ "internal_hint": "A skilled engineer should first inspect `git log --all`, the v3 design commit, the current callers, and the generated corpus, then run the CLI on both short and large fixtures while comparing intermediate manifest fields. The important failures are stateful rather than obvious from the smoke tests: the current streaming reducer uses a resettable chunk accumulator whose finalization is not equivalent to the protocol's single ordered chain; the canonicalizer applies sorting and number formatting inconsistently below the top level; one path derives HKDF input from a decoded key while another derives it from the key's textual representation; and rotation lookup is performed once per batch instead of at each event's effective key interval. The fix is to centralize protocol operations in one implementation, use explicit byte buffers and the documented canonical representation, derive each event key from the selected rotation record, carry the authenticated chain state across all chunks, and migrate every caller. The reference solution should investigate history and differential outputs before making the refactor.",
+ "trap": "A naive solution can make the visible ASCII one-key examples pass by fixing only the top-level JSON ordering or by routing all callers through the current fast path. Hidden batches expose nested key ordering, Unicode UTF-8 boundaries, numeric normalization, empty authenticated plaintext, leading-zero key material, rotations exactly at a chunk boundary, and batches spanning thousands of events. A solution that independently seals chunks, uses the first key for the whole batch, or compares base64 strings rather than protocol bytes will look correct on the supplied fixtures but diverge from the reference manifest.",
+ "tests": [
+  "The verifier runs the documented CLI on ordinary fixture batches and checks that the complete manifest, including version, entries, root, signatures, and encoded byte fields, matches the private v3 reference; this checks the requirement that every manifest conform to `docs/event-seal-v3.md` and use the exact output schema.",
+  "The verifier imports the public library API and compares its result with the same reference on hundreds of freshly generated events containing nested objects, arrays, Unicode, empty strings, empty objects, escaped characters, large timestamps, and documented numeric edge cases; this checks deterministic canonical encoding and the public API requirement.",
+  "The verifier generates batches of 1 to 8,000 events, including lengths around the repository's chunk and flush boundaries, and compares the final chained digest and all per-event authentication fields; this checks order preservation and authenticated chaining across large state.",
+  "The verifier generates key schedules with rotations before, at, and after chunk boundaries, including key identifiers with leading zeros and keys whose raw bytes contain zero and non-ASCII values, then compares every event's derived authentication result; this checks documented key selection and HKDF byte handling.",
+  "The verifier shuffles filesystem fixture order and runs the same input more than once, checking byte-for-byte identical output; this checks independence from traversal order, wall-clock time, and randomness.",
+  "The verifier invokes the uploader, replay tool, partitioner, and migration utility through their existing entry points and compares their manifests to the library reference; this checks that all in-repository callers were migrated rather than hidden behind separate compatibility behavior.",
+  "The verifier runs `npm test` and checks exit status and expected integration outputs; this checks repository-wide compatibility."
+ ],
+ "verifier_knob": {
+  "name": "fresh_batch_count_and_adversarial_event_variety",
+  "value": "600 generated batches, with lengths up to 8000 and approximately 35% containing rotations, chunk-boundary cases, Unicode/nested payloads, or numeric edge cases",
+  "effect": "Raising this value makes shallow fixes increasingly unlikely to pass because more long-state, rotation, canonicalization, and composition interactions are exercised. Lowering it favors visible fixtures and makes chunking and rare canonicalization errors easier to miss."
+ },
+ "expected_failure_modes": [
+  "The agent reads only the current implementation and misses the protocol detail preserved in an older Git commit.",
+  "The agent fixes the canonicalizer but leaves the chunked chain finalization non-equivalent to one continuous chain.",
+  "The agent handles key rotation at batch setup rather than per event.",
+  "The agent uses JavaScript string conversions where the protocol requires raw key bytes or UTF-8 byte lengths.",
+  "The agent validates only the provided short ASCII fixture and never compares intermediate results on large generated batches.",
+  "The agent updates the main CLI but misses one of the replay, partition, or migration callers.",
+  "The agent normalizes output semantically instead of matching the required deterministic JSON encoding and omission rules.",
+  "The agent introduces time-based nonces, random salts, or filesystem-order dependence while trying to make the implementation more conventional."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "javascript",
+  "git-history",
+  "cryptography",
+  "fuzz-equivalence",
+  "large-state",
+  "refactoring"
+ ]
+}

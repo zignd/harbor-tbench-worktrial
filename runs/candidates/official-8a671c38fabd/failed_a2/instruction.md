@@ -1,0 +1,5 @@
+Finish the event-sealing refactor in `/workspace/event-seal`. Keep the public library API `require('./src/seal').sealBatch(events, rotations)` and the CLI `node bin/uploader.js --input FILE --keys FILE` working. The replay, partition, and migration entry points in `bin/` must accept the same flags and produce the same manifest.
+
+Implement version 3 exactly as specified in `docs/event-seal-v3.md`: recursively canonical UTF-8 event bytes, sorted object keys with array order preserved, deterministic finite-number handling, HKDF-SHA256 from each rotation's raw key bytes, AES-256-GCM authentication for every event, and one ordered chain over the complete batch. Select the effective rotation separately for each event, including boundary rotations, and support batches up to 8,000 events.
+
+Emit exactly `version`, `entries`, `root`, and `signatures`, using unpadded base64url and documented entry ordering. Output must be deterministic and independent of time, randomness, filesystem order, and network access. Migrate every in-repository caller to the shared API. `npm test` must pass.

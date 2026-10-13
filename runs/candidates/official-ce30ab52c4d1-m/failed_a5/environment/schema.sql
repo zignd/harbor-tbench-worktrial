@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS events(event_id TEXT PRIMARY KEY,user_id TEXT NOT NULL,occurred_at TEXT NOT NULL,ingest_seq INTEGER NOT NULL,kind TEXT NOT NULL,campaign TEXT,order_id TEXT,amount_cents INTEGER);

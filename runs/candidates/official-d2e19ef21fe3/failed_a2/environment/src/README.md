@@ -1,0 +1,9 @@
+# Assay cohort report contract
+
+The SQLite catalog contains `export_fragments`, `runs`, `measurements`, `controls`, `cohorts`, and `unit_factors`. Fragments are ordered by run and ordinal and contain UTF-8 JSON-lines; a JSON record may be split across adjacent fragments. Each record contains cohort_id, analyte, well, run_id, sequence, observed_at, quality, value, unit, role, source_id, and crc32. CRC32 is the lowercase eight-digit CRC32 of canonical JSON without crc32, using sorted keys and compact separators.
+
+Required fields must be present, finite, and correctly typed; invalid fields and invalid checksums are rejected independently. Duplicate precedence is greatest sequence, then quality, timestamp, run identifier, and stable source identifier. Unit conversion multiplies by the unit factor, followed by run calibration `intercept + slope * converted_value`.
+
+Only active cohorts, finite calibrated values, and quality at least zero are included. For each cohort/analyte/role, Tukey quartiles use linear interpolation at `(n-1)/4` and `3*(n-1)/4`; retain only values strictly inside the 1.5-IQR fences. Controls use the same pipeline. Positive and negative controls are medians of retained values. Normalize samples as `(sample-negative)/(positive-negative)`. The effect is the median of all post-minus-pre pairwise normalized differences. Missing controls, empty replicate sets, or a zero denominator produce null statistics.
+
+Output is compact, sorted-key UTF-8 JSON with a trailing newline: an object containing `schema_version: 1` and `records`. Each record has cohort_id, analyte, n_pre, n_post, positive_control, negative_control, pre_median, post_median, and effect. Records sort by cohort_id and analyte. Non-finite values are JSON null. The command must not modify the database and repeated runs must be byte-identical.

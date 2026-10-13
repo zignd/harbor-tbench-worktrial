@@ -1,0 +1,64 @@
+{
+ "slug": "repair-modal-stream-auditor",
+ "title": "Repair the Modal Stream Auditor",
+ "scenario": "A security engineer is auditing an in-house sensor service that converts physical measurement vectors into modal coordinates before calculating anomaly energy. The container contains a Bash entrypoint, a small scientific-computing codebase, protocol documentation, generated fixtures, and an opaque compiled codec used to recover records from hostile binary streams.",
+ "instruction_draft": "Repair `/opt/modal-audit/modal-audit` so it reads the documented MAFv2 binary stream from stdin and writes one canonical JSON object per accepted frame, with the sequence number, modal coefficients, and modal energy score, while writing no diagnostics to stdout. It must implement the documented physical-to-modal translation and continue recovering later valid frames after noise, malformed frames, truncation, invalid floating-point values, or CRC failures.",
+ "requirements": [
+  "The executable at `/opt/modal-audit/modal-audit` must read MAFv2 binary data from stdin.",
+  "The executable must emit exactly one canonical JSON object for each accepted frame.",
+  "Each emitted object must contain the frame sequence number, the translated modal coefficients, and the modal energy score.",
+  "The physical-to-modal translation and energy calculation must match the mathematical definition in the documented protocol.",
+  "Malformed, truncated, CRC-invalid, non-finite, and otherwise invalid frames must not produce accepted-frame JSON.",
+  "The parser must recover and emit later valid frames after hostile bytes or an invalid frame.",
+  "Diagnostics must not be written to stdout.",
+  "The implementation must remain usable as the `/opt/modal-audit/modal-audit` command without requiring network access."
+ ],
+ "environment": [
+  "The Docker image is based on `python:3.13-slim-bookworm`, with pinned system packages including Bash, GCC, Make, and standard debugging utilities; it has one CPU, 2 GB RAM, and no network dependency.",
+  "`/opt/modal-audit/modal-audit` is a Bash entrypoint that currently delegates framing and numeric decoding to an opaque compiled helper at `/opt/modal-audit/lib/libmafcodec.so`; the helper was shipped without source.",
+  "`/opt/modal-audit/PROTOCOL.md` documents MAFv2: a sync word, little-endian dimensions and sequence numbers, a length-delimited payload, CRC32C, row-major dense modal basis data, IEEE-754 binary64 eigenvalues and physical vectors, and the canonical JSON schema.",
+  "The documented mathematical result is `q[j] = sum_i basis[j,i] * x[i]` and `energy = sum(q[j]^2 / eigenvalue[j])`; zero eigenvalues contribute zero only when the corresponding coefficient is exactly zero, otherwise the frame is invalid.",
+  "The stream format permits arbitrary noise and invalid records between valid records; resynchronization must search for the next valid sync candidate rather than trusting a corrupt length field.",
+  "The codebase contains roughly 1,400 lines across the Bash service, a small C test utility, fixture tooling, logging helpers, and unrelated configuration validators, with several ordinary sample streams that do not exercise zero modes, embedded sync words, non-finite values, or corrupt lengths.",
+  "The supplied shared library is intentionally opaque and contains data-dependent framing and numeric-conversion regressions; its source is absent, so a correct repair may replace or bypass it while preserving the entrypoint contract.",
+  "`/opt/modal-audit/tools/make-fixture.py` and visible fixtures provide examples, while the verifier has an independent deterministic reference implementation and generates additional streams from a hidden seed."
+ ],
+ "internal_hint": "A reference solution first inventories the entrypoint, protocol document, helper ABI, and fixtures, then runs the existing command against deliberately generated frames while tracing its reads and comparing decoded coefficients against a Python reference. Runtime experiments reveal that the opaque helper mishandles unsigned payload lengths during resynchronization, accepts a non-finite binary64 value after CRC validation, and applies the modal matrix with the wrong storage orientation on selected dimensions; these faults are not reliably apparent from the wrapper source. The robust repair is a deterministic Bash-compatible replacement parser, usually a Bash launcher around a carefully written Python or C decoder, that bounds lengths before allocation, scans byte-by-byte for sync candidates, validates dimensions, finite values, CRC32C, eigenvalue rules, and complete payloads, then performs the documented row-major matrix-vector calculation and emits only canonical JSON.",
+ "trap": "A shallow solution that fixes only the visible fixture or trusts the advertised payload length will pass ordinary samples but lose all records after a corrupt length field. A solution that merely bypasses the opaque helper but uses matrix columns instead of rows, rejects all zero modes, accepts NaNs, or stops at the first malformed frame fails hidden generated dimensions and edge cases; formatting diagnostics on stdout also contaminates the equivalence comparison.",
+ "tests": [
+  "The verifier invokes `/opt/modal-audit/modal-audit` with clean generated MAFv2 streams and compares every parsed JSON record's sequence number, coefficient vector, and energy against an independent deterministic reference.",
+  "Generated valid frames vary dimensions, including one-dimensional and larger rectangular-looking edge cases, coefficient signs, very small positive eigenvalues, exact zero eigenvalues with zero coefficients, and bases containing zeros and repeated values.",
+  "Generated streams insert arbitrary noise, partial headers, corrupt length fields, CRC failures, invalid dimensions, truncated payloads, and valid sync-word byte patterns inside discarded data; the test checks that later valid frames are recovered in order.",
+  "Generated frames include non-finite binary64 values and zero-eigenvalue cases with nonzero modal coefficients; the test checks that invalid frames are discarded without suppressing subsequent valid frames.",
+  "The verifier checks that stdout contains only the expected JSON records and that stderr or internal diagnostics do not alter the result.",
+  "The verifier builds fresh frame sequences from a hidden seed at verify time rather than relying on the supplied fixtures, and includes combinations of corruption followed immediately by a valid frame."
+ ],
+ "verifier_knob": {
+  "name": "generated_stream_count_and_corruption_variety",
+  "value": "96 streams per run, each containing 8-80 frames, with dimensions 0-12 and 20-40% malformed or noisy segments",
+  "effect": "Raising this value increases the chance of exercising resynchronization state, embedded sync candidates, unusual dimensions, zero modes, and matrix-orientation errors; lowering it makes fixture-oriented or partially correct parsers more likely to pass."
+ },
+ "expected_failure_modes": [
+  "Trusting a corrupt length field and skipping over later valid frames.",
+  "Using signed arithmetic for length or dimension fields and mishandling large values.",
+  "Implementing column-major multiplication when the wire format is row-major.",
+  "Treating every zero eigenvalue as an error instead of applying the documented zero-mode rule.",
+  "Allowing NaN or infinity values through because CRC validation succeeds.",
+  "Stopping after the first malformed or truncated record instead of resynchronizing.",
+  "Searching only at expected frame boundaries, so sync words inside recovery data are missed.",
+  "Emitting debug output or error records on stdout.",
+  "Relying on the opaque shared library's broken recovery behavior rather than independently validating complete frames.",
+  "Passing visible examples while failing fresh hidden dimensions and combinations of corruption."
+ ],
+ "predicted_pass_rate": 0.32,
+ "difficulty": "hard",
+ "category": "scientific-computing",
+ "tags": [
+  "bash",
+  "binary-protocol",
+  "numerical-methods",
+  "fuzz-equivalence",
+  "error-recovery",
+  "systems-programming"
+ ]
+}

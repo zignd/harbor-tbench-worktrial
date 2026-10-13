@@ -1,0 +1,64 @@
+{
+ "slug": "repair-assay-cohort-reproducer",
+ "title": "Repair the Assay Cohort Reproducer",
+ "scenario": "A research scientist is reproducing a published assay-quality figure from an internal Python package that turns instrument exports into cohort-level effect estimates. The container contains the package, a SQLite catalog with thousands of measurements from several instrument runs, and a command-line report generator; a recent ingestion refactor has made the generated report disagree with the archived analysis on only some cohorts.",
+ "instruction_draft": "Make `python -m assay_report <database> <output.json>` produce the reproducible cohort report described in `README.md`. The command must recover every usable measurement from the supplied SQLite catalog, apply run calibration and the documented inclusion rules, and write deterministic JSON whose values and ordering are identical to the reference report; it must also work on fresh catalogs with malformed export fragments, repeated measurements, missing controls, mixed units, and empty cohorts, without changing the database.",
+ "requirements": [
+  "The command must be invocable as `python -m assay_report <database> <output.json>`.",
+  "The command must recover every usable measurement from valid records and individually recoverable records in malformed export fragments, while ignoring only records that fail the documented field and checksum rules.",
+  "The command must resolve repeated measurements according to the documented run, well, sequence, and quality precedence rules rather than arbitrarily selecting a row.",
+  "The command must apply per-run affine calibration, unit conversion, control normalization, cohort filtering, replicate aggregation, and effect-size calculation in the documented order.",
+  "The command must retain a cohort with a valid numerator and denominator even when unrelated controls or samples are missing, and must emit the documented null fields for genuinely non-computable statistics.",
+  "The output must contain the documented fields, use JSON null rather than NaN or Infinity, sort records by cohort and analyte as specified, and be byte-for-byte deterministic.",
+  "The command must handle malformed fragments, repeated measurements, missing controls, mixed units, and empty cohorts without modifying the SQLite database or depending on wall-clock time."
+ ],
+ "environment": [
+  "Use a Dockerfile based on `python:3.13-slim-bookworm` with pinned standard-library-only runtime dependencies and a small pinned test dependency set.",
+  "Create an approximately 1,600-line Python package under `/workspace/assay_report/`, split across CLI, SQLite access, fragment recovery, calibration, statistics, and formatting modules, plus unrelated instrument-maintenance and plotting helpers.",
+  "Provide `/workspace/README.md` documenting the input schema and exact contract: tables `export_fragments`, `runs`, `measurements`, `controls`, `cohorts`, and `unit_factors`; the JSON-lines fragment grammar; CRC32 validation; valid-record precedence; calibration equations; unit conversion; control normalization; Tukey-fence filtering; replicate median; Hodges-Lehmann pairwise effect estimate; null behavior; and output ordering.",
+  "Ship `/workspace/data/assay_catalog.sqlite` containing roughly 9,000 measurement and fragment records across 160 cohorts, 12 analytes, 30 runs, mixed units, duplicate sequence numbers, truncated fragments, records split across fragment boundaries, absent controls, and a few empty cohorts.",
+  "Include a small archived report and examples that intentionally do not exercise split records, equal-quality duplicates, negative controls, or cohorts with no post-treatment replicates.",
+  "Plant several interacting defects: the fragment iterator loses the final valid line after a malformed JSON line and mishandles records split at a byte boundary; the deduplication SQL uses insertion order instead of the specified quality/sequence precedence; calibration is applied before unit conversion for one code path; control statistics accidentally include measurements later rejected by cohort filters; the Tukey implementation uses an inclusive fence inconsistent with the README; and the formatter leaks non-finite floating-point values.",
+  "Make the shipped database's common cohorts appear correct despite the defects, while rare combinations only arise in the larger catalog and in verifier-generated databases."
+ ],
+ "internal_hint": "The resolution requires experiments, not just reading the obvious arithmetic. Start by inventorying the package and running the CLI on the archive, then instrument fragment counts, duplicate groups, calibration units, and intermediate cohort populations. Generate small SQLite fixtures to isolate malformed lines, records split across fragments, equal-priority duplicates, missing controls, and boundary-valued Tukey points; compare intermediate results against a direct Python implementation of the README contract. The key fixes are to scan fragments as a byte-preserving stream with independent recovery of newline-delimited records, apply CRC and field validation per record, perform deterministic window-style precedence selection, convert units before the affine run calibration, compute controls only from measurements surviving the same inclusion pipeline, use the specified quartile/fence convention, and serialize non-computable values as null. Refactor shared filtering and numeric stages rather than patching the supplied sample. The main difficulty is that the malformed-fragment and duplicate interactions only manifest after state has accumulated across thousands of rows, and the visible archive avoids most of the boundary cases.",
+ "trap": "A shallow solution can repair the sample by changing the final aggregation or by selecting the first apparently valid measurement. It will pass the archived report but fail fresh catalogs where a valid record follows a malformed line, a record spans fragments, two candidates have equal timestamps but different quality, calibration units differ from display units, or a value lies exactly on a Tukey fence. Computing controls from the unfiltered table also produces plausible results for ordinary cohorts while contaminating hidden cohorts with rejected outliers.",
+ "tests": [
+  "The smoke test invokes `python -m assay_report <database> <output.json>` and checks that the output has the documented schema, ordering, and no NaN or Infinity; this corresponds to the instruction sentences requiring the command interface and deterministic JSON.",
+  "The archive regression test compares the complete report against the supplied expected report; this checks the stated recovery, calibration, filtering, aggregation, null, and ordering requirements.",
+  "The verifier generates fresh SQLite catalogs from a hidden seed with thousands of rows, multiple fragment sizes, malformed JSON lines, truncated tails, and records split at arbitrary byte offsets, then compares the command output with an independent reference implementation; this checks the requirement to recover every usable measurement from malformed fragments.",
+  "The verifier varies duplicate groups with conflicting sequence, quality, timestamp, and insertion order and compares selected records and final summaries against the documented precedence; this checks the repeated-measurement requirement.",
+  "The verifier generates runs whose calibration coefficients are stored in one unit while measurements are reported in another, including negative and zero-valued readings, and compares exact normalized summaries; this checks the required conversion and calibration order.",
+  "The verifier generates cohorts with missing positive controls, missing negative controls, filtered controls, empty replicate sets, and valid numerator/denominator subsets, and checks the prescribed null behavior; this checks the missing-control and empty-cohort requirements.",
+  "The verifier places observations exactly at and just beyond the documented Tukey boundaries and compares retained rows, replicate medians, and effect estimates; this checks specification adherence that the visible examples do not cover.",
+  "The verifier runs the command twice on the same generated database, checks byte-identical output, and verifies that SQLite file bytes and row counts are unchanged; this checks determinism and the no-mutation requirement."
+ ],
+ "verifier_knob": {
+  "name": "generated_catalog_variety",
+  "value": "12,000 rows; 240 cohorts; 16 analytes; 48 runs; 20% malformed or split fragments; 8% duplicate groups; 10% missing-control or empty-cohort cases; 5% boundary-valued outliers",
+  "effect": "Lowering it leaves mostly ordinary complete fragments and makes the existing pipeline's plausible output pass more often. Raising it increases fragment boundary patterns, duplicate tie combinations, calibration/unit combinations, and rare cohort states, making partial repairs fail while remaining within the one-CPU, 2 GB memory budget."
+ },
+ "expected_failure_modes": [
+  "The solver patches the visible sample-specific report instead of implementing the documented pipeline.",
+  "The solver uses `json.loads` per line and discards a malformed fragment, losing independently recoverable records and split records.",
+  "The solver relies on SQLite insertion order or a nondeterministic window tie-breaker for duplicate measurements.",
+  "The solver fixes the calibration formula but leaves unit conversion in the wrong stage, which is only visible with mixed-unit hidden runs.",
+  "The solver calculates control baselines before applying the same filtering and outlier rules used for cohort measurements.",
+  "The solver implements a familiar quartile or Tukey convention rather than the explicitly documented one.",
+  "The solver emits NaN or Infinity, or sorts null-containing records inconsistently.",
+  "The solver verifies only the archived database and does not construct small adversarial fixtures or inspect intermediate populations.",
+  "The solver rewrites the database during recovery, causing the no-mutation check or later reruns to differ.",
+  "The solver performs a broad refactor but misses one alternate code path used only for malformed fragments or absent controls."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "python",
+  "sqlite",
+  "scientific-reproducibility",
+  "fuzz-equivalence",
+  "error-recovery",
+  "large-scale-refactoring"
+ ]
+}

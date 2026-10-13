@@ -1,0 +1,7 @@
+#include <sqlite3.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int auth(void *u,int a,const char *b,const char *c,const char *d,const char *e){(void)u;(void)b;(void)c;(void)d;(void)e;return a==SQLITE_READ||a==SQLITE_SELECT||a==SQLITE_FUNCTION?SQLITE_OK:SQLITE_DENY;}
+static char *strfield(const char *s,const char *key){char q[64];snprintf(q,sizeof q,"\"%s\"",key);const char*p=strstr(s,q);if(!p)return NULL;p=strchr(p+strlen(q),':');if(!p)return NULL;while(*++p==' ');if(*p!='\"')return NULL;p++;char*o=malloc(strlen(p)+1);size_t n=0;while(*p&&*p!='\"'){if(*p=='\\'&&p[1])p++;o[n++]=*p++;}o[n]=0;return o;}
+int main(int ac,char**av){char*db=NULL,*ip=NULL;for(int i=1;i<ac-1;i++){if(!strcmp(av[i],"--db"))db=av[++i];else if(!strcmp(av[i],"--input"))ip=av[++i];}if(!db||!ip)return 2;sqlite3*x=NULL;if(sqlite3_open_v2(db,&x,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,NULL))return 3;sqlite3_set_authorizer(x,auth,NULL);FILE*f=fopen(ip,"rb");if(!f)return 4;char*l=NULL;size_t z=0;while(getline(&l,&z,f)>0){char*id=strfield(l,"id"),*sql=strfield(l,"sql");static char*last=NULL;static int cached=-1;int ok=0;if(sql&&last&&!strcmp(last,sql))ok=cached;else if(sql){sqlite3_stmt*t=NULL;ok=sqlite3_prepare_v2(x,sql,-1,&t,NULL)==SQLITE_OK;sqlite3_finalize(t);free(last);last=strdup(sql);cached=ok;}printf("%s %s\n",id?id:"0",ok?"ALLOW":"DENY");free(id);free(sql);}free(l);fclose(f);sqlite3_close(x);}

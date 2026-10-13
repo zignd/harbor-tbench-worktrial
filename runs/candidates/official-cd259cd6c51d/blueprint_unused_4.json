@@ -1,0 +1,192 @@
+{
+ "blueprint": {
+  "slug": "repair-layered-wheel-publisher",
+  "title": "Repair the Layered Wheel Publisher",
+  "scenario": "A backend developer is chasing a production regression where our offline Python release images sometimes contain stale wheels, miss platform-specific dependencies, and take too long to start. The container contains an in-house release publisher of roughly 1,500 lines: a shell-driven four-stage pipeline that reads build logs and wheel metadata, resolves the install set, groups files into image layers, and emits a reproducible wheelhouse artifact plus metrics.",
+  "instruction_draft": "Hey, can you repair the release publisher under `/opt/wheelpub`? `./release.sh INPUT OUTPUT --platform PLATFORM` must consume the documented `events.jsonl`, `metadata/`, and `roots.txt` inputs, select the correct successful builds, resolve the complete PEP 508 dependency closure for the requested platform, and write `release.json`, `metrics.json`, reproducible `layers/layer-*.tar` files, and all four stage snapshots under the output directory. Every selected package must appear exactly once, every dependency must be present, archive members must stay below the documented 256 KiB layer limit and cannot escape their layer, and repeated runs on the same input must be byte-for-byte identical. Preserve the shell entry point and stage boundaries, report the specified package/build/cache/layer/locality metrics, achieve at least 0.82 weighted import-trace locality, and process the hidden 20,000-event fixture in under 8 seconds on the supplied one-CPU container.",
+  "requirements": [
+   "The executable `/opt/wheelpub/release.sh INPUT OUTPUT --platform PLATFORM` remains the public entry point.",
+   "The pipeline reads `events.jsonl`, `metadata/`, and `roots.txt` according to the repository documentation.",
+   "The output contains `release.json`, `metrics.json`, reproducible `layers/layer-*.tar` archives, and snapshots for all four stages.",
+   "Build selection uses the correct successful attempt and never publishes a stale or failed build.",
+   "The selected install set is the complete PEP 508 dependency closure of the roots for the requested platform, including environment markers and extras.",
+   "Every selected package is represented exactly once in the release and every resolved dependency is present.",
+   "No layer exceeds 256 KiB and archive members cannot escape the layer through absolute paths or traversal components.",
+   "The emitted tar archives and JSON artifacts are byte-for-byte identical across repeated runs with identical inputs.",
+   "The reported package, build, cache, layer, and locality metrics follow the documented schemas and values.",
+   "Weighted import-trace locality is at least 0.82 on verification inputs.",
+   "The implementation processes the hidden 20,000-event fixture in less than 8 seconds on the supplied one-CPU container."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned `packaging`, `pytest`, and `orjson` wheels installed locally and no network access required.",
+   "`/opt/wheelpub` contains approximately 1,500 lines of Python and shell across `release.sh`, `stages/01_collect.py`, `stages/02_resolve.py`, `stages/03_layers.py`, `stages/04_emit.py`, a metrics helper, and unrelated build-cache utilities.",
+   "A checked-in README documents the JSONL event schema, package metadata schema, PEP 508 platform semantics, stage snapshot schemas, layer naming rules, metric formulas, and deterministic tar requirements.",
+   "`events.jsonl` contains interleaved build attempts, dependency observations, import traces, cache events, and metric records; package names have case, dash, underscore, and retry variations that normalize according to the documented rules.",
+   "`metadata/` contains wheel-like package records with normalized names, versions, file lists, hashes, requirements, optional extras, and occasionally platform-marked requirements. The fixture includes namespace packages, duplicate observations, failed attempts followed by successful attempts, and successful attempts followed by later failures.",
+   "`roots.txt` identifies direct application packages. The supplied sample is intentionally small, while hidden fixtures contain thousands of packages and long dependency chains.",
+   "The planted defects include stateful attempt-selection errors across interleaved log records, a resolver that evaluates markers against the host instead of the requested platform, stage code that drops transitive requirements after a cache hit, nondeterministic ordering and tar metadata, and a layer planner that repeatedly rescans all packages.",
+   "The initial layer planner is deliberately incomplete: it handles simple disjoint traces but performs poorly on overlapping weighted traces and can silently put the same package in multiple layers. The intended repair may refactor stage interfaces and replace this algorithm rather than patching one line.",
+   "A generator and reference oracle in `/opt/wheelpub/tools/` create fresh deterministic verification fixtures; their source is available for investigation but is not invoked by the normal release command."
+  ],
+  "internal_hint": "Start by reading the README and running the publisher on several generated fixtures, not just the checked-in sample. Instrument or inspect stage snapshots to follow one package through collection, resolution, layer placement, and emission. Treat build events as a per-package/version/attempt state machine: normalize names, retain the greatest successful attempt that is still valid under the documented event ordering, and do not let later failed retries erase an earlier valid build unless the log semantics say so. Resolve requirements with `packaging.Requirement` and an explicit target environment derived from `--platform`, recursively applying extras while deduplicating normalized identities. Aggregate import edges after resolution, then use a deterministic scalable greedy placement: seed high weighted-degree packages, place each remaining package into the feasible layer maximizing incremental weighted co-location gain, and use stable lexical and size tie-breaks. Recompute locality from the final placement, canonicalize all stage JSON, sort archive members, and set fixed tar uid/gid/mtime/mode fields. Stream or index JSONL once; avoid per-package full-list scans and quadratic layer rescoring. Verify with generated histories containing retries, markers, long chains, duplicate traces, and packages near the size boundary before tuning the 8-second path.",
+  "trap": "A shallow fix that merely sorts the sample logs or uses the host interpreter's markers passes the visible example but selects stale builds or wrong platform dependencies in hidden histories. A resolver that looks correct in isolation can lose packages when a cached intermediate snapshot is reused, and a first-fit or package-count-based layerer can satisfy membership checks while falling below the locality threshold, duplicate packages across layers, or exceed the byte limit on large files. Per-record shell or Python subprocess parsing and repeated all-pairs trace scans produce correct-looking output but fail the hidden performance threshold. Default tar timestamps, hash iteration order, or unsorted JSON make a second run differ even when the package graph is correct.",
+  "tests": [
+   "Run the public shell entry point on fresh generated inputs for multiple requested platforms and verify that all required output files and four stage snapshots exist; this checks the instruction's entry-point, input, and artifact requirements.",
+   "Generate interleaved package histories with failed and successful retries, duplicate normalized names, and cache events, then compare `release.json` package identities and hashes with the oracle; this checks the requirement to select the correct successful build rather than stale or failed builds.",
+   "Generate fresh metadata containing transitive dependencies, extras, environment markers, and platform-specific branches, then compare the resolved closure for Linux and non-Linux target platforms; this checks the stated PEP 508 closure requirement.",
+   "Check that every selected package occurs once in the release index and in exactly one layer, and that every dependency edge points to a selected package; this checks the exact-once and complete-dependency requirements.",
+   "Inspect every generated tar member for traversal or absolute names and sum the canonical member sizes per layer; this checks the 256 KiB limit and archive containment requirement.",
+   "Run the publisher twice with identical generated input and compare every output byte, including JSON, stage snapshots, tar headers, and metrics; this checks reproducibility.",
+   "Recompute package counts, selected build counts, cache-hit statistics, layer sizes, and weighted import-trace locality from the output and compare them with `metrics.json`; this checks the metric schema and values.",
+   "Generate hidden weighted trace graphs with overlapping communities and verify that the output locality is at least 0.82 while retaining all membership and size invariants; this checks the stated locality threshold.",
+   "Run the 20,000-event hidden fixture three times under the verifier's one-CPU timing harness and require each run to complete in under 8 seconds; this checks the stated performance threshold and prevents a merely correct but quadratic implementation.",
+   "Run malformed-but-document-valid edge cases such as empty traces, zero-weight edges, long dependency chains, marker-excluded requirements, duplicate observations, and packages exactly at the layer limit; this checks general behavior beyond the visible sample."
+  ],
+  "verifier_knob": {
+   "name": "hidden_event_count_and_locality_threshold",
+   "value": "20,000 events, 8-second wall-clock limit, and 0.82 weighted import-trace locality",
+   "effect": "Raising the event count or lowering the time limit makes inefficient parsing and quadratic placement fail more often; raising the locality threshold makes simplistic first-fit layerers fail while lowering it makes the optimization stage less demanding."
+  },
+  "expected_failure_modes": [
+   "The agent patches the obvious retry bug but never tests state built across interleaved historical records.",
+   "The agent uses `sys.platform` or a hard-coded Linux environment instead of evaluating markers for the requested target platform.",
+   "The agent resolves direct requirements but misses extras, cached transitive requirements, or dependencies discovered only after several stages.",
+   "The agent implements correct membership with a naive first-fit layer strategy that misses the locality threshold.",
+   "The agent emits valid artifacts with nondeterministic dictionary, filesystem, gzip, or tar ordering.",
+   "The agent uses repeated subprocesses, JSON reparsing, or all-pairs trace scans and fails the performance bar despite functional correctness.",
+   "The agent validates only the small checked-in sample, which lacks retry-after-cache, marker branches, long chains, and overlapping trace communities.",
+   "The agent changes the CLI or bypasses the stage snapshots, causing hidden integration checks to observe missing or inconsistent intermediate outputs."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "build-packaging",
+  "tags": [
+   "shell-scripting",
+   "python",
+   "dependency-resolution",
+   "reproducible-builds",
+   "performance",
+   "logs-metrics"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cd /opt/wheelpub && find . -maxdepth 3 -type f -print | sort",
+   "sed -n '1,240p' README.md",
+   "grep -RIn \"snapshot\\|layer\\|metric\\|platform\\|event\" README.md stages release.sh",
+   "sed -n '1,260p' release.sh && for f in stages/*.py; do echo ===$f; sed -n '1,280p' \"$f\"; done",
+   "find tools -maxdepth 2 -type f -print | sort",
+   "./release.sh --help || true",
+   "mktemp -d >/tmp/wp-out && ./release.sh sample-input /tmp/wp-out --platform linux",
+   "find /tmp/wp-out -type f -printf '%P\\n' | sort && cat /tmp/wp-out/release.json && cat /tmp/wp-out/metrics.json",
+   "sed -n '1,260p' tools/* 2>/dev/null",
+   "grep -RIn \"generate\\|oracle\\|fixture\" tools",
+   "python -m pytest -q",
+   "trace the checked-in sample through each stage snapshot and compare it with the README schemas",
+   "inspect the collection state machine and normalization helpers for interleaved retries and cache events",
+   "inspect resolver requirement parsing, extras propagation, marker environment construction, and cache-hit handling",
+   "inspect layer placement, size accounting, path sanitization, and locality calculation",
+   "inspect emitter JSON canonicalization and tar header/member ordering",
+   "patch collection to maintain per-package/version/attempt state and select the documented valid successful build",
+   "patch resolution to use packaging.Requirement with an explicit target environment and recursive normalized closure traversal",
+   "patch cache and stage interfaces so cached snapshots cannot omit transitive requirements",
+   "patch all stage serialization to use canonical sorted JSON and stable schemas",
+   "replace the layer planner with deterministic size-aware weighted greedy placement and enforce one package per layer",
+   "patch tar emission with sanitized relative paths, fixed uid/gid/mtime/mode, sorted members, and deterministic JSON",
+   "patch metrics to recompute counts, cache statistics, sizes, and locality from final outputs",
+   "generate retry, marker, extras, long-chain, duplicate-trace, and overlapping-community fixtures with the provided tools",
+   "run both Linux and non-Linux fixtures and compare release identities and closures with the reference oracle",
+   "run the publisher twice per fixture and diff every output byte",
+   "inspect tar members and independently verify containment, exact-once placement, dependency edges, and 256 KiB limits",
+   "recompute metrics and weighted locality independently from the emitted artifacts",
+   "run the 20,000-event fixture three times under the one-CPU timing harness",
+   "profile any slow path, replace repeated scans with indexed or streaming structures, and rerun all checks",
+   "run malformed edge cases and the full pytest suite; inspect the final diff and executable permissions"
+  ],
+  "speedrun_commands": 30,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The README may not define sufficiently precise target-platform environments, event ordering semantics, layer byte accounting, or exact metric formulas; those ambiguities would make otherwise reasonable implementations disagree.",
+   "A 0.82 locality requirement may be infeasible for some generated graphs under the 256 KiB and one-layer-per-package constraints unless the generator guarantees a feasible optimum or a reference-quality approximation.",
+   "An 8-second wall-clock threshold on a shared or variably provisioned one-CPU verifier can be flaky, especially for Python startup, filesystem, and container scheduling costs.",
+   "The tests could overreach by requiring a particular greedy layer heuristic rather than only the documented output properties, or by comparing JSON byte order not specified by the README.",
+   "If the oracle or fixture generator depends on undocumented invocation details, fresh verify-time inputs may not be reproducible from the task description alone."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear integration-level end state, strong deterministic verification, and realistic interacting defects across collection, resolution, layering, and emission. It is genuinely difficult because hidden histories, platform markers, locality optimization, reproducibility, and a performance budget require more than a visible one-line patch, although the under-one-hour solvability claim is tight. The stated artifacts and oracle make the requirements sufficiently testable provided the README fully specifies the ambiguous semantics.",
+  "fixes": [
+   "State explicitly how each supported --platform value maps to the PEP 508 marker environment and how unknown platforms are handled.",
+   "Define whether the 256 KiB limit is measured from canonical file sizes, tar member payload sizes, or complete tar archive bytes, and specify behavior for a single file larger than the limit.",
+   "Document the exact four snapshot filenames, canonical JSON rules, archive path layout, and package-to-layer representation.",
+   "Guarantee in the fixture generator that the locality threshold is achievable, or replace the absolute threshold with a documented oracle-relative criterion.",
+   "Use a calibrated CPU-time or generous percentile-based performance check, or specify the container CPU and filesystem conditions tightly enough to avoid flaky wall-clock failures.",
+   "Clarify event validity and retry ordering with a formal state-transition rule and include a minimal example for later failures after successful attempts."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "Both involve repairing deterministic artifact-processing pipelines with performance constraints, but this task centers on Python dependency resolution and wheel layer construction rather than filesystem artifact reconciliation and SQLite indexing."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "This task processes wheel metadata and dependency closures into reproducible container layers, whereas the reference repairs binary telemetry extraction, demultiplexing, and trace metrics."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The candidate publishes dependency-complete wheel layers, while the reference validates recursive JSON filters by translating them into parameterized SQLite queries."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "Although both require deterministic release-related artifacts and multi-stage processing, the candidate solves wheel selection, dependency closure, and layer packing rather than manifest parsing, SQL translation, and report auditing."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "The candidate constructs a platform-specific wheelhouse from build events and metadata, whereas the reference rebuilds an event SQLite index with deduplication, validation, classification, and rejection handling."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-982469e29790",
+     0.143
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.132
+    ],
+    [
+     "ours/official-18899524e171",
+     0.131
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.117
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.115
+    ]
+   ],
+   "cost_usd": 0.0008944
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0033008
+}

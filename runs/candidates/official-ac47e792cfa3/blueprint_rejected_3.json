@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "repair-liquidity-exposure-close",
+  "title": "Repair the Liquidity Exposure Close",
+  "scenario": "The finance-ops close job turns compressed intraday treasury snapshots into account-level liquidity exposure and accrued carry reports. A recent feed upgrade added amended snapshots and occasional truncated files; the current Python pipeline sometimes produces plausible totals, repeats records after recovery, and takes too long on a full month. The container includes the existing service, fixtures, a SQLite state database, and an opaque compiled snapshot decoder built during the image build.",
+  "instruction_draft": "Can you get `/opt/liquidity/bin/close-runner` ready for the next close? It must ingest every file in `/opt/liquidity/inbox`, recover past truncated or CRC-invalid frames without losing later valid frames, and be safe to run repeatedly or after an interrupted run. For each account and UTC business date, write the exact duration-weighted exposure, peak utilization, and carry charge to `/opt/liquidity/state/close.db` in the existing tables, and keep the checkpoint, quarantine records, and `/opt/liquidity/out/close-summary.json` consistent with that database. Use integer/fixed-point arithmetic according to the README, retain amended records by sequence number rather than arrival order, and make the supplied 31-day workload complete in under 8 seconds on this one-CPU container; the verifier will generate additional feeds, including duplicate, out-of-order, amended, and damaged frames, and will check that rerunning produces byte-for-byte identical state.",
+  "requirements": [
+   "The executable at `/opt/liquidity/bin/close-runner` must ingest every input file in `/opt/liquidity/inbox`.",
+   "The runner must recover past truncated or CRC-invalid frames and continue processing later valid frames rather than stopping at the damaged frame.",
+   "The runner must be safe to run repeatedly and after an interrupted run without duplicating or losing records.",
+   "For each account and UTC business date, `/opt/liquidity/state/close.db` must contain the exact duration-weighted exposure required by the README.",
+   "For each account and UTC business date, `/opt/liquidity/state/close.db` must contain the exact peak utilization required by the README.",
+   "For each account and UTC business date, `/opt/liquidity/state/close.db` must contain the exact fixed-point carry charge required by the README.",
+   "Amended records must be selected by sequence number rather than arrival order.",
+   "The checkpoint state, quarantine records, and `/opt/liquidity/out/close-summary.json` must agree with the contents of the SQLite database.",
+   "The supplied 31-day workload must complete in under 8 seconds in the one-CPU container.",
+   "The implementation must produce byte-for-byte identical final state when rerun.",
+   "The implementation must also work on verifier-generated feeds containing duplicate, out-of-order, amended, and damaged frames."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt and pip dependencies, one CPU assumptions, and no network access at runtime.",
+   "The image contains roughly 1,500 lines of Python across a CLI, SQLite schema/migration code, checkpoint handling, report generation, and unrelated treasury utilities.",
+   "The image contains `/opt/liquidity/bin/close-runner`, `/opt/liquidity/state/close.db`, `/opt/liquidity/inbox/`, `/opt/liquidity/out/`, and `/opt/liquidity/README.md`.",
+   "The image build compiles `/opt/liquidity/build/snapdecode.c` into `/opt/liquidity/bin/snapdecode` and removes the C source; the shipped binary is the only implementation of the packed snapshot decoder.",
+   "The README documents the packed frame layout, CRC, timestamp units, sequence semantics, fixed-point units, and the intended formulas, but does not provide a failing reproduction.",
+   "The existing runner invokes the opaque decoder through a subprocess and writes decoded observations, checkpoints, quarantine entries, account-day aggregates, and a summary manifest.",
+   "The supplied inbox contains a 31-day, multi-account workload with tens of thousands of frames, including a damaged frame followed by valid frames, duplicate sequence numbers, and an amendment that arrives earlier in one file but later in another.",
+   "The planted problems are data-dependent: recovery can replay a decoder boundary and reinsert an already accepted observation, floating-point accumulation can change carry rounding near half-unit boundaries, and the report/checkpoint path can describe a different accepted-frame set from SQLite after a retry.",
+   "The verifier can replace the inbox with fresh deterministic feeds and can start from a copied partially processed state to exercise recovery."
+  ],
+  "internal_hint": "First run the existing close command on the supplied data while recording decoder stderr, SQLite row counts, checkpoint offsets, quarantine rows, and the summary digest; compare a clean run with a kill-and-resume run and with files concatenated in different orders. Probe snapdecode around a damaged frame: it resynchronizes at the next magic header, but the wrapper's retry logic replays the last complete frame. Replace the ingestion loop with a durable frame identity keyed by source-independent account/sequence identity, validate CRC and sequence amendments before aggregation, and commit accepted observations plus checkpoint/quarantine changes atomically. Derive the daily metrics from sorted effective observations using integer nanosecond durations and a signed fixed-point product, with explicit round-half-even at the documented carry unit; calculate peak utilization from interval endpoints, not sampled rows. Generate the report and manifest from the committed database, use deterministic ordering, and benchmark with one streaming pass plus indexed upserts rather than repeatedly rescanning all history. Validate using reordered files, injected truncation, duplicate amendments, and forced process termination before declaring success.",
+  "trap": "A shallow solution can make the visible totals look right by sorting one fixture and rounding with Python floats, or can simply discard the damaged file. Hidden feeds place valid frames after corruption, put an amendment before its superseded record in a different file, and create values exactly on a carry rounding tie. A retry then exposes duplicate observations or a checkpoint/report digest that disagrees with SQLite; file-order-dependent aggregation and repeated full-table scans also fail the generated-state and runtime checks.",
+  "tests": [
+   "The verifier runs the runner on the supplied inbox and checks that the required account-day rows, fixed-point values, and deterministic ordering in `/opt/liquidity/state/close.db` match the reference.",
+   "It checks that valid frames after truncated and CRC-invalid frames are present, that damaged frames are recorded in the quarantine table with the documented reason, and that the checkpoint reaches the end of every input.",
+   "It kills the process at deterministic commit boundaries, resumes it, and checks that accepted observations, checkpoint offsets, quarantine rows, and aggregates equal a clean run.",
+   "It runs the job twice without changing inputs and checks byte-for-byte equality of the SQLite database, summary JSON, and checkpoint state.",
+   "It permutes input file order and checks that sequence-based amendment selection and all account-day results remain unchanged.",
+   "It supplies verifier-generated feeds with duplicates, out-of-order frames, superseding sequence numbers, corrupted payloads, and exact fixed-point rounding ties, then compares every database metric and manifest digest with the reference implementation.",
+   "It checks cross-component consistency between accepted frame identities, aggregate row counts, checkpoint state, quarantine records, and the summary's database digest.",
+   "It measures the supplied 31-day workload and fails runs taking 8 seconds or more in the one-CPU container."
+  ],
+  "verifier_knob": {
+   "name": "generated_frame_count_and_history_depth",
+   "value": "75000 frames across 31 days, with 6 percent duplicates/amendments and 1 percent damaged frames",
+   "effect": "Lowering it makes naive rescans and file-order bugs less visible and reduces the chance of recovery-state interactions; raising it increases performance pressure, the number of dependent checkpoint transitions, and the probability of rare rounding and amendment cases."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the visible fixture and does not test a damaged frame followed by valid data.",
+   "The agent trusts arrival order or uses a last-write-wins SQL upsert, selecting the wrong amendment when files are reordered.",
+   "The agent aggregates with binary floating point and fails exact half-unit carry cases.",
+   "The agent retries decoder output without an idempotent frame identity, creating duplicate exposure intervals.",
+   "The agent updates the checkpoint separately from accepted rows, so interruption leaves a skipped or replayed range.",
+   "The agent generates the report from in-memory counters or raw files instead of committed SQLite state, causing digest and count mismatches.",
+   "The agent discards an entire damaged file rather than recovering later valid frames.",
+   "The agent implements a correct but repeatedly rescanning algorithm that exceeds the supplied workload limit.",
+   "The agent fixes the visible runner but misses the opaque decoder's resynchronization behavior and only discovers it during hidden corruption cases."
+  ],
+  "predicted_pass_rate": 0.32,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "data-processing",
+   "fixed-point-arithmetic",
+   "checkpoint-recovery",
+   "opaque-binary",
+   "sqlite-consistency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. Inspect the image contents, runner entry point, README, and state directories.",
+   "2. Read the README sections covering frame layout, CRC recovery, sequence semantics, fixed-point units, formulas, and checkpoint format.",
+   "3. Read the runner, schema/migration, checkpoint, aggregation, and report-generation modules.",
+   "4. Inspect the decoder invocation and query the opaque decoder's help/strings behavior.",
+   "5. Run the supplied workload once while capturing stderr, timing, SQLite counts, checkpoint contents, quarantine rows, and summary digest.",
+   "6. Dump representative inbox bytes and database rows around the damaged frame, duplicate sequences, and amendment.",
+   "7. Run clean, kill-and-resume, and reordered-file experiments to isolate replay and ordering failures.",
+   "8. Define a source-independent accepted-frame identity using account and sequence semantics, including amendment validation.",
+   "9. Replace decoder retry handling with forward resynchronization that cannot replay the last accepted frame.",
+   "10. Implement CRC/truncation quarantine and continue scanning after invalid frames.",
+   "11. Make accepted observations, quarantine entries, and checkpoint advancement one atomic SQLite transaction.",
+   "12. Add idempotent upserts keyed by the effective account/sequence identity.",
+   "13. Rework amendment selection to use sequence semantics rather than arrival or file order.",
+   "14. Replace floating-point aggregation with integer nanosecond duration arithmetic and documented fixed-point carry multiplication.",
+   "15. Implement explicit signed round-half-even at the README-specified carry unit.",
+   "16. Compute peak utilization from interval endpoints and effective sorted observations.",
+   "17. Generate summaries and database digests only from committed SQLite state with deterministic ordering.",
+   "18. Add or repair indexes and change processing to one streaming pass with indexed upserts.",
+   "19. Run syntax checks and a small hand-built feed containing duplicates, reordering, corruption, truncation, and a rounding tie.",
+   "20. Reset to a clean state and run the supplied workload, checking all required rows and digests.",
+   "21. Kill at several commit boundaries, resume, and compare every table, checkpoint, quarantine row, and manifest with a clean run.",
+   "22. Permute file order and verify identical effective observations and account-day aggregates.",
+   "23. Generate hidden-style feeds with amended-before-original records, duplicate amendments, and valid frames after corruption.",
+   "24. Run the 75,000-frame benchmark repeatedly on one CPU and optimize any remaining full-history scans.",
+   "25. Compare canonical database, summary, checkpoint, and quarantine bytes across repeated runs."
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The eight-second limit may be flaky on shared or differently provisioned verification hosts unless CPU pinning and timing methodology are tightly controlled.",
+   "Byte-for-byte equality of SQLite files can be affected by page allocation, journal mode, SQLite version, or prior file history even when logical state is identical; the verifier must canonicalize or specify a deterministic database lifecycle.",
+   "The exact definition of an interruption 'commit boundary' and how the verifier forces termination must be exposed to the implementation or made independent of instrumentation.",
+   "Generated-feed framing, file-order, checkpoint, and quarantine-reason expectations must be fully specified by the README and fixtures; otherwise correct recovery behavior could be judged against undocumented conventions.",
+   "The phrase 'UTC business date' and the exact accepted-frame identity must be unambiguously defined in the shipped documentation, not only in the reference implementation."
+  ],
+  "verdict": "accept",
+  "reasons": "This is a coherent, realistic recovery and deterministic-processing task with strong cross-component verification and several substantive failure modes. It is difficult but potentially solvable in the described container by an experienced engineer, although the broad scope and strict runtime make solvability only moderate.",
+  "fixes": [
+   "Document the exact canonicalization or database-reset procedure used for byte-for-byte SQLite comparisons.",
+   "Specify the verifier's kill mechanism and commit-boundary semantics.",
+   "Define the benchmark protocol, CPU isolation, warmup policy, and acceptable timing variance.",
+   "Add a concise schema contract for frame identity, quarantine reasons, checkpoint semantics, and UTC business-date calculation."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both are durable replay/recovery repairs requiring tolerant damaged-frame ingestion, deterministic supersession, idempotent reconstruction, and consistency across SQLite and derived views, but the candidate adds domain-specific time-weighted financial aggregation rather than reconstructing a replay service's object state."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "variant",
+     "reason": "Both are idempotent high-throughput ingestion pipelines that reconcile every input into SQLite, quarantine rejected data, and generate a consistent summary, although the candidate uses amended binary snapshots and financial aggregation instead of artifact classification."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34-m",
+     "verdict": "variant",
+     "reason": "The central problem is similarly repairing deterministic recovery from damaged persistent segments while keeping catalog and exposed state consistent across reruns, but the candidate's output is an aggregated close database rather than a replay daemon's object and audit state."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "variant",
+     "reason": "Both rebuild durable state from complete-but-partly-invalid inputs while continuing past corruption, deduplicating and resolving revisions, recording rejects, and enforcing deterministic reruns, with the candidate differing mainly in binary snapshots and fixed-point exposure calculations."
+    },
+    {
+     "ref_id": "ours/official-a67391f8734",
+     "verdict": "variant",
+     "reason": "Both center on scanning a corrupted binary stream and recovering later valid CRC-checked frames, but the candidate extends that parser-recovery problem into amended-record selection, idempotent SQLite materialization, and financial reporting."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.135
+    ],
+    [
+     "ours/official-982469e29790",
+     0.132
+    ],
+    [
+     "ours/official-ea89cb64bf34-m",
+     0.126
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.115
+    ],
+    [
+     "ours/official-a67391f8734a",
+     0.109
+    ]
+   ],
+   "cost_usd": 0.0014841999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0040593999999999995
+}

@@ -1,0 +1,7 @@
+Make the contract compiler produce the correct deterministic registry and diagnostics for the supplied contract corpus and newly generated contract sets. The command interface and TOML configuration format must remain unchanged.
+
+Compile every valid JSON contract under the configured input directory. Contracts may inherit fields and policy from other contracts; resolve inheritance transitively, reject missing parents and dependency cycles, and retain every valid resolved contract. Apply configured aliases and compatibility exceptions using the documented local-over-inherited precedence, while preserving explicit false and empty values as intentional settings.
+
+Malformed individual documents must produce deterministic diagnostics without preventing unrelated valid contracts from compiling. Reject only malformed documents, unresolved dependencies, cycles, policy violations, and failed or ambiguous compatibility checks. Invalid contracts must not appear in the registry, and each diagnostic must identify the contract and reason.
+
+Registry entries, resolved fields, policy data, diagnostics, and summary output must be deterministically ordered regardless of filesystem order, JSON key order, or repeated runs. Compilation must write registry.json, diagnostics.ndjson, and summary.json beneath build/ using atomic replacement only after the complete compilation succeeds; a failed run must leave prior good outputs unchanged and no temporary artifacts. Running unchanged inputs twice must produce byte-identical files.

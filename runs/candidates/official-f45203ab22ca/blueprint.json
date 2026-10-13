@@ -1,0 +1,62 @@
+{
+ "slug": "repair-assay-calibration-reports",
+ "title": "Repair Assay Calibration Reports",
+ "scenario": "A laboratory analyst reports that calibration numbers from the in-house spectroscopy pipeline stopped adding up after several instruments began sending corrections and delayed measurements. The container contains a small SQLite-backed JSONL service, historical assay events, an SQL report layer, and a compiled numerical helper used by the existing ingestion path.",
+ "instruction_draft": "Extend `/opt/assay/bin/assayd` so its JSONL stdin/stdout protocol supports the documented `calibration_report` request and returns correct weighted linear-calibration coefficients and prediction uncertainties for every assay and as-of time, while preserving all existing protocol operations. Reports must use the effective measurement history at the requested cutoff, apply superseding corrections exactly once, remain invariant to event delivery order and duplicate delivery, and produce finite deterministic JSON for empty, singleton, degenerate, and numerically ill-scaled datasets.",
+ "requirements": [
+  "The executable at `/opt/assay/bin/assayd` must continue serving the existing JSONL protocol and add the documented `calibration_report` operation.",
+  "Each JSONL request must receive exactly one JSONL response without relying on wall-clock time or network access.",
+  "A calibration report must return the documented weighted linear-regression coefficients, effective observation count, residual scale, and prediction estimates and uncertainties for all requested x values.",
+  "The report must evaluate the effective measurement history as of the request's cutoff timestamp.",
+  "Superseding corrections must replace the referenced measurement exactly once, and duplicate delivery of an event must not change any result.",
+  "Results must be invariant to the order in which valid historical events are delivered.",
+  "Empty, singleton, rank-deficient, and numerically ill-scaled inputs must produce the documented finite deterministic response rather than NaN, infinity, a crash, or a protocol desynchronization.",
+  "All existing ingestion, replay, and health requests documented in the repository must retain their previous observable behavior."
+ ],
+ "environment": [
+  "A Docker image based on `python:3.13-slim-bookworm` with pinned system and Python dependencies, one CPU, and no network access.",
+  "A roughly 1,400-line in-house Python/SQL codebase under `/opt/assay`, split among a JSONL protocol server, SQLite schema and migrations, event ingestion, report formatting, replay tooling, and unrelated instrument-health code.",
+  "The service is launched by `/opt/assay/bin/assayd`; its protocol and schema are described in `/opt/assay/docs/protocol.md` and `/opt/assay/docs/calibration.md`.",
+  "A seeded SQLite database containing thousands of spectroscopy calibration events across instruments and assays, including delayed observations, correction chains, duplicate deliveries, boundary timestamps, repeated x values, very different standard errors, and several nearly singular calibration runs.",
+  "A compiled black-box numerical helper at `/opt/assay/lib/libassaymath.so`, loaded by the existing ingestion path, which normalizes instrument values and exposes no source code; its behavior is documented through the service contract and must not be replaced with a guessed Python implementation.",
+  "The planted failure is distributed across event-history materialization, SQL grouping/window logic, and report-state caching: ordinary samples and a one-shot chronological replay appear correct, while accumulated histories with correction chains, late events, duplicate deliveries, and extreme weights yield silently inconsistent coefficients or uncertainties.",
+  "A deterministic reference generator and hidden-seed database builder are included outside the solver-visible runtime and generate fresh event histories and request sequences during verification."
+ ],
+ "internal_hint": "First inspect the protocol, calibration contract, schema, migrations, replay utility, and service logs, then drive the daemon with small hand-built histories before examining larger seeded behavior. The intended semantics are to canonicalize event identity, resolve each sample's latest valid supersession as of the cutoff, ignore events delivered after that cutoff, and only then perform the documented weighted least-squares sufficient-statistic calculation in numerically stable SQL/Python code; cached report state must be keyed by assay and cutoff and invalidated or rebuilt when history changes. The reference solution investigates by replaying the same events in permutations, inserting corrections after reports, and comparing reports with an independent high-precision calculation before changing the materialization/report path.",
+ "trap": "A shallow solution can make the visible chronological example pass by selecting the latest row per sample or by fixing the final regression formula, but hidden histories contain correction chains whose middle events arrive late, duplicate event IDs, reports at multiple historical cutoffs, and weights spanning many orders of magnitude. Such a solution either counts superseded observations, lets post-cutoff corrections leak backward, depends on insertion order, reuses stale cached sufficient statistics, or emits unstable zero-division results.",
+ "tests": [
+  "Launch `/opt/assay/bin/assayd` and verify that existing health, ingestion, and replay JSONL requests still return their documented responses.",
+  "Send generated append/replay requests followed by `calibration_report` requests and compare coefficients, effective count, residual scale, predictions, and uncertainties against an independent high-precision reference.",
+  "For every hidden seed, compare reports for chronological delivery, reverse delivery, shuffled delivery, and delivery with repeated duplicate events; all report fields must agree within the documented numeric tolerances.",
+  "Build fresh histories containing one or more supersession chains and request reports before and after corrections, including corrections whose delivery occurs after the report cutoff; only events effective at that cutoff may contribute.",
+  "Issue multiple reports for the same assay at different cutoffs, then append later events and repeat the requests; historical results must remain unchanged while current results incorporate eligible events.",
+  "Exercise empty, singleton, repeated-x, exactly-fit, rank-deficient, zero-residual, and extreme-weight histories and verify the documented finite deterministic fallback fields and prediction behavior.",
+  "Generate thousands of events across multiple assays and instruments, including timestamp-boundary cases and interleaved histories, and verify that grouping never leaks observations between assays or cutoffs.",
+  "Send malformed but protocol-valid edge requests covered by the repository contract and verify one deterministic error response per line without terminating or desynchronizing the service."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "12 hidden request histories, each containing 500-4000 generated events and 6-20 report/replay requests",
+  "effect": "Lowering the number of histories or requests makes insertion-order and cache bugs easier to miss; raising it increases the chance of exposing correction-chain, cutoff, numerical-conditioning, and protocol-state interactions while keeping the same service contract."
+ },
+ "expected_failure_modes": [
+  "The agent reads the obvious SQL query, patches a visible aggregation, and never compares shuffled or duplicate event delivery.",
+  "The agent implements weighted regression correctly but materializes the wrong effective event set for historical cutoffs.",
+  "The agent handles one-level corrections but not chains, late delivery, or duplicate event identity.",
+  "The agent caches sufficient statistics without invalidating them after ingestion or without including the cutoff in the cache key.",
+  "The agent uses ordinary floating-point subtraction or an unstable normal-equation calculation and fails extreme-weight or nearly singular hidden cases.",
+  "The agent tests only the supplied seed and misses fresh verify-time histories with empty and degenerate groups.",
+  "The agent changes the protocol framing or existing replay behavior while adding the new operation.",
+  "The agent attempts to reimplement the opaque numerical helper and introduces discrepancies in instrument-normalized values."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "scientific-computing",
+ "tags": [
+  "sql",
+  "weighted-regression",
+  "event-sourcing",
+  "jsonl-protocol",
+  "numerical-stability"
+ ]
+}

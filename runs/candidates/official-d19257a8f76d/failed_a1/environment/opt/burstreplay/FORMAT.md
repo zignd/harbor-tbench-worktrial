@@ -1,0 +1,1 @@
+Logical records are timestamp|name|value|weight|payload|checksum. Pipe and backslash escapes are backslash-pipe and doubled backslash. Quoted fields may contain physical newlines and doubled quotes. CRC32 covers the first five decoded fields joined by a literal pipe. Empty and Unicode fields are legal.

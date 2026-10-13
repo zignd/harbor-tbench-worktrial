@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "repair-assay-normalization",
+  "title": "Repair the Assay Normalization Pipeline",
+  "scenario": "A research scientist is reproducing a published single-cell assay result from an internal analysis package whose SQLite-backed normalization report has drifted after a scale-up. The container contains the Python package, command-line entry point, schema documentation, calibration fixtures, and a multi-thousand-row experiment database; several unrelated report and import modules are present because this is the deployed analysis tree.",
+  "instruction_draft": "Repair the analysis package in `/opt/assaypipe` so that `python -m assaypipe reproduce --db PATH --output PATH` produces the documented normalization report without changing its command-line interface or JSON schema. The report must be deterministic and must give the same result whether the database is processed in one pass or in arbitrary internal chunks, and repeated invocations in one Python process must not leak state between databases.\n\nThe observable result must follow the repository's assay specification: discard non-passing observations, resolve feature aliases before combining replicates, use the documented even-sample median, apply each batch's documented affine calibration with its fallback, perform tie-aware per-sample rank normalization over the available canonical features, and calculate the weighted sample score and status exactly as specified. Preserve all documented handling of NULLs, duplicate aliases, missing features, degenerate calibrations, negative and zero values, and stable ordering; the output must remain valid JSON with the documented numeric precision and row ordering.",
+  "requirements": [
+   "Keep the existing command-line invocation `python -m assaypipe reproduce --db PATH --output PATH` and its documented JSON schema.",
+   "Discard observations whose QC flag is not passing, and resolve feature aliases before combining observations.",
+   "Combine replicate observations using the documented median rule, including the documented even-count median.",
+   "Apply the documented per-batch affine calibration and its documented fallback for insufficient or degenerate calibration controls.",
+   "Perform tie-aware rank normalization independently for each sample over its available canonical features.",
+   "Calculate weighted sample scores and statuses using the documented weights, missing-feature rules, and precision.",
+   "Preserve documented behavior for NULL values, duplicate aliases, missing features, negative values, zero values, and stable output ordering.",
+   "Produce deterministic output independent of internal chunk size or processing order.",
+   "Ensure repeated calls in the same Python process do not retain rows, caches, temporary tables, or calibration state from an earlier database."
+  ],
+  "environment": [
+   "Use a Docker image based on `python:3.13-slim-bookworm` with pinned standard Python dependencies and SQLite available.",
+   "Create `/opt/assaypipe` as an approximately 1,300-line Python codebase with modules for SQLite loading, feature catalogs, calibration, rank normalization, scoring, report serialization, CLI handling, and unrelated import/export utilities.",
+   "Provide a README and schema document defining the `features`, `feature_aliases`, `observations`, `calibration_controls`, `feature_weights`, and `sample_metadata` tables, the exact normalization stages, fallback rules, rounding, status thresholds, and JSON schema.",
+   "Provide a realistic SQLite fixture containing tens of thousands of observations across batches, samples, aliases, duplicate replicates, missing values, failed QC rows, tied values, and degenerate calibration groups.",
+   "Plant defects across the implementation: a chunked loader loses accumulator state at page boundaries, a SQL grouping query selects a non-grouped alias-dependent value, the calibration cache is keyed too coarsely, rank ties are resolved by incidental SQLite order, and a temporary-table path survives across repeated calls.",
+   "Include plausible unrelated code and data-processing paths so the defect cannot be located by inspecting one small function.",
+   "Provide a small visible example whose values avoid chunk boundaries, aliases with conflicting display names, exact ties, and degenerate calibrations, while hidden verification generates those cases."
+  ],
+  "internal_hint": "The reliable path is to read the schema/specification first, inventory all callers of the loader and report builder, then run the supplied fixture while varying page size and invoking the library repeatedly in one interpreter. Compare intermediate row counts and per-stage values against a small independent Python implementation. The main fixes are to canonicalize and aggregate observations before any chunk-local reduction, carry state across chunks without relying on SQLite's arbitrary GROUP BY choice, key calibration and normalization state by the complete batch/sample identity, define explicit secondary ordering for equal values, and create or clear temporary state per run. Validate with generated databases containing alias collisions, NULL controls, odd/even replicate counts, ties, missing features, degenerate calibration controls, and multiple sequential database runs.",
+  "trap": "A shallow repair that makes the visible fixture match usually passes because its rows fit within one loader page and have unique ranks. Hidden databases put duplicate aliases and replicate groups across chunk boundaries, use equal values whose SQLite row order changes, reuse batch identifiers between databases, and include calibration groups that trigger the fallback; a solution that merely changes SQL ordering or patches the sample still produces plausible but incorrect scores.",
+  "tests": [
+   "Run the unchanged CLI on hidden-seed SQLite databases and compare the complete parsed JSON report against an independent reference computation for freshly generated inputs.",
+   "Generate thousands of observations with replicate groups split across arbitrary loader page boundaries and verify that canonical feature medians, counts, scores, and statuses equal the reference.",
+   "Generate aliases that map several raw feature names to one canonical feature, including conflicting display metadata, and verify canonicalization occurs before aggregation.",
+   "Generate odd and even replicate counts, NULL values, failed QC observations, negative values, and zero values and verify the specified filtering and median behavior.",
+   "Generate batches with valid controls, fewer than the required controls, collinear or zero-slope controls, and NULL controls and verify affine calibration and fallback behavior.",
+   "Generate samples with tied normalized values and randomized insertion order and verify tie-aware ranks and deterministic scores.",
+   "Generate samples with missing canonical features and verify the documented denominator, status, and output-row rules.",
+   "Run multiple databases sequentially through the library in one Python process, including databases reusing the same batch and sample identifiers, and verify no temporary rows or cached calibration values leak between runs.",
+   "Run the same generated database with different supported chunk sizes and insertion orders and verify byte-stable serialized output and stable row ordering."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "12 generated SQLite databases, 8,000-40,000 observations each, with 5-15% adversarial alias, tie, missing, and degenerate-calibration cases",
+   "effect": "Raising the number of fresh databases and adversarial cases makes fixture-specific patches and shallow visual checking ineffective; lowering it makes the task more tolerant of an implementation that only handles the common path."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the visible SQL query but does not preserve aggregates across chunk boundaries.",
+   "The agent implements ordinary ordinal ranks instead of average ranks for ties.",
+   "The agent aggregates raw aliases separately and only canonicalizes after scoring.",
+   "The agent uses a calibration cache keyed only by batch or sample and contaminates later runs.",
+   "The agent relies on SQLite's incidental ordering for equal values or grouped columns.",
+   "The agent handles valid affine controls but misses the documented degenerate-control fallback.",
+   "The agent tests only the supplied fixture and never changes page size, insertion order, or process reuse.",
+   "The agent rewrites the report serializer and accidentally changes numeric precision, NULL representation, or stable ordering.",
+   "The agent attempts a full rewrite from the README but misses an interaction between missing features, weights, and status thresholds."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "python",
+   "sqlite",
+   "fuzz-equivalence",
+   "scientific-reproducibility",
+   "large-scale-refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `cd /opt/assaypipe && find . -maxdepth 2 -type f | sort`",
+   "2. `sed -n '1,240p' README.md && sed -n '1,260p' schema.md`",
+   "3. `grep -R \"reproduce\\|Report\\|load_\\|chunk\\|calibr\" -n assaypipe`",
+   "4. `sed -n '1,260p' assaypipe/__main__.py && sed -n '1,260p' assaypipe/cli.py`",
+   "5. `grep -R \"load\\|aggregate\\|temporary\\|cache\" -n assaypipe`",
+   "6. Read the SQLite loader and all of its callers, including page/chunk handling.",
+   "7. Read the report builder, canonicalization, and SQL grouping paths.",
+   "8. Read calibration, rank-normalization, scoring, and serialization implementations against the specification.",
+   "9. Run the visible CLI fixture and inspect the emitted JSON.",
+   "10. Inspect any local tests and configuration for supported chunk-size and library-call hooks.",
+   "11. Patch the loader so canonicalization and replicate accumulation persist across page boundaries.",
+   "12. Replace non-grouped SQL-derived values with explicit canonical aggregation and deterministic grouping.",
+   "13. Key calibration and normalization state by the complete batch/sample identity and handle all fallback cases.",
+   "14. Implement explicit average tie ranks with deterministic secondary ordering.",
+   "15. Reset or scope temporary tables, accumulators, and caches for every report invocation.",
+   "16. Preserve the existing serializer, precision, NULL behavior, and ordering while fixing callers as needed.",
+   "17. Run the fixture with multiple page sizes and compare parsed and serialized output.",
+   "18. Generate local adversarial databases covering aliases, even medians, ties, missing values, and degenerate controls.",
+   "19. Run sequential databases in one interpreter and vary insertion order and chunk size.",
+   "20. Run the full test suite and inspect diffs for schema, precision, status, and row-order regressions."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact meaning of \u201cdocumented\u201d median, calibration fallback, missing-feature denominator, precision, and status thresholds must be identical in the README, schema document, implementation fixtures, and reference tests; any mismatch makes failures invalid.",
+   "The CLI does not expose a chunk-size or processing-order control, so tests must use a documented library hook or configuration mechanism rather than requiring an undisclosed interface.",
+   "Requiring byte-stable JSON can be overreaching if the documented schema permits object-key reordering or if floating-point serialization differs despite numerically equivalent results.",
+   "The repeated-invocation requirement is invalid unless the package exposes a supported in-process report-building API; testing private internals would exceed the stated CLI contract.",
+   "Generated tests must avoid relying on SQLite incidental row order while simultaneously expecting a particular order, and must keep generated databases within the stated 1 CPU/2 GB resource budget."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is clear, realistically testable, and has strong fuzz-equivalence verification, but the planted defects and internal guidance make the likely repair path largely discoverable by reading the source. The 20-step speedrun is likely to succeed for a strong agent, so genuine difficulty is only 2 and the minimum-score acceptance rule is not met.",
+  "fixes": [
+   "Make the defects arise from less explicitly signposted interactions and remove the near-complete internal repair recipe from the task-construction context used to assess difficulty.",
+   "Expose a documented, non-CLI test hook for chunk size and processing order, or state explicitly that tests may call a public library API.",
+   "Put one authoritative, machine-readable specification in the repository and have both fixtures and the independent reference derive behavior from it.",
+   "Add a small public regression-test harness for sequential in-process runs and chunk variation without changing the required CLI interface.",
+   "To raise genuine difficulty without adding ambiguity, distribute related state bugs across realistic call paths and include a few non-defective alternatives rather than one obvious defect per subsystem."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a single-cell assay normalization and scoring pipeline with medians, calibration, and rank normalization, rather than settlement-frame authentication and financial reconciliation."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both use SQLite and deterministic processing, the candidate computes assay normalization and sample scores rather than replaying event histories into incident and SLA state."
+    },
+    {
+     "ref_id": "ours/official-ee9176b9c4d1",
+     "verdict": "distinct",
+     "reason": "The candidate concerns canonical-feature assay transformations and calibration, not JSONL incident-event aggregation, wire decoding, and percentile reporting."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The candidate is an offline database-backed assay report repair, whereas this reference implements a stateful line-oriented weighted-quantile service with checkpoint and recovery semantics."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Despite shared deterministic database processing, the candidate performs scientific normalization and scoring rather than transactional shard replay, checksum validation, and live-row materialization."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.211
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.172
+    ],
+    [
+     "ours/official-ee9176b9c4d1",
+     0.17
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.164
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.162
+    ]
+   ],
+   "cost_usd": 0.0008393999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0036942
+}

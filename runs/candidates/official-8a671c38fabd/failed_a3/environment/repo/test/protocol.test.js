@@ -1,0 +1,1 @@
+const assert=require('assert'),{sealBatch,canon}=require('../src/seal');const r=[{from:0,id:'x',key:Buffer.alloc(32,1).toString('base64url')}],m=sealBatch([{b:1,a:{z:'é',a:[]}},{empty:''}],r);assert.equal(canon({b:1,a:2}),'{"a":2,"b":1}');assert.equal(m.version,3);assert.equal(m.entries.length,2);assert.notEqual(m.entries[0].chain,m.entries[1].chain);console.log('ok');

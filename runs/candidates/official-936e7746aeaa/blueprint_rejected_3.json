@@ -1,0 +1,176 @@
+{
+ "blueprint": {
+  "slug": "repair-bitmap-filter-daemon",
+  "title": "Repair the Incident Bitmap Filter Daemon",
+  "scenario": "After a production incident, a database administrator found that an internal event-search daemon sometimes returned incomplete result sets for compound filters. The container contains a small C codebase for a TCP query daemon, an opaque index-generation utility, format notes, fixtures, and unrelated maintenance tools; the daemon must be repaired without changing the wire contract.",
+  "instruction_draft": "Repair `/opt/bitmapd/bin/bitmapd` so it listens on `127.0.0.1:7070` and correctly handles newline-delimited JSON `load` and `query` requests for every documented boolean, term, prefix, and numeric-range filter, returning sorted unique record IDs and exact counts. It must also reload different index files correctly and answer the supplied large-index workload within 2 seconds on one CPU without scanning every record for each query.",
+  "requirements": [
+   "The repaired service must run as `/opt/bitmapd/bin/bitmapd`.",
+   "The service must listen on TCP address `127.0.0.1:7070`.",
+   "The service must accept one newline-delimited JSON request per line.",
+   "A `load` request must load the index file named by its `path` field and make it the active index.",
+   "A `query` request must evaluate the documented nested `and`, `or`, and `not` boolean expressions.",
+   "A `query` request must support exact term predicates, prefix predicates, and inclusive numeric-range predicates.",
+   "Each successful query response must contain the exact matching-record count and record IDs in strictly increasing order with no duplicates.",
+   "Queries against an empty result set must return count zero and an empty ID array.",
+   "Loading a second index must discard all state from the first index before subsequent queries are evaluated.",
+   "Malformed requests and invalid filter expressions must produce the documented JSON error response without terminating the daemon.",
+   "The service must complete the documented large-index workload in no more than 2 seconds on the one-CPU container.",
+   "The implementation must preserve the existing request and response field names and newline-delimited protocol."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned build tools and no network dependency at runtime.",
+   "The codebase under `/opt/bitmapd` contains roughly 1,500 lines of C and support code spread across the daemon, JSON handling, compressed-posting readers, query planning, logging, and maintenance utilities.",
+   "`/opt/bitmapd/bin/bitmapd` is the existing C daemon to repair; it currently builds but has data-dependent correctness failures.",
+   "`/opt/bitmapd/bin/indexforge` is an opaque compiled utility with no source. It generates `.sidx` files from newline-delimited event records and is used by fixtures and verification-time generators.",
+   "`/opt/bitmapd/FORMAT.md` documents the `.sidx` format: a dictionary of field terms, delta-varint posting lists divided into independently seekable blocks, numeric-value lists, and a record-count universe.",
+   "`/opt/bitmapd/PROTOCOL.md` documents the TCP JSON protocol, including `load`, `query`, success responses, and error responses.",
+   "`/opt/bitmapd/fixtures/` contains a small hand-written index and a few example requests, but no reproduction of the incident.",
+   "The planted failures involve compressed posting blocks and query-plan interactions that only appear after indexes have enough terms and records to create multiple blocks; one stale in-memory structure also becomes observable only after a reload.",
+   "The index format and protocol are deterministic, and the verification harness creates fresh indexes with `indexforge` from hidden seeded records."
+  ],
+  "internal_hint": "The reference investigation first reads the format and protocol notes, runs the daemon against the tiny fixture, then generates progressively larger indexes with indexforge while varying term counts, posting-list lengths, duplicate matches, block boundaries, and reload order. Instrumentation or a small client reveals that the reader's seek path can skip a posting block when the target falls at a block boundary because its stopping comparison uses the block's first document incorrectly; a second issue in the boolean planner combines already materialized child results with an iterator whose current position was advanced by a failed seek, losing matches in nested AND/OR expressions. The NOT path also uses the previous index's record universe after reload because the universe count is cached outside the index object. Fix the decoder/iterator invariants, make boolean evaluation consume independent iterators or correctly rewind them, and bind the universe to the active loaded index. Preserve the indexed execution strategy rather than replacing it with a full record scan. The reference shell script investigates by generating boundary-focused indexes, comparing protocol output with a simple Python reference evaluator, timing the large workload, then applies and builds the focused C fixes.",
+  "trap": "A shallow solution passes the supplied fixture and simple exact-term examples but fails hidden indexes whose posting lists span several compressed blocks, especially when a requested document is exactly the first document of a later block. Another plausible solution evaluates every query by scanning decoded records and gets correct small answers but exceeds the two-second workload limit. Implementations that cache the universe or dictionary across `load` requests return plausible results for positive filters while producing incorrect complements after a reload.",
+  "tests": [
+   "The verifier starts `/opt/bitmapd/bin/bitmapd`, connects to `127.0.0.1:7070`, sends a `load` request for the supplied small fixture, and checks exact-term, empty-result, and malformed-request responses; this checks the requirements for the executable, address, line protocol, loading, empty results, and nonterminating errors.",
+   "The verifier sends nested AND/OR/NOT expressions combining exact terms and checks exact counts and sorted unique IDs against an independent reference evaluator; this checks boolean-expression support and canonical result formatting.",
+   "The verifier uses `indexforge` with a hidden seed to create indexes containing hundreds of terms, posting lists crossing compressed-block boundaries, repeated matches across branches, and numeric values at range endpoints; it then checks exact, prefix, inclusive-range, and compound-query results; this checks all documented filter modalities and boundary correctness.",
+   "The verifier loads one generated index, runs complement and compound queries, loads a different generated index, and repeats them; this checks that reload discards all prior index state and binds NOT to the active universe.",
+   "The verifier sends invalid JSON, unknown operations, missing paths, and malformed nested predicates between valid requests and checks documented error objects followed by successful later responses; this checks protocol robustness.",
+   "The verifier generates a fresh large index of approximately 100,000 records and sends 500 mixed queries, including prefixes and nested boolean expressions, then compares every response with the reference evaluator and requires total service time below 2 seconds on one CPU; this checks hidden-input correctness and the stated performance bar."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "6 scenario groups: fixture protocol, nested boolean filters, generated compression boundaries, reload isolation, malformed requests, and 500-query performance workload",
+   "effect": "Reducing the number of groups mostly tests the visible fixture and makes shallow fixes pass; increasing generated index size, boundary diversity, nesting depth, and query count exposes iterator-state, complement-universe, and performance errors more reliably."
+  },
+  "expected_failure_modes": [
+   "The solver reads only the daemon's obvious query code, patches a comparison, and never generates an index large enough to expose the compressed-block seek failure.",
+   "The solver implements prefix or range filters by enumerating records, producing correct answers but missing the performance threshold.",
+   "The solver materializes child results and accidentally reuses an advanced posting iterator in nested boolean expressions.",
+   "The solver handles NOT using a global record count that remains stale after a second load.",
+   "The solver tests only positive filters and never checks exact block boundaries, duplicate branch matches, inclusive endpoints, or complements.",
+   "The solver changes the response shape or treats a malformed request as a fatal connection error.",
+   "The solver makes a broad rewrite of the opaque-format reader without validating it against the indexforge-generated format, introducing failures on uncommon varint lengths."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "c",
+   "database",
+   "compressed-index",
+   "tcp-protocol",
+   "algorithmic",
+   "debugging"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/bitmapd",
+   "find . -maxdepth 3 -type f | sort",
+   "cat FORMAT.md PROTOCOL.md",
+   "grep -RniE 'seek|block|posting|iterator|universe|record_count|load|query' src . --exclude='*.sidx'",
+   "sed -n '1,240p' daemon/query and reader source files identified by grep",
+   "inspect the build instructions and compile bitmapd",
+   "run bitmapd against the supplied fixture",
+   "send the documented example load and query requests with a short Python TCP client",
+   "inspect indexforge usage or its fixture-generation scripts",
+   "generate a larger boundary-focused index with repeated terms and multiple posting blocks",
+   "compare daemon responses against a small Python reference evaluator",
+   "trace the compressed-posting seek comparison at a block boundary",
+   "patch the decoder or iterator seek invariant",
+   "trace nested AND/OR evaluation for iterator reuse after failed seeks",
+   "patch boolean evaluation to use independent or correctly reset iterators",
+   "trace load and NOT handling for cached record-universe state",
+   "bind the universe and related dictionary state to the active index object",
+   "rebuild bitmapd and rerun fixture, boundary, reload, malformed-request, and reference comparisons",
+   "run the large generated workload and verify the two-second limit",
+   "install or copy the rebuilt binary to /opt/bitmapd/bin/bitmapd and perform a final protocol smoke test"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact build commands and source layout are not specified, so a solver may lose time discovering how to rebuild or install the daemon.",
+   "A strict two-second limit on a shared or variable-speed one-CPU verifier could cause flaky failures despite an algorithmically valid implementation.",
+   "The protocol's exact malformed-request error shape must be fully documented; otherwise tests could overconstrain equivalent valid error handling.",
+   "The performance test may conflate indexforge generation, daemon startup, socket setup, and query execution unless timing boundaries are explicitly defined.",
+   "If the daemon or a prior verifier process leaves port 7070 occupied, failures may be environmental rather than attributable to the submitted repair."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements and deterministic generated-input checks are unusually clear and strongly verify correctness, performance, reload isolation, and protocol robustness. However, the likely solution path is about twenty direct inspection, focused-patch, and test steps, and the stated measurements show that source-visible versions of this task were solved by Opus 4/4 and 4/5 times; genuine difficulty therefore scores only 2 and fails the acceptance rule.",
+  "fixes": [
+   "Make the principal failure depend on a less obvious interaction that cannot be located by a simple grep for seek, iterator, or universe handling, while retaining a reproducible diagnostic path.",
+   "Add a second independently necessary correctness issue involving prefix or numeric-range planning, with adversarial cases that distinguish a superficial decoder fix from a complete repair.",
+   "Provide explicit build and deployment commands so difficulty comes from debugging and algorithmic reasoning rather than repository archaeology.",
+   "Define the performance measurement boundary and add verifier-side process cleanup and a stable CPU-time measurement to reduce environmental invalid-failure risk.",
+   "Include a documented reference-client invocation or harness command for local differential testing without revealing the planted bug locations."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This repairs a TCP bitmap-index query daemon with boolean, term, prefix, and numeric-range filtering, unlike the stdin metric ingestion and weighted quantile service."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "This concerns exact bitmap-index filtering and index reload semantics, not adaptive quantile estimation, systemd deployment, or HTTP latency accuracy."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The candidate is an indexed query-server repair, whereas this task reconciles filesystem artifacts into SQLite, quarantine state, and summaries."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The candidate evaluates JSON bitmap filters over loaded indexes, while this task computes HMACs over canonical WAL records with refund resolution."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The candidate is a TCP bitmap-filter daemon with index-backed predicates, not an HTTP time-series aggregation service backed by a compiled windowing engine."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e05a846f6234",
+     0.208
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.161
+    ],
+    [
+     "ours/official-982469e29790",
+     0.147
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.145
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.143
+    ]
+   ],
+   "cost_usd": 0.000812
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0028063999999999997
+}

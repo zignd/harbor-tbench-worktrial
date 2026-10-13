@@ -1,0 +1,64 @@
+{
+ "slug": "reproduce-burst-trace-results",
+ "title": "Reproduce Burst Trace Results",
+ "scenario": "A research scientist is reproducing a published result from an in-house burst-trace experiment, but the container's replay service no longer agrees with the archived reports. The environment contains a Go JSONL service, shell-based launch and staging scripts, large synthetic trace fixtures, and a compiled line-format helper whose implementation is unavailable.",
+ "instruction_draft": "Repair `/opt/burstreplay/bin/replayd` and its launcher so the service accepts newline-delimited JSON requests for `reset`, `ingest`, and `report`, preserves state only within the requested run, and returns one newline-delimited JSON response for every request. Follow `/opt/burstreplay/SPEC.md` exactly for the escaped trace format, event fields, ordering and session rules, three-stage burst calculation, checksums, error responses, and all output fields; the result must work for fresh generated traces as well as the supplied examples.",
+ "requirements": [
+  "The executable service must be available at `/opt/burstreplay/bin/replayd` and its documented launcher must start it without network access.",
+  "The service must read one JSON request per input line and emit exactly one JSON response line per request.",
+  "The service must support the `reset`, `ingest`, and `report` operations with the request and response shapes specified in `/opt/burstreplay/SPEC.md`.",
+  "State must be isolated by run identifier, reset must discard the selected run's accumulated state, and unrelated runs must not affect one another.",
+  "The implementation must decode every record accepted by the escaped trace format, including quoted separators, escaped backslashes, multiline payloads, Unicode text, malformed-record handling, and the specified checksum.",
+  "The implementation must perform the documented event-time ordering and sessionization before calculating the burst metrics.",
+  "Reports must contain every documented output field, use the specified integer and fixed-point representations, and reproduce the documented checksum and tie-breaking rules.",
+  "The service must return the specified deterministic error response for invalid requests or invalid trace records and must continue serving later requests.",
+  "The implementation must handle the supplied fixtures and verify-time generated traces without relying on wall-clock time, randomness, or network access."
+ ],
+ "environment": [
+  "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pins apt and pip dependencies, and creates `/opt/burstreplay` with roughly 1,500 lines spread across Go service packages, shell launch/staging scripts, configuration, documentation, and fixtures.",
+  "`/opt/burstreplay/bin/replayd` is a Go binary compiled during the Docker build from service source; the source includes realistic unrelated ingestion, JSON, and reporting code as well as regressions involving accumulated state, event ordering, and stage handoff.",
+  "`/opt/burstreplay/bin/linepack` is another compiled Go binary built in the Dockerfile and then shipped without its source. It decodes the unusual physical trace format described in `FORMAT.md`; its shipped implementation has data-dependent failures on continuation records, escaped delimiters, and checksum-boundary cases.",
+  "`/opt/burstreplay/SPEC.md` documents the JSONL protocol, all request and response fields, reset semantics, the three dependent processing stages, fixed-point arithmetic, error behavior, and report checksum. `FORMAT.md` documents the linepack framing and escaping rules with small examples but not exhaustive cases.",
+  "`/opt/burstreplay/bin/replay.sh` creates a staging directory, invokes the decoder and replay service, and cleans up intermediate files; it contains quoting, pipeline-status, and repeated-run problems that only become visible with generated paths and malformed records.",
+  "`/opt/burstreplay/fixtures/` contains several small examples that exercise ordinary records and one visible continuation case, plus larger traces of several thousand records. The visible reports are intentionally insufficient to expose all ordering, state, and rare escaping interactions.",
+  "The Docker image includes Go tooling and standard build tools but no internet dependency; all verification inputs and the deterministic reference generator are installed in the container."
+ ],
+ "internal_hint": "Start by exercising the JSONL protocol and the shell launcher with multiple runs in one process, then compare intermediate decoder output, session boundaries, and final reports against the supplied fixtures. The durable solution is to replace the opaque linepack helper with a Go implementation of the documented framing, escaping, continuation, and checksum grammar; repair the launcher so failures and temporary files are handled correctly; and fix the service's stage boundaries so decoded records are ordered by event time with the specified stable tie break, sessionized, transformed into the documented gap/run histogram, and only then aggregated with exact fixed-point arithmetic. The key interactions are state surviving between requests, decoder output changing the ordering stage, ordering changing sessions, and sessions changing the final checksum, so inspection of isolated functions is not sufficient; generate traces containing duplicates, out-of-order events, boundary gaps, malformed lines, Unicode, and all escape forms while observing each stage.",
+ "trap": "A shallow solution can make the visible report pass by patching the final aggregate or by implementing only ordinary escaped lines. Hidden requests combine continuation records with escaped separators, equal timestamps, late events at session boundaries, repeated run identifiers, malformed records followed by valid records, and several requests in one process; an early decoder or ordering error then changes sessions, fixed-point totals, and the final checksum.",
+ "tests": [
+  "A protocol smoke test starts the launcher, sends `reset`, `ingest`, and `report` requests, and checks one valid JSON response per request, all documented fields, and deterministic output; this corresponds to the instruction's JSONL service and documented protocol requirements.",
+  "A state-isolation test interleaves two run identifiers, resets one, and reports both; it checks the instruction's requirement that state is isolated by run and reset only affects the selected run.",
+  "A generated-format test creates fresh traces with quoted separators, escaped backslashes, multiline payloads, Unicode, empty fields, checksum edge cases, and malformed records, then compares decoder-driven reports and error responses with the reference; it checks the instruction's complete escaped-format and deterministic-error requirements.",
+  "An ordering and session test generates thousands of events with duplicate timestamps, out-of-order arrival, boundary-sized gaps, and late events, then compares the complete report including counts, fixed-point metrics, tie breaks, and checksum; it checks the instruction's event-time ordering, sessionization, and exact output requirements.",
+  "A multi-stage dependency test varies one early decoded field while holding the raw trace shape constant and verifies the changed session and aggregate outputs against the reference; it checks that all documented processing stages are actually applied rather than bypassed with a final-field patch.",
+  "A recovery test sends invalid requests and bad records followed by valid requests in the same process and checks that the service emits the specified error response and continues correctly; it checks the instruction's protocol resilience requirement.",
+  "A launcher test runs the shell entrypoint with generated temporary paths and repeated invocations, verifies nonzero failure propagation, cleanup, and no stale intermediate data; it checks the instruction's requirement that the documented launcher start the service reliably.",
+  "A scale test feeds several thousand records across multiple reports under the container's CPU and memory limits and compares exact results, checking generality rather than success on only the supplied examples."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "8",
+  "effect": "Each scenario is a stateful protocol conversation with a different mix of generated trace features; lowering this to 3 mostly exercises the examples and makes partial fixes likely to pass, while raising it adds more interleavings, malformed-record recovery cases, and cross-stage boundary combinations."
+ },
+ "expected_failure_modes": [
+  "The solver patches the final aggregation without reconstructing the decoder and therefore fails hidden escaped-format and checksum cases.",
+  "The solver sorts by arrival order or uses an unstable timestamp sort, producing incorrect sessions only when timestamps tie or arrive late.",
+  "The solver resets all global state on every request or leaks one run's records into another run.",
+  "The solver implements the protocol as a one-shot command and does not preserve or recover state across a long JSONL conversation.",
+  "The solver builds a plausible line parser but mishandles continuation boundaries, quoted separators, Unicode byte lengths, or CRC input bytes.",
+  "The solver uses floating-point arithmetic for fixed-point metrics and fails exact hidden comparisons near rounding and tie boundaries.",
+  "The solver verifies only the visible fixture and misses the interaction where a rare early decode error changes later session and checksum results.",
+  "The solver fixes the Go binary but leaves the shell launcher unable to propagate pipeline failures or clean up repeated staging runs."
+ ],
+ "predicted_pass_rate": 0.22,
+ "difficulty": "hard",
+ "category": "text-log-processing",
+ "tags": [
+  "shell-scripting",
+  "go",
+  "stateful-protocol",
+  "opaque-binary",
+  "multi-stage-pipeline",
+  "log-parsing"
+ ]
+}

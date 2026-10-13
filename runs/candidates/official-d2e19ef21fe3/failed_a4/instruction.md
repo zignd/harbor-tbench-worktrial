@@ -1,0 +1,7 @@
+Repair the assay report package in `/workspace/assay_report` so that `python -m assay_report <database> <output.json>` writes the reproducible cohort report described by `/workspace/README.md`.
+
+Recover every usable record from valid JSON-lines export fragments, including independently recoverable lines after malformed JSON and records split across fragment boundaries; reject only records failing the documented fields or CRC32. Resolve duplicates deterministically using run, well, sequence, quality, timestamp, and record identity precedence from the README. Do not modify the SQLite database or depend on wall-clock time.
+
+Apply unit conversion before each run's affine calibration, then apply the documented cohort inclusion rules and Tukey fences, compute controls from the same surviving measurements, aggregate replicates by median, and calculate the documented Hodges-Lehmann effect estimate. Preserve cohorts with computable numerator and denominator even when unrelated controls or samples are absent, and emit JSON null for non-computable statistics.
+
+The output must be valid deterministic JSON with fields `cohort`, `analyte`, `n`, `control_n`, `median`, `control_median`, `effect`, and `unit`; null must be used instead of NaN or Infinity. Sort rows by cohort then analyte, and use compact UTF-8 JSON with a final newline. The command must work for empty cohorts, malformed and truncated fragments, repeated measurements, mixed units, missing controls, and fresh catalogs following the README schema.

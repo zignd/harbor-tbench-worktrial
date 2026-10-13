@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "repair-telemetry-release-bundler",
+  "title": "Repair the telemetry release bundler",
+  "scenario": "A backend developer is chasing a production discrepancy: release telemetry bundles sometimes have the wrong event totals, and the CI job is now too slow for the nightly build window. The container contains a small Python packaging pipeline and shell-based release driver that turn service logs and metric snapshots into a deterministic distributable bundle.",
+  "instruction_draft": "Hey, can you repair the release bundler under `/opt/telemetry-bundler`? `bin/build_bundle.sh INPUT_DIR OUTPUT_TAR` needs to produce a deterministic gzip tarball containing the canonical event stream, shard index, and metrics report: valid event records must be preserved exactly once, malformed records must be excluded and counted, metric snapshots must be rolled up correctly, and the result must be byte-for-byte reproducible. Please keep the command-line interface and documented output names intact; it also needs to process at least 60,000 generated log records per second on the container's single CPU.",
+  "requirements": [
+   "The executable `/opt/telemetry-bundler/bin/build_bundle.sh INPUT_DIR OUTPUT_TAR` remains the public interface.",
+   "The command must create a deterministic gzip tarball at the requested output path.",
+   "The tarball must contain the documented canonical event stream, shard index, and metrics report under their existing output names.",
+   "Every valid event record from the input logs must occur exactly once in the canonical event stream.",
+   "Malformed, truncated, and unsupported log records must be excluded from the canonical event stream and counted in the metrics report.",
+   "Metric snapshot records must be rolled up into the metrics report using the documented grouping and aggregation rules.",
+   "The canonical event stream and index must use the documented stable ordering and shard assignment rules.",
+   "Repeated builds from identical input must produce byte-for-byte identical tarballs, including gzip metadata.",
+   "The command must achieve at least 60,000 generated log records per second on the one-CPU container."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned apt and pip dependencies and no network requirement.",
+   "`/opt/telemetry-bundler` contains roughly 1,300 lines across a shell release driver, Python log reader, normalizer, metric reducer, shard/index builder, tarball writer, CLI utilities, tests, and operational documentation.",
+   "`fixtures/sample/` contains representative service logs, metric snapshots, a malformed multiline record, and a reference-shaped bundle; the sample is intentionally too small to expose all failures.",
+   "Input logs use the documented line-oriented format with event, metric, continuation, and comment records. Events include tenant, event_id, sequence, timestamp, kind, and payload fields; timestamps can cross hour and day boundaries.",
+   "The intended pipeline has dependent stages: shell discovery and filtering feed normalization, normalization feeds aggregation and ordering, and the resulting records feed shard/index generation and deterministic packaging.",
+   "The planted defects include shell pipelines that mishandle filenames and exit status, a stateful parser that loses continuation records at file boundaries, normalization that conflates distinct sequence values in some data-dependent cases, a reducer that depends on arrival order, and packaging that leaks filesystem and gzip metadata.",
+   "The repository includes plausible unrelated Python utilities and a metrics-reporting helper so the fault cannot be located reliably by inspecting only one file.",
+   "A hidden-input generator creates fresh directories containing thousands to hundreds of thousands of records, many files, unusual filenames, duplicate event identifiers with different sequences, out-of-order timestamps, boundary timestamps, malformed records, and metric snapshots whose groups are split across files."
+  ],
+  "internal_hint": "Start by running the documented sample and tracing every intermediate artifact rather than patching the final tar writer. Generate small adversarial inputs that split a multiline record across files, reorder the same metric group, use duplicate IDs with competing sequence values, and include filenames beginning with punctuation; compare each stage against a simple reference calculation. The shell driver needs null-safe file enumeration, strict failure propagation, and streaming handoff without repeatedly reparsing the same data. The parser must carry continuation state until the logical record is complete, normalization must retain the full identity and apply the documented sequence winner rule, and aggregation must be keyed independently of input order. Build the canonical stream and index once, then package sorted names with fixed tar metadata and fixed gzip mtime. Finally benchmark a large generated directory: the successful design streams records and uses bounded dictionaries/sorts rather than invoking Python once per line or rescanning every intermediate file.",
+  "trap": "A shallow fix can make the visible fixture pass while silently dropping the final continuation record in a file, choosing the first duplicate instead of the winning sequence, or producing order-dependent metric totals. Another common solution computes correct output but repeatedly launches subprocesses or reparses intermediate JSON, falling below the 60,000-records-per-second threshold. Non-deterministic tar member order or gzip timestamps also makes two apparently identical successful runs differ.",
+  "tests": [
+   "The smoke test runs `/opt/telemetry-bundler/bin/build_bundle.sh` on the supplied fixture and checks that the required event stream, shard index, and metrics report are present and semantically correct; this checks the instruction sentences about the public interface, output names, valid records, malformed counts, and metric rollups.",
+   "A verify-time generator creates fresh multi-file inputs with unusual filenames, comments, malformed lines, multiline records, and records split at file boundaries; the test compares the extracted canonical stream and malformed count with an independent reference implementation, checking the requirements to preserve every valid record exactly once and exclude/count invalid records.",
+   "A generated case distributes duplicate event IDs, competing sequence numbers, out-of-order timestamps, and metric snapshots for the same groups across many files; the test checks the documented winner, stable canonical ordering, shard assignments, and order-independent aggregate values.",
+   "The determinism test builds the same generated input twice in separate temporary directories and compares SHA-256 hashes of the complete tarballs as well as extracted contents, checking the byte-for-byte reproducibility requirement.",
+   "The performance test generates a fresh large workload of at least 600,000 records spread across hundreds of files and measures the complete command from input discovery through tarball creation; it requires at least 60,000 records per second on the one-CPU container.",
+   "A failure-propagation test injects an unreadable or invalidly encoded input file and verifies that the command exits nonzero rather than emitting a successful partial bundle, checking the observable behavior implied by a production release command."
+  ],
+  "verifier_knob": {
+   "name": "minimum_records_per_second",
+   "value": "60000",
+   "effect": "Raising the value makes subprocess-heavy or multi-pass implementations fail despite being correct; lowering it makes the task primarily a correctness and determinism challenge."
+  },
+  "expected_failure_modes": [
+   "The agent patches only the visible sample path and misses state that spans file boundaries or rare malformed-record branches.",
+   "The agent implements aggregation using arrival order, so hidden shuffled inputs produce different winners or totals.",
+   "The agent loses shell failures because of pipelines, whitespace, unusual filenames, or missing strict exit handling.",
+   "The agent gets semantic output right but uses per-record process launches, repeated scans, or excessive JSON serialization and misses the throughput threshold.",
+   "The agent sorts logical records correctly but leaves tar member ordering, uid/gid, mtime, or gzip headers nondeterministic.",
+   "The agent changes an intermediate format or output name while fixing the implementation, breaking downstream packaging and hidden consumers."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "build-packaging",
+  "tags": [
+   "shell-scripting",
+   "python",
+   "logs",
+   "metrics",
+   "deterministic-builds",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/telemetry-bundler && find . -maxdepth 3 -type f -print",
+   "cat README* docs/* 2>/dev/null",
+   "sed -n '1,240p' bin/build_bundle.sh",
+   "grep -RInE 'parse|normalize|aggregate|shard|tar|gzip|output' . --exclude-dir=.git",
+   "sed -n '1,260p' src/*.py 2>/dev/null",
+   "./bin/build_bundle.sh fixtures/sample /tmp/sample.tar.gz",
+   "tar -tzvf /tmp/sample.tar.gz && mkdir -p /tmp/sample-extract && tar -xzf /tmp/sample.tar.gz -C /tmp/sample-extract && find /tmp/sample-extract -type f -maxdepth 3 -print",
+   "find tests -type f -maxdepth 3 -print -exec sed -n '1,220p' {} \\;",
+   "grep -RInE 'sequence|winner|malformed|continuation|metric|shard|ordering' . --exclude-dir=.git",
+   "mkdir -p /tmp/adversarial && generate small multi-file inputs with split continuations, duplicate IDs, reordered metrics, and unusual filenames",
+   "./bin/build_bundle.sh /tmp/adversarial /tmp/adversarial.tar.gz; inspect the intermediate and extracted artifacts",
+   "patch bin/build_bundle.sh for null-safe enumeration, strict pipeline failures, and one streaming handoff",
+   "patch the parser to retain continuation state through EOF and file transitions and reject/count invalid records",
+   "patch normalization to preserve full identity and implement the documented sequence winner rule",
+   "patch metric reduction to key groups independently of arrival order",
+   "patch canonical ordering and shard/index generation to use the documented stable rules",
+   "patch tar/gzip creation to sort members and fix uid, gid, mode, mtime, and gzip metadata",
+   "run the sample, adversarial cases, determinism comparison, and failure-propagation checks",
+   "generate the large workload and benchmark the complete command, then run the repository test suite"
+  ],
+  "speedrun_commands": 21,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The blueprint refers to documented output names, grouping rules, sequence-winner rules, ordering, and shard assignment without including those definitions; if the repository documentation is incomplete or inconsistent, the task is ambiguous.",
+   "The 60000-records-per-second threshold may vary with host CPU allocation, filesystem behavior, Python startup state, and tar/gzip implementation, making a correct solution flaky near the boundary.",
+   "The failure test's unreadable-file behavior can depend on whether the command runs as root, since root may still read files made unreadable with ordinary permission bits.",
+   "The phrase 'malformed, truncated, and unsupported' requires the parser's exact classification and count semantics to be documented; otherwise the independent verifier may over-specify behavior.",
+   "The requirement to compare builds from separate temporary directories is invalid if any undocumented input path or filesystem metadata is intentionally incorporated into the archive."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly well covered by deterministic hidden tests, but the stated benchmark experience indicates that the defects are discoverable by source inspection and a short trace-and-patch workflow. A strong agent can plausibly reach a passing implementation in roughly twenty commands, so genuine_difficulty is only 2 and the acceptance threshold is not met.",
+  "fixes": [
+   "Make the documented semantic rules explicit in the task materials and add a machine-readable reference specification so output expectations are not inferred from scattered documentation.",
+   "Calibrate the throughput test on the actual verification container, use a meaningful margin above the threshold, and report workload shape and timing methodology precisely.",
+   "Add a less source-obvious behavioral interaction, such as cross-stage recovery or bounded-memory requirements, while keeping the oracle explicit and fair.",
+   "Ensure the failure test uses a reliably unreadable or invalid-encoding fixture under the task's actual execution user.",
+   "Add tests for archive metadata, path independence, EOF continuation handling, and exact malformed-record classification so those cases are explicitly and independently verified."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ee9176b9c4d1",
+     "verdict": "distinct",
+     "reason": "The candidate is a batch packaging pipeline requiring deterministic tar/gzip output, shard indexing, and snapshot rollups, rather than the reference's JSONL-to-TSV decoding, deduplication, and percentile reporting."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The candidate repairs an offline log-bundling and deterministic archive workflow, while this reference implements a stateful line-protocol metric service with persistence, lateness handling, and weighted quantiles."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234-m",
+     "verdict": "distinct",
+     "reason": "The candidate repairs an offline log-bundling and deterministic archive workflow, while this reference implements a stateful line-protocol metric service with persistence, lateness handling, and weighted quantiles."
+    },
+    {
+     "ref_id": "ours/official-8a671c38fabd",
+     "verdict": "distinct",
+     "reason": "The candidate concerns validation, aggregation, sharding, and reproducible archive generation, whereas the reference concerns authenticated event sealing, canonical encoding, key rotation, and cryptographic chaining."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "The candidate is an offline deterministic release-bundle builder, unlike the reference's deployed restart-safe TCP/HTTP relay requiring framed-stream recovery, delivery guarantees, and live services."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ee9176b9c4d1",
+     0.238
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.198
+    ],
+    [
+     "ours/official-e05a846f6234-m",
+     0.198
+    ],
+    [
+     "ours/official-8a671c38fabd",
+     0.183
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.179
+    ]
+   ],
+   "cost_usd": 0.0013508
+  },
+  "novel": true
+ },
+ "cost_usd": 0.003398
+}

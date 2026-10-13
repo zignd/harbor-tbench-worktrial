@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "reproduce-trace-burst-metrics",
+  "title": "Repair the Trace Burst Reproduction Service",
+  "scenario": "A research scientist is reproducing a paper's latency-burst analysis from archived distributed-trace logs. The container contains a Go service, calibration data, shell-based launch tooling, an incomplete framed-log parser, and an opaque compiled timestamp-normalization helper built during the image build; the service currently produces plausible results for its small example but diverges on long, fragmented traces.",
+  "instruction_draft": "Repair and rebuild `/opt/repro/bin/tracepipe` so its line-delimited JSON protocol implements the complete pipeline documented in `/opt/repro/PROTOCOL.md`, including `reset`, `push`, and `finish` requests, persistent state across requests, and the exact response fields and error behavior specified there. It must reproduce the documented results for arbitrary fragmented, reordered, escaped, and calibration-boundary trace streams, emit only one JSON response per request on stdout, and remain deterministic.",
+  "requirements": [
+   "The repaired executable must be installed at `/opt/repro/bin/tracepipe`.",
+   "The executable must accept one JSON request per line on stdin and emit exactly one JSON response per request on stdout.",
+   "The protocol must support the documented `reset`, `push`, and `finish` request types.",
+   "State must persist across related requests until `reset`, and `reset` must discard all accumulated stream state.",
+   "The implementation must produce every response field and error response required by `/opt/repro/PROTOCOL.md`.",
+   "The implementation must correctly process arbitrary fragmented trace streams, including records split across `push` requests.",
+   "The implementation must correctly process reordered records, escaped delimiters, multiline payloads, and timestamps on calibration-table boundaries.",
+   "The implementation must be deterministic and must not write diagnostic output to stdout."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pins apt and pip dependencies, creates `/opt/repro`, and builds the opaque helper `/opt/repro/bin/zonefold` from temporary Go source before deleting that source.",
+   "The repository contains approximately 1,500 lines of Go across a protocol server, stream accumulator, calibration loader, quantile report generator, shell launch scripts, fixtures, and unrelated utility code.",
+   "`/opt/repro/PROTOCOL.md` documents the newline-delimited JSON protocol, the trace-frame grammar, calibration semantics, report fields, percentile interpolation, checksum construction, and error behavior.",
+   "`/opt/repro/data/calibration.tbl` contains piecewise timestamp-offset and clock-domain calibration entries, including adjacent ranges with different tie behavior.",
+   "`/opt/repro/bin/zonefold` is a stripped compiled binary that converts a raw timestamp and clock-domain identifier into a calibrated integer microsecond timestamp; it is correct but exposes only its documented stdin/stdout interface.",
+   "`/opt/repro/src/frameparser.go` contains an incomplete parser for the project's length-prefixed, escaped, multiline trace-frame format; the missing implementation must be built rather than replaced with line-oriented splitting.",
+   "The existing Go pipeline has stateful defects involving partial-frame retention, duplicate sequence suppression, late span completion, empty-window handling, and signed 64-bit duration accumulation.",
+   "The visible fixture is small, has no escaped delimiter inside a payload, no frame split at a calibration boundary, and only one request sequence, so a shallow smoke test appears correct.",
+   "The supplied `Makefile` builds the service and installs it at the required path; the verifier starts that executable directly rather than inspecting source."
+  ],
+  "internal_hint": "Start by reading PROTOCOL.md, the shell launcher, calibration files, and all callers of frameparser.go, then drive the existing binary manually with reset/push/finish sequences while comparing intermediate counts and reports. Probe zonefold independently around lower and upper calibration bounds, inspect parser state after deliberately splitting bytes at every offset, and generate small streams to isolate framing, deduplication, span joining, clock correction, and quantile/checksum stages. Implement a real incremental parser with escaped length-prefixed frames and retained partial bytes, then repair state transitions so sequence deduplication is per trace, late child spans update already-open roots, and duration arithmetic saturates before histogram insertion; rebuild with the Makefile and use a shell harness to compare many generated streams against an independent reference implementation.",
+  "trap": "A naive solution that only fixes newline splitting or computes a report from each push independently passes the visible fixture but loses frames split across requests and corrupts later stages. Solutions that sort timestamps before deduplication, use floating-point percentiles, treat calibration endpoints uniformly, or finalize a root span before late children arrive produce plausible p50 values while failing hidden p95, checksum, and multi-request cases.",
+  "tests": [
+   "The verifier starts `/opt/repro/bin/tracepipe`, sends a documented `reset`/`push`/`finish` sequence, and checks every returned field against the reference pipeline on the supplied basic fixture; this exercises the requirement to implement the JSON protocol and exact response fields.",
+   "Fresh requests generated from a hidden seed split frames at arbitrary byte offsets across multiple `push` calls, including splits inside escaped fields and multiline payloads; this checks incremental framing and persistent state.",
+   "Generated streams contain reordered records, repeated sequence numbers, late child spans, and interleaved trace IDs; this checks per-trace deduplication and the ordered multi-stage aggregation result.",
+   "Generated timestamps cover both sides of every calibration interval boundary and use multiple clock domains; expected calibrated durations are obtained from the reference implementation and compared exactly.",
+   "Generated durations include empty traces, zero-length spans, negative raw deltas corrected by calibration, and values near signed 64-bit limits; this checks specified saturation and empty-window behavior.",
+   "The verifier sends several independent `reset` sequences in one process and confirms that no records, parser bytes, deduplication keys, or histogram state leak between them.",
+   "A hidden scenario sends malformed JSON, invalid frame lengths, invalid escapes, unknown operations, and finish-before-push requests; responses must match the documented structured errors while the service remains usable for the next valid request.",
+   "A larger generated corpus containing thousands of frames is streamed in randomly sized chunks and compared field-for-field, including exact percentile interpolation and the final rolling checksum.",
+   "The verifier checks that stdout contains exactly protocol responses and that repeated execution on the same generated request sequence gives byte-identical output."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "14",
+   "effect": "Each scenario is an independently generated protocol conversation with different chunk boundaries, trace ordering, calibration regions, malformed requests, and state resets; lowering the count mostly exercises visible paths, while raising it increases coverage of interacting state and rare parser/calibration cases."
+  },
+  "expected_failure_modes": [
+   "The solver reads the obvious service code and patches a visible aggregation condition without exercising state across multiple requests.",
+   "The solver implements a line-based parser and misses length-prefixed frames, escaped delimiters, or partial bytes retained between pushes.",
+   "The solver builds a parser that works on complete frames but mishandles parser state after malformed input or after reset.",
+   "The solver uses ordinary integer addition and fails rare overflow or negative-duration cases.",
+   "The solver computes common percentile formulas that agree on the sample but differ from the documented interpolation for even and small sample counts.",
+   "The solver calls the opaque calibration helper only for complete timestamps and mishandles domain transitions or exact interval endpoints.",
+   "The solver finalizes traces when their root arrives and misses late child records, causing downstream quantiles and checksums to drift.",
+   "The solver forgets to rebuild or install the repaired binary, so the verifier runs the stale prebuilt executable.",
+   "The solver adds debugging output or changes the protocol framing while investigating the service."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "text-and-log-processing",
+  "tags": [
+   "shell-scripting",
+   "go",
+   "stateful-protocol",
+   "incremental-parser",
+   "trace-aggregation",
+   "opaque-binary"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/repro && find . -maxdepth 3 -type f -print",
+   "cat PROTOCOL.md",
+   "cat Makefile && find scripts bin -maxdepth 2 -type f -print -exec sed -n '1,220p' {} \\;",
+   "sed -n '1,260p' src/frameparser.go",
+   "grep -R \"frameparser\\|TODO\\|FIXME\\|panic(\\\"\" -n src",
+   "sed -n '1,300p' src/accumulator.go",
+   "sed -n '1,280p' src/calibration.go",
+   "sed -n '1,320p' src/report.go",
+   "sed -n '1,260p' src/main.go",
+   "cat data/calibration.tbl",
+   "printf '%s\\n' '{\"op\":\"reset\"}' '{\"op\":\"finish\"}' | ./bin/tracepipe",
+   "printf '...' | ./bin/zonefold",
+   "probe zonefold at every calibration lower and upper endpoint",
+   "trace all state transitions and identify parser, deduplication, late-span, overflow, and empty-window defects",
+   "implement an incremental length-prefixed escaped-frame parser with retained partial bytes",
+   "repair reset, push, finish, per-trace deduplication, late-child joining, and parser error recovery",
+   "repair calibrated timestamp handling and saturating signed 64-bit duration arithmetic",
+   "repair percentile interpolation, empty-window behavior, and checksum construction",
+   "make clean && make",
+   "test -x /opt/repro/bin/tracepipe",
+   "run the documented basic reset/push/finish sequence",
+   "write a shell or Go harness that splits every fixture frame at arbitrary byte offsets",
+   "test reordered, duplicated, escaped, multiline, interleaved, and calibration-boundary streams",
+   "test malformed JSON, invalid frames, unknown operations, finish-before-push, and reset isolation",
+   "test overflow, negative, zero-length, and empty traces",
+   "run the larger randomized corpus and compare every JSON field and checksum",
+   "run the same corpus twice and verify byte-identical stdout with no diagnostics"
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "If PROTOCOL.md does not precisely define parser recovery after malformed input, especially whether partial bytes are retained or discarded, malformed-input tests could overreach.",
+   "If the protocol does not explicitly define canonical JSON/checksum serialization, exact checksum comparisons may be ambiguous despite deterministic logical results.",
+   "The claimed no-internet buildability could fail if the pinned base image, apt packages, or Go toolchain artifacts are not actually available in the task environment.",
+   "Tests must use only calibration and timestamp behavior explicitly documented by PROTOCOL.md; inferring undocumented zonefold endpoint behavior would make failures invalid."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear executable end state, strong stateful and generated-input verification, and realistic engineering failure modes beyond the visible fixture. It is demanding and likely requires substantially more than a quick source patch, although the under-an-hour solvability target is tight for the parser, protocol recovery, and multi-stage aggregation fixes.",
+  "fixes": [
+   "Ensure PROTOCOL.md explicitly specifies malformed-request recovery, partial-frame handling after errors and reset, and all integer overflow and saturation rules.",
+   "State the checksum canonicalization and JSON numeric/string serialization rules unambiguously in PROTOCOL.md.",
+   "Add an offline build smoke check to the task image or verifier so pinned dependency availability is guaranteed before solver evaluation.",
+   "Include a small documented boundary example for each calibration endpoint and a malformed-frame recovery example to reduce ambiguity without exposing hidden cases."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "variant",
+     "reason": "Both require repairing a stateful newline-delimited JSON service with exact schemas, deterministic stream processing, and boundary-sensitive event handling, though the candidate centers on trace framing and timestamp normalization rather than weighted metric aggregation."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "variant",
+     "reason": "Both are trace-reproduction repairs whose core challenge is robust processing of fragmented or reordered trace frames and correct timestamp-derived results, despite differing deployment and protocol architectures."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference is fundamentally about durable transactional recovery from segment files and a SQLite catalog, whereas the candidate is about incremental in-memory stream parsing and timestamp normalization."
+    },
+    {
+     "ref_id": "ours/official-ee9176b9c4d1",
+     "verdict": "distinct",
+     "reason": "The reference builds a deterministic incident report from JSONL with aggregation and deduplication, while the candidate repairs a persistent framed-trace service with calibration-aware parsing."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference concerns deploying an HTTP quantile-sketch daemon with mathematical accuracy, memory, and latency guarantees, not reconstructing fragmented trace streams through a JSON-line service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e05a846f6234",
+     0.264
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.174
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.172
+    ],
+    [
+     "ours/official-ee9176b9c4d1",
+     0.142
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.141
+    ]
+   ],
+   "cost_usd": 0.0013732
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0039318
+}

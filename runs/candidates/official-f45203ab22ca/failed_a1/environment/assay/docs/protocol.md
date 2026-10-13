@@ -1,0 +1,1 @@
+assayd is a line-oriented JSON service. Each nonempty input line is one JSON request and produces one JSON response. Supported operations are health, append, replay, and calibration_report. Event IDs are immutable identities and duplicate IDs are ignored.

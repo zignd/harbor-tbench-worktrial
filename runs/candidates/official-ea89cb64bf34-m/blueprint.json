@@ -1,0 +1,74 @@
+{
+ "slug": "repair-segment-replay-service",
+ "title": "Repair Segment Replay Service",
+ "scenario": "At 03:00 an on-call SRE is paged because the replay daemon reports successful recovery while several tenants see missing or resurrected objects. The container contains a Go service, a SQLite catalog, an opaque native segment-inspection helper, damaged segment files from several generations, and operational tools that all consume the same recovered state.",
+ "instruction_draft": "replayd: opening catalog /var/lib/replay/catalog.db\nreplayd: replayed 1842 records, indexed 1811 objects\nreplayd: warning: catalog checksum differs from manifest\nreplayctl get tenant-a/config: not found\n\nRepair the service in /opt/replay so that the existing executable protocol works correctly after recovery and during normal operation. You may modify the Go sources, generated artifacts, startup configuration, and supporting scripts, but do not change the request or response protocol documented in /opt/replay/PROTOCOL.md.\n\nThe service must recover the authoritative state from the supplied segment files and SQLite catalog, preserve the meaning of committed, deleted, superseded, and incomplete records, and produce the same state on repeated recovery. It must keep all exposed views consistent: point reads, prefix listings, tenant statistics, the SQLite catalog, the manifest/checksum endpoint, and the audit endpoint. Recovery must tolerate truncated tails, empty segments, duplicate sequence numbers across files, records split at buffer boundaries, non-ASCII keys and values, explicit empty values, deletes followed by recreation, and more than one tenant.\n\nStart /opt/replay/bin/replayd as a line-oriented JSON service on stdin/stdout and handle the request scenarios in the protocol document, including recovery, reads, writes, deletes, prefix listings, statistics, manifest verification, and audit queries. Do not emit logs on stdout. The observable state must remain correct across a restart, and a successful recovery must be idempotent rather than duplicating events or changing checksums.",
+ "requirements": [
+  "The repaired /opt/replay/bin/replayd must start with the documented command line and communicate only through the documented newline-delimited JSON protocol on stdout/stdin.",
+  "Recovery must reconstruct the authoritative key/value state for every tenant from the segment files and SQLite catalog.",
+  "Committed records must be applied in the format's ordering semantics, while incomplete or invalid records must not change observable state.",
+  "Deletes, later recreation of a key, supersession, explicit empty values, Unicode data, and keys containing separators must be handled correctly.",
+  "Truncated tails, empty files, duplicate sequence numbers across files, and records crossing read-buffer boundaries must not cause data loss, crashes, or phantom records.",
+  "Point reads and prefix listings must return exactly the same key/value state as the recovered SQLite catalog.",
+  "Tenant statistics must agree with the recovered live-key state and must distinguish absent keys from keys whose value is empty.",
+  "The manifest/checksum request must describe the same recovered generation and checksum as the SQLite catalog and segment replay state.",
+  "Audit queries must report the recovered event history without duplicating events when recovery is run more than once.",
+  "Write and delete requests must update all persistent and served views atomically enough that a restart cannot expose a partially applied operation.",
+  "A second recovery over unchanged files must be idempotent: responses, catalog contents, live listings, statistics, manifest data, and audit results must remain unchanged.",
+  "The service must pass protocol requests issued in multiple sessions, including recovery followed by reads, writes followed by restart, and verification after a fresh recovery."
+ ],
+ "environment": [
+  "The Docker image is based on python:3.13-slim-bookworm with pinned Debian packages including sqlite3, gcc, make, and Go, and contains no network dependency.",
+  "The workspace contains roughly 1,500 lines of Go across replayd, replayctl, catalog, protocol, and operational-report packages, with unrelated health and metrics code mixed in.",
+  "/opt/replay/bin/replayd is built from the supplied Go tree and initially contains a partially working recovery implementation, a stale in-memory index path, and inconsistent transaction handling.",
+  "/opt/replay/PROTOCOL.md documents JSON request and response schemas for recover, get, list, put, delete, stats, manifest, and audit operations, including error responses and deterministic ordering.",
+  "/var/lib/replay/catalog.db is a SQLite database with tables for tenants, live objects, replayed events, generations, and manifest metadata. Some rows reflect an earlier partial replay.",
+  "/var/lib/replay/segments contains several binary segment files with thousands of records, including valid records, aborted transactions, tombstone records, superseding records, duplicate sequence values from separate writers, and deliberately damaged tails.",
+  "The segment format is an in-house framed format not fully described in the protocol document. Constants, field names, sample dumps, and a small inspection wrapper are present in the tree, but the complete framing and ordering rules must be inferred by exploring the files and comparing tools.",
+  "/usr/local/libexec/segment-inspect is a compiled native helper with no source shipped. It can dump selected frame metadata and validate individual ranges, but it does not implement service recovery; the Go code invokes it for diagnostics.",
+  "The repository includes replayctl, a catalog-dump utility, a manifest verifier, and a deterministic fixture generator used for local experiments. Their outputs disagree on the supplied incident data before repair.",
+  "The Dockerfile creates a writable service state directory and a deterministic initial fixture. The verifier additionally creates fresh segment sets from hidden seeds, including rare malformed-frame and Unicode cases, before launching the repaired service."
+ ],
+ "internal_hint": "The real difficulty is not visible by reading one source file: the solver must instrument and run replayctl, catalog-dump, the opaque segment-inspect helper, and replayd against the supplied history to infer the binary framing and commit ordering. The reference behavior treats a segment as a stream of length-delimited frames with a per-frame integrity trailer, transaction begin/data/commit markers, and writer-local sequence values; ordering is determined by committed transaction generation and frame position, not by filename or sequence alone. A bad or truncated final frame is ignored, but a malformed frame before a later valid frame terminates that segment's scan at the last safe boundary. Tombstones remain in the audit history while removing the live row, and a later put for the same key wins only when its committed transaction is later in the recovered total order. The planted service faults include decoding only the first buffer-sized portion of a frame, using sequence number alone as an event identity, rebuilding the live index without rebuilding audit/generation metadata, treating empty values as absent, and committing SQLite updates separately from the replay watermark. A skilled solution first captures protocol behavior, compares all three existing tools on small extracted ranges, writes a standalone Go decoder with explicit safe-boundary handling, then makes recovery transactional and derives reads, listings, stats, manifest, and audit responses from one SQLite-backed state. It must test recovery twice and restart between mutations rather than trusting the initial row count.",
+ "trap": "A shallow fix can make the supplied point-read examples pass by selecting the newest visible row from SQLite or by trusting the existing index. Hidden fixtures contain frames larger than the service buffer, same-sequence records from different segments, an empty value, a delete followed by recreation, and a valid record after an aborted transaction. Such a solution reports plausible counts but loses audit entries, resurrects deleted keys, produces a different manifest after the second recovery, or disagrees between list, stats, and point reads after restart.",
+ "tests": [
+  "Launches replayd and checks that it emits no unsolicited stdout and accepts the documented JSON-line protocol.",
+  "Runs recovery on the supplied incident fixture, then checks point reads for ordinary values, deletes, recreated keys, explicit empty values, Unicode keys, and multiple tenants.",
+  "Checks deterministic prefix-list ordering and verifies that list results exactly match the live rows in catalog.db.",
+  "Checks tenant statistics, including zero live objects, empty values, and tenants whose only events are tombstones.",
+  "Queries the manifest endpoint and independently recomputes the expected generation and digest from the recovered SQLite and segment state.",
+  "Queries audit history and verifies committed events, tombstones, transaction ordering, and absence of aborted or incomplete records.",
+  "Runs recovery twice without changing files and compares all protocol responses, SQLite row sets, watermarks, and manifest values for idempotence.",
+  "Restarts the process after recovery and confirms that reads, listings, statistics, manifest, and audit responses are unchanged.",
+  "Applies put and delete requests, restarts, and verifies that the mutation is represented consistently in the live catalog, event history, manifest, and all read endpoints.",
+  "Generates fresh segment files from several hidden deterministic seeds and compares the service's responses with an independent reference decoder.",
+  "Uses hidden inputs with frames larger than common read buffers, records split at every possible byte boundary, empty payloads, non-ASCII data, separator-containing keys, and duplicate writer-local sequence values.",
+  "Uses hidden histories containing truncated final frames, malformed frames followed by bytes, empty segments, aborted transactions, deletes followed by puts, and repeated recovery to detect plausible-but-wrong replay implementations."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "12 protocol scenarios over 6 hidden segment histories",
+  "effect": "Raising the value adds more ordered request sequences, restarts, mutations, and cross-endpoint consistency checks over independently generated histories; lowering it can leave recovery or one of the secondary views insufficiently exercised."
+ },
+ "expected_failure_modes": [
+  "The solver reads only the Go service and patches an obvious SQL query without experimentally decoding the binary segments.",
+  "The solver implements a parser that handles normal frames but stops incorrectly at buffer boundaries or accepts bytes after a malformed frame.",
+  "The solver orders records by a sequence field that is only unique per writer, causing hidden cross-segment histories to differ from the reference.",
+  "The solver reconstructs live rows but does not rebuild audit, generation, watermark, and manifest tables together.",
+  "The solver treats an empty value as a missing key or mishandles Unicode and embedded delimiter bytes.",
+  "The solver updates SQLite and an in-memory index through separate non-atomic paths, so restart tests expose inconsistent views.",
+  "The solver validates only the visible incident fixture and misses the hidden combination of delete/recreate, aborted transactions, and duplicate sequence numbers.",
+  "The solver makes recovery appear successful through a plausible row count but does not make repeated recovery idempotent."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "systems",
+ "tags": [
+  "go",
+  "sqlite",
+  "binary-format",
+  "recovery",
+  "protocol",
+  "debugging"
+ ]
+}

@@ -1,0 +1,159 @@
+{
+ "blueprint": {
+  "slug": "finite-field-frame-recovery",
+  "title": "Recover Finite-Field Audit Frames",
+  "scenario": "A security engineer is auditing an in-house scientific telemetry service that validates calibration snapshots encoded as a binary stream. The container contains the service launcher, a stripped native wire-decoder component, protocol notes, sample captures, and unrelated analysis utilities; the deployed validator currently loses synchronization on damaged captures and produces mathematically incorrect classifications for some singular systems.",
+  "instruction_draft": "Repair `/opt/spectra/bin/field-audit` so it reads the documented binary frame stream from stdin and emits one JSON object per accepted frame, preserving input order. Each object must contain the exact reduced row-echelon form over GF(65537), zero-based coefficient pivot columns, rank, and `consistent` or `inconsistent` status, while damaged, truncated, unknown-version, and checksum-invalid frames are skipped and later valid frames are recovered without mistaking payload bytes for headers.",
+  "requirements": [
+   "The executable `/opt/spectra/bin/field-audit` must read the documented binary frame stream from standard input.",
+   "The tool must emit exactly one JSON object for every accepted frame and no object for rejected frames, preserving accepted-frame order.",
+   "Each JSON object must report the frame sequence number, the complete reduced row-echelon augmented matrix over GF(65537), zero-based pivot columns belonging to the coefficient matrix, the coefficient rank, and either `consistent` or `inconsistent` status.",
+   "All matrix arithmetic and pivot decisions must be performed in the finite field GF(65537), including reduction of encoded values outside the canonical field range.",
+   "The tool must reject damaged, truncated, unknown-version, dimension-invalid, length-invalid, and checksum-invalid frames.",
+   "After a rejected frame, the tool must resynchronize to later valid frames and must not accept arbitrary occurrences of the frame magic bytes inside a payload as a frame boundary."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned system packages and no network dependency.",
+   "`/opt/spectra/bin/field-audit` is an executable launcher around a stripped native `lib/libwiredecode.so`; the native component has no shipped source and has deliberately unreliable behavior on malformed streams.",
+   "`/opt/spectra/PROTOCOL.md` documents version-1 frames: magic bytes `SF`, version, row count, coefficient count, big-endian sequence number, big-endian payload length, row-major big-endian 16-bit augmented coefficients, and a CRC-32 checksum over the header beginning at the version byte through the final payload byte.",
+   "The protocol permits dimensions from 1 through 24, requires the payload length to equal rows times (columns plus one) times two, and defines coefficient arithmetic modulo the prime 65537.",
+   "The expected JSON schema and a few benign sample captures are present under `/opt/spectra/examples`; the samples do not contain duplicate pivots, zero leading rows, inconsistent equations, embedded magic bytes, or multiple consecutive corruptions.",
+   "The surrounding codebase contains roughly 1,300 lines across a frame capture utility, a calibration report formatter, a CRC benchmark, test fixtures, and the validator launcher; most files are realistic but irrelevant to the requested result.",
+   "The deployed validator has planted failures in native length handling and CRC coverage, and its historical Gaussian-elimination path mishandles row swaps, modular inverses, zero rows, and augmented-column inconsistency. The solver may replace the launcher or implement a replacement decoder, but must preserve the documented command path and stdin/stdout interface."
+  ],
+  "internal_hint": "The intended resolution is investigative and constructive rather than a small source patch. A skilled engineer first inventories the tree, reads the protocol notes, probes the opaque decoder with generated frames and mutations, and compares its output with an independent finite-field reference. The robust solution scans candidate magic positions, validates version, dimensions, exact length, and CRC before consuming a candidate, then performs full Gauss-Jordan elimination modulo 65537 with deterministic row selection and explicit inconsistency detection. The main difficulty is not visible in one readable file: malformed streams, payload-contained magic, and accumulated resynchronization behavior only appear under execution, while the replacement finite-field and binary parser are a substantial component.",
+  "trap": "A shallow solution that parses only the provided clean examples, trusts the advertised length, or searches for the next magic occurrence after a checksum failure will pass visible checks but lose later frames when corruption or magic-like payload data occurs. Likewise, ordinary integer elimination or forward elimination without normalizing every pivot produces plausible ranks while failing hidden singular, dependent, and inconsistent systems.",
+  "tests": [
+   "A clean-stream test generates fresh valid frames with random dimensions, coefficients, sequence numbers, and payloads, including payloads containing `SF`, then compares every parsed JSON field and matrix entry with an independent GF(65537) reference.",
+   "A mathematical edge-case test generates zero rows, repeated equations, row swaps, rank-deficient systems, full-rank systems, coefficients equal to 0, 65536, and values larger than one field modulus, and checks exact reduced row-echelon output, pivots, rank, and consistency.",
+   "An inconsistency test generates systems whose augmented column contains a nonzero value on an all-zero coefficient row and verifies that the status is `inconsistent` while the complete RREF is still reported.",
+   "A recovery test builds fresh streams containing valid frames separated by truncated headers, bad lengths, unknown versions, invalid dimensions, bad CRCs, and arbitrary garbage, then checks that all and only the later valid frames are emitted in order.",
+   "An adversarial resynchronization test inserts magic bytes and header-like byte sequences into corrupted payloads and verifies that the implementation does not consume them as frames unless the complete candidate passes structural and CRC validation.",
+   "A chained-stream test concatenates dozens of generated frames with multiple adjacent corruptions and end-of-file truncation, exercising stateful recovery rather than isolated one-frame parsing.",
+   "An interface test runs the installed executable without changing the working directory, supplies input only on stdin, parses stdout as JSON lines, and rejects extra diagnostic output on stdout."
+  ],
+  "verifier_knob": {
+   "name": "generated_frame_streams",
+   "value": "240 verify-time streams containing 8-70 frames each, with 1-24 row and coefficient dimensions, 20% singular systems, 15% inconsistent systems, and 35% corruption or payload-embedded-magic cases",
+   "effect": "Increasing the number and variety of fresh streams makes memorized handling of the examples ineffective and increases the chance of exposing incorrect modular elimination or parser resynchronization. Lowering it leaves more room for a parser that only handles clean frames or ordinary full-rank matrices to pass."
+  },
+  "expected_failure_modes": [
+   "The agent inspects the launcher but does not black-box probe the stripped decoder, so it misses the actual CRC and malformed-length behavior.",
+   "The agent implements a conventional real-number or integer Gaussian elimination routine and fails modular inverses, repeated pivots, or exact RREF requirements.",
+   "The agent emits only rank and consistency, omitting the complete normalized augmented matrix or coefficient pivot list.",
+   "The parser trusts a corrupt length field and consumes valid subsequent frames, making recovery dependent on the first damaged record.",
+   "The parser resynchronizes on any `SF` occurrence and mistakes magic-like bytes inside a valid or damaged payload for a real frame.",
+   "The agent tests only the supplied clean captures, which contain no inconsistent equations, zero rows, embedded magic, or consecutive corruption.",
+   "The agent writes a correct helper but leaves the required executable path, executable bit, stdin behavior, or stdout-only JSON interface broken."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "finite-field",
+   "binary-parser",
+   "error-recovery",
+   "gauss-jordan",
+   "bash",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. Inventory the installation and locate the launcher, protocol notes, examples, and libraries with `find`/`ls`.",
+   "2. Read `/opt/spectra/PROTOCOL.md` completely.",
+   "3. Inspect the launcher, example JSON, and sample captures with `sed`, `cat`, and `xxd`.",
+   "4. Confirm the executable interface and current failures by running it on the supplied captures and a malformed probe.",
+   "5. Implement a self-contained Python replacement that buffers stdin, scans candidate `SF` positions, validates version, dimensions, exact length, and CRC before accepting a frame.",
+   "6. Implement GF(65537) Gauss-Jordan elimination with modular inverses, row swaps, zero-row handling, complete RREF output, coefficient pivots, rank, and inconsistency detection.",
+   "7. Write the JSON-lines result to stdout only, preserving sequence and accepted-frame order.",
+   "8. Install the replacement at `/opt/spectra/bin/field-audit` and set its executable bit.",
+   "9. Run it on all supplied examples and inspect JSON parsing and matrix fields.",
+   "10. Generate a few valid frames independently, including singular and inconsistent systems, and compare output with a small reference implementation.",
+   "11. Exercise bad lengths, CRC failures, unknown versions, truncation, embedded `SF`, and adjacent corruptions, then fix any parser recovery issue.",
+   "12. Run the executable from a different working directory with stdin redirection and verify stdout contains only JSON lines."
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 5,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact CRC-32 parameters, byte order, and JSON field names are delegated to files rather than stated in the instruction; if those files are incomplete or inconsistent, failures would be ambiguous.",
+   "A corrupted payload can theoretically contain a complete structurally valid frame with a valid CRC, and the specification does not define how to distinguish that from an intended later frame.",
+   "If tests require exact JSON text or key ordering rather than semantic JSON fields, that would be an unstated interface constraint.",
+   "The speedrun assumes the protocol notes are accurate and readable and that replacing the native launcher with Python is permitted by the container permissions."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is clear, deterministic, and realistic, and its fuzz-equivalence tests provide strong verification. However, after reading the protocol, a skilled agent can implement a standard-library parser and finite-field solver in roughly twelve straightforward steps, so the required speedrun rule caps genuine_difficulty at 2; the aggregate quality is therefore insufficient for acceptance.",
+  "fixes": [
+   "Inline the exact CRC-32 initialization, polynomial, finalization, checksum encoding, and JSON schema in the instruction or explicitly require the solver to use named protocol sections.",
+   "Define candidate selection when a damaged payload contains a fully valid frame, or constrain corruption generation so such inherently ambiguous streams cannot occur.",
+   "Add a meaningful performance requirement with very large streams and dense candidate magic occurrences, plus memory limits, to make scanning and recovery materially harder.",
+   "If hard difficulty is required, add a documented compatibility requirement for selected native-decoder behavior or another substantial operational constraint beyond implementing the parser and textbook RREF solver."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "The candidate combines robust checksummed frame-stream recovery with GF(65537) row reduction, whereas the reference only repairs a simple length-prefixed frame encoder/decoder service."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Although both process binary frames and reject malformed data, the candidate's core task is finite-field matrix classification and parser resynchronization rather than authenticated settlement decryption and reconciliation."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The candidate is an offline binary-frame and finite-field linear-algebra utility, not a stateful event-time weighted-quantile JSON service."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate focuses on checksum-aware stream parsing and GF(65537) RREF computation, while the reference concerns durable transactional log recovery and replicated catalog state."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Despite binary record handling and recovery of malformed input, the candidate solves finite-field matrix auditing, not TCP line processing with canonical serialization and HMAC generation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aac910462208",
+     0.234
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.231
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.153
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.148
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.144
+    ]
+   ],
+   "cost_usd": 0.0008592
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0032832
+}

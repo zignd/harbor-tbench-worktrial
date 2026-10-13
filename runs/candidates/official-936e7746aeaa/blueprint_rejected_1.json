@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "repair-replication-replay-service",
+  "title": "Repair Replication Replay Service",
+  "scenario": "After a database incident, archived replication pages must be replayed to answer audit queries, but the in-house replay daemon is returning incomplete historical rows and timing out on large archives. The container contains a roughly 1,600-line C service, fixtures, protocol documentation, query tools, and a source-less compiled wire-codec library used to translate binary replication pages into logical records.",
+  "instruction_draft": "Repair `/opt/replay/bin/replayd` so its newline-delimited JSON protocol on TCP port 7077 correctly loads the documented hexadecimal RPL2 page streams and answers every `query` request with the exact rows, ordering, and snapshot semantics defined in `/opt/replay/PROTOCOL.md`, while rejecting malformed loads without corrupting later requests. It must return correct results for out-of-order, duplicated, fragmented, deleted, and multi-version records and sustain the documented performance bar of at least 100 queries over a 100,000-record stream within 3 seconds on this container.",
+  "requirements": [
+   "The repaired `/opt/replay/bin/replayd` must accept newline-delimited JSON requests and emit one newline-delimited JSON response per request on TCP port 7077.",
+   "A `load` request containing a hexadecimal RPL2 page stream must decode the stream and make its committed records available to later requests.",
+   "A `query` request must apply the requested table, key-prefix, column, and snapshot filters and return canonical JSON rows in the documented key and column ordering.",
+   "Snapshot queries must expose the newest committed version at or before the requested snapshot, omit aborted transactions, and treat committed tombstones as deletions.",
+   "The service must handle pages arriving out of order, duplicate physical pages, records split across page boundaries, multiple versions of one key, and transaction metadata that appears after the records it commits.",
+   "Malformed loads must return the documented error response, leave the previously loaded valid dataset usable, and not terminate or poison the service.",
+   "The service must answer at least 100 query requests over a 100,000-record stream within 3 seconds on the supplied one-CPU container.",
+   "The service must preserve the request/response protocol for all documented operations, including load acknowledgement, query errors, and statistics responses."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, installs pinned GCC, make, binutils, and Python packages, and exposes no network dependency.",
+   "The codebase is under `/opt/replay` and contains approximately 1,600 lines of C across a TCP JSON server, a page scanner, a transaction table, an MVCC materializer, a query index, and unrelated logging and configuration modules.",
+   "`/opt/replay/PROTOCOL.md` documents the JSONL-over-TCP protocol, RPL2 binary page layout, little-endian fields, unsigned LEB128 and zigzag values, page identity and generation rules, transaction states, tombstones, query semantics, canonical response formatting, and the performance benchmark.",
+   "`/opt/replay/lib/libwirecodec.so` is a compiled helper with no shipped source; it translates RPL2 payloads into logical record callbacks. Small utilities in `/opt/replay/tools` can inspect headers and issue protocol requests, allowing the solver to explore the format and runtime behavior.",
+   "`/opt/replay/fixtures` contains valid example archives, deliberately non-failing sample queries, incident logs, and several small malformed streams; the samples do not include the combinations that trigger the production failures.",
+   "The initial daemon contains several interacting defects: replay assumes commit metadata is encountered before data records, physical-page replacement mishandles generations and duplicates, one varint path mishandles values crossing byte boundaries, the query cache omits part of the predicate, and the fallback query path rescans all materialized versions.",
+   "The verifier generates fresh deterministic RPL2 archives from hidden seeds, including thousands of pages, shuffled transaction metadata, rare large and negative values, boundary splits, generation collisions, tombstones, and mixed valid/invalid requests."
+  ],
+  "internal_hint": "The reference shell script first builds and runs the daemon against the supplied fixtures, then probes the protocol with shuffled copies of the same archive, malformed loads, large zigzag values, repeated queries, and a generated 100,000-record stream; this reveals that the visible fixture passes while state-dependent histories fail. It uses the page inspection utility and dynamic-library symbols to confirm the codec's callback contract, then patches the replay pipeline into separate phases: validate and deduplicate the highest valid generation for each physical page, collect all records and transaction metadata, resolve transaction state before materializing versions, and build a key/table index. It fixes the boundary-safe varint decoder and signed conversion, makes the query cache include every predicate or removes unsafe caching, and replaces repeated full scans with indexed snapshot selection; finally it rebuilds and runs protocol, corruption-isolation, randomized differential, and timing checks.",
+  "trap": "A shallow solution can make the supplied examples pass by buffering only a few records, sorting pages by arrival order, or disabling the cache, but hidden streams place commit records after data, reuse physical page numbers across generations, split varints and records at boundaries, and issue different predicates at the same snapshot. Such a solution either returns stale or resurrected rows, mishandles rare integer values, lets an invalid load destroy a valid dataset, or passes correctness while exceeding the three-second throughput bar.",
+  "tests": [
+   "A protocol smoke test starts the daemon on TCP port 7077, sends documented load, query, statistics, and error requests, and checks one valid JSON response per request with the required fields and canonical formatting.",
+   "A hidden-seed differential test generates a fresh valid RPL2 archive with shuffled pages, duplicate pages, multiple page generations, fragmented records, transaction metadata after data records, commits, aborts, updates, and tombstones; it compares several table, prefix, projection, and snapshot queries against an independent reference materializer.",
+   "A numeric-boundary test generates large unsigned values, negative zigzag values, multi-byte lengths, and records split at every payload boundary, then checks exact decoded values and row contents.",
+   "A recovery test sends a valid load, a malformed stream containing bad magic, truncation, invalid varints, and CRC failures, and then queries the original dataset; it checks the error response and verifies that the valid state remains unchanged.",
+   "A cache-isolation test issues identical-snapshot queries with different table, prefix, and column predicates and checks that no response reuses rows from another predicate.",
+   "A generation-resolution test supplies stale and current copies of the same physical page in both arrival orders and checks that only the highest valid generation contributes records.",
+   "A performance test generates a deterministic 100,000-record archive and sends at least 100 mixed queries, requiring all results to match the reference and the complete exchange to finish within 3 seconds on one CPU.",
+   "A protocol robustness test checks that malformed query fields produce documented request errors without killing the daemon and that subsequent valid requests still succeed."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "8 protocol and differential scenarios, including one 100-query performance scenario",
+   "effect": "Increasing the number of scenarios adds more independently generated histories, malformed-request sequences, predicate combinations, and snapshot patterns, making partial fixes less likely to pass; lowering it permits solutions that handle only the visible or simplest replay path."
+  },
+  "expected_failure_modes": [
+   "The solver reads the obvious replay code and patches arrival ordering without discovering that transaction metadata and page generations require separate reconciliation phases.",
+   "The solver treats duplicate pages as identical byte strings and misses generation replacement when stale and current pages have different payloads.",
+   "The solver implements a conventional varint decoder but gets signed zigzag conversion, overflow checks, or a record split across pages wrong.",
+   "The solver fixes correctness with a full scan for every query and fails the stated throughput threshold.",
+   "The solver repairs the query cache for one predicate while leaving cache keys incomplete for another predicate or projection.",
+   "The solver tests only the supplied fixture, which has commit metadata in convenient order and no rare boundary values.",
+   "The solver mishandles malformed loads by clearing state or leaving partially applied records visible.",
+   "The solver cannot infer the source-less codec's callback and ownership behavior from the utilities, symbols, and runtime probes."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "c",
+   "mvcc",
+   "binary-protocol",
+   "debugging",
+   "performance",
+   "service"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `cd /opt/replay && ls -la && find . -maxdepth 2 -type f | sort`",
+   "2. `cat /opt/replay/PROTOCOL.md`",
+   "3. `grep -RIn 'TODO\\|FIXME\\|cache\\|generation\\|varint\\|commit\\|materializ' /opt/replay/src /opt/replay 2>/dev/null`",
+   "4. `make -C /opt/replay`",
+   "5. Start `/opt/replay/bin/replayd` and confirm it listens on port 7077",
+   "6. Run the supplied protocol utility against the example fixture",
+   "7. Read the TCP server, page scanner, transaction table, materializer, and query-index implementations",
+   "8. Inspect `/opt/replay/lib/libwirecodec.so` with `nm -D`, `readelf`, and the supplied page-inspection tools",
+   "9. Probe codec callbacks and ownership behavior with a small valid archive",
+   "10. Reproduce failures using shuffled pages, duplicate generations, malformed loads, and boundary values",
+   "11. Patch loading into an atomic validate/deduplicate/collect phase before replacing the active dataset",
+   "12. Select the highest valid generation per physical page and discard stale or duplicate copies",
+   "13. Make page and record parsing preserve fragmented records and use a boundary-safe unsigned LEB128 decoder",
+   "14. Correct zigzag conversion, overflow checks, and signed-value handling",
+   "15. Resolve all transaction metadata after collection, then materialize only committed versions and tombstones",
+   "16. Build an index keyed by table and record key and remove or fully key the unsafe query cache",
+   "17. Rebuild the daemon with `make -C /opt/replay`",
+   "18. Run protocol, malformed-load recovery, generation, numeric-boundary, and randomized differential checks",
+   "19. Generate the 100,000-record archive and compare mixed query results with the reference",
+   "20. Run the 100-query benchmark and verify completion within three seconds on one CPU"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The three-second performance requirement is potentially flaky unless the verifier specifies whether archive generation, loading, connection setup, and response parsing are included and controls CPU scheduling.",
+   "The source-less codec's callback ABI, buffer lifetime, error behavior, and ownership rules may be insufficiently specified if they cannot be established reliably from PROTOCOL.md and the supplied tools.",
+   "Canonical JSON formatting and exact error/statistics response requirements must be fully documented; otherwise hidden tests could overreach the instruction.",
+   "The requirement to reject an entire malformed load atomically should explicitly define behavior for streams containing valid pages followed by invalid pages and for duplicate pages with one invalid generation.",
+   "A one-CPU, 2 GB environment should have fixed toolchain and runtime limits documented to avoid failures caused by compiler or allocator variation."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly clear and verifiable, but the listed defects and the internal architecture make a likely solution path visible from source inspection. A strong agent can plausibly reach the key fixes in about twenty commands, so under the stated rubric its genuine difficulty is at most 2; the resulting average score is only 3.4.",
+  "fixes": [
+   "Remove the explicit inventory of interacting defects from the environment description, or provide only symptoms rather than naming each required repair.",
+   "Avoid making the intended multi-phase repair architecture explicit in the internal guidance available to task authors; design hidden failures that require discovering the decomposition independently.",
+   "Provide a precise benchmark accounting rule and a deterministic CPU/runtime harness.",
+   "Document codec ABI and ownership guarantees, or ship a minimal introspection contract/test utility that makes them unambiguous without reverse engineering.",
+   "Add an independently checked malformed-stream oracle specifying atomicity and all protocol error/statistics fields."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This is a binary replication-page replay daemon with snapshot and transaction semantics, not a metric ingestion and weighted-quantile service."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both repair an /opt/replay replay service that reconstructs deterministic transactional state for JSON queries, but they use substantially different storage formats, operations, and consistency requirements."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both replay committed transactional records into canonical row state, but this task is an online TCP snapshot-query daemon decoding paged binary input rather than a batch text-file utility producing reports."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate replays replication pages into queryable table snapshots, whereas this task transforms incident SQLite events into a derived incident-management database."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The candidate implements a TCP replication replay and snapshot store, while the reference is an HTTP time-series aggregation service backed by a log database and compiled analytics engine."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e05a846f6234",
+     0.27
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.265
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.247
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.181
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.17
+    ]
+   ],
+   "cost_usd": 0.0013828
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0034111999999999996
+}

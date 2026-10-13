@@ -1,0 +1,67 @@
+{
+ "slug": "repair-wire-event-rollups",
+ "title": "Repair Wire Event Rollups",
+ "scenario": "I\u2019m on call and the incident dashboard is under-reporting errors after last night\u2019s telemetry rollout. The container has a small in-house SQLite reporting service with SQL migrations, sharded event tables, a Python runner, fixtures, and a compiled wire-decoder utility whose source was lost. Please get the replay/report path reliable again without changing its command-line contract.",
+ "instruction_draft": "Can you repair and refactor `./incident-report` so it produces the correct deterministic TSV report from every valid event in the supplied JSONL stream? Preserve the documented columns and ordering, include all supported modalities and error events, ignore malformed input lines without aborting, and make the result match the reference semantics on unseen generated streams; it also needs to process at least 30,000 input events per second on the included benchmark shape. Please leave the normal command usable as `./incident-report INPUT.jsonl OUTPUT.tsv` and don\u2019t solve this by hard-coding the supplied fixture.",
+ "requirements": [
+  "The executable `./incident-report INPUT.jsonl OUTPUT.tsv` must continue to be the supported interface.",
+  "The output must be deterministic TSV with the existing documented columns and ordering.",
+  "Every valid event from the input stream must contribute according to the repository's report semantics, including every supported modality.",
+  "Error events must remain represented in the report's total and error-related fields rather than being silently discarded.",
+  "Malformed input lines must be ignored without aborting the run.",
+  "The output must match the reference report semantics on fresh, hidden generated input streams, not only the checked-in fixture.",
+  "At least 99.5% of expected report cells must match the reference on hidden inputs.",
+  "The implementation must process at least 30,000 input events per second on the benchmark input.",
+  "The existing command-line contract and output file format must remain compatible with the surrounding scripts."
+ ],
+ "environment": [
+  "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt packages and no network dependency.",
+  "A roughly 1,600-line in-house codebase containing `incident-report`, Python ingestion code, SQL schema and migration files, SQL views, query fragments, benchmark scripts, and unrelated maintenance utilities.",
+  "A SQLite database assembled from several monthly event shards, with roughly 18,000 seeded events and a small visible fixture that does not exercise the rare cases.",
+  "Input JSONL records representing four modalities: spans, counters, synthetic checks, and sampled logs. Records contain stream identifiers, sequence numbers, timestamps, status, duration, trace identifiers, and a compact hexadecimal wire payload.",
+  "A compiled executable `bin/wire-decode` and a shared library used by the ingestion path; neither ships with source code. The executable accepts probe records and prints decoded fields, allowing behavior to be characterized experimentally.",
+  "The decoder uses a compact tagged wire representation with modality-dependent fields, signed values, sequence resets, and duplicate suppression. Its behavior is only partially described in a short local operations note.",
+  "The current implementation has a Python per-record decoding path, SQL report views over the shards, and a migration that introduced a compatibility view. The planted regression spans the decoder wrapper, shard/view filtering, and aggregation query, rather than being a single readable typo.",
+  "The seeded fixture contains ordinary positive timestamps, mostly successful spans, and one modality, so a shallow run appears plausible.",
+  "Hidden verification creates fresh deterministic JSONL streams containing thousands to hundreds of thousands of records, rare modalities, malformed lines, duplicate sequence numbers, negative and boundary-valued fields, shard boundaries, and interleaved streams."
+ ],
+ "internal_hint": "A reference shell script first inventories the repository, runs the visible report and benchmark, and probes `bin/wire-decode` with one-field-at-a-time records, boundary values, reordered tags, duplicate sequence numbers, and stream changes. The important observations are that signed wire integers use a zigzag-style representation, decoder state is scoped by stream rather than globally, sequence duplicates are suppressed only after modality normalization, and one modality emits a duration of zero while still counting as an error when its status is non-success. The SQL compatibility view currently filters non-success rows and exposes only the first shard for one event family; the report query also joins decoded span rows in a way that drops counter and synthetic-check rows. The successful repair batches or implements the characterized decode behavior once, materializes a normalized event relation, unions all shards through a single set-based SQL path, applies duplicate suppression before aggregation, and computes percentile fields with the repository\u2019s specified deterministic rank rule. The reference solution investigates these behaviors before changing the wrapper, SQL views, and aggregation query, then validates against independently generated streams and the throughput fixture.",
+ "trap": "A naive solution can make the visible totals look correct by removing the obvious status filter or by adding the missing shard, while still decoding signed values incorrectly, sharing decoder sequence state between streams, or dropping uncommon modalities in the SQL join. Another tempting fix retains one subprocess invocation per event; it passes small examples but misses the throughput threshold. Hidden streams also place duplicates and malformed records around shard and timestamp boundaries, where post-aggregation deduplication produces plausible but incorrect percentiles and counts.",
+ "tests": [
+  "Runs the unchanged command-line interface on the checked-in fixture and verifies TSV schema, stable ordering, and deterministic output.",
+  "Generates seeded hidden JSONL streams with all four modalities, valid and malformed lines, interleaved stream identifiers, duplicate sequence numbers, and mixed statuses; compares the produced report cells with an independent reference implementation.",
+  "Generates records with negative signed wire fields, zero and maximum boundary values, reordered tags, sequence resets, and stream transitions; checks that decoded normalized fields and downstream aggregates match the reference.",
+  "Splits generated events across all configured monthly shards and places events exactly at shard and report-window boundaries; verifies that no shard or boundary records disappear or are double-counted.",
+  "Checks that failed statuses contribute to total and error counts, that zero-duration synthetic checks remain present, and that every supported modality appears when present.",
+  "Checks deterministic percentile and unique-trace results against the reference on fresh data with ties, empty groups, repeated traces, and uneven group sizes.",
+  "Runs a 100,000-event benchmark stream and requires at least 30,000 input events per second on the one-CPU container, allowing a fixed startup grace period.",
+  "Verifies malformed lines are skipped and do not corrupt subsequent decoder state or terminate the report.",
+  "Uses several independent generated seeds at verification time so hard-coded fixture outputs or hand-maintained lookup tables do not pass."
+ ],
+ "verifier_knob": {
+  "name": "minimum_events_per_second",
+  "value": "30000",
+  "effect": "Raising the threshold forces more complete batching and set-based SQL work and makes per-record subprocess or Python-loop solutions fail; lowering it permits slower but otherwise correct implementations."
+ },
+ "expected_failure_modes": [
+  "The agent reads the SQL views and patches only the visible status or shard filter without experimentally characterizing the compiled decoder.",
+  "The decoder is reverse-engineered from ordinary positive examples but mishandles signed values, tag order, stream-local state, or sequence duplicates.",
+  "The SQL refactor handles spans and logs but silently loses counters or synthetic checks because of an inner join or modality-specific projection.",
+  "Deduplication is performed after aggregation, causing wrong counts and percentile ranks on hidden duplicate-heavy streams.",
+  "Malformed records are skipped at the parser level but leave stale decoder state that affects the next valid record.",
+  "The implementation is semantically close but invokes the opaque binary once per record and fails the throughput threshold.",
+  "The agent validates only the small visible fixture, which lacks the rare modalities, boundaries, and interleaved streams used by verification.",
+  "A plausible percentile implementation uses interpolation or a different rank convention and fails groups with ties or small cardinalities."
+ ],
+ "predicted_pass_rate": 0.22,
+ "difficulty": "hard",
+ "category": "systems",
+ "tags": [
+  "sql",
+  "reverse-engineering",
+  "sqlite",
+  "large-scale-refactoring",
+  "performance",
+  "telemetry"
+ ]
+}

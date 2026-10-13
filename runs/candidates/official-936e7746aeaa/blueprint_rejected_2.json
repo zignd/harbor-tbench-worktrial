@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "repair-temporal-segment-service",
+  "title": "Repair Temporal Segment Query Service",
+  "scenario": "After a storage incident, a database administrator found that the internal replay service gives correct-looking answers for the latest database state but produces stale results when auditors query historical snapshots. The container contains a small C service, several unrelated utilities, documented binary segment fixtures, and a closed-source segment decoder used by the service.",
+  "instruction_draft": "Repair `/opt/replayd` so `./replayd --dir DIR` serves the documented newline-delimited JSON protocol on stdin/stdout, returning exact historical `get`, `range`, and `sum` results for every requested `asof` sequence, including updates, deletes, duplicate sequence numbers, and records spread across segments. It must preserve request-order independence and process the supplied large workload within the documented 4-second limit on one CPU.",
+  "requirements": [
+   "The repaired program must be runnable as `/opt/replayd/replayd --dir DIR`.",
+   "The program must serve the documented newline-delimited JSON protocol over stdin/stdout.",
+   "The `get`, `range`, and `sum` operations must return exact results.",
+   "Results must represent the database state at the requested `asof` sequence.",
+   "Updates, deletes, duplicate sequence numbers, and records distributed across multiple segment files must be handled correctly.",
+   "Results must not depend on the order in which requests arrive.",
+   "The supplied large workload must complete within 4 seconds on one CPU."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, installs pinned `gcc`, `make`, `libc6-dev`, and `jq` packages, and contains no network dependency at verification time.",
+   "`/opt/replayd` contains roughly 1,400 lines of C across a daemon, protocol parser, segment catalog, replay helpers, a small JSON writer, tests, and unrelated maintenance utilities.",
+   "`README.md` documents the invocation, JSON request and response schemas, the binary segment layout, and the event ordering rule: events are ordered by `(sequence, segment_id, record_ordinal)`.",
+   "Segment events contain a numeric key and one of PUT, ADD, or DELETE operations. PUT replaces the value, ADD changes the current value, and DELETE removes the key. An event is visible only when its sequence is no greater than the request's `asof` value.",
+   "The protocol includes `get` for one key, `range` for sorted active key/value pairs in an inclusive key interval, and `sum` for the sum of active values in an inclusive interval. The README specifies canonical JSON output, not-found behavior, and integer widths.",
+   "The service links against `/opt/replayd/lib/libsegmentcodec.so`, a supplied binary-only decoder with a public header. The decoder handles varint boundaries and checksums, but does not merge segments or implement temporal queries.",
+   "The checked-in fixtures contain ordinary current-state examples and a few harmless-looking multi-segment records; they do not reproduce the historical or scaling failures.",
+   "The planted implementation materializes only one mutable latest-state table, mishandles the ordering of some equal-sequence events while merging segments, and scans replay history for historical and range requests. The source does not contain a ready-made persistent temporal index.",
+   "Verification replaces the fixture directory with freshly generated deterministic segment sets, including 100,000 to 250,000 events, overlapping segments, deletes followed by reinsertions, repeated keys, equal sequence numbers, negative values, and varint-length boundary values."
+  ],
+  "internal_hint": "A reference shell script first inventories the tree and README, builds and runs the daemon on the supplied fixtures, then generates small segment sets through the provided writer utility and compares the service with a simple Python event simulator. Differential tests expose that the current table answers only the final state, while equal-sequence cases expose the missing `(sequence, segment_id, ordinal)` merge order. The durable fix is to decode every segment, perform a deterministic k-way merge, coordinate-compress keys, and construct a persistent segment tree (or equivalent versioned ordered structure) whose root is recorded after each ordered event; point lookup, interval sum, and sorted interval enumeration then use the root selected by binary-searching the requested `asof`. The script finishes by running randomized request orders and the large benchmark before rebuilding the binary.",
+  "trap": "A shallow fix that merely sorts events and replays them for each request passes the visible examples and small historical tests but exceeds the 4-second limit on the generated workload. A mutable latest-state map also passes current-state queries but fails when requests go backward in `asof`, and a merge that groups equal sequence numbers without segment and ordinal tie-breaking fails only on rare duplicate-sequence inputs.",
+  "tests": [
+   "Build and launch the repaired binary with each generated data directory and verify that it accepts the documented newline-delimited JSON requests and emits parseable canonical JSON responses.",
+   "For deterministic generated datasets, compare `get` responses against a reference event simulator at early, middle, final, and nonexistent `asof` sequences, including PUT, ADD, DELETE, reinsertion, negative values, and missing keys.",
+   "Compare `range` responses against the reference for empty, singleton, full, and partially overlapping inclusive key intervals, requiring sorted active key/value pairs.",
+   "Compare `sum` responses against the reference for the same interval classes and historical snapshots, including negative totals and deleted keys.",
+   "Generate fresh multi-segment inputs with overlapping sequence ranges and duplicate sequence numbers, and verify ordering by sequence, segment identifier, and record ordinal.",
+   "Send the same mixed set of requests in several permutations and verify byte-equivalent responses for each request, proving that query order does not affect state.",
+   "Run a fresh 100,000-to-250,000-event workload with thousands of mixed historical point and range requests and fail if the service exceeds the stated 4-second one-CPU performance bar.",
+   "Exercise decoder boundary cases and checksum-valid records whose encoded integers cross several varint lengths, verifying that protocol answers remain exact."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "8",
+   "effect": "This is the number of distinct generated request workloads and semantic mixes used at verification time. Lowering it leaves fewer historical, duplicate-sequence, range, and request-order combinations; raising it adds more independently seeded workloads and makes partial implementations less likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads the obvious mutable-table code and patches only the current-state path.",
+   "The agent implements historical replay by scanning all events per request and misses the performance threshold.",
+   "The agent merges segments with a comparator that treats equal sequence numbers as interchangeable.",
+   "The agent assumes requests arrive in increasing `asof` order and caches only the most recently built state.",
+   "The agent handles point lookups but returns incorrect range enumeration or interval sums after deletes and reinsertion.",
+   "The agent tests only the supplied fixtures, which lack the generated duplicate-sequence and long-history cases.",
+   "The agent spends time reverse-engineering or attempting to modify the opaque decoder even though the failure is in temporal materialization and query indexing."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "c",
+   "temporal-indexing",
+   "binary-format",
+   "debugging",
+   "performance",
+   "service-protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/replayd && find . -maxdepth 2 -type f -print",
+   "sed -n '1,240p' README.md",
+   "grep -RIn \"latest\\|replay\\|merge\\|range\\|sum\\|asof\" --include='*.c' --include='*.h' .",
+   "make clean && make",
+   "printf '%s\\n' '{\"op\":\"get\",\"key\":1,\"asof\":0}' | ./replayd --dir fixtures",
+   "sed -n '1,260p' segment_catalog.c && sed -n '1,320p' replay.c",
+   "sed -n '1,260p' protocol.c && sed -n '1,220p' include/libsegmentcodec.h",
+   "inspect the writer utility and existing tests to determine segment IDs, ordinals, and event encoding",
+   "generate a small multi-segment reproducer with duplicate sequences and historical queries",
+   "run the reproducer against the current daemon and compare it with a short Python reference simulator",
+   "replace latest-state materialization with a deterministic k-way merge ordered by sequence, segment ID, and ordinal",
+   "add coordinate compression and a persistent/versioned ordered tree storing roots after each merged event",
+   "implement point lookup, interval sum, and sorted interval enumeration against the root selected by binary-searching asof",
+   "make the source changes with apply_patch or a heredoc",
+   "make clean && make",
+   "run randomized differential tests in several request orders, including deletes, reinsertions, negatives, and varint boundaries",
+   "run the generated large workload under the one-CPU 4-second limit and fix any performance or memory issue",
+   "rebuild the final binary and run protocol smoke tests"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 5,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The stated 4-second threshold can be flaky if verification containers share CPU despite the one-CPU specification; the benchmark needs a controlled CPU quota and precise workload definition.",
+   "Byte-equivalent permutation checks are only valid if canonical JSON serialization and request-to-response matching are specified exactly, including object key ordering and whitespace.",
+   "The semantics of an asof sequence with no visible events, duplicate segment identifiers, or malformed-but-checksum-valid records should be explicitly fixed if those cases can occur in generated inputs.",
+   "The Docker build claim should ensure pinned packages and the decoder library are available from the build cache or image, since otherwise package installation could depend on network availability."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements and verification plan are clear, realistic, and mostly deterministic, but the planted defects are directly discoverable in a small codebase and the supplied measurement says frontier agents solve this shape in roughly 20 commands. That makes genuine_difficulty a 2, which violates the rule that every score must be at least 3 despite the strong average of the other criteria.",
+  "fixes": [
+   "Make the repair require investigating a less obvious interaction, such as a documented decoder/catalog boundary bug combined with temporal materialization, while retaining a reproducible oracle.",
+   "Add a documented memory bound and adversarial segment-layout cases that distinguish efficient persistent indexing from merely optimized replay, without relying on hidden limits.",
+   "Specify the exact benchmark dataset, CPU quota, response canonicalization, and all edge-case asof semantics to eliminate invalid performance or protocol failures."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both repair a newline-delimited replay service by deterministically reconstructing state from segment files with updates, deletes, duplicates, and cross-segment records, but the candidate centers on historical as-of queries rather than the reference's transactional catalog recovery and mutation APIs."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The candidate is a segment-backed historical key-value query service, whereas this reference is an event-time metric ingestion and weighted-quantile service with lateness and identity semantics."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference concerns concurrent HTTP code-evaluation CPU budgets and persistent accounting, not temporal database replay or segment querying."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both replay historical records deterministically, this reference builds canonical incident and SLA SQLite data with dependency ordering and policy evaluation rather than serving as-of key-value queries."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference is an HTTP log-metric aggregation service using a compiled windowing engine, with no segment replay or historical database-state semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.213
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.14
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.138
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.137
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.137
+    ]
+   ],
+   "cost_usd": 0.0013732
+  },
+  "novel": false
+ },
+ "cost_usd": 0.004466599999999999
+}

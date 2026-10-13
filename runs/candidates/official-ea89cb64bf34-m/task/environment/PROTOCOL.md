@@ -1,0 +1,5 @@
+replayd reads one JSON object per line and writes exactly one JSON object per request. Start it with `/opt/replay/bin/replayd`.
+
+Requests are `{\"op\":\"recover\"}`, `{\"op\":\"get\",\"tenant\":string,\"key\":string}`, `{\"op\":\"list\",\"tenant\":string,\"prefix\":string}`, `{\"op\":\"put\",\"tenant\":string,\"key\":string,\"value\":string}`, `{\"op\":\"delete\",\"tenant\":string,\"key\":string}`, `{\"op\":\"stats\",\"tenant\":string}`, `{\"op\":\"manifest\"}`, and `{\"op\":\"audit\",\"tenant\":string}`.
+
+Successful recover returns `ok`, `generation`, `events`, and `objects`. A successful get returns `ok`, `found`, and, when found, `value`; missing keys return `found:false`. List returns `ok` and `items`, an array of objects with `key` and `value`, sorted by UTF-8 key order. Stats returns `ok`, `tenant`, `live`, and `events`. Put and delete return `ok` and the resulting `generation`; delete also reports `deleted`. Manifest returns `ok`, `generation`, `checksum`, and `events`. Audit returns `ok` and `events`, whose objects contain `tenant`, `key`, `value`, `op`, and `generation`. Errors return `ok:false` and `error`.

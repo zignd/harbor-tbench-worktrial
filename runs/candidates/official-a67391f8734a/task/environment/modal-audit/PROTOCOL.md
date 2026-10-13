@@ -1,0 +1,5 @@
+MAFv2 binary stream protocol
+
+A frame begins with the four-byte ASCII sync word `MAF2`. The fixed header after sync is 16 bytes: little-endian uint16 `rows`, uint16 `cols`, uint32 `sequence`, and uint32 `payload_length`, followed by four reserved bytes that must be zero. Rows and cols are each in 1..12. The payload length must equal `8*(rows*cols + rows + cols)` and may not exceed 4096. The payload consists of rows*cols IEEE-754 binary64 basis values in row-major order, then rows eigenvalues, then cols physical-vector values. A little-endian CRC32C (Castagnoli polynomial) follows the payload and covers payload bytes only.
+
+A frame is accepted only if its complete bytes are present, reserved bytes and dimensions are valid, CRC32C matches, and every decoded value is finite. The modal result is `q[j] = sum_i basis[j,i] * x[i]`; energy is `sum(q[j]^2 / eigenvalue[j])`. An eigenvalue of zero is permitted only if the corresponding q is exactly zero, and contributes zero in that case. Any other zero or nonpositive eigenvalue rejects the frame. Output is one JSON line with keys `sequence`, `coefficients`, and `energy`.

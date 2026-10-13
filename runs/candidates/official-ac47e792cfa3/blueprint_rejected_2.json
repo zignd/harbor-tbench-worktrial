@@ -1,0 +1,195 @@
+{
+ "blueprint": {
+  "slug": "repair-fixed-point-ledger-reconcile",
+  "title": "Repair the Fixed-Point Ledger Reconciler",
+  "scenario": "A finance-ops reconciliation job consumes daily transaction batches from several custodians and produces the accounting ledger, exception report, and recovery checkpoint. The container contains a roughly 1,500-line reconciliation service, a SQLite state store, sample history, and an opaque compiled transaction codec that was promoted with the latest feature iteration. The current deployment appears healthy on the small sample, but month-end batches contain enough volume and malformed-record recovery to expose inconsistencies.",
+  "instruction_draft": "Hey, can you make `/usr/local/bin/ledger-reconcile` reliable for the next close? Given the documented files in `/work/incoming`, it needs to process every valid transaction exactly once, recover cleanly when a batch is interrupted or contains rejected records, and leave `/work/reconcile.db`, `/work/reconciliation.json`, `/work/exceptions.json`, and `/work/checkpoint.json` mutually consistent; rerunning the same input must be idempotent. Please preserve the documented fixed-point currency rules, reference-based refund matching, deterministic largest-remainder allocation, and the existing command-line interface, and make the normal 50,000-record run finish within 8 seconds on this one-CPU container.",
+  "requirements": [
+   "The command `/usr/local/bin/ledger-reconcile` must retain its existing command-line interface and process the documented files under `/work/incoming`.",
+   "Every valid transaction must be represented exactly once in the final ledger state.",
+   "Malformed or rejected records must be recorded in `/work/exceptions.json` with their source batch, line number, and reason, without preventing later valid records from being processed.",
+   "An interrupted run followed by rerunning the command must recover without lost transactions, duplicate transactions, or partially applied allocations.",
+   "Rerunning the same complete input must be idempotent.",
+   "The fixed-point currency conversion and rounding rules documented in the environment must be preserved exactly.",
+   "Refunds must offset the charge identified by their explicit reference, rather than an unrelated transaction with the same amount.",
+   "When a converted amount must be split among ledger lines, the implementation must use deterministic largest-remainder allocation with the documented tie-break order.",
+   "The final SQLite database must be written to `/work/reconcile.db`.",
+   "The final aggregate and per-currency reconciliation report must be written to `/work/reconciliation.json`.",
+   "Rejected-record details must be written to `/work/exceptions.json`.",
+   "The resumable processing position and input digest must be written to `/work/checkpoint.json`.",
+   "The database, report, exception file, and checkpoint must describe the same processed input set and totals.",
+   "The normal 50,000-record run must complete within 8 seconds on the one-CPU container.",
+   "The implementation must work for fresh verify-time inputs, not only the files initially present in `/work/incoming`."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt and pip dependencies, one CPU, and 2 GB RAM, with no network required at runtime.",
+   "The image contains an authored multi-module Python service under `/opt/ledger-reconcile`, including CLI dispatch, SQLite persistence, journaling, report generation, and configuration loading, totaling roughly 1,500 lines with unrelated operational code.",
+   "The image contains `/usr/local/bin/ledger-reconcile`, a wrapper around the service, and a documented configuration at `/etc/ledger-reconcile/config.toml`.",
+   "The image contains `/opt/ledger/bin/txncodec`, a stripped compiled ELF binary built during the Dockerfile build from temporary C source that is removed before the image is finalized; its source is not present in the container.",
+   "The codec accepts the documented line-oriented transaction batches in `/work/incoming/*.txn`, emits normalized records for the Python service, and exposes no debugging or source-level hints.",
+   "The transaction format includes account, currency, signed minor-unit amount, exchange-rate numerator and denominator, transaction identifier, optional charge reference, allocation labels, and a batch sequence number.",
+   "The fixed-point rule is to compute the exact rational converted minor amount, round by largest remainder across allocation lines, assign leftover units by descending remainder then ascending allocation label, and never use binary floating point for ledger values.",
+   "The initial sample history contains multiple batches, a few rejected lines, one interrupted-run marker, and examples where a refund reference and an equal-valued unrelated charge coexist.",
+   "The planted deployment problems are data-dependent: the opaque codec mishandles a rare high-volume accumulator boundary and loses synchronization after a malformed record; the service has checkpoint and SQLite-transaction interactions that can replay only part of a batch; and report generation and checkpoint writing use subtly different notions of the processed prefix.",
+   "The supplied sample is deliberately too small to trigger the codec boundary or expose a collision between replay and largest-remainder allocation.",
+   "A deterministic hidden-input generator is installed at `/opt/ledger/tools/generate_verify_inputs.py`; it is used by verification to create fresh batches with thousands of records, malformed lines at varying positions, repeated amounts, negative refunds, tied remainders, multiple currencies, and interruption points."
+  ],
+  "internal_hint": "Start by running the existing CLI on the sample and inspecting SQLite rows, checkpoint contents, reports, and codec output rather than reading only the Python source. Differentially feed the opaque codec small generated batches, then increase record counts and place malformed lines around the first divergent output; the failure is an accumulator-width/state-reset issue combined with a resynchronization bug that only appears after enough records. Independently kill the service at several batch boundaries and compare database, report, exception, and checkpoint digests after resume; the recovery bug comes from committing ledger rows before advancing the durable batch journal while report/checkpoint code advances by physical line count instead of accepted-record count. A robust repair is to normalize or replace the codec boundary and malformed-record handling with a streaming implementation, make each batch application and journal transition atomic and replay-safe, derive all four artifacts from one committed accepted-record set, and implement exact integer rational allocation with stable tie-breaking. Exercise the repaired command against generated cases and benchmark it before finalizing.",
+  "trap": "A shallow solution that fixes the visible equal-amount refund sample or merely resets the checkpoint will pass the supplied history but fail on a hidden batch that crosses the codec accumulator boundary, contains a malformed line before a valid record, or is interrupted after SQLite commit and before checkpoint publication. A floating-point conversion, amount-based refund lookup, or independently recomputed report can look correct on ordinary values while disagreeing on tied remainders, negative refunds, or replayed batches. Bypassing the codec without preserving its malformed-record semantics or atomic journal behavior also produces inconsistent exception and checkpoint state.",
+  "tests": [
+   "The verifier invokes `/usr/local/bin/ledger-reconcile` on the supplied sample and checks that `/work/reconcile.db`, `/work/reconciliation.json`, `/work/exceptions.json`, and `/work/checkpoint.json` exist and describe one identical input digest.",
+   "It compares SQLite transaction identity, accepted/rejected counts, per-account totals, per-currency totals, and allocation rows against a deterministic reference implementation using exact integer arithmetic.",
+   "It checks that every rejected record in `/work/exceptions.json` has the required batch, line, and reason fields and that rejected records do not alter ledger totals.",
+   "It reruns the command on the same sample and checks byte-equivalent canonical report and exception content, unchanged ledger row counts, and unchanged totals.",
+   "It generates fresh verify-time inputs with the installed generator, including 50,000 records, repeated transaction amounts, explicit refund references that collide with unrelated charges, negative amounts, multiple currencies, and exact remainder ties, then compares all final database and JSON state to the reference.",
+   "It generates malformed records at different positions in a batch and verifies that subsequent valid records are present exactly once and that line-numbered exceptions are complete.",
+   "It runs deterministic interruption scenarios at several journal and batch offsets, then resumes with the same input and checks that the final database, report, exceptions, and checkpoint exactly match an uninterrupted reference run.",
+   "It verifies that the checkpoint's accepted-record prefix, batch digest, and final totals agree with the SQLite journal and report rather than merely checking that a checkpoint file exists.",
+   "It checks reference-based refund matching and exact largest-remainder allocation on hidden cases where amount-only matching and floating-point rounding produce different answers.",
+   "It runs the 50,000-record generated case under the one-CPU container and fails if the command exceeds 8 seconds or requires network access."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "9",
+   "effect": "The verifier checks nine independent consistency properties spanning ledger rows, journal state, checkpoint digest and prefix, aggregate report, exception records, allocation rows, idempotent replay, recovery replay, and performance. Lowering this to three or four lets a partial fix hide behind a correct report; raising it adds more cross-component fields and interruption points, making inconsistent partial repairs much harder to pass."
+  },
+  "expected_failure_modes": [
+   "The agent inspects readable Python files and misses the data-dependent defect in the stripped codec.",
+   "The agent validates only the supplied small sample and never generates enough records to cross the codec boundary.",
+   "The agent repairs normal parsing but mishandles resynchronization after malformed lines.",
+   "The agent makes SQLite writes idempotent but leaves report and checkpoint generation based on different prefixes.",
+   "The agent uses floating point for rational currency conversion and fails rare remainder ties or negative values.",
+   "The agent matches refunds by amount or account instead of the explicit charge reference.",
+   "The agent writes a correct but slow per-record or repeatedly recomputed reconciliation path that exceeds the runtime bar.",
+   "The agent handles a clean rerun but not interruption between database commit, journal update, and checkpoint publication.",
+   "The agent replaces the binary with a parser that disagrees with the documented codec rejection semantics on hidden records."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "data-processing",
+   "fixed-point-arithmetic",
+   "crash-recovery",
+   "compiled-binary",
+   "sqlite",
+   "reconciliation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls -la /work/incoming /opt/ledger-reconcile /opt/ledger/tools && cat /etc/ledger-reconcile/config.toml",
+   "sed -n '1,240p' /usr/local/bin/ledger-reconcile",
+   "grep -RInE 'checkpoint|journal|sqlite|codec|report|exception|refund|allocation' /opt/ledger-reconcile",
+   "run /usr/local/bin/ledger-reconcile on the supplied sample",
+   "inspect /work/reconcile.db with sqlite3, including journal, transaction, allocation, and exception tables",
+   "cat /work/reconciliation.json /work/exceptions.json /work/checkpoint.json",
+   "run /opt/ledger/bin/txncodec directly on each supplied batch and save normalized output",
+   "generate a small valid input with /opt/ledger/tools/generate_verify_inputs.py and compare codec output with service behavior",
+   "generate progressively larger inputs and locate the first codec divergence near the accumulator boundary",
+   "place malformed records before valid records and characterize codec resynchronization and rejection output",
+   "read the parser, journal, SQLite transaction, checkpoint, and report-generation implementations together",
+   "trace one batch through commits, journal advancement, accepted-record counting, report generation, and checkpoint publication",
+   "identify the codec state-width/reset defect and the malformed-record synchronization defect",
+   "identify partial replay windows between SQLite commit, durable journal update, report publication, and checkpoint publication",
+   "identify amount-based refund lookup and any floating-point or nondeterministic allocation logic",
+   "replace or wrap codec parsing with a streaming implementation preserving documented normalized and rejection semantics",
+   "implement exact integer rational conversion and deterministic largest-remainder allocation with label tie-breaking",
+   "change refund handling to resolve only the explicit referenced charge",
+   "make batch application, journal advancement, and replay protection atomic and keyed by transaction identity",
+   "derive reports, exceptions, and checkpoints from the same committed accepted/rejected input state",
+   "fix checkpoint prefixes and digests to use accepted-record semantics consistently",
+   "add or repair durable uniqueness constraints and idempotent upserts for replayed records and allocations",
+   "run the sample and inspect all four artifacts against SQLite totals",
+   "rerun the sample and verify unchanged rows, totals, canonical reports, exceptions, and checkpoint",
+   "run generated malformed, refund-collision, negative, multi-currency, and tied-remainder cases",
+   "kill the process at several batch/journal offsets, resume with the same input, and compare every artifact with an uninterrupted run",
+   "run the 50,000-record generated case under one CPU, profile the hot path, and remove any repeated scans or per-record commits",
+   "verify the original CLI and fresh-input behavior, then perform a final SQLite and JSON consistency check"
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The interruption tests require deterministic kill points or a documented fault-injection mechanism; otherwise process timing can make them flaky.",
+   "The opaque codec's exact malformed-record and resynchronization semantics may not be sufficiently documented to reproduce when replacing or bypassing it.",
+   "An eight-second limit on a one-CPU container can vary with host load and Docker scheduling unless the verifier controls CPU isolation and timing conditions.",
+   "The requirement that all artifacts describe the same input set needs a precise canonical definition for digesting files, rejected lines, and accepted-record prefixes.",
+   "If transaction identifiers are not guaranteed unique, the meaning of exactly-once identity and replay protection is ambiguous."
+  ],
+  "verdict": "accept",
+  "reasons": "The task specifies a concrete end state and exercises independent correctness dimensions across parsing, exact arithmetic, persistence, recovery, and performance. It is genuinely difficult because the defects are data-dependent and cross component boundaries, while the verification plan uses fresh deterministic inputs and interruption scenarios rather than only the supplied sample. The main risks are operational determinism and insufficiently explicit codec and fault-injection semantics, but these are fixable without changing the core task.",
+  "fixes": [
+   "Document the exact CLI invocation, input-selection behavior, and canonical digest definition.",
+   "Provide a deterministic fault-injection knob or wrapper that kills the process at named journal and commit points.",
+   "Publish the codec's rejection and resynchronization contract, including whether line numbers refer to physical input lines.",
+   "Specify transaction identity uniqueness and the expected behavior for duplicate identifiers in distinct batches.",
+   "Make the benchmark environment enforce CPU affinity and define whether the eight-second limit includes startup and artifact publication."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Both involve deterministic financial reconciliation with malformed-record handling, but this task centers on an idempotent ledger, refunds, checkpoint recovery, and allocation while the reference centers on authenticated encrypted settlement frames and adjustment validation."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "The reference is an event-log index rebuild with address classification, revisions, and signatures, whereas this task is a financial ledger reconciliation pipeline with currency arithmetic, refunds, allocations, and crash recovery."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "The reference concerns deployment and ingestion defects in a Monte Carlo risk simulation service, not repairing a transaction ledger reconciler and its financial consistency guarantees."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The reference is a transactional database replay utility with shard parsing and atomic snapshot publication, which differs fundamentally from financial reconciliation and refund matching."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "It shares the same central finance-ledger reconciliation problem, especially reference-based refund matching and idempotent repeated imports, but expands it with checkpoint recovery, fixed-point allocation, rejection handling, and cross-artifact consistency."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.276
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.231
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.217
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.215
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.205
+    ]
+   ],
+   "cost_usd": 0.0012828
+  },
+  "novel": false
+ },
+ "cost_usd": 0.004639399999999999
+}

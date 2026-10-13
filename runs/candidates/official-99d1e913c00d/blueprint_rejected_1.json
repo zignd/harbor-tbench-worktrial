@@ -1,0 +1,185 @@
+{
+ "blueprint": {
+  "slug": "repair-field-telemetry-gateway",
+  "title": "Repair the Field Telemetry Gateway",
+  "scenario": "A colleague has a cheap ARM field logger whose telemetry gateway stopped agreeing with the maintenance dashboard after a firmware update. The container contains a small Rust deployment with CSV capture files, calibration manifests, an index-builder, and a line-oriented TCP service; several components appear healthy in the bundled sample but disagree on less common data. Please get the gateway deployed without adding network dependencies.",
+  "instruction_draft": "Can you get `/opt/field-gateway/bin/telemetryd` working on localhost:4711 and make it use the files under `/opt/field-gateway/data`? It must read the manifest-listed CSV captures in manifest order, accept RFC-4180 quoted fields, retain the last occurrence of each `(device, seq)` identity, ignore malformed records without stopping the load, and apply each device's calibration as `value_u = trunc_toward_zero((raw * scale_num) / scale_den) + offset_u`; only records whose quality is `ok` count as valid measurements. Keep the index, `/health`, `latest`, `window`, and `daily` results consistent after restart: `latest` must return the greatest sequence present for a device, `window` must use an inclusive start and exclusive end timestamp and return count/min/max/sum over valid deduplicated measurements, and `daily` must return those same aggregates grouped by UTC calendar date. The newline-delimited JSON protocol must return one JSON response per request for `{\"op\":\"health\"}`, `{\"op\":\"latest\",\"device\":\"...\"}`, `{\"op\":\"window\",\"device\":\"...\",\"from\":N,\"to\":N}`, and `{\"op\":\"daily\",\"device\":\"...\",\"from\":N,\"to\":N}`, including a stable error response for unknown devices or invalid ranges; do not change the port or require internet access.",
+  "requirements": [
+   "Deploy `/opt/field-gateway/bin/telemetryd` listening on localhost TCP port 4711.",
+   "Use the data and manifest under `/opt/field-gateway/data`.",
+   "Read manifest-listed CSV captures in manifest order.",
+   "Accept RFC-4180 quoted CSV fields.",
+   "Retain the last occurrence of each `(device, seq)` identity.",
+   "Ignore malformed records without stopping the load.",
+   "Apply `value_u = trunc_toward_zero((raw * scale_num) / scale_den) + offset_u` using the device calibration.",
+   "Count only records whose quality is exactly `ok` as valid measurements.",
+   "Keep the persisted or rebuilt index, `/health`, and query results consistent after restart.",
+   "For `latest`, return the greatest sequence present for the requested device.",
+   "For `window`, use an inclusive `from` timestamp and exclusive `to` timestamp.",
+   "For `window`, return count, minimum, maximum, and sum over valid deduplicated measurements.",
+   "For `daily`, return the same aggregates grouped by UTC calendar date.",
+   "Support newline-delimited JSON requests and emit exactly one JSON response per request.",
+   "Support the `health`, `latest`, `window`, and `daily` request shapes specified in the instruction.",
+   "Return a stable error response for unknown devices and invalid ranges.",
+   "Keep the service on the specified port and avoid requiring internet access."
+  ],
+  "environment": [
+   "A Dockerfile based on `python:3.13-slim-bookworm`, with pinned apt packages and a preinstalled Rust toolchain/cache sufficient for offline builds.",
+   "Approximately 1,600 lines of Rust spread across a CSV loader, calibration stage, binary index writer, query library, TCP JSON server, and deployment scripts.",
+   "`/opt/field-gateway/data/manifest.json` lists capture files, calibration files, and an index location; the initial data set contains several thousand records across multiple devices.",
+   "Capture files use a documented CSV header with device, seq, timestamp, raw, and quality columns. They include quoted fields, duplicate identities spanning files, out-of-order timestamps, malformed rows, negative values, and records on UTC day boundaries.",
+   "Calibration files contain signed integer numerator, denominator, and offset fields. Denominators are positive and hidden verification data includes negative raw values and non-divisible ratios.",
+   "The supplied service currently starts and answers the obvious sample requests, but its loader, normalizer, index builder, and query server have deliberately inconsistent handling of ordering, duplicate replacement, integer division, and UTC grouping.",
+   "A small prebuilt helper used by the index stage is shipped only as an executable and documented through its `--describe` output; its source is not present. It emits the canonical index framing expected by the query library and exposes edge cases involving truncated files and duplicate keys.",
+   "A systemd-like launch wrapper and a sample client are included, but the container does not run systemd. The verifier starts the requested binary or wrapper directly.",
+   "A reference data generator is included outside the service source and is used by the verifier to create fresh manifests, calibration tables, and captures with deterministic seeds."
+  ],
+  "internal_hint": "Investigate the manifest, the sample client's wire behavior, the helper's description, and the index bytes rather than trusting the bundled sample. Exercise the loader with generated quoted commas, malformed rows, duplicate keys split across files, negative fractional calibration results, records exactly on range boundaries, and timestamps around midnight UTC. The likely repair is to make one canonical load pass preserve manifest order and last-write-wins identity state, normalize calibration with signed truncation toward zero before adding the offset, ensure every consumer reads that same normalized index, and perform date grouping from integer Unix timestamps in UTC rather than local time. The deployment wrapper also needs to rebuild or invalidate stale indexes when the manifest or capture content changes, while preserving deterministic health metadata and framing one response per request.",
+  "trap": "A shallow solution can make the visible sample and the first `latest` request pass while leaving the old index or one query path using pre-deduplicated records. It will fail when a later manifest file replaces an earlier sequence, when a negative value exposes floor-versus-truncation behavior, when a quoted CSV field shifts columns, or when a timestamp at UTC midnight belongs to a different daily bucket than the container's local timezone. Another common failure is reporting a healthy service from an index generated before the data replacement, so restart tests disagree with a clean start.",
+  "tests": [
+   "Start the deployed service and send `health`; verify it responds on localhost:4711 with valid newline-delimited JSON and metadata consistent with the loaded manifest and index.",
+   "Send `latest` for several known devices, including devices whose highest sequence is in a later capture and devices with duplicate sequence identities; verify the greatest sequence and last-occurrence semantics from the instruction.",
+   "Send `window` requests with empty ranges, exact-boundary timestamps, negative calibrated values, malformed source rows nearby, and ranges spanning multiple capture files; compare count/min/max/sum with a fresh reference implementation.",
+   "Send `daily` requests spanning UTC midnight, including timestamps near local-time offset boundaries; verify inclusive/exclusive range behavior and UTC date grouping.",
+   "Generate fresh deterministic manifests with hundreds to thousands of records, RFC-4180 quoted fields, malformed rows, duplicate identities, out-of-order timestamps, negative raws, and non-divisible positive and negative calibration ratios; replace the data directory and verify all four protocol operations against the reference.",
+   "Restart the service after each generated data replacement and verify that health, latest, window, and daily remain identical rather than serving a stale index.",
+   "Issue unknown-device and invalid-range requests and verify the documented stable JSON error response without terminating the connection.",
+   "Send multiple requests over one TCP connection, including requests after an error, and verify exactly one valid response per newline-delimited request.",
+   "Run the service without network access and verify it binds only to the requested local port and remains usable by the protocol client."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "10 generated data sets with 4 protocol operations, restart checks, and persistent-connection sequences",
+   "effect": "Increasing the number of generated manifests, edge-case request combinations, and restart cycles makes stale-index and cross-component inconsistencies more likely to surface; lowering it toward the bundled sample makes partial fixes much easier to pass."
+  },
+  "expected_failure_modes": [
+   "Fixing only the visible server bug while leaving the loader and index builder with different duplicate semantics.",
+   "Using floating-point calibration or language-default integer division instead of signed truncation toward zero.",
+   "Treating malformed CSV as a fatal load error or using naive comma splitting that breaks quoted fields.",
+   "Grouping daily results using local time or converting timestamps through a platform-dependent date library.",
+   "Returning aggregates over all records rather than filtering quality to exactly `ok`.",
+   "Reusing an index after the manifest or capture files change.",
+   "Testing only one request per connection and accidentally closing or desynchronizing the newline protocol.",
+   "Assuming the bundled executable helper can be replaced with an approximate reimplementation without checking its framing and edge behavior.",
+   "Reporting health based on startup success rather than consistency between the loaded data, index, and query state."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "networking-and-services",
+  "tags": [
+   "rust",
+   "deployment",
+   "telemetry",
+   "csv",
+   "data-consistency",
+   "protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the deployment tree, binaries, manifests, data files, and build instructions under /opt/field-gateway.",
+   "Read the manifest and capture/calibration schemas, including the index location.",
+   "Inspect the sample client to determine request and response JSON shapes and persistent-connection behavior.",
+   "Run the shipped index helper with --describe and inspect an existing index.",
+   "Read the loader and CSV parsing code for ordering, quoting, malformed-row, and duplicate handling.",
+   "Read calibration and normalization code for integer arithmetic and negative division behavior.",
+   "Read the index writer, query library, and server for divergent record paths and aggregate filtering.",
+   "Read the launch wrapper for stale-index detection and startup health behavior.",
+   "Build and run the baseline service, then exercise health, latest, window, and daily.",
+   "Patch loading to use one manifest-ordered pass with RFC-4180 parsing, malformed-row skipping, and last-write-wins identities.",
+   "Patch calibration to use checked signed integer arithmetic with truncation toward zero before applying the offset.",
+   "Make index construction and all queries consume the same normalized deduplicated records.",
+   "Patch window bounds, exact-ok filtering, latest ordering, and UTC daily grouping.",
+   "Patch startup to rebuild or invalidate indexes when manifest or capture content changes.",
+   "Patch the TCP loop to emit exactly one response per request and continue after errors.",
+   "Format and build the Rust deployment offline.",
+   "Generate a quoted, malformed, duplicate, negative-calibration fixture and compare all operations with a reference calculation.",
+   "Restart after replacing the data directory and verify health and all query results remain unchanged.",
+   "Exercise unknown devices, invalid ranges, empty ranges, boundary timestamps, and multiple requests on one connection."
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The response schemas and exact stable error JSON are not specified, so tests that require particular field names or error codes could overreach the instruction.",
+   "The meaning of health metadata being \"consistent\" with the manifest and index is underspecified.",
+   "Tests may depend on undocumented framing details of the shipped helper or infer them from --describe in a way that is not reproducible across helper builds.",
+   "Fresh generated data could expose integer overflow or resource behavior not constrained by the task, making failures implementation- or environment-dependent.",
+   "Index invalidation based on file metadata could be flaky if generated replacements preserve timestamps or occur within coarse filesystem timestamp resolution."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and largely verifiable, but the protocol response schema, error shape, and health metadata contract are not fully stated. More importantly, the core defects are directly discoverable in the supplied source and the repair path is plausibly about 19 commands, so under the stated rubric genuine difficulty is at most 2; the minimum-score acceptance rule therefore fails.",
+  "fixes": [
+   "Specify exact response JSON schemas for health, latest, window, daily, unknown-device errors, and invalid-range errors, including numeric types and empty-result behavior.",
+   "Define the health metadata fields and exact consistency checks expected by the verifier.",
+   "Increase genuine difficulty by distributing the behavior across less obvious runtime boundaries or requiring investigation of a documented but nontrivial compatibility contract, while keeping all required semantics explicit.",
+   "Provide an explicit cache-key or invalidation contract for manifest and capture changes, including behavior when timestamps do not change.",
+   "State overflow and malformed-field handling requirements, or constrain generated values so verifier failures cannot depend on unspecified arithmetic limits."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "This repairs a telemetry CSV ingestion, calibration, deduplication, and aggregation service, unlike the reference's route-policy classification and adversarial input handling."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "Although both involve stateful event aggregation and identity handling, this task centers on manifest-ordered CSV loading, calibration, TCP queries, and daily/window statistics rather than weighted quantiles over a JSON stdin protocol."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "The reference is a binary-framed TCP-to-HTTP relay with delivery guarantees, whereas this task is a CSV-backed telemetry index and query service."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The reference computes campaign attribution and refund semantics from HTTP event batches, while this task performs calibrated telemetry ingestion and time-series aggregation."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "The reference fixes canary promotion and rollback state based on sampled request health, not telemetry CSV parsing, deduplication, calibration, or aggregate queries."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.199
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.162
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.127
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.125
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.0009606
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0030245999999999997
+}

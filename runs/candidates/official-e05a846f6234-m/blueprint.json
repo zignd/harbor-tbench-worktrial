@@ -1,0 +1,70 @@
+{
+ "slug": "repair-event-metric-query",
+ "title": "Repair Event Metric Query Service",
+ "scenario": "A backend developer is chasing a production discrepancy in an internal Rust service that replays JSON metric logs, persists checkpoints, and answers rolling percentile queries. The container contains the service, several days of generated logs and metrics, recovery fixtures, and a compiled histogram component used by the live deployment but not shipped with source.",
+ "instruction_draft": "Hey, can you get `metricq` back into shape? It reads newline-delimited JSON commands on stdin and must keep its existing protocol, survive a truncated journal and restart, and return the same rolling weighted-percentile results as the deployed metric implementation for late, duplicated, and out-of-order events. Please make the fix general rather than matching the sample fixture: checkpoint/recover cycles must be idempotent, valid events must not disappear, corrupt journal tails must be ignored safely, and responses must stay deterministic with the documented JSON error format.",
+ "requirements": [
+  "Build and run the Rust metricq service using the existing stdin/stdout JSON-lines protocol.",
+  "Preserve successful responses and documented error responses for reset, ingest, query, checkpoint, and recover requests.",
+  "Compute the deployed implementation's weighted percentile result for arbitrary generated streams, including weighted observations, equal timestamps, out-of-order timestamps, late observations, and multiple metric names.",
+  "Treat event-time windows as half-open intervals and apply the configured lateness policy consistently across ingestion, querying, checkpointing, and recovery.",
+  "Do not lose valid events merely because they arrive out of order or after a checkpoint.",
+  "Do not count a journal record more than once when a checkpoint is replayed or a client retries an ingest request with the same event identity.",
+  "Recover successfully when the journal ends with a partial or malformed record, while still reporting genuinely invalid complete requests using the existing protocol error shape.",
+  "Make checkpoint followed by recover observationally equivalent to uninterrupted execution.",
+  "Produce deterministic numeric responses and stable JSON field ordering for all supported requests.",
+  "Pass fresh verify-time scenarios rather than only the supplied fixtures."
+ ],
+ "environment": [
+  "A Dockerfile based on `python:3.13-slim-bookworm`, with pinned Rust tooling and build dependencies installed locally and no network requirement.",
+  "A roughly 1,500-line Rust workspace under `/opt/metricq`, including protocol handling, journal persistence, checkpoint management, event-time windows, metrics exposition, logging, and unrelated health/admin code.",
+  "A runnable `metricq` binary or Cargo target that reads one JSON request per stdin line and writes exactly one JSON response per request.",
+  "A documented protocol file describing requests such as `reset`, `ingest`, `query`, `checkpoint`, and `recover`, including stream identifiers, event IDs, event timestamps, values, weights, query ranges, quantiles, and error responses.",
+  "Generated production-like logs in `/opt/metricq/fixtures/`, containing thousands of events across several streams, retries, out-of-order delivery, late arrivals, checkpoint markers, and a deliberately truncated journal tail.",
+  "A compiled opaque component at `/opt/metricq/lib/libloghist.so` and a small ABI header describing its add, merge, and percentile entry points, but no implementation source. The existing Rust wrapper calls this component for the deployed histogram semantics.",
+  "A helper executable at `/opt/metricq/bin/histprobe` that exposes only controlled add/merge/percentile experiments against the opaque component; it does not disclose its bucket boundaries or interpolation algorithm.",
+  "Prometheus-style metrics and structured service logs showing percentile drift, replay counts, journal offsets, dropped-late-event counts, and recovery status. The visible smoke fixture is chosen so that either of the main defects can appear fixed in isolation.",
+  "Planted problems include a state-dependent journal/checkpoint replay defect, an incorrect event identity/ordering interaction during recovery, and a wrapper/aggregation path whose behavior depends on the opaque histogram's merge and quantile semantics. Several unrelated parsing and metrics modules are intentionally present to require investigation."
+ ],
+ "internal_hint": "The intended path is to inspect the protocol and logs, run the service against the production fixtures, then use histprobe with single observations, carefully selected weights, merges, and boundary values to characterize the opaque logarithmic histogram rather than replacing it with an exact percentile implementation. Differential probes around checkpoint boundaries expose that recovery replays the record at the saved offset; probes with retries and non-monotone event IDs expose that deduplication is based on a per-stream maximum sequence instead of the durable event identity, so valid older arrivals vanish while replayed records can be double-counted. Fix the journal offset to denote the first uncommitted record, persist and restore the deduplication set or equivalent durable identity index, and make recovery tolerate only an incomplete final line. Ensure event-time lateness filtering happens after durable identity handling and that bucket aggregation uses the characterized component for both live and recovered state. The reference solution is a deterministic shell script that first probes logs, histprobe, restart/recovery behavior, and generated differential cases before editing the Rust implementation and running a broad protocol matrix.",
+ "trap": "A shallow solution either replaces the opaque histogram with an ordinary exact weighted percentile, which passes simple values but fails hidden bucket-boundary and merge cases, or fixes only the checkpoint offset. Such a solution passes the supplied smoke fixture but fails when a retry and a valid out-of-order event share a recovery boundary: one is counted twice and the other is discarded. Replaying a malformed final line as a normal error also causes restart scenarios to diverge from uninterrupted execution.",
+ "tests": [
+  "Start the service, issue basic reset, ingest, and query requests, and verify the documented response schema, weighted percentile values, and error handling.",
+  "Generate fresh streams with seeded values, weights, timestamps, duplicate event IDs, and non-monotone delivery order; compare every query against a reference implementation that uses the characterized opaque histogram.",
+  "Exercise quantiles near opaque bucket boundaries, singleton and heavily weighted observations, repeated merges, and empty windows to ensure the solver did not substitute a superficially plausible percentile algorithm.",
+  "Run equivalent command sequences with and without checkpoints and compare all subsequent query responses, including checkpoints taken between duplicate and out-of-order deliveries.",
+  "Write a journal containing committed records followed by a partial JSON line, restart with recover, and verify that committed state is restored, the partial tail is ignored, and later valid appends work.",
+  "Replay the same recovery sequence multiple times and verify idempotence of event identity handling and stable journal offsets.",
+  "Test lateness boundaries at exactly the configured cutoff and just on either side, including events delivered after a checkpoint and events in half-open query endpoints.",
+  "Use multiple independent metric streams and interleaved requests to catch accidental global deduplication or cross-stream aggregation.",
+  "Inspect exported counters and structured logs only for consistency checks such as recovered records and dropped-tail status; correctness is judged from protocol results, not source matching.",
+  "Run a larger verify-time generated workload with thousands of records and rare duplicate/out-of-order combinations so sampling the visible logs is insufficient."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "10 protocol scenarios, including 4 fresh generated recovery streams",
+  "effect": "Lowering this to a few basic scenarios mostly tests protocol plumbing and simple percentile queries. Raising it adds more restart boundaries, opaque-histogram edge probes, duplicate/out-of-order combinations, streams, and generated workloads, making partial fixes increasingly unlikely to pass."
+ },
+ "expected_failure_modes": [
+  "The agent reads the obvious aggregation code and patches the first percentile or timestamp comparison without experimentally characterizing the compiled histogram.",
+  "The agent verifies only uninterrupted execution and never compares checkpoint/recovery with the same uninterrupted command sequence.",
+  "The agent uses a maximum-sequence watermark for deduplication, silently dropping valid late events with older sequence numbers.",
+  "The agent advances or persists the journal offset at the wrong side of a record, causing exactly one checkpoint-boundary record to be replayed.",
+  "The agent treats a truncated final journal line as a fatal parse error or as a valid event.",
+  "The agent implements exact quantiles instead of preserving the deployed component's nonlinear bucket and merge behavior.",
+  "The agent fixes deduplication in memory but does not restore its state durably, so the first run passes and restart tests fail.",
+  "The agent changes the public JSON protocol or emits logging on stdout, corrupting the service protocol.",
+  "The agent tests only the supplied fixture, where the two recovery defects do not interact."
+ ],
+ "predicted_pass_rate": 0.22,
+ "difficulty": "hard",
+ "category": "system-administration",
+ "tags": [
+  "rust",
+  "logs",
+  "metrics",
+  "recovery",
+  "opaque-component",
+  "protocol"
+ ]
+}

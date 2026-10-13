@@ -1,0 +1,64 @@
+{
+ "slug": "repair-mosaic-statistics-daemon",
+ "title": "Repair Mosaic Statistics Daemon",
+ "scenario": "After a database incident, the DBA found that the query planner was receiving incorrect cardinality statistics from an internal service used for archived columnar snapshots. The container contains a small C codebase, a binary Mosaic capsule reader, sample capsules, protocol documentation, and a partially working statistics daemon that must be repaired without changing its line-oriented service interface.",
+ "instruction_draft": "Repair `/opt/mosaic-statd` so `./bin/mosaic-statd` reads one JSON request per line from stdin and writes exactly one JSON response per request, supporting `load`, `count`, `quantile`, `topk`, and `group_count` requests with the documented inclusive ranges, null handling, ordering, and error responses. It must return correct results for arbitrary generated Mosaic capsules, preserve request order, and process a generated 250,000-row capsule and 2,000 mixed queries in under 2 seconds while using under 128 MiB of memory.",
+ "requirements": [
+  "The executable at `/opt/mosaic-statd/bin/mosaic-statd` must accept one JSON request per stdin line and emit exactly one JSON response per request on stdout.",
+  "The service must support the documented `load`, `count`, `quantile`, `topk`, and `group_count` operations.",
+  "Count ranges must use the documented inclusive lower and upper bounds and must count null and non-null values according to the protocol's specified rules.",
+  "Quantile responses must use the documented nearest-rank definition, including duplicate values and null exclusion.",
+  "Top-k responses must apply the documented frequency-descending and value-ascending tie ordering.",
+  "Group-count responses must include the documented null group and deterministic key ordering.",
+  "Requests must be answered in input order, including requests issued after multiple loads and queries against different columns.",
+  "Malformed requests, unknown columns, unloaded capsules, and invalid ranges must produce the documented JSON error responses without terminating the service.",
+  "The implementation must return correct results for arbitrary generated Mosaic capsules, not only the supplied examples.",
+  "A generated 250,000-row capsule with 2,000 mixed queries must complete in under 2 seconds and use less than 128 MiB of memory."
+ ],
+ "environment": [
+  "The Docker image is based on `python:3.13-slim-bookworm`, with pinned build tools and no network dependency.",
+  "`/opt/mosaic-statd` contains roughly 1,500 lines of C across a JSON-line protocol frontend, capsule loading code, column metadata handling, query dispatch, test utilities, and unrelated logging/configuration code.",
+  "`bin/mosaic-statd` is the service entry point and the repository includes a Makefile and deterministic local test harnesses.",
+  "`share/MOSAIC-FORMAT.md` documents the Mosaic binary capsule format: a header, column directory, independently compressed blocks, zigzag-varint signed values, dictionary resets, null bitmaps, and per-block indexes.",
+  "The capsule format is produced by an installed helper at `/usr/local/bin/mosaic-pack`; its packing implementation is not shipped as source, and the helper is used by verification to generate fresh capsules.",
+  "`examples/` contains several small capsules and protocol transcripts, but none exercises the combination of block boundaries, null runs, repeated dictionary values, negative values, and high-cardinality groups that exposes the main failure.",
+  "The initial C implementation contains a mixture of an incomplete block-rank/index path and data-dependent mistakes in decoding and query-boundary handling; ordinary scans appear correct on the examples but do not meet the performance requirement.",
+  "The verifier generates seeded capsules with varying block sizes, column types, null distributions, signed values, duplicate-heavy dictionaries, and values straddling block boundaries, then launches the daemon over its real stdin/stdout protocol."
+ ],
+ "internal_hint": "First inspect the protocol and format documents, build the supplied harness, and use the opaque packer plus small probing capsules to compare packed metadata and decoded rows. The reliable fix is to make zigzag-varint and dictionary-reset decoding block-local, represent nulls separately, and construct a reusable rank/select index for each block's bit-sliced value representation rather than repeatedly scanning every row. Range counting must combine complete blocks with partial-block rank queries using inclusive endpoints; quantile must perform a nearest-rank selection over the indexed value domain while excluding nulls; topk and group_count must aggregate decoded dictionary identities and apply the protocol's exact tie rules. Differentially test against a simple Python reference on newly packed cases, then benchmark mixed requests and check RSS before finalizing the C implementation.",
+ "trap": "A shallow solution can decode every row and pass the visible transcripts, or can fix only the signed-value decoder while retaining the fast path's off-by-one rank behavior. Hidden capsules place queried values exactly at block starts and ends, repeat dictionary entries after resets, and mix nulls with negative values; a scan-based implementation is also rejected by the throughput and memory checks.",
+ "tests": [
+  "A protocol smoke test sends load, count, quantile, topk, and group_count requests and checks one valid JSON response per request, in order, including exact tie ordering and null behavior; this checks the first instruction sentence.",
+  "An error-path test sends malformed JSON, unknown operations, bad ranges, unknown columns, and queries before load and checks the documented error objects without daemon exit; this checks the malformed-request requirement.",
+  "A differential test uses verify-time generated capsules with signed values, nulls, duplicates, dictionary resets, and queries crossing block boundaries, compares every response with an independent reference implementation, and checks arbitrary rather than sample-only correctness.",
+  "A state test performs multiple loads and interleaves queries for several columns, checking that responses do not leak state from the prior capsule and remain in request order.",
+  "A performance test packs a seeded 250,000-row capsule, sends 2,000 mixed count, quantile, topk, and group_count requests, and requires completion below 2 seconds on one CPU; this checks the stated performance bar.",
+  "A resource test runs the same workload under a 128 MiB RSS limit and rejects implementations that materialize all rows or otherwise exceed the memory requirement."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "2000 mixed requests over generated 250000-row capsules, with 5 column/query distributions",
+  "effect": "Lowering the number of requests or using only one distribution makes scan-based and partially correct implementations more likely to pass; increasing it adds more block-boundary, null, dictionary-reset, quantile, and tie-order cases and makes performance failures more visible."
+ },
+ "expected_failure_modes": [
+  "The solver reads only the sample transcript and misses rank errors that require values exactly on block boundaries.",
+  "The solver treats a dictionary index as a globally stable value identifier even though dictionaries reset per block.",
+  "The solver decodes signed zigzag values as ordinary varints, which passes nonnegative examples but corrupts negative ranges and quantiles.",
+  "The solver includes nulls in nearest-rank positions or omits the required null group.",
+  "The solver returns correct top-k members but uses an unstable or incorrect tie order.",
+  "The solver implements a full row scan that is functionally correct but misses the stated latency bar.",
+  "The solver repairs the protocol frontend while leaving the optimized partial-block index path inconsistent with the reference decoder.",
+  "The solver tests only one load and does not notice stale per-column indexes after reload."
+ ],
+ "predicted_pass_rate": 0.27,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "c",
+  "binary-format",
+  "query-service",
+  "rank-select",
+  "performance",
+  "debugging"
+ ]
+}

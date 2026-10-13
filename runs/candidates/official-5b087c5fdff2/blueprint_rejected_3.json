@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "repair-feature-bundle-pipeline",
+  "title": "Repair the Feature Bundle Pipeline",
+  "scenario": "A data engineer has inherited an offline customer-feature pipeline that turns tab-separated account snapshots into a SQLite feature catalog, binary model shards, and a published manifest. The container contains several Bash stages, a small catalog service, an opaque feature-vector encoder, stage-specific configuration files, sample snapshots, and an already populated but inconsistent output directory.",
+  "instruction_draft": "Configure and repair `/opt/featurepipe` so `/opt/featurepipe/bin/rebuild --config /etc/featurepipe/pipeline.conf` deterministically rebuilds `/var/lib/featurepipe/features.sqlite`, `/var/lib/featurepipe/shards`, and `/srv/published/manifest.json` from every `/srv/featurepipe/incoming/*.snapshot`; the rebuild must retain the newest valid row for each trimmed `entity_id` (breaking timestamp ties by source filename and then line number), reject malformed or superseded rows with reasons, and produce the documented feature vectors, shard assignments, counts, and digests consistently across all outputs. It must also be idempotent and continue to satisfy those properties for newly generated snapshot files containing duplicates, ties, empty optional fields, non-ASCII values, and entities whose IDs differ only by surrounding whitespace.",
+  "requirements": [
+   "The command `/opt/featurepipe/bin/rebuild --config /etc/featurepipe/pipeline.conf` must be the working rebuild entry point.",
+   "All files matching `/srv/featurepipe/incoming/*.snapshot` must be included in every rebuild.",
+   "The winning record must be selected independently for each `entity_id` after trimming surrounding ASCII whitespace.",
+   "A valid row with the greatest `captured_at` timestamp must win; equal timestamps must be resolved by lexicographically smallest source filename and then smallest one-based line number.",
+   "Malformed rows and valid rows superseded by a winner must be retained in the rejects state with the documented rejection reason and source coordinates.",
+   "Empty optional fields must use the documented null/default feature behavior rather than causing the entity to be dropped.",
+   "The generated feature vector must use the documented feature names, order, numeric conversions, one-hot categories, and float encoding.",
+   "Each winning entity must be assigned to the configured shard using the documented canonical entity-key hash, and the same assignment must appear in SQLite, the binary shards, and the manifest.",
+   "The SQLite database at `/var/lib/featurepipe/features.sqlite` must contain consistent entity, vector, reject, run, and shard metadata tables.",
+   "The directory `/var/lib/featurepipe/shards` must contain exactly the configured shard files and no stale files from an earlier rebuild.",
+   "The manifest at `/srv/published/manifest.json` must contain totals, per-shard counts, schema/version information, and digests matching the SQLite catalog and binary shard contents.",
+   "Running the rebuild twice without changing inputs must leave all output bytes and database rows unchanged.",
+   "The same behavior must work for verify-time generated snapshots containing duplicate IDs, timestamp ties, empty optional values, non-ASCII plan or region text, and whitespace-only ID variations."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, installs pinned `sqlite3`, `jq`, `coreutils`, and `xxd` packages, and contains no network dependency.",
+   "The repository is approximately 1,500 lines across Bash orchestration, Python catalog and manifest code, configuration loaders, a shard reader, and unrelated operational utilities.",
+   "The input format is documented in `/opt/featurepipe/docs/input-format.md`: each `.snapshot` is UTF-8 tab-separated data with header `entity_id\\tcaptured_at\\tplan\\tregion\\tseats\\tmrr_cents\\tenabled`, with backslash escapes for tabs and backslashes in text fields.",
+   "The feature contract is documented in `/opt/featurepipe/docs/feature-contract.md`; it defines validation, timestamp parsing, default handling, canonicalization, feature order, and the exact little-endian float32 vector representation.",
+   "The pipeline has separate configuration sections for ingestion, winner selection, vector encoding, hashing, SQLite loading, shard writing, and publishing, with several values currently disagreeing across sections.",
+   "The vector encoder and shard writer are supplied as stripped executables under `/opt/featurepipe/lib`; their source is not present, but their command-line help, reader utility, and format documentation are available.",
+   "The current sample data is deliberately friendly: it has unique ASCII IDs, no timestamp ties, no empty optional values, and only one record per shard, so a shallow run can appear correct.",
+   "The planted deployment problems include an inconsistent canonical-key setting between the encoder and hash stage, an old feature-order version selected by one stage, a shard-count mismatch between writer and catalog, locale-dependent manifest ordering, and stale-file cleanup that is skipped on one rebuild path.",
+   "The initial SQLite database and published artifacts contain plausible results from an older configuration and must be replaced rather than treated as authoritative.",
+   "A deterministic reference generator and verifier are available only to the task harness; verification adds fresh generated snapshots to the incoming directory before invoking the repaired rebuild."
+  ],
+  "internal_hint": "The intended solution is to inspect the documentation, stage diagnostics, config precedence, and the opaque tools' help/reader behavior, then run controlled probes rather than infer correctness from the friendly sample. The failures arise from configuration values being independently overridden: the normalizer and hash stage disagree about trimmed entity keys, the encoder selects a legacy feature schema, the shard writer and catalog use different shard counts, and publishing preserves filesystem/locale order while the verifier requires canonical byte order; one Bash cleanup branch also leaves old shard files. A skilled solution should establish one canonical configuration source, pass it explicitly to every stage, make rebuild cleanup and ordering deterministic, and validate with duplicate, tie, empty-field, Unicode, and multi-shard probes before fixing the deployment.",
+  "trap": "A naive solution can make the sample totals and first manifest look correct while leaving the legacy vector schema or hash setting active. It will fail when hidden inputs create whitespace-equivalent IDs, timestamp ties, Unicode values, or enough entities to occupy every shard; stale shard files and nondeterministic ordering also make a second rebuild or a manifest/database cross-check fail even when the visible row count is right.",
+  "tests": [
+   "The harness checks that the documented rebuild command succeeds and that all three output locations exist after a clean run; this corresponds to the first instruction sentence naming the command and paths.",
+   "It generates fresh `.snapshot` files with valid and malformed rows, then compares SQLite winning entities and rejection records against the reference winner-selection rules; this checks the requirements about all inputs, trimmed IDs, timestamp/source/line tie-breaking, and rejection reasons.",
+   "It includes duplicate IDs differing only by surrounding whitespace, equal timestamps, empty optional fields, and non-ASCII text; this checks the explicit edge-case requirement in the second instruction sentence.",
+   "It decodes every generated binary shard with the supplied reader and compares feature names, vector bytes, entity keys, and shard assignments with the reference feature contract; this checks the documented feature-vector and canonical-hash requirements.",
+   "It verifies that SQLite entity rows, vector rows, shard metadata, and manifest per-shard counts agree exactly; this checks the cross-component consistency requirement covering SQLite, shards, and manifest.",
+   "It checks that the shard directory contains exactly the configured shard set and no files from the initial deployment; this checks the stale-file cleanup requirement.",
+   "It recomputes manifest totals and digests from the database and shard bytes and compares canonical JSON bytes; this checks the manifest consistency and deterministic ordering requirements.",
+   "It runs the repaired rebuild twice with identical inputs and compares output bytes and all relevant database rows; this checks idempotence.",
+   "It runs multiple hidden generated datasets with different duplicate distributions, shard occupancy, optional-field combinations, and Unicode values, rather than relying on the supplied sample."
+  ],
+  "verifier_knob": {
+   "name": "generated_snapshot_records_and_edge_case_density",
+   "value": "1,200 records across 37 entities, 16 shards, with approximately 8% timestamp ties, 12% whitespace-equivalent IDs, 10% empty optional fields, and 3% non-ASCII text",
+   "effect": "Lowering the record count and edge-case rates makes the stale-shard, ordering, and cross-stage mismatches easier to miss and reduces runtime; raising them increases the chance that inconsistent hashing, winner selection, vector schema, and cleanup are exposed while keeping the same required end state."
+  },
+  "expected_failure_modes": [
+   "The solver fixes the visible sample output but does not exercise duplicate and tie cases, so hidden winner-selection inputs produce different entities.",
+   "The solver edits one stage's shard count or feature schema without updating the other consumers, causing internally plausible but inconsistent artifacts.",
+   "The solver leaves the opaque encoder on its legacy schema because the sample vectors have compatible-looking dimensions.",
+   "The solver uses raw IDs for hashing while SQLite stores trimmed IDs, creating silent cross-component shard mismatches.",
+   "The solver makes output ordering depend on glob order, locale, or SQLite query order, so repeated builds differ.",
+   "The solver appends to the existing shard directory or database instead of performing a complete deterministic rebuild.",
+   "The solver implements only the visible input fields and mishandles escaped tabs, empty values, Unicode normalization, or malformed-row accounting.",
+   "The solver verifies row counts but not binary bytes, digests, rejection state, or manifest/catalog agreement."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "bash",
+   "configuration",
+   "data-pipeline",
+   "feature-store",
+   "sqlite",
+   "determinism"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/featurepipe && find docs bin lib -maxdepth 2 -type f -print",
+   "cat docs/input-format.md docs/feature-contract.md",
+   "cat /etc/featurepipe/pipeline.conf && find /etc/featurepipe -type f -maxdepth 2 -print",
+   "sed -n '1,240p' bin/rebuild",
+   "grep -RInE 'config|canonical|shard|feature|locale|sort|cleanup|manifest' bin lib /etc/featurepipe",
+   "lib/encoder --help; lib/shard-writer --help; find . -type f -iname '*reader*' -o -iname '*format*'",
+   "/opt/featurepipe/bin/rebuild --config /etc/featurepipe/pipeline.conf",
+   "sqlite3 /var/lib/featurepipe/features.sqlite '.tables' && jq . /srv/published/manifest.json",
+   "grep -RInE 'legacy|canonical|shard_count|LC_|rm |glob|order by|override' . /etc/featurepipe",
+   "edit the configuration to establish one canonical schema, trimmed-key hashing, and one shard count",
+   "edit rebuild and stage invocation paths to pass the configuration explicitly to every component",
+   "edit cleanup to recreate the database/shard output state and remove every stale shard file",
+   "edit publishing and database queries to use explicit canonical ordering and deterministic serialization",
+   "/opt/featurepipe/bin/rebuild --config /etc/featurepipe/pipeline.conf",
+   "create a temporary probe snapshot containing duplicate trimmed IDs, timestamp ties, empty fields, escapes, Unicode, malformed rows, and multiple shards",
+   "/opt/featurepipe/bin/rebuild --config /etc/featurepipe/pipeline.conf && decode all shards, query SQLite rejects/entities, and compare against the documented contract",
+   "run the rebuild again and compare manifest, shard, and database outputs and rows byte-for-byte"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact feature contract, rejection-reason strings, configuration precedence, and opaque-tool interfaces are not included in the blueprint, so feasibility depends on those documents being complete and internally consistent.",
+   "If the verifier compares SQLite database file bytes rather than logical rows, SQLite page allocation, journaling, or metadata behavior could create false failures unless the task specifies the comparison mode and deterministic database settings.",
+   "The requirement to include every incoming snapshot means generated probe files persist across rebuilds; tests must isolate or deliberately account for prior generated inputs, otherwise expected totals can become environment-dependent.",
+   "The phrase 'all relevant database rows' should identify whether run history and timestamps are included, since appending run metadata would conflict with strict idempotence."
+  ],
+  "verdict": "reject",
+  "reasons": "The end state is mostly clear, testable, and realistic, but the speedrun is plausibly under 20 commands because the planted defects are discoverable in the visible source/configuration, so genuine difficulty is at most 2 under the stated rubric. That fails the mandatory minimum score even though the other criteria are strong.",
+  "fixes": [
+   "Make the defects less directly discoverable from source by requiring investigation of stage interactions, runtime behavior, or opaque-tool diagnostics rather than exposing all inconsistent settings in plainly searchable files.",
+   "Require a nontrivial compatibility or migration repair, such as preserving a documented existing catalog schema while changing deterministic rebuild semantics, without making the task ambiguous.",
+   "Provide a reproducibility test involving multiple independently generated datasets or process/environment variations that requires deeper reasoning rather than a direct configuration cleanup.",
+   "Specify exact SQLite idempotence semantics, including whether byte identity, logical rows, run records, and database metadata are compared.",
+   "Define the expected lifecycle of harness-generated snapshots and the precise rejection reason vocabulary in the task-facing documentation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate builds a feature-vector catalog with entity deduplication, hashing-based sharding, and binary artifacts, whereas this task reconstructs a transactional replay service and live state."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate is an account-snapshot feature engineering pipeline, not an incident-event correlation and policy/SLA materialization system."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Although both require deterministic processing and publication, this task replays transactional event shards into canonical rows while the candidate encodes entities into feature vectors and shards."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938",
+     "verdict": "distinct",
+     "reason": "The reference indexes signed JSONL deliveries by event revision and classifies endpoints, while the candidate performs timestamp-based entity selection, feature encoding, and shard/catalog generation."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "The candidate concerns feature extraction and catalog consistency from tab-separated snapshots, not authenticated settlement-frame parsing and monetary reconciliation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.151
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.13
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.122
+    ],
+    [
+     "ours/official-1112cdbd9938",
+     0.112
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.109
+    ]
+   ],
+   "cost_usd": 0.0010455999999999998
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0030955999999999996
+}

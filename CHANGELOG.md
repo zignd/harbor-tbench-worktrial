@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 15:39 -03:00 · Commit the 22 candidate evidence directories
+- Added the 22 candidate records for `openai/gpt-5.6-luna|openrouter/openai/gpt-5.4-mini`, with designs, current packages, saved attempts, reviews and available calibration results. `runs/candidates/README.md` provides a clickable index; `evidence-manifest.json` records snapshot statuses and package hashes.
+- These are candidate attempts, not 22 complete or independently generated tasks: some were rejected, and `-m` copies reuse earlier authored packages for a new calibration model. Other model pairs and unrelated untracked outputs are not included in this commit.
+- Scanned the selected files against the live credential and credential patterns without printing secrets: zero findings. Excluded dependency/build caches and nested `.git` metadata; preserved two generated Git-history fixtures as bundles with restoration instructions so clones retain the evidence rather than broken gitlinks.
+
 ### 15:26 -03:00 · Plan reconciled with what was actually done
 - **What:** ticked the items that were complete in practice but never marked (dev-mode dry run, pilot batch, ≥5 gated tasks, the failure judge, Phase-1/Batch-1 calibration, the tuner on near-misses, Batch 2, the 10+ generated target, ledger-vs-usage reconciliation, curtailment and predicted-vs-observed in the report, tests/lint, per-shipped-task validation, the changelog and final usage), struck the optional stretch A/D and top-up items with the reason they were skipped, and fixed the run header and the "Models" tradeoff bullet to the final pairing (`openai/gpt-5.6-luna` author + `openai/gpt-5.4-mini` calibrator) and the three shipped tasks. Progress 92/94 (Phase 0/1/2/3 at 100%, Phase 4 27/29).
 - **Spend reconciliation (the item that was open):** `make usage` at 15:20 shows **$209.17 spent / $290.83 remaining** on the key (usage counter $186.63). The ledger's cross-label official total is $524.62, which **over-counts** because it recorded estimated per-token costs during the earlier high-burn period; the key is the source of truth and is under the $400 ceiling. This run's own label cost $10.43.

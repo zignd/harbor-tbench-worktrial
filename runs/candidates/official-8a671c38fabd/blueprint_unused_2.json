@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "repair-signed-snapshot-publisher",
+  "title": "Repair the Signed Snapshot Publisher",
+  "scenario": "A data engineer inherited a JavaScript pipeline that publishes partitioned NDJSON snapshots for downstream feature jobs. The repository has a long Git history, several thousand generated fixture rows, multiple publisher and verifier components, and an unfinished v2 cryptographic format migration. The current commands appear to work on the small examples, but production snapshots occasionally disagree between the publisher and independent consumers.",
+  "instruction_draft": "Hey, can you finish the v2 snapshot migration in this repo so `npm test` and the publisher/verifier workflows work again? `node bin/publish.js --keyring keys.json input.ndjson output.json` must read `{partition,keyId,row}` records, preserve input order within each partition, emit partitions sorted by UTF-16 name order, and produce the documented SHA-256 Merkle roots and base64url HMAC signatures; `node bin/verify.js --keyring keys.json input.ndjson output.json` must accept an untouched output and reject any changed, reordered, duplicated, missing, or cross-partition record. Please keep the existing CLI and JSON shapes, handle thousands of records and all valid JSON row values including empty objects, nested values, Unicode, `-0`, and large numbers, and do not add timestamps or nondeterministic fields.",
+  "requirements": [
+   "The existing `npm test` command must pass.",
+   "`node bin/publish.js --keyring keys.json input.ndjson output.json` must remain the publishing entry point.",
+   "The publisher must read NDJSON records with the fields `partition`, `keyId`, and `row`.",
+   "Rows must remain in their original input order within each partition.",
+   "Output partitions must be ordered by UTF-16 lexicographic order of their partition names.",
+   "The publisher must emit the repository's documented v2 JSON shape without timestamps or other nondeterministic fields.",
+   "Leaf and parent hashes must use the documented SHA-256 Merkle construction.",
+   "Manifest signatures must use the documented HMAC construction and unpadded base64url encoding.",
+   "The publisher must handle thousands of records.",
+   "Valid JSON row values must include empty objects, nested arrays and objects, Unicode strings, `-0`, and large numeric values.",
+   "`node bin/verify.js --keyring keys.json input.ndjson output.json` must remain the verification entry point.",
+   "The verifier must accept an untouched publisher output.",
+   "The verifier must reject changed records.",
+   "The verifier must reject reordered records.",
+   "The verifier must reject duplicated or missing records.",
+   "The verifier must reject records assigned to the wrong partition.",
+   "The implementation must retain the existing CLI and JSON interfaces rather than requiring callers to migrate."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt and pip packages and Node.js installed from a pinned local package, is provided; there is no network access.",
+   "The repository is a roughly 1,600-line JavaScript project with `bin/publish.js`, `bin/verify.js`, partition scanners, canonicalization helpers, Merkle helpers, keyring handling, and downstream fixture readers.",
+   "The repository has approximately 7,000 generated fixture rows across many partitions, including rare Unicode keys, astral-plane characters, empty containers, negative zero, exponent-form numbers, and records whose partition names differ only by ordering-sensitive characters.",
+   "Git history contains the v1 publisher, a partially merged v2 migration, an abandoned implementation of the canonical wire format, and commit messages describing compatibility requirements; the current checkout contains a mixture of old and new helpers.",
+   "The documented v2 format defines canonical JSON as compact JSON with recursively sorted object keys using JavaScript UTF-16 code-unit order, array order unchanged, JSON number serialization matching JavaScript `JSON.stringify`, and rejection of non-finite values.",
+   "For each row, the leaf is `SHA256(0x00 || UTF8(canonicalJSON(row)))`.",
+   "For each tree level, an internal node is `SHA256(0x01 || leftHash || rightHash)`; an odd final node is promoted unchanged rather than duplicated, and a one-row partition uses its leaf as its root.",
+   "Each partition requires one consistent `keyId`; its signature is `HMAC-SHA256(keyring[keyId], UTF8(canonicalJSON({version:2,name,count,root})))`, encoded as unpadded base64url.",
+   "The manifest contains version 2 and partition entries with `name`, `count`, `root`, `keyId`, and `signature`; no input-derived ordering or metadata may be discarded.",
+   "The planted defects include shallow rather than recursive canonicalization, incorrect Unicode key ordering, textifying hashes before parent hashing, duplicate-padding of odd Merkle levels, chunk-local rather than partition-global state, and verifier paths that check only counts and signatures."
+  ],
+  "internal_hint": "The deterministic reference solution should first inspect `git log`, the migration commits, the format documentation, and the call graph, then run the supplied fixtures plus generated probes for odd tree sizes, reordered keys, astral Unicode, `-0`, and key rotation before editing. The likely repair is to consolidate all publisher and verifier paths around one recursive canonicalizer, one byte-oriented leaf/parent hash implementation, and one manifest-signing routine; partition records must be accumulated or streamed with state that survives input chunks while preserving per-partition order. The verifier must reconstruct rows from the input, compare exact ordered membership and partition assignment, recompute every root and signature, and reject mixed key IDs and structural mismatches. A reference shell script should create seeded edge-case and 5,000-row inputs, run both CLIs, and compare their outputs and exit statuses against an independent deterministic Node/Python reference rather than grepping source.",
+  "trap": "A shallow solution can make the visible fixtures pass by using `JSON.stringify`, sorting only top-level keys, duplicating odd Merkle nodes, hashing hexadecimal digests as text, or validating only the manifest signature. Fresh verifier inputs contain odd partition sizes, nested objects with deliberately different insertion orders, astral Unicode keys, negative zero, and late records after multiple chunk boundaries, so those implementations produce plausible roots but fail exact equivalence or accept reordered and duplicated data.",
+  "tests": [
+   "Run `npm test`; this checks the existing unit and integration contract stated by the requirement that `npm test` pass.",
+   "Generate seeded NDJSON inputs ranging from 0 to 5,000 records, with many partitions and rare edge-case row values, run `bin/publish.js`, and compare the complete output JSON with an independent reference implementation of the stated canonicalization, Merkle, and HMAC rules.",
+   "Generate partitions with one, two, three, powers-of-two-minus-one, powers-of-two, and powers-of-two-plus-one rows; compare roots to the reference to check promotion of odd nodes and one-row behavior.",
+   "Generate nested objects whose keys are inserted in different orders and include BMP and astral Unicode keys; compare roots and signatures to check recursive UTF-16 canonical ordering.",
+   "Generate rows containing empty arrays and objects, `-0`, exponent-form numbers, large representable numbers, and deeply nested values; compare exact publisher output to the reference.",
+   "Generate multiple key IDs and verify that a partition with a consistent key ID signs correctly while a partition with mixed key IDs is rejected.",
+   "Run `bin/verify.js` on untouched outputs and require exit success and the documented success JSON.",
+   "For each generated case, mutate one row value, reorder two records within a partition, duplicate a record, remove a record, and move a record between partitions; require the verifier to reject every mutation.",
+   "Mutate a root, signature, count, partition ordering, or key ID in the manifest and require the verifier to reject it.",
+   "Run the publisher twice on identical generated input and require byte-identical output with no timestamps, random values, or environment-dependent fields.",
+   "Use a large generated input spanning many internal processing chunks to ensure partition state and row order survive chunk boundaries."
+  ],
+  "verifier_knob": {
+   "name": "generated_input_count_and_edge_case_mix",
+   "value": "5,000 rows per equivalence case across 37 partitions, with 20% nested/Unicode/number edge cases and 30 mutation checks per case",
+   "effect": "Lowering the count or edge-case fraction makes shallow implementations more likely to pass by reducing chunk-boundary, odd-tree, and canonicalization coverage; raising it increases runtime and the chance of exposing rare ordering, numeric, and state-accumulation errors."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the current implementation and misses the relevant v2 behavior documented in Git history.",
+   "The agent fixes the publisher but leaves one downstream verifier or fixture reader on the v1 canonicalization path.",
+   "The agent uses a standard JSON canonicalization package or lexicographic string sort whose ordering differs from JavaScript UTF-16 code-unit order.",
+   "The agent hashes hex strings or base64 strings instead of concatenating raw hash bytes.",
+   "The agent duplicates an odd Merkle node because that is a common Merkle-tree convention, despite the repository's promotion rule.",
+   "The agent validates signatures without reconstructing ordered input membership, allowing duplicates, omissions, or reordered records.",
+   "The agent tests only the supplied small fixtures and misses chunk-boundary state bugs exposed by thousands of rows.",
+   "The agent mishandles negative zero, large JavaScript numbers, or astral Unicode while producing apparently reasonable JSON.",
+   "The agent changes the CLI or output schema instead of completing the existing migration.",
+   "The agent treats mixed key IDs as independently valid records rather than rejecting the partition."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "javascript",
+   "git-history",
+   "merkle-tree",
+   "canonical-json",
+   "hmac",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "List the repository and package scripts (`pwd`, `find`, `cat package.json`).",
+   "Run `npm test` to establish the baseline failures.",
+   "Inspect `git log --oneline --all`, migration commits, and repository format documentation.",
+   "Trace publisher, verifier, scanner, canonicalization, Merkle, keyring, and fixture-reader call paths with `rg` and `sed`.",
+   "Run the existing publisher and verifier workflows on supplied fixtures.",
+   "Create small probes for nested key ordering, astral keys, odd tree sizes, `-0`, and mixed key IDs.",
+   "Consolidate all paths on one recursive canonicalizer implementing JavaScript UTF-16 key ordering and JSON number behavior.",
+   "Fix byte-oriented leaf and parent hashing, odd-node promotion, and one-row roots.",
+   "Fix publisher partition accumulation so ordering survives chunks, enforce one key ID per partition, and emit deterministic v2 manifests and signatures.",
+   "Fix verifier reconstruction to compare ordered partition membership and recompute rows, roots, counts, key IDs, and signatures.",
+   "Update remaining downstream imports or fixture readers still using v1 helpers.",
+   "Run `npm test` and repair regressions.",
+   "Generate seeded 5,000-row, 37-partition edge-case input and publish it.",
+   "Run verification and compare complete output against an independent reference implementation.",
+   "Apply value, order, duplicate, omission, partition, manifest, and key-ID mutations and confirm every verification failure.",
+   "Run the publisher twice, check byte identity, rerun the full test suite, and inspect the final diff."
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The requirement that the verifier reject any changed record is broader than canonical equivalence: reordered object keys, `-0` versus `0`, and some numerically equivalent JSON spellings normalize to the same canonical row and cannot necessarily be distinguished after parsing.",
+   "The exact v2 JSON shape and keyring encoding are delegated to repository documentation; if that documentation is incomplete or contradictory, an otherwise correct implementation could be judged against an unstated convention.",
+   "A pinned local Node package or pinned apt/pip dependency that is absent or incompatible with the supplied image would make the task fail for environmental rather than implementation reasons.",
+   "Tests should avoid treating semantically equivalent canonical JSON spellings as mutations unless raw-source preservation is explicitly part of the format."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a deterministic, concrete end state and strong verify-time equivalence and mutation coverage, while retaining realistic compatibility and migration constraints. It is difficult because correctness spans history-guided integration, JavaScript canonicalization, byte-level Merkle construction, streaming state, and substantive verification, although the detailed specification makes it solvable by a skilled engineer.",
+  "fixes": [
+   "Clarify whether mutation rejection is semantic after canonicalization or requires preserving raw JSON spellings, especially for object-key order, `-0`, and exponent forms.",
+   "State the expected keyring value encoding and include a concise authoritative v2 output example if the repository documentation may be inconsistent.",
+   "Ensure the independent reference uses the same explicitly documented JavaScript number semantics rather than host-language JSON serialization."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This concerns repairing a signed, partitioned snapshot publisher and verifier with Merkle hashing and HMAC, whereas the reference concerns replaying sharded transactional event logs into canonical snapshots."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "This concerns cryptographic snapshot publication, deterministic partitioning, and integrity verification, whereas the reference concerns schema-filtered log ingestion and throughput."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "This concerns a JavaScript publisher/verifier and cryptographic snapshot format migration, whereas the reference is a SQL query correction involving window functions and ordering."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "This concerns Merkle-rooted and HMAC-signed NDJSON snapshots, whereas the reference concerns configuration and manifest parsing, SQL translation, Git recovery, and SQLite report generation."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "Although both involve cryptography and verifier agreement, this task concerns deterministic snapshot hashing and HMAC signatures, while the reference concerns ECDH session-key derivation for encrypted audit-log windows."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.195
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.181
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.167
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.144
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.135
+    ]
+   ],
+   "cost_usd": 0.0008221999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0033535999999999996
+}

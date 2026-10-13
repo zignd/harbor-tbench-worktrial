@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "repair-event-rollup-deployment",
+  "title": "Repair the Meridian Event Rollup Pipeline",
+  "scenario": "A data engineer has inherited Meridian, a Bash-driven event ingestion pipeline used to publish tenant rollups from daily CSV drops. The container contains several pipeline stages, deployment configuration files, sample event files, a compiled normalization helper, a SQLite catalog, and partially populated output directories; the current deployment produces internally inconsistent results on some real-world data.",
+  "instruction_draft": "Repair the deployment so that running `/opt/meridian/bin/rebuild` from a clean state deterministically processes every `/srv/meridian/inbox/*.events.csv` file and makes `/srv/meridian/state/events.csv`, `/srv/meridian/state/rollups.csv`, `/srv/meridian/state/catalog.sqlite`, and `/srv/meridian/state/manifest.json` agree. Each event ID must appear once using the greatest revision (with lexical source filename and then one-based input row as deterministic tie-breakers), timestamps must be interpreted as UTC, decimal values must be aggregated exactly in milliunits, rollups must be grouped by tenant and UTC calendar day, and the manifest must contain SHA-256 hashes and row counts for both CSV outputs plus the SQLite row counts; malformed rows must be excluded and listed in `/srv/meridian/state/rejected.csv`.",
+  "requirements": [
+   "Running `/opt/meridian/bin/rebuild` from a clean state must process every `/srv/meridian/inbox/*.events.csv` file.",
+   "The rebuild must be deterministic.",
+   "`/srv/meridian/state/events.csv` must contain one row for each accepted event ID.",
+   "When an event ID occurs more than once, the selected row must have the greatest revision.",
+   "Revision ties must be resolved by lexical source filename and then one-based input row number.",
+   "Timestamps must be interpreted as UTC.",
+   "Decimal values must be aggregated exactly in milliunits rather than through floating-point rounding.",
+   "`/srv/meridian/state/rollups.csv` must group accepted events by tenant and UTC calendar day.",
+   "Malformed rows must be excluded from accepted outputs.",
+   "Every malformed row must be listed in `/srv/meridian/state/rejected.csv`.",
+   "`/srv/meridian/state/catalog.sqlite` must agree with the accepted event and rollup CSV outputs.",
+   "`/srv/meridian/state/manifest.json` must contain SHA-256 hashes and row counts for both CSV outputs.",
+   "`/srv/meridian/state/manifest.json` must contain SQLite row counts corresponding to the accepted event and rollup tables."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned packages including Bash, SQLite, coreutils, jq, and build-essential; it has no network dependency.",
+   "The installation contains roughly 1,200 lines across Bash orchestration scripts, Python helpers, SQL schema/load scripts, configuration files, and operational documentation.",
+   "`/opt/meridian/bin/rebuild` invokes four stages: discovery, normalization, rollup, and publication.",
+   "The inbox contains several ordinary sample CSV files and a pre-existing state directory, but the samples do not exercise every failure case.",
+   "The event schema includes event_id, tenant, occurred_at, revision, value, and source metadata; values are decimal quantities whose canonical representation is milliunits.",
+   "Configuration is split across `/etc/meridian/discovery.conf`, `/etc/meridian/normalize.conf`, `/etc/meridian/rollup.conf`, and `/etc/meridian/publish.conf`, with overlapping settings for delimiters, ordering, timezone, precision, temporary directories, and SQLite destinations.",
+   "A compiled helper at `/opt/meridian/lib/libmeridian-normalize` performs CSV quoting, timestamp normalization, decimal parsing, and rejection classification; its source is not present in the image.",
+   "The planted deployment problems include incompatible stage configuration, an incorrect ordering/locale setting, a timezone mismatch between normalization and rollup, a precision mismatch between CSV and SQLite publication, and publication metadata computed from a different temporary snapshot than the one loaded into SQLite.",
+   "The scripts contain unrelated logging, cleanup, retry, and metrics code so the faulty behavior must be found by exercising the pipeline and comparing artifacts rather than by changing one obvious line."
+  ],
+  "internal_hint": "First run the existing rebuild while preserving all artifacts, then compare events.csv, rollups.csv, catalog.sqlite, rejected.csv, and manifest.json rather than relying on the exit status. Generate or mutate input rows to expose duplicate revisions, revision ties, quoted commas, negative and high-precision decimals, offsets around midnight, malformed records, and filenames whose lexical order differs from directory enumeration. Trace the temporary files and SQLite load path; the intended repair is to align all stage configuration on the same input glob and canonical schema, force bytewise lexical ordering and UTC interpretation, configure the opaque normalizer for integer milliunit output and the documented rejection policy, make rollup and SQLite consume the identical deduplicated snapshot, and make publication hash and count that same snapshot. Validate with independently calculated results and then leave the corrected configuration and scripts in place; hidden verification replaces the inbox with seeded fresh datasets and repeats the rebuild.",
+  "trap": "A shallow fix can make the provided sample look correct while retaining locale-dependent file ordering, treating an offset timestamp as local time, rounding decimal values in one stage, or resolving duplicate revisions differently in the SQLite loader. Another common failure is to regenerate the CSVs correctly but leave the catalog or manifest based on a stale temporary directory; hidden datasets with tied revisions, midnight boundaries, malformed quoted rows, and repeated event IDs expose these inconsistencies.",
+  "tests": [
+   "A clean-state rebuild test replaces the inbox with a hidden seeded collection of CSV files and checks that every file matching `/srv/meridian/inbox/*.events.csv` is consumed.",
+   "Deduplication tests include repeated event IDs across files, lower and higher revisions, and equal revisions; they verify greatest-revision selection followed by lexical filename and one-based row tie-breaking.",
+   "Parsing tests include quoted delimiters, empty and malformed fields, negative values, extra decimal precision, and rows that must be rejected; they compare both accepted events and `/srv/meridian/state/rejected.csv`.",
+   "Timestamp tests include explicit UTC timestamps and offsets that fall on opposite sides of a UTC midnight; rollups are compared against UTC calendar-day grouping.",
+   "Exactness tests include values whose decimal sum would be wrong under binary floating-point arithmetic and verify milliunit totals in events, rollups, and SQLite.",
+   "Ordering tests use filenames and tenant/event values that distinguish bytewise lexical ordering from locale or filesystem enumeration ordering.",
+   "Cross-component consistency tests compare `/srv/meridian/state/events.csv` with the SQLite event table, `/srv/meridian/state/rollups.csv` with the SQLite rollup table, and both CSV row counts with the manifest.",
+   "Manifest tests recompute SHA-256 hashes and row counts from the final CSV files and verify the recorded SQLite row counts.",
+   "Repeatability tests run rebuild twice from identical hidden inputs and require byte-identical CSV, JSON, and SQLite logical contents.",
+   "A publication-integrity test changes input data between stage boundaries in a controlled run and verifies that the final CSVs, database, and manifest all originate from one consistent snapshot rather than mixed temporary artifacts."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "10",
+   "effect": "Raising the value adds more independently checked consistency properties and rarer generated data cases across accepted events, rejected rows, rollups, SQLite tables, ordering, exact arithmetic, timestamps, and manifest metadata; lowering it permits partially repaired deployments that only produce plausible CSV output."
+  },
+  "expected_failure_modes": [
+   "The solver inspects configuration and patches the visible sample path without running adversarial data through the pipeline.",
+   "The solver fixes normalization but misses the separate SQLite loader or manifest snapshot path.",
+   "The solver uses filesystem or locale ordering instead of the specified deterministic filename and row tie-breakers.",
+   "The solver converts decimal quantities through floating point and only notices the problem on hidden high-precision sums.",
+   "The solver interprets timestamps in the container timezone or applies offsets inconsistently between stages.",
+   "The solver handles duplicate revisions but applies a different winner-selection rule in rollup and SQLite publication.",
+   "The solver changes code around the opaque normalizer without discovering its actual rejection and precision behavior through experiments.",
+   "The solver validates only exit status and sample row counts, overlooking stale state, rejected-row accounting, hashes, or logical SQLite contents."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "bash",
+   "configuration",
+   "data-pipeline",
+   "sqlite",
+   "determinism",
+   "state-consistency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "find /opt/meridian /etc/meridian /srv/meridian -maxdepth 3 -type f -print",
+   "sed -n '1,240p' /opt/meridian/bin/rebuild",
+   "for f in /etc/meridian/*.conf; do echo ===$f; cat \"$f\"; done",
+   "grep -RInE 'events\\.csv|rollups\\.csv|catalog|manifest|sort|locale|timezone|precision|sqlite|snapshot' /opt/meridian/bin /opt/meridian/lib /opt/meridian/share",
+   "cp -a /srv/meridian/state /tmp/meridian-state.before",
+   "/opt/meridian/bin/rebuild; echo status=$?",
+   "for f in /srv/meridian/state/events.csv /srv/meridian/state/rollups.csv /srv/meridian/state/rejected.csv /srv/meridian/state/manifest.json; do echo ===$f; cat \"$f\"; done",
+   "sqlite3 /srv/meridian/state/catalog.sqlite '.tables' '.schema'",
+   "strings /opt/meridian/lib/libmeridian-normalize | grep -Ei 'milli|reject|utc|precision|decimal|timezone'",
+   "python3 - <<'PY'\nfrom pathlib import Path\np=Path('/srv/meridian/inbox'); p.mkdir(parents=True,exist_ok=True)\n(p/'z.events.csv').write_text('event_id,tenant,occurred_at,revision,value\\ne1,t,2024-01-02T00:30:00+01:00,2,0.0015\\ne2,t,bad,1,1\\n')\n(p/'a.events.csv').write_text('event_id,tenant,occurred_at,revision,value\\ne1,\"t,x\",2024-01-01T23:30:00Z,2,-0.0005\\ne3,t,2024-01-01T23:59:59Z,1,0.1\\n')\nPY",
+   "/opt/meridian/bin/rebuild; echo status=$?",
+   "cat /srv/meridian/state/events.csv; cat /srv/meridian/state/rollups.csv; cat /srv/meridian/state/rejected.csv",
+   "grep -RInE 'LC_|sort |sort\\(|TZ=|round|float|glob|sqlite.*insert|manifest' /opt/meridian/bin /opt/meridian/share /etc/meridian",
+   "edit the four configuration files to use one input glob, UTC, C/bytewise ordering, integer milliunits, one temporary snapshot, and one SQLite destination",
+   "edit the deduplication and SQLite-load paths so both consume the same normalized deduplicated snapshot with the specified filename and row tie-breakers",
+   "edit publication to hash and count the exact CSVs and SQLite snapshot that were loaded",
+   "rm -rf /srv/meridian/state; mkdir /srv/meridian/state; /opt/meridian/bin/rebuild; python3 independently recompute expected rows, hashes, and counts; sqlite3 verify both tables; rerun and compare logical outputs"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 2,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The direction of the lexical filename and row-number tie-breakers is not specified, so tests could choose a winner that the instruction does not identify.",
+   "The canonical CSV schemas, header handling, rejected.csv record format, SQLite table/column names, and manifest JSON structure are not defined sufficiently for an independent implementation.",
+   "The policy for values with more than three decimal places is unclear: they might be rejected, truncated, or rounded, and the instruction only says that canonical values are milliunits.",
+   "Accepted timestamp formats and the handling of missing time zones are unspecified, despite timestamp behavior being tested.",
+   "The publication-integrity test that changes input between stage boundaries requires a documented synchronization hook or deterministic fault-injection mechanism; otherwise it can be flaky or impossible to reproduce.",
+   "If tests require byte-identical SQLite files rather than logical contents, SQLite page layout and vacuum/order behavior could make repeatability environment-dependent.",
+   "The meaning of clean state and whether headers, blank lines, and malformed files count as malformed rows is not explicitly defined."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and cross-component verification is valuable, but the end state is not unambiguous: several formats and policies needed by the tests are unstated. The speedrun is about 20 commands and the internal hint largely names the intended repairs, so the genuine difficulty is capped at 2 under the stated rubric; consequently the score threshold is not met.",
+  "fixes": [
+   "Specify the exact winning direction for each tie-breaker, preferably as an explicit min/max rule over (revision, filename, row).",
+   "Document the canonical headers and field encoding for events.csv, rollups.csv, rejected.csv, the SQLite table schemas, and the manifest JSON schema.",
+   "Define accepted timestamp syntax, missing-timezone behavior, and the exact policy for decimal inputs below or above milliunit precision.",
+   "Define whether headers, blank lines, missing columns, and malformed files produce rejected records, and specify the exact rejected-row representation.",
+   "Provide a deterministic stage-boundary test hook, such as a documented pause/barrier or wrapper used by the verifier, for the publication-integrity test.",
+   "Reduce the internal hint and avoid exposing the complete intended repair strategy; provide only observable symptoms or a smaller failure fixture so the task requires more investigation without relying on ambiguity."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "variant",
+     "reason": "Both repair deterministic multi-file event ingestion with malformed-row rejection, ID deduplication, derived outputs, and idempotent rebuilding, though their formats and aggregation semantics differ."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "This candidate is not primarily about chunk-file header handling and chunked CSV concatenation, which is the core problem in the reference."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference is a persistent transactional service with log recovery and request handling, rather than a batch CSV rollup pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference centers on reverse-engineering a compiled numeric normalizer and correcting SQL statistics, not deterministic event revision selection and cross-artifact consistency."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938",
+     "verdict": "variant",
+     "reason": "Both rebuild deterministic state from multiple event files, select revisions by event ID, record malformed or superseded inputs, and reconcile SQLite-backed outputs, but the candidate uses CSV rollups and different validation and tie-breaking rules."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-37d13d3e2124",
+     0.194
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.173
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.129
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.113
+    ],
+    [
+     "ours/official-1112cdbd9938",
+     0.11
+    ]
+   ],
+   "cost_usd": 0.0020358
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0050994
+}

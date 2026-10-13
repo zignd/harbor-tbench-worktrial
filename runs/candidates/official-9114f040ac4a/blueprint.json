@@ -1,0 +1,73 @@
+{
+ "slug": "repair-flowwatch-rollups",
+ "title": "Repair FlowWatch Rollups",
+ "scenario": "A network analyst says the link-usage numbers in FlowWatch stopped adding up after a collector upgrade. The container contains a small C rollup service, capture spools from several collectors, deployment/configuration files, and a route-tag oracle shipped only as a compiled executable. The service currently produces plausible summaries on the included captures but disagrees with independently reconciled traffic totals.",
+ "instruction_draft": "Hey, can you get `/opt/flowwatch/bin/flowwatch` producing trustworthy rollups again? Run it with the existing config and capture data, and make sure `/var/lib/flowwatch/out/summary.tsv` has one row per canonical flow and route, counts each physical packet exactly once, preserves the packet byte totals, and never assigns a packet to a route that the capture does not permit. It needs to work when captures are reordered, duplicated across collectors, split at sequence-number wraparound, or contain ambiguous candidates; on fresh verification spools, at least 99.5% of expected summary rows must match the reference exactly and the remaining rows must have no byte-total error greater than 1%. Keep the command-line interface and tab-separated output format intact, and do not require network access.",
+ "requirements": [
+  "The repaired program must be `/opt/flowwatch/bin/flowwatch` and must continue accepting the existing configuration and command-line interface.",
+  "Running the program with the existing config and capture data must create `/var/lib/flowwatch/out/summary.tsv`.",
+  "The output must remain tab-separated and contain one row per canonical flow-and-route result.",
+  "Each physical packet must contribute to the rollup exactly once, including when it appears in multiple collector captures.",
+  "Packet byte totals must be preserved in the output.",
+  "A packet must never be assigned to a route that is not permitted by its capture record.",
+  "The result must remain correct when capture records are reordered.",
+  "The result must remain correct when records are duplicated across collectors.",
+  "The result must remain correct when sequence numbers wrap around.",
+  "The result must remain correct when a packet has ambiguous route candidates.",
+  "On fresh verification spools, at least 99.5% of expected summary rows must match the reference exactly.",
+  "For any remaining non-exact rows, the byte-total error must not exceed 1%.",
+  "The implementation must not require network access."
+ ],
+ "environment": [
+  "The Docker image is built from `python:3.13-slim-bookworm` with pinned Debian build tools and no internet dependency at runtime.",
+  "The environment contains roughly 1,600 lines of C across a flow-spool parser, packet deduplicator, route resolver, rollup writer, configuration loader, and a small local control endpoint; much of the code is unrelated operational plumbing.",
+  "The main executable is `/opt/flowwatch/bin/flowwatch`; its normal invocation and output paths are specified by `/etc/flowwatch/flowwatch.conf` and a supplied wrapper script.",
+  "Capture data is stored in `/var/lib/flowwatch/spool/*.cap` as tab-separated records containing collector identity, capture time, flow tuple, epoch marker, sequence number, payload length, route candidates, and packet flags.",
+  "The visible spool contains several thousand records and a reconciliation note with expected broad totals, but does not expose all duplicate, wraparound, or ambiguity cases.",
+  "The output is `/var/lib/flowwatch/out/summary.tsv`, with canonical flow fields, route identifier, packet count, byte count, and first/last sequence information.",
+  "A compiled, source-less executable `/opt/flowwatch/bin/routeoracle` supplies canonical route identities for encoded route tags over a local UNIX-socket protocol. It has deliberately non-obvious framing, reset, and state behavior that can be characterized only by running it.",
+  "The C client and resolver contain planted interactions involving oracle state, collector duplicate handling, sequence epochs, and candidate assignment. They are not all apparent from a single source inspection because their effects depend on accumulated capture history.",
+  "A deterministic generator used only by verification creates new spools with thousands of records, reordered collector files, repeated packets, sequence wraparound, ambiguous route candidates, and oracle edge cases.",
+  "The reference implementation is a deterministic shell script that first probes the oracle, generates diagnostic subsets of the supplied captures, compares intermediate counts, and then applies the final repair."
+ ],
+ "internal_hint": "The intended investigation starts by running the unmodified service on each capture file separately and in different concatenation orders, then comparing packet and byte deltas by collector, epoch, and route. Probing routeoracle with repeated requests, explicit reset messages, malformed-length boundaries, and multiple requests per connection reveals that responses are framed independently of writes and that its route mapping is stateful across an epoch but must be reset at capture epoch boundaries. The visible parser treats sequence numbers as globally unique and the resolver greedily chooses the first candidate, which fails when duplicate observations arrive out of order or when two candidate flows overlap around a 32-bit sequence wrap. The robust repair normalizes oracle sessions per epoch, reconstructs packet identity using the full flow/epoch/sequence/payload tuple, collapses collector observations deterministically, and resolves ambiguous candidates as a constrained matching problem over sequence continuity and permitted route candidates rather than by input order. The reference shell script verifies each stage with reordered and duplicate subsets before patching the C implementation and rebuilding.",
+ "trap": "A shallow solution can make the sample totals look correct by sorting input, taking the first route candidate, or deduplicating on the visible five-tuple and sequence number. That passes the supplied spool and simple reruns, but hidden spools reuse sequence values across epochs, place duplicate observations on different collectors, split oracle requests across reads, and create ambiguous candidate sets; the resulting summaries silently double-count bytes or assign them to the wrong route.",
+ "tests": [
+  "The verifier runs the preserved FlowWatch command-line interface against the supplied spool and checks that `/var/lib/flowwatch/out/summary.tsv` exists, is tab-separated, and has the required canonical flow-and-route rows.",
+  "A baseline correctness test compares packet counts and byte totals on the supplied captures and checks that every physical packet contributes exactly once.",
+  "A permutation test regenerates equivalent capture files with collector files and records in different orders, then checks that the summary is invariant.",
+  "A duplicate-observation test adds repeated copies of records from different collectors and checks that packet and byte totals do not increase.",
+  "A wraparound test generates flows crossing sequence-number rollover and checks canonical flow assignment, packet count, and byte totals.",
+  "An ambiguity test generates records with multiple permitted route candidates and checks the constrained reference assignment rather than first-candidate behavior.",
+  "An oracle-protocol test exercises split request/response reads, multiple requests per connection, reset boundaries, and unseen route tags through the shipped compiled oracle, then compares the resulting route identities.",
+  "A fresh hidden-input test generates thousands of deterministic records and compares output rows against the reference; at least 99.5% of expected rows must match exactly, as required by the instruction.",
+  "The same hidden-input test permits non-exact rows only when their byte-total error is at most 1%, also as required by the instruction.",
+  "A deployment test runs the program in the offline container from a clean output directory and checks that it does not attempt DNS, HTTP, or other network access."
+ ],
+ "verifier_knob": {
+  "name": "exact_row_accuracy_threshold",
+  "value": "99.5%",
+  "effect": "Raising the threshold toward 100% makes rare ambiguity, oracle framing, and epoch-boundary errors decisive; lowering it allows partially repaired deduplication or route resolution to pass more often."
+ },
+ "expected_failure_modes": [
+  "The solver inspects the main C files and fixes an obvious aggregation issue without observing order-dependent behavior in real spools.",
+  "The solver treats sequence numbers as globally unique and misses the epoch component needed across rollover.",
+  "The solver uses a greedy first-candidate route assignment instead of satisfying all continuity and permitted-route constraints.",
+  "The solver assumes one oracle response per write or one request per connection, so split I/O and state resets corrupt route identities.",
+  "The solver validates only the supplied captures and never generates reordered, duplicated, or ambiguous subsets.",
+  "The solver deduplicates by an incomplete key, causing collisions between epochs or distinct packets with equal sequence values.",
+  "The solver rewrites the output format or invocation path while making the calculations correct, failing deployment checks.",
+  "The solver achieves broad totals but emits incorrect per-route rows, which the hidden row-level metric detects."
+ ],
+ "predicted_pass_rate": 0.22,
+ "difficulty": "hard",
+ "category": "networking-services",
+ "tags": [
+  "c",
+  "packet-accounting",
+  "constraint-satisfaction",
+  "opaque-binary",
+  "hidden-inputs",
+  "devops"
+ ]
+}

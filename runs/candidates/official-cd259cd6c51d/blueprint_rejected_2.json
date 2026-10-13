@@ -1,0 +1,176 @@
+{
+ "blueprint": {
+  "slug": "repair-telemetry-release-bundler",
+  "title": "Repair the Telemetry Release Bundler",
+  "scenario": "A backend developer is chasing a production discrepancy in the release-health dashboard: the bundle produced from archived worker logs is occasionally missing samples and is too slow for the nightly rebuild. The container contains an internal Python telemetry package, shell-based build stages, fixtures, metrics tooling, and a packaging command that turns JSONL logs into a reproducible release bundle.",
+  "instruction_draft": "Hey, can you get `bin/release_bundle` working again? Given an input JSONL telemetry log and an output directory, it needs to produce the contract described in `CONTRACT.md`: deduplicate events, retain only samples from jobs whose final status is successful, aggregate every run/metric pair, and include the error counts. The result must be byte-for-byte reproducible, include the required manifest and checksums, handle arbitrary event ordering and duplicate sequence numbers, and process the hidden 200,000-event fixture in under 4 seconds on this container; please leave the normal command and package layout intact.",
+  "requirements": [
+   "The normal `bin/release_bundle INPUT_JSONL OUTPUT_DIR` command must complete successfully without network access.",
+   "The output must conform to the JSON, manifest, checksum, and archive layout specified in `CONTRACT.md`.",
+   "Events must be deduplicated by `(run_id, job_id, seq)`, retaining the record with the greatest `ingest` value and applying the documented deterministic tie break.",
+   "The pipeline must tolerate arbitrary input ordering rather than requiring records for a job or run to be adjacent.",
+   "Only metric samples belonging to jobs whose final status is `success` may contribute to report aggregates.",
+   "The report must contain every run/metric pair represented by at least one retained sample, with the exact count, sum, minimum, maximum, p50, p95, successful-job count, and error-log count required by `CONTRACT.md`.",
+   "Percentiles and numeric output must use the deterministic definitions in `CONTRACT.md`, including the specified interpolation and decimal serialization rules.",
+   "The generated bundle and manifest must be byte-for-byte reproducible across repeated runs with identical input, regardless of filesystem traversal order.",
+   "The implementation must process the hidden 200,000-event fixture in no more than 4 seconds on the one-CPU container.",
+   "Existing package imports and the documented `make test` and `make wheel` workflows must continue to work."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned build tools and Python dependencies installed locally and no internet required.",
+   "The repository contains roughly 1,400 lines across `telemetry/`, `pipeline/`, `bin/`, packaging metadata, tests, and a small CLI package; much of it is unrelated request and dashboard code.",
+   "`CONTRACT.md` documents the JSONL event forms (`job`, `sample`, and `log`), status precedence, duplicate resolution, percentile calculation, report schema, reproducible archive format, and checksum files.",
+   "`bin/release_bundle` is a shell orchestrator for four dependent stages: canonicalization, job/sample correlation, metric reduction, and release packaging. Each stage communicates through a temporary JSONL or JSON artifact and emits timing counters consumed by the next stage.",
+   "The initial implementation contains several interacting defects: it assumes local input ordering during correlation, mishandles duplicate terminal job records when the records are separated, uses a reducer that is correct on the small fixture but fails on boundary percentile ranks and decimal values, and packages files using nondeterministic discovery order.",
+   "The shell stages also have a scale problem caused by repeatedly invoking a Python process for individual records and by retaining all raw log lines in an intermediate representation.",
+   "Visible fixtures are small and mostly ordered, contain no duplicate sequence numbers, and do not exercise tied percentile ranks, failed jobs with later records, escaped identifiers, or repeated output-directory builds.",
+   "A compiled helper is not involved; all behavior needed to solve the task is observable by running the supplied command, inspecting stage metrics, comparing generated artifacts, and creating additional local fixtures."
+  ],
+  "internal_hint": "Difficulty source: the important failures are data-dependent and quantitative rather than visible from a single source read. A skilled engineer should first run the supplied fixtures, inspect stage counts/timings, read CONTRACT.md, generate small adversarial logs with shuffled records, duplicate seq values, failed-then-successful jobs, ties, and decimal samples, and compare each intermediate artifact. The fix is to make canonicalization deterministic and streaming, perform a keyed stateful join after deduplication instead of an adjacent-record scan, finalize job status by the contract's ordering rules before admitting samples, implement the exact rank/interpolation percentile algorithm, and sort archive members and JSON keys before writing the reproducible package. The shell should batch Python work or invoke one process per stage, rather than spawning a process per event; then benchmark the full generated fixture and verify two independent builds byte-for-byte.",
+  "trap": "A shallow solution can make the visible ordered fixture pass by sorting only the final report or by changing the percentile formula, while still losing samples when duplicate or terminal records are separated, admitting samples from jobs that later fail, or producing a different archive when directory enumeration changes. A per-line shell/Python implementation can also be functionally correct but fail the 4-second hidden performance check.",
+  "tests": [
+   "Run the command on the visible fixture and verify the output directory, report schema, manifest, checksums, and archive contents; this checks the instruction's requirement that the output conform to `CONTRACT.md`.",
+   "Generate fresh seeded JSONL inputs containing shuffled records, duplicate `(run_id, job_id, seq)` keys with different ingest values, and tie cases; compare the report against an independent reference implementation, checking the instruction's deduplication and arbitrary-order requirements.",
+   "Generate jobs with interleaved start, sample, log, and terminal records, including failures followed by later records and successful jobs with error logs; verify that only samples from final successful jobs are included and that error counts match.",
+   "Generate metric values that exercise empty-adjacent groups, repeated values, exact and fractional percentile ranks, negative values, large integers, decimals, escaped identifiers, and multiple runs; compare every aggregate and serialized number with the contract reference.",
+   "Run the command twice in separate output directories and compare all report files, manifest files, checksums, and archive bytes; this checks the stated reproducibility requirement.",
+   "Run the command on a hidden seeded fixture of 200,000 events with thousands of jobs and rare duplicate/order/pathological cases, requiring the full command to finish within 4 seconds on the one-CPU container; this checks the stated performance threshold and general correctness.",
+   "Run `make test`, import the package through its documented public API, and run `make wheel` followed by installation into a clean local target; this checks the stated compatibility and packaging requirement."
+  ],
+  "verifier_knob": {
+   "name": "hidden_fixture_time_limit_seconds",
+   "value": "4",
+   "effect": "Lowering the limit makes process-per-record shell solutions fail while preserving correct batched implementations; raising it reduces the performance pressure and makes the task substantially easier."
+  },
+  "expected_failure_modes": [
+   "The agent patches the visible adjacent-order bug without redesigning the keyed, stateful multi-stage join.",
+   "The agent keeps the first or last duplicate record instead of applying the ingest and tie-break rules, causing only rare hidden records to differ.",
+   "The agent decides job success while scanning samples, so a later terminal status silently changes the correct result.",
+   "The agent uses a common nearest-rank or integer-index percentile implementation that passes ordinary samples but fails fractional and tied ranks.",
+   "The agent sorts report rows but leaves archive member order, JSON serialization, or checksum generation nondeterministic.",
+   "The agent produces a correct report with an inefficient shell loop and misses the four-second threshold.",
+   "The agent rewrites the core package and accidentally breaks the documented wheel or public import workflow."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "build-packaging",
+  "tags": [
+   "shell-scripting",
+   "telemetry",
+   "deterministic-builds",
+   "streaming-aggregation",
+   "performance",
+   "large-scale-refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd; find . -maxdepth 2 -type f | sort",
+   "cat CONTRACT.md",
+   "sed -n '1,240p' bin/release_bundle",
+   "find telemetry pipeline bin -type f -maxdepth 3 -print",
+   "make test",
+   "run bin/release_bundle on the visible fixture",
+   "inspect generated files, stage artifacts, and timing counters",
+   "read the canonicalization stage implementation",
+   "read the correlation/join stage implementation",
+   "read the reducer and packaging implementations",
+   "create a small shuffled fixture with duplicate keys and separated terminal records",
+   "run the stages on that fixture and compare intermediate artifacts with the contract",
+   "patch canonicalization to batch JSONL processing and apply deterministic deduplication",
+   "patch correlation to build keyed state independent of input adjacency",
+   "patch job finalization so samples are admitted only after final status resolution",
+   "patch reduction with the exact contract percentile and decimal serialization rules",
+   "patch packaging to sort members and keys and normalize all archive metadata",
+   "run visible and adversarial fixtures against a small independent reference checker",
+   "build two copies into separate directories and compare reports, manifests, checksums, and archive bytes",
+   "generate and run the seeded 200000-event fixture while inspecting timing counters",
+   "iterate on hot paths until the full command is below four seconds",
+   "run make test and verify documented public imports",
+   "run make wheel, install it into a clean target, and verify imports and the command"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 5,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The four-second limit can be flaky if verification hosts differ materially in CPU scheduling, filesystem performance, or container load; the verifier should control affinity and report warm-up policy.",
+   "Exact archive-byte checks are valid only if CONTRACT.md fully specifies archive format, member ordering, timestamps, permissions, compression settings, and JSON serialization; any omitted field creates ambiguity.",
+   "Decimal parsing and serialization can be ambiguous if the contract does not explicitly distinguish numeric values, precision limits, and negative-zero handling.",
+   "The hidden fixture must be available locally and generated deterministically; otherwise failures could reflect missing data or environment setup rather than the implementation.",
+   "Wheel installation tests should use the pinned local build environment and avoid requiring network access or undeclared build dependencies."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear contract, deterministic functional checks, an independently measurable performance requirement, and realistic multi-stage failure modes. The speedrun is longer than the roughly-20-command source-visible threshold and requires adversarial fixture creation, stateful redesign, exact numeric handling, reproducibility work, and benchmarking, so the difficulty is genuine rather than cosmetic.",
+  "fixes": [
+   "State the exact benchmark invocation, CPU affinity, filesystem location, and warm-up policy for the four-second check.",
+   "Ensure CONTRACT.md explicitly specifies every archive metadata field and JSON/decimal serialization rule used for byte comparisons.",
+   "Provide or document a local reference checker for percentile, deduplication, and decimal semantics so solver-side validation is practical.",
+   "Specify whether an existing output directory must be removed, replaced atomically, or reused between builds."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ee9176b9c4d1",
+     "verdict": "variant",
+     "reason": "Both are deterministic telemetry-log processing pipelines requiring deduplication, filtering, aggregation, percentile computation, and stable output, but they produce different artifacts and enforce substantially different event semantics."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "The reference centers on rebuilding a revision-aware SQLite index with rejection tracking, canonical address classification, and signature validation, unlike this report-bundling pipeline."
+    },
+    {
+     "ref_id": "ours/official-f821c68cb15f",
+     "verdict": "distinct",
+     "reason": "The reference is a continuously running trace-attribution daemon with HTTP APIs and log correlation, whereas this task is an offline JSONL aggregation and packaging command."
+    },
+    {
+     "ref_id": "ours/official-df18f32a069b",
+     "verdict": "distinct",
+     "reason": "The reference compiles inherited JSON contracts into a deterministic registry with diagnostics and atomic builds, which is fundamentally different from aggregating telemetry events into a release bundle."
+    },
+    {
+     "ref_id": "ours/official-df18f32a069b-m",
+     "verdict": "distinct",
+     "reason": "The reference compiles inherited JSON contracts into a deterministic registry with diagnostics and atomic builds, which is fundamentally different from aggregating telemetry events into a release bundle."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ee9176b9c4d1",
+     0.203
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.181
+    ],
+    [
+     "ours/official-f821c68cb15f",
+     0.173
+    ],
+    [
+     "ours/official-df18f32a069b",
+     0.172
+    ],
+    [
+     "ours/official-df18f32a069b-m",
+     0.172
+    ]
+   ],
+   "cost_usd": 0.0013465999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0035306
+}

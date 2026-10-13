@@ -1,0 +1,194 @@
+{
+ "blueprint": {
+  "slug": "repair-fast-settlement-reconcile",
+  "title": "Repair the Fast Settlement Reconciler",
+  "scenario": "The finance-ops overnight job reconciles our processor export against the broker settlement feed, but the latest run left a plausible report while drifting from the ledger after a restart. The container includes the existing reconciliation pipeline, a compiled `reconpack` helper, a SQLite ledger, a torn checkpoint/journal, and several generations of input data. Please get the job reliable and fast enough for the larger daily file without changing the external report format.",
+  "instruction_draft": "Can you get `/opt/recon/reconcile.sh` into shape and run it against the data under `/srv/recon/incoming`? The final source of truth is `/srv/recon/state/recon.db`: every processor record must have the correct one-to-one broker match or an explicit exception, with settlement amounts calculated using the documented fixed-point rules in `/opt/recon/contract.md`; chargebacks and adjustments need to be included too. Keep `/srv/recon/out/reconciliation.ndjson`, `/srv/recon/out/summary.json`, `/srv/recon/state/checkpoint.json`, and `/srv/recon/state/manifest.sha256` mutually consistent, make rerunning after an interrupted run idempotent, and preserve the existing JSON/NDJSON field names. The job must process a fresh 120,000-record input in under 5 seconds on this one-CPU container and use under 300 MB of RSS.",
+  "requirements": [
+   "`/opt/recon/reconcile.sh` must be a working executable entrypoint for the reconciliation job.",
+   "The job must read the processor and broker inputs under `/srv/recon/incoming` and populate `/srv/recon/state/recon.db`.",
+   "Every processor record must result in exactly one one-to-one broker match or one explicit exception row.",
+   "Matching must follow the fixed-point matching and tie-breaking rules documented in `/opt/recon/contract.md`.",
+   "Settlement amounts must follow the documented fixed-point conversion, fee, sign, and rounding rules.",
+   "The implementation must handle chargeback and adjustment records in addition to ordinary settlement records.",
+   "`/srv/recon/out/reconciliation.ndjson` must retain the existing field names and contain the same reconciled records represented in the database.",
+   "`/srv/recon/out/summary.json` must agree with the database counts and aggregate totals.",
+   "`/srv/recon/state/checkpoint.json` must identify the completed input position and agree with the committed database state.",
+   "`/srv/recon/state/manifest.sha256` must contain hashes for the final database and output artifacts.",
+   "Recovery from a torn checkpoint or interrupted journal must not lose, duplicate, or resurrect records.",
+   "Rerunning the entrypoint on the same inputs must be idempotent and must not change committed results.",
+   "A fresh 120,000-record input must complete in under 5 seconds on the one-CPU container.",
+   "A fresh 120,000-record input must use under 300 MB of resident memory.",
+   "The final state must preserve the current external JSON and NDJSON schema rather than introducing incompatible field names."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt and pip dependencies, one CPU assumptions, and no network access at runtime.",
+   "The image contains roughly 1,400 lines across a Python ingestion/database layer, a shell runner, report generation code, configuration files, and test fixtures.",
+   "`/opt/recon/reconcile.sh` invokes `/opt/recon/bin/reconpack`, a compiled opaque helper built during the Docker image build from temporary C sources that are deleted before the image is finalized; no helper source is shipped.",
+   "`reconpack` reads a documented binary record stream and emits candidate groups, packed decimal fields, and a checksum stream. Its behavior includes data-dependent paths for negative amounts, duplicate sequence numbers, adjustment events, and groups spanning a checkpoint boundary.",
+   "`/opt/recon/contract.md` documents the wire format, event types, fixed-point scale, matching eligibility, one-to-one assignment objective, deterministic tie breaks, settlement arithmetic, report schema, and checkpoint protocol, but does not identify the implementation defects.",
+   "`/srv/recon/incoming` contains several days of processor CSV and broker JSONL files, including duplicate business references, near-equal amounts, reversals, adjustments, out-of-order sequence numbers, and records surrounding a simulated interruption.",
+   "`/srv/recon/state/recon.db` is pre-populated with an older schema version, partial matches, an intentionally torn journal tail, and a checkpoint whose last committed batch does not equal the last physically written batch.",
+   "`/srv/recon/out` contains a superficially plausible report and summary from the broken run, while `/opt/recon/config/profile.json` selects the current schema/profile and checksum mode.",
+   "A small diagnostic utility can inspect the binary stream and database, but there is no supplied golden reproduction and no source for the compiled helper.",
+   "The verifier replaces the incoming files with newly generated seeded datasets, including larger groups and interruption positions not present in the visible fixtures."
+  ],
+  "internal_hint": "The intended resolution is investigative rather than a visible one-line patch. First run the existing entrypoint repeatedly, compare database rows, report rows, checkpoint offsets, and helper output, and use small generated streams to characterize `reconpack`; the important defects only appear after state has accumulated or when a restart crosses a batch boundary. Recover the journal by validating length, sequence, and CRC records, truncate only the torn suffix, and rebuild committed state transactionally. Implement or wrap the processing as a deterministic staged pipeline: normalize all event types, use an indexed/sorted candidate join, solve each eligible group as a one-to-one minimum-cost assignment with the contract's ID tie break, then apply signed fixed-point arithmetic with exact half-even rounding and adjustment/chargeback semantics. Commit database rows, checkpoint, report, summary, and manifest in an order that makes replay safe; avoid relying on the opaque helper for cases whose behavior is observably inconsistent with the contract. The reference solution is a deterministic shell script that snapshots the initial state, probes the helper with seeded micro-cases, validates the torn journal, runs the corrected bulk pipeline, and performs a second replay before finalizing the artifacts.",
+  "trap": "A shallow solution can make the visible report look correct by deleting the checkpoint and rebuilding ordinary settlements, yet fail on hidden groups with three or more possible matches, equal-cost ties, negative half-cent values, or adjustments that reference an earlier settlement. Another common failure is writing the report before the database commit or advancing the checkpoint past a failed batch; the visible rerun then appears successful while hidden interruption tests create duplicates or missing rows. A Python nested-loop matcher may pass the supplied fixtures but exceed the time limit and memory limit on the generated 120,000-record input.",
+  "tests": [
+   "A state check compares every expected match and exception row in `/srv/recon/state/recon.db`, including processor ID, broker ID, event type, reason, signed settlement amount, and deterministic assignment choice.",
+   "A state check verifies that each processor record appears exactly once across match and exception tables and that no broker record is consumed by more than one processor record.",
+   "A mathematical correctness check generates fresh seeded records with negative values, half-cent boundaries, reversals, chargebacks, and adjustments, then compares settlement amounts and aggregate totals with an independent exact-integer reference.",
+   "A matching check generates fresh ambiguous candidate groups and verifies minimum total absolute difference plus the documented lexicographic tie break, including groups split across input files and checkpoint batches.",
+   "A recovery check creates fresh torn journal tails and checkpoints at several offsets, runs the entrypoint, and compares the repaired database with a clean reference run.",
+   "An idempotence check runs the entrypoint twice without changing inputs and requires identical database contents, output bytes, checkpoint contents, and manifest hashes.",
+   "A cross-component consistency check compares database rows with every line in `/srv/recon/out/reconciliation.ndjson`, summary counts and totals with SQL aggregates, and manifest hashes with the actual final artifacts.",
+   "A schema check validates the required existing JSON and NDJSON field names, numeric encoding, ordering, and omission rules.",
+   "A performance check generates a fresh deterministic 120,000-record workload with rare ambiguous groups, runs the entrypoint on one CPU, and requires completion in under 5 seconds.",
+   "A resource check samples the same generated run and requires resident memory to remain below 300 MB.",
+   "A regression check confirms that the compiled `reconpack` binary remains usable for supported stream/checksum operations and that the solution has not replaced the external contract with a private format."
+  ],
+  "verifier_knob": {
+   "name": "generated-records-and-recovery-scenarios",
+   "value": "120000 records, 40 ambiguous matching groups, 12 interruption positions, and 6 independently checked state artifacts",
+   "effect": "Lowering the record count and number of interruption positions makes a simple rebuild or nested-loop implementation more likely to pass. Raising them increases pressure on the assignment algorithm, streaming design, exact arithmetic, checkpoint recovery, and cross-component consistency checks."
+  },
+  "expected_failure_modes": [
+   "The agent inspects only the visible fixtures and misses helper behavior triggered by negative, duplicate, or boundary-valued records.",
+   "The agent treats matching as a per-record lookup instead of solving the one-to-one group assignment problem.",
+   "The agent uses floating point for fees, conversion, or half-even rounding and fails rare cent-boundary cases.",
+   "The agent ignores chargebacks or treats adjustments as ordinary settlements.",
+   "The agent deletes all state and rebuilds successfully once but does not implement safe replay from a torn journal.",
+   "The agent advances the checkpoint independently of the database transaction, producing inconsistent recovery state.",
+   "The agent generates a report from a separate code path, causing database/report/summary disagreement.",
+   "The agent relies on a slow Python nested loop and exceeds the fresh-input performance bar.",
+   "The agent patches a visible configuration or fixture rather than making the entrypoint general for verify-time inputs.",
+   "The agent reverse-engineers only the normal path of the opaque binary and fails hidden checksum or boundary cases."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "data-processing",
+   "financial-reconciliation",
+   "compiled-binary",
+   "checkpoint-recovery",
+   "exact-arithmetic",
+   "state-consistency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the repository layout and executable permissions under /opt/recon and /srv/recon.",
+   "Read /opt/recon/contract.md completely, including wire format, matching, arithmetic, report schema, and checkpoint protocol.",
+   "Read /opt/recon/config/profile.json and inspect reconcile.sh and the report-generation modules.",
+   "List all source files, fixtures, database tables, and input files; identify the diagnostic utility and its usage.",
+   "Run reconcile.sh once under time and RSS measurement and capture all logs and exit status.",
+   "Inspect recon.db schema and rows, checkpoint.json, manifest.sha256, reconciliation.ndjson, and summary.json.",
+   "Run the entrypoint a second time and diff database contents and all artifacts.",
+   "Inspect reconpack file type, strings, documented invocation, and diagnostic output format.",
+   "Generate small processor and broker micro-cases covering negative amounts, duplicate sequences, adjustments, chargebacks, ties, and checkpoint boundaries.",
+   "Run reconpack on each micro-case and compare its candidate groups, decimal fields, and checksums with the contract.",
+   "Trace the Python ingestion, database, checkpoint, journal, and report code to locate transaction and ordering assumptions.",
+   "Use the diagnostic utility or a small parser to validate journal record lengths, sequence numbers, and CRCs.",
+   "Back up the initial state and truncate only the invalid journal suffix, recording the last valid committed position.",
+   "Design a deterministic normalized event representation covering settlements, reversals, chargebacks, and adjustments.",
+   "Implement indexed candidate grouping and per-group one-to-one minimum-cost assignment with deterministic lexicographic tie breaks.",
+   "Implement exact integer settlement arithmetic, signed fees, and half-even rounding from the contract.",
+   "Make database writes, checkpoint advancement, and committed positions transactional and replay-safe.",
+   "Generate reconciliation output and summary from committed database state while preserving the existing schemas and ordering.",
+   "Compute the manifest only after all final database and output artifacts are complete.",
+   "Run the repaired entrypoint on visible inputs and compare every match, exception, amount, count, and total with independent calculations.",
+   "Run fresh adversarial micro-tests for ambiguous groups, negative half-cent values, reversals, adjustments, and groups crossing batches.",
+   "Recreate torn journals and checkpoints at multiple positions and compare recovery results with a clean run.",
+   "Run the entrypoint twice and byte-compare the database dump, outputs, checkpoint, and manifest.",
+   "Generate the 120000-record workload, run it on one CPU under a timer and RSS monitor, and optimize joins or serialization if necessary.",
+   "Verify reconpack still works for its documented supported stream and checksum operations.",
+   "Perform final SQL, NDJSON, summary, checkpoint, schema, and manifest consistency checks."
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The five-second limit on a one-CPU container may be flaky across host hardware, container startup conditions, and Python/SQLite performance, especially if timing includes fixture generation or recovery setup.",
+   "The requirement that reconpack remain usable is underspecified if the intended solution is allowed to bypass behavior that is observably inconsistent with the contract; tests need to define exactly which helper operations must still work.",
+   "Recovery semantics are potentially ambiguous when the verifier replaces incoming files while the image contains a pre-populated database, checkpoint, journal, and outputs; the required reset or generation-detection behavior should be explicit.",
+   "Manifest coverage and ordering are not fully specified, so independently valid implementations could hash the same artifacts in different representations and be rejected.",
+   "The stated under-an-hour solvability is questionable: the task requires reverse-engineering an opaque binary, repairing journal recovery, implementing global assignment and exact arithmetic, preserving schemas, and meeting a tight benchmark without a golden reproduction. "
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements and outcome checks are mostly clear and the task is realistically difficult, but the described solution scope is too large for a skilled engineer to complete reliably in under an hour, particularly with an opaque helper and no reproduction. The speedrun is about 26 substantive commands and includes several major implementation subsystems, so this is a genuine engineering project rather than a bounded repair task; solvability scores below the acceptance threshold.",
+  "fixes": [
+   "Ship helper source or a deterministic black-box characterization suite, including expected outputs for all contract edge cases, so reverse engineering is not a prerequisite.",
+   "Provide a minimal reference implementation or scaffold for journal validation, transactional replay, schema-preserving output, and exact arithmetic, leaving the matching defect as the primary task.",
+   "Reduce the scope to one or two coupled defects, or relax the under-an-hour expectation and explicitly classify it as a multi-hour hard task.",
+   "Define the initial-state reset/versioning behavior when inputs are replaced, the exact manifest serialization and ordering, and which reconpack operations the regression test requires.",
+   "Use a benchmark tolerance or calibrated performance budget based on the actual verification container, and state whether fixture generation and process startup count toward the five-second limit."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "variant",
+     "reason": "Both are settlement-reconciliation repair tasks requiring deterministic matching, adjustment handling, integer money rules, and a consistent external report, although their input formats and recovery mechanisms differ."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "This task reconciles financial processor and broker transactions, whereas the reference indexes and quarantines filesystem artifacts using a canonical scanner."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is a schema-validation log ingestion task, not a transaction matching, ledger reconciliation, or crash-consistent settlement pipeline."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34-m",
+     "verdict": "distinct",
+     "reason": "Although both require idempotent recovery and consistent SQLite-derived views after interruption, this task solves financial settlement matching rather than segmented object-log replay."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The reference implements a streaming weighted-quantile metric service with a request protocol, which has no shared underlying reconciliation problem beyond generic statefulness."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.158
+    ],
+    [
+     "ours/official-982469e29790",
+     0.135
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.127
+    ],
+    [
+     "ours/official-ea89cb64bf34-m",
+     0.11
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.096
+    ]
+   ],
+   "cost_usd": 0.0011871999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0038017999999999997
+}

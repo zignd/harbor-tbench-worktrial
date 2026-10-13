@@ -1,0 +1,64 @@
+{
+ "slug": "repair-reproducible-release-packager",
+ "title": "Repair the release packager",
+ "scenario": "A backend developer is chasing a production incident where releases occasionally contain the wrong build variant and cannot be reproduced from the CI evidence. The container contains an internal Python release-packaging tool with a shell-driven, three-stage pipeline: it normalizes build logs, resolves the dependency closure for a requested release, and emits a deterministic artifact archive plus build metrics.",
+ "instruction_draft": "Can you fix `/opt/releaseforge` so `bin/releaseforge INPUT --out OUTPUT` reliably packages the requested release? The output must contain the exact successful build closure for the target platform, reject missing or tampered artifacts, and be byte-for-byte reproducible regardless of input ordering, locale, or file mtimes. Keep it fast enough to process the large CI fixture in under 6 seconds on this container, and make sure the emitted metrics describe what was actually packaged rather than merely what appeared in the logs.",
+ "requirements": [
+  "`/opt/releaseforge/bin/releaseforge INPUT --out OUTPUT` must complete successfully for valid inputs and create the requested output archive and metrics sidecar.",
+  "The package must select exactly one terminal successful build attempt for each logical job, ignoring superseded attempts and excluding jobs whose terminal attempt is unsuccessful.",
+  "Dependency resolution must produce the transitive closure of the release roots for the requested platform and variant, while excluding artifacts belonging only to another platform or variant.",
+  "Every packaged artifact must be read from the catalogued path, checked against its declared SHA-256 digest, and missing or digest-mismatched artifacts must cause a nonzero exit without publishing a successful package.",
+  "Each artifact must occur once in the archive under `payload/<sha256>`, and the manifest must map logical artifact identities to their digest, size, platform, variant, and dependency identities.",
+  "The archive must include canonical `manifest.json` and `metrics.json` files and must be byte-for-byte identical across repeated runs with reordered input records, different source mtimes, different locale settings, and different temporary output directories.",
+  "The metrics must report selected jobs, excluded jobs, dependency edges traversed, packaged artifact count, total payload bytes, and cache-hit count based on the final packaged closure.",
+  "The implementation must process the supplied large fixture in fewer than 6 seconds on the one-CPU container."
+ ],
+ "environment": [
+  "The Docker image is built from `python:3.13-slim-bookworm`, with pinned apt and pip dependencies and no network access at verification time.",
+  "`/opt/releaseforge` contains roughly 1,500 lines across a shell entrypoint, Python log normalization, graph resolution, archive writing, metrics, configuration, and unrelated maintenance utilities.",
+  "The input format is a directory containing `release.yaml`, `ci/build-events.jsonl`, `catalog/artifacts.jsonl`, and artifact payload files; the repository includes a small visible fixture and documentation describing the fields and archive layout.",
+  "The release file specifies a release name, platform, variant, and logical root artifacts. Build events include logical job identity, attempt number, status, artifact identity, platform, variant, and retry metadata; records are intentionally interleaved.",
+  "The catalog describes artifact identities, content paths, SHA-256 digests, sizes, platform and variant selectors, and dependency identities. The generated fixtures contain thousands of artifacts and tens of thousands of build-event records.",
+  "The shell pipeline currently materializes intermediate JSONL files and invokes the Python stages. Planted defects include order-sensitive retry reduction, incorrect selector handling when a dependency has both a generic and platform-specific candidate, a deduplication step that conflates similarly formatted identities, stale metrics calculated before closure pruning, and nondeterministic archive metadata.",
+  "The visible fixture exercises only one attempt per job, one platform, no same-name variant collision, and a nearly linear dependency graph; hidden fixtures include late retries, interleaved records, diamond graphs, generic fallbacks, variant names containing punctuation, duplicate content under different identities, and irrelevant failed jobs.",
+  "A deterministic reference implementation and hidden-input generator are available only to the verifier. The task does not require internet access, external services, or changes to the Docker image."
+ ],
+ "internal_hint": "The reliable resolution path is to run the existing command on the visible fixture, inspect every intermediate stage and metrics file, then generate small adversarial fixtures that vary event order, retry order, selectors, and graph shape. The intended semantics require grouping events by logical job before choosing the highest attempt, resolving each dependency using the requested platform/variant with the documented generic fallback rules, retaining identity separately from content digest, and calculating metrics only after the final reachable set is known. The shell orchestration also needs stable sorting and explicit locale settings; the archive writer must normalize member order, uid/gid, mode, timestamps, and gzip metadata. The performance fix is to replace repeated whole-file scans and recursive per-edge catalog lookups with one-pass indexing and iterative closure traversal. The main difficulty is not visible in the small sample: state accumulated across retries and selector interactions silently changes downstream closure and metrics on generated histories.",
+ "trap": "A shallow solution that merely sorts the visible JSONL, takes the last line for each job, or deduplicates by filename will pass the sample but fail when a retry is recorded earlier or later, when generic and platform-specific artifacts coexist, or when two logical artifacts share content. Another plausible implementation will produce correct contents but fail reproducibility because tar headers, gzip timestamps, JSON key order, or locale-dependent sorting vary. A straightforward Python scan for every dependency can also be functionally correct yet exceed the six-second threshold on the hidden fixture.",
+ "tests": [
+  "A basic valid-fixture test invokes the documented CLI and checks that the archive, manifest, and metrics sidecar are created with the exact reachable artifact set.",
+  "A generated retry-history test permutes and expands build attempts, including failed and superseded attempts, and checks that the manifest contains only the highest terminal attempt with successful status; this checks the requirement that exactly one terminal successful build attempt is selected per logical job.",
+  "Generated platform and variant fixtures include generic fallbacks, platform-specific overrides, punctuation-bearing identities, and irrelevant jobs; the verifier compares the selected transitive closure and manifest fields with the reference, checking the platform/variant dependency requirement.",
+  "Generated diamond and duplicate-content graphs check that all reachable logical identities are represented, each payload digest is stored once, and dependency edges are not lost through digest-based conflation.",
+  "Mutation tests delete an artifact or alter its bytes while leaving the catalog digest unchanged and require a nonzero exit with no successful published package, checking integrity validation.",
+  "Reproducibility tests reorder every input file, change artifact and input mtimes, run under several locales, and write to different temporary directories; the verifier compares archive bytes and canonical manifest/metrics bytes.",
+  "Metrics tests compare selected jobs, excluded jobs, traversed edges, artifact count, payload bytes, and cache hits against the final reference closure, including fixtures with many failed irrelevant jobs.",
+  "A hidden scale fixture generated from a seed contains tens of thousands of interleaved events and thousands of catalog entries; the verifier requires correct output and wall-clock completion below 6 seconds on the one-CPU container."
+ ],
+ "verifier_knob": {
+  "name": "large-fixture runtime threshold",
+  "value": "6 seconds",
+  "effect": "Raising the threshold makes inefficient repeated scans more likely to pass; lowering it requires more aggressive indexing and shell/Python pipeline optimization and increases the chance that a functionally correct solution fails."
+ },
+ "expected_failure_modes": [
+  "Selecting the last textual event instead of grouping attempts and applying terminal-attempt semantics.",
+  "Using a filename, short name, or digest as the dependency identity and silently merging distinct variants.",
+  "Applying platform selection only at the roots or only at the first dependency level rather than throughout the closure.",
+  "Counting catalog entries or log records in metrics instead of counting the final reachable and packaged set.",
+  "Publishing a partial archive after an integrity error or failing to validate payload bytes against catalogued digests.",
+  "Leaving tar or gzip timestamps, ownership, member order, JSON ordering, or locale-dependent sorting nondeterministic.",
+  "Implementing correct graph semantics with an O(events \u00d7 jobs) or O(edges \u00d7 catalog) algorithm that misses the performance threshold.",
+  "Testing only the visible linear fixture and never constructing histories with retries, permutations, selector collisions, or diamond dependencies."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "build-packaging",
+ "tags": [
+  "shell-scripting",
+  "reproducible-builds",
+  "dependency-resolution",
+  "log-processing",
+  "performance",
+  "metrics"
+ ]
+}

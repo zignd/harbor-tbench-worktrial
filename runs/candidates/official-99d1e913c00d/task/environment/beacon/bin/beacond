@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+import socket,threading,json,os,subprocess
+ROOT='/opt/beacon'; DATA=ROOT+'/data'; STATE=ROOT+'/state'; mu=threading.RLock(); snap=None; gen=0
+def reload_():
+ global snap,gen
+ with mu:
+  gen+=1; d=os.path.join(STATE,'g'+str(gen)); os.makedirs(d,exist_ok=True); subprocess.run([ROOT+'/bin/catalog-build',DATA,d],check=True,stdout=subprocess.DEVNULL); rows=json.load(open(d+'/snapshot.json')); stats=json.load(open(d+'/stats.json')); by={}
+  for r in rows: by.setdefault(r['device'],[]).append(r)
+  for a in by.values(): a.sort(key=lambda r:(r['at'],r['source_sequence']))
+  snap=(gen,by,stats)
+ return gen
+def err(x): return {'ok':False,'error':x}
+def answer(x):
+ global snap
+ if not isinstance(x,dict) or not isinstance(x.get('op'),str): return err('invalid_request')
+ op=x['op']
+ if op=='reload':
+  try: return {'ok':True,'generation':reload_()}
+  except Exception: return err('reload_failed')
+ with mu: s=snap
+ if op=='stats':
+  if s is None:return err('not_found')
+  return {'ok':True,'generation':s[0],**s[2]}
+ if op not in ('lookup','history'): return err('unknown_operation')
+ try:
+  d=x['device'].lower(); assert len(d)==16 and int(d,16)>=0
+  a=s[1].get(d,[])
+  if op=='lookup':
+   t=x['at']; assert isinstance(t,int) and not isinstance(t,bool); r=next((z for z in a if z['at']==t),None)
+   return err('not_found') if r is None else {'ok':True,'device':d,'at':r['at'],'value':r['value'],'quality':r['quality'],'source_sequence':r['source_sequence']}
+  lo,hi=x['from'],x['to']; assert isinstance(lo,int) and isinstance(hi,int); rs=[{k:r[k] for k in ('at','value','quality','source_sequence')} for r in a if lo<=r['at']<=hi]
+  return err('not_found') if not a else {'ok':True,'device':d,'records':rs}
+ except Exception:return err('invalid_request')
+def client(c):
+ try:
+  for line in c.makefile():
+   try: out=answer(json.loads(line))
+   except Exception: out=err('invalid_request')
+   c.sendall((json.dumps(out,separators=(',',':'))+'\n').encode())
+ finally:c.close()
+os.makedirs(DATA,exist_ok=True); reload_(); q=socket.socket(); q.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); q.bind(('0.0.0.0',4711)); q.listen(64)
+while True: threading.Thread(target=client,args=(q.accept()[0],),daemon=True).start()

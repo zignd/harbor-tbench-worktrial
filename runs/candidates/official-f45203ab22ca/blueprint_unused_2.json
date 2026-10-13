@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "isotope-mass-balance-service",
+  "title": "Repair the Isotope Mass-Balance Service",
+  "scenario": "An analytical chemistry group uses a small in-house SQLite service to reconcile isotope inventories across sample preparation runs, but an analyst reports that published totals stopped adding up after several months of revised measurements and mixed laboratory units. The container contains the service, its SQL catalog, historical fixture data, protocol documentation, and a command-line client; the missing or defective reconciliation feature must be made reliable for new projects and historical as-of queries.",
+  "instruction_draft": "Implement the documented `reconcile` JSON-lines service operation on port 8765 so that each request returns the latest valid measurement revision at or before its requested `as_of` time, converts all supported mass and concentration units, applies dilution and recovery factors, and reports per-isotope input mass, output mass, signed balance, relative discrepancy, and pass/fail status using the documented tolerances. Preserve the existing protocol and make the result deterministic for repeated requests, including projects with multiple aliquots, corrections, rejected records, missing optional uncertainties, and several independent reconciliation runs.",
+  "requirements": [
+   "Expose the documented `reconcile` JSON-lines operation on TCP port 8765.",
+   "For every request, select the latest valid revision of each measurement whose effective timestamp is at or before the request's `as_of` timestamp.",
+   "Exclude rejected, superseded, and otherwise invalid measurements according to the existing schema's status rules.",
+   "Convert every supported mass, concentration, volume, and isotope-unit representation into the service's canonical units before aggregation.",
+   "Apply dilution and recovery factors in the documented order when calculating adjusted mass.",
+   "Return per-isotope input mass, output mass, signed balance, relative discrepancy, and pass/fail status.",
+   "Use the documented absolute and relative tolerances, with the documented zero-denominator behavior for relative discrepancy.",
+   "Aggregate multiple aliquots and independent reconciliation runs without double-counting shared historical revisions.",
+   "Handle missing optional uncertainty fields deterministically without producing NaN, Infinity, or non-JSON values.",
+   "Preserve the existing request and response envelope and return deterministic output ordering and numeric formatting."
+  ],
+  "environment": [
+   "Use `FROM python:3.13-slim-bookworm` with pinned apt and pip dependencies and no network requirement.",
+   "Create an approximately 1,400-line in-house Python/SQL codebase under `/opt/isotope-audit`, including a JSON-lines TCP daemon, a SQLite schema, migration scripts, a SQL query catalog, a client, fixtures, and unrelated reporting utilities.",
+   "Provide protocol and schema documentation in `/opt/isotope-audit/docs`, including supported units, status meanings, canonical-unit definitions, factor order, tolerance rules, and example requests.",
+   "Store the operational database at `/opt/isotope-audit/state/lab.sqlite`; include projects, samples, aliquots, isotope measurements, measurement revisions, preparation factors, reconciliation runs, and run-membership tables.",
+   "Ship a partially implemented reconciliation path consisting of SQL views and Python dispatch code. It works on the small example but mishandles historical revision selection, unit conversion branches, and shared run membership when exercised on accumulated real fixture history.",
+   "Include roughly 8,000 historical rows across several projects, with mixed grams, milligrams, micrograms, kilograms, ppm, ppb, milliliters, microliters, and isotope-specific concentration units; include corrections, rejected revisions, duplicate aliquot membership, null uncertainties, and timestamps near request cutoffs.",
+   "Include a visible seed dataset whose simple examples do not contain a same-timestamp correction, a rejected latest revision, a mixed concentration/volume conversion, or a run shared by two reports.",
+   "Provide a startup script and health operation, but do not provide a complete implementation or a reference output file that can be copied."
+  ],
+  "internal_hint": "The intended resolution is investigative: read the protocol and schema, run the daemon against the examples, then generate or query historical cases while tracing SQL parameters and intermediate rows. The existing latest-revision view partitions by aliquot but omits isotope and uses an effective-time comparison that admits an invalid same-time row; the aggregation view joins run membership before deduplicating shared runs, causing historical double counting. A unit conversion branch also treats concentration units as mass units when volume is present, and the factor expression applies recovery before dilution for one preparation type. The fix is a staged SQL pipeline: establish the as-of revision set with deterministic revision-id tie-breaking, filter statuses, normalize units, calculate adjusted aliquot mass with the documented factor order, deduplicate run membership at the correct grain, aggregate signed input/output totals, and compute tolerances with guarded zero behavior. A skilled solution should instrument the service and compare intermediate query results across generated cases rather than only patching the visible view.",
+  "trap": "A shallow implementation that selects the current row, multiplies obvious gram values, and sums directly passes the supplied examples but fails when a historical request predates a correction, when the latest revision is rejected, when concentration and volume use different prefixes, or when the same aliquot participates in two reconciliation runs. Another plausible solution returns numerically reasonable totals but silently double-counts shared runs or emits NaN for a zero expected mass, so hidden protocol requests reject it.",
+  "tests": [
+   "Start the service and send the documented health and `reconcile` requests; verify the operation remains available on port 8765 with the documented JSON-lines envelope.",
+   "Use visible fixture projects to check exact per-isotope input, output, signed balance, discrepancy, status, stable ordering, and deterministic repeatability; this corresponds to the instruction requirements for the protocol, reported fields, tolerances, and determinism.",
+   "Build a fresh SQLite instance from a hidden seed containing multiple revisions and query several `as_of` timestamps; verify that the selected row is the latest valid revision at or before each cutoff, including same-time revision ties.",
+   "Generate hidden projects with rejected latest revisions, superseded records, and missing uncertainties; verify exclusion and finite deterministic JSON behavior.",
+   "Generate hidden measurements across every documented mass, concentration, volume, and isotope-unit combination; compare adjusted masses against an independent Decimal reference implementation.",
+   "Generate hidden preparation chains with dilution and recovery factors in different orders; verify the documented order and canonical-unit conversion.",
+   "Generate hidden reconciliation runs sharing aliquots and historical revisions; verify no duplicate contribution occurs and that independent runs aggregate at the correct grain.",
+   "Test zero and near-zero expected mass cases plus positive and negative signed balances; verify absolute/relative tolerance selection, zero-denominator behavior, and pass/fail status.",
+   "Send requests in different row insertion orders and repeat identical requests; verify identical numeric results, key ordering where specified, and deterministic isotope ordering.",
+   "Run nine protocol scenarios against fresh verify-time databases built from a hidden seed, so hard-coded fixture answers or special-cased project identifiers cannot pass."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9",
+   "effect": "Raising the value adds more independently generated as-of cutoffs, unit combinations, revision histories, shared-run graphs, and tolerance edge cases; lowering it leaves only the basic protocol and a few aggregate cases, making shallow fixes more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The solver reads the obvious SQL view and patches only the visible aggregation without running historical or mixed-unit experiments.",
+   "The solver uses a current-state query instead of an as-of revision query and misses same-timestamp deterministic tie-breaking.",
+   "The solver deduplicates by sample rather than by the documented aliquot/run grain, producing plausible but inflated totals.",
+   "The solver implements unit conversion with floating-point shortcuts that fail rare prefixes or concentration-volume combinations.",
+   "The solver applies dilution and recovery factors in the wrong order because the simple fixtures use factors of one.",
+   "The solver handles null uncertainty by propagating SQL NULL into JSON or by inventing an undocumented fallback.",
+   "The solver computes relative discrepancy without guarding a zero expected mass.",
+   "The solver validates only the supplied examples and does not inspect intermediate rows after building up revision history.",
+   "The solver changes the response shape or launches a one-shot command instead of preserving the long-running JSON-lines protocol.",
+   "The solver hard-codes the visible project names or expected totals and fails hidden seed instances."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "sql",
+   "sqlite",
+   "mass-balance",
+   "historical-as-of",
+   "service-protocol",
+   "unit-conversion"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "List the repository and service entry points: `pwd; find /opt/isotope-audit -maxdepth 3 -type f | sort`",
+   "Read the protocol and example requests in `/opt/isotope-audit/docs`",
+   "Read the schema, status meanings, canonical units, factor-order, and tolerance documentation",
+   "Search all reconciliation-related code, views, queries, and dispatch paths with `grep -Rni reconcile /opt/isotope-audit`",
+   "Inspect the SQL catalog and the latest-revision and aggregation views",
+   "Inspect migrations and fixture-loading scripts to understand revision, membership, and run keys",
+   "Inspect the daemon, JSON-lines envelope, client, and numeric serialization code",
+   "Start the service using the supplied startup script",
+   "Send the documented health request and a visible reconciliation example",
+   "Repeat the example and compare raw response ordering and numeric formatting",
+   "Query the SQLite tables and views for the example project and trace the intermediate rows",
+   "Create a small temporary fixture with same-time revisions, rejected revisions, mixed units, factors, and shared run membership",
+   "Send historical `as_of` requests against that fixture and compare results with manual calculations",
+   "Instrument or run the relevant SQL directly to identify invalid revision selection and duplicate membership rows",
+   "Patch the revision-selection pipeline with status filtering, cutoff filtering, and deterministic revision-id tie-breaking",
+   "Patch mass, concentration, volume, and isotope-unit normalization using the documented canonical conversions",
+   "Patch adjusted-mass calculation to apply dilution and recovery in the documented order",
+   "Patch run-membership deduplication at the documented aliquot/run/revision grain before aggregation",
+   "Patch discrepancy, zero-denominator, tolerance, and missing-uncertainty handling to emit finite deterministic JSON",
+   "Patch response ordering and numeric serialization without changing the protocol envelope",
+   "Restart the daemon and rerun health and all visible examples",
+   "Build or load several generated edge-case fixtures and compare service results against independent Decimal calculations",
+   "Test insertion-order invariance, repeated requests, historical cutoffs, shared runs, and zero or near-zero expected masses",
+   "Run the supplied test suite and inspect the final diff for accidental protocol or schema changes"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "If the documentation does not precisely define the grain at which shared reconciliation runs are deduplicated, tests could enforce one plausible interpretation of 'without double-counting' over another.",
+   "If the hidden-seed loader or fresh-database setup is not exposed and reproducible in the container, failures could reflect test harness assumptions rather than the service implementation.",
+   "Exact numeric formatting or JSON key-order assertions would be invalid if those details are not explicitly documented as part of the protocol rather than merely implementation preferences.",
+   "Pinned apt or pip dependencies could make the build flaky if the required packages are not cached or otherwise made available without network access.",
+   "A test that treats JSON object key order as semantically significant without documenting it would overreach, though deterministic ordering is stated for the response."
+  ],
+  "verdict": "accept",
+  "reasons": "The task specifies the protocol, data semantics, edge cases, and deterministic verification targets sufficiently well, while the hidden fresh databases prevent fixture-specific hard-coding. The speedrun is materially longer than a source-only patch and requires constructing historical and mixed-unit cases, giving the difficulty genuine investigative substance. Solvability is somewhat constrained by the breadth of the SQL and unit-conversion behavior, but the contained codebase and documentation make it feasible.",
+  "fixes": [
+   "State explicitly in the protocol documentation and task metadata the exact deduplication grain for shared runs and historical revisions.",
+   "Provide a documented fixture-generation or fresh-database command that the solver can use to reproduce hidden-style cases locally.",
+   "Specify the required numeric serialization precision and whether JSON object key order is tested or only array ordering is significant.",
+   "Ensure all pinned dependencies and any database initialization assets are present in the build context so no network access is needed."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This concerns isotope mass-balance calculations over a SQLite measurement catalog and JSON-lines TCP service, not authenticated binary settlement-frame processing and financial reconciliation."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This implements event-time weighted metric ingestion and quantile queries with checkpoint recovery, rather than chemical unit conversion, revision selection, and isotope reconciliation."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "This replays and canonicalizes incident events with actor resolution, dependencies, and policy transitions, not laboratory measurement mass-balance computation."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "This repairs a Monte Carlo risk deployment and binary-spool-to-SQLite ingestion pipeline, whereas the candidate implements an isotope reconciliation protocol."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This builds an HTTP windowed log-metrics query service backed by a compiled aggregation engine, not a revision-aware isotope mass-balance service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.152
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.146
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.133
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.13
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.115
+    ]
+   ],
+   "cost_usd": 0.0007932
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0034165999999999997
+}

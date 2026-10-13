@@ -1,0 +1,187 @@
+{
+ "blueprint": {
+  "slug": "repair-beam-profile-replay",
+  "title": "Repair Beam Profile Replay",
+  "scenario": "A database administrator is recovering a synchrotron beamline archive after an interrupted migration left committed scattering runs with empty or inconsistent radial profiles. The container contains an in-house JSON-lines replay daemon, a small scientific reduction pipeline, archived fixtures, and an opaque compiled detector-frame decoder built during the image build. The daemon must be repaired and left running so archive clients can replay detector data and retrieve scientifically correct one-dimensional profiles.",
+  "instruction_draft": "beam-replay: commit run=demo-17 profile bins=0\narchive-audit: expected checksum 8d1c..., observed checksum 31a7...\n\nRepair the beam-profile replay service in the container. Keep its existing public protocol and make it listen on 127.0.0.1:7077. A client sends one JSON object per line and receives one JSON object per line; a TCP connection may contain several commands. Support independent runs with this ordered command sequence: `begin`, zero or more `geometry`, `dark`, and `frame` commands, then `commit`, followed by `result` or `abort`. A run must not become visible through `result` until `commit` succeeds, and a later run must not inherit any state from an earlier run.\n\n`begin` contains `run_id`, `width`, `height`, `q_min`, `q_max`, and `bin_width`; `geometry` contains the detector origin, pixel sizes, sample-to-detector distance, wavelength, and beam-center offset; `dark` contains a detector-valued array; and `frame` contains `frame_no`, `modality` (`transmission` or `fluorescence`), and a base64 detector frame in the documented archive format. Frames and setup commands may arrive in any order permitted by the protocol documentation, and duplicate frame numbers must be harmless. `commit` must acknowledge the run with its profile checksum, while `result` must return the committed profile.\n\nFor every committed run, return exactly the documented profile fields: bin centers, weighted intensity, population count, and weighted variance. Apply the documented detector decoding, dark-current subtraction, modality correction, pixel-to-q transformation, half-open q-bin assignment, and per-pixel accumulation rules. Preserve deterministic ordering and numeric precision, reject malformed or incomplete runs without exposing partial results, and return protocol errors as JSON rather than terminating the daemon. The service must handle at least 100 runs, 2,000 frames per run, and 256x256 detector frames within the provided resource limits. Do not hard-code the sample checksum or fixture contents; verification creates fresh runs and frame payloads after your changes. Leave the repaired daemon startable by `/opt/beam-replay/bin/start.sh`.",
+  "requirements": [
+   "The service listens on 127.0.0.1:7077.",
+   "The public interface is persistent TCP JSON-lines: one JSON request per line and one JSON response per line.",
+   "The service supports the ordered commands begin, geometry, dark, frame, commit, result, and abort.",
+   "A begin request accepts run_id, width, height, q_min, q_max, and bin_width.",
+   "A geometry request accepts detector origin, pixel sizes, sample-to-detector distance, wavelength, and beam-center offset.",
+   "A dark request accepts a detector-valued array.",
+   "A frame request accepts frame_no, modality, and a base64 detector frame in the documented archive format.",
+   "Frames and setup commands are accepted in every order allowed by the protocol documentation.",
+   "Duplicate frame numbers do not change the committed result.",
+   "A run is not visible through result before commit succeeds.",
+   "Independent runs do not share state.",
+   "Committed results contain bin centers, weighted intensity, population count, and weighted variance.",
+   "The reduction applies detector decoding, dark-current subtraction, modality correction, pixel-to-q transformation, half-open q-bin assignment, and the documented accumulation rules.",
+   "Profiles and responses are deterministic and use the documented numeric precision and ordering.",
+   "Malformed or incomplete runs are rejected as JSON protocol errors without exposing partial results or killing the daemon.",
+   "The daemon handles at least 100 runs and 2,000 frames per run with 256x256 detector frames within the container's resource limits.",
+   "The daemon is startable through /opt/beam-replay/bin/start.sh.",
+   "The implementation is general and does not hard-code the visible sample checksum or fixture contents."
+  ],
+  "environment": [
+   "The Dockerfile uses FROM python:3.13-slim-bookworm and installs pinned runtime packages only from the image's local build context; it builds a small C detector decoder with gcc, strips the resulting binary, removes its source and compiler, and leaves the executable at /opt/beam-replay/lib/detector-unpack.",
+   "The image contains roughly 1,700 lines across a Python daemon, protocol helpers, scientific reduction modules, fixture generators, logging utilities, and decoy maintenance tools.",
+   "The daemon source is distributed under /opt/beam-replay/app and currently starts successfully but has several state-dependent recovery and numerical errors.",
+   "The opaque detector-unpack binary translates the archive's packed 12-bit interleaved detector format into signed detector samples. Its command-line contract and byte-level format are documented in /opt/beam-replay/docs/ARCHIVE_FORMAT.md, but its source is absent.",
+   "The protocol and reduction semantics, including modality factors, geometry equations, bin boundary rules, variance definition, frame identity rules, and checksum serialization, are documented in /opt/beam-replay/docs/PROTOCOL.md and /opt/beam-replay/docs/REDUCTION.md.",
+   "Visible fixtures include a small transmission-only run and a manually readable 4x4 frame set. They do not contain duplicate frames, negative dark-corrected values, q values exactly on bin boundaries, interleaved modalities, out-of-order setup, or multiple committed runs.",
+   "The planted implementation errors interact: a recovery path commits staged frames before canonical frame identity is established, one modality is reduced with the wrong normalization stage, and a geometry cache can retain dimensions and beam offsets across runs. Some failures only appear after enough history has accumulated or on particular detector dimensions and q boundaries.",
+   "The service is expected to be operated by /opt/beam-replay/bin/start.sh and logs diagnostics to /var/log/beam-replay.log. The verifier starts a fresh process for each scenario."
+  ],
+  "internal_hint": "A skilled solution first reads the protocol and reduction documents, inventories the daemon, exercises the visible fixture through a raw TCP client, and probes the opaque decoder with generated tiny frames rather than trusting the fixture. The essential repair is to make run state transactional: retain setup and raw frame identities separately, canonicalize and deduplicate frame numbers before reduction, tolerate documented reordering, and publish only an immutable committed snapshot. The reduction must decode each frame through detector-unpack, subtract the matching dark sample before modality normalization, use the per-run geometry rather than a process-global cache, map q values into half-open bins with the documented floating-point convention, and accumulate weighted mean and population variance using the stable documented accumulator. The fluorescence and transmission modality paths use different normalization factors. Finally, clear every run-local cache on abort, commit, and connection teardown, preserve JSON error responses, and test generated frames with odd dimensions, duplicate/reordered inputs, boundary q values, and multiple sequential runs.",
+  "trap": "A shallow repair that makes the visible 4x4 transmission example match will still fail when hidden runs mix modalities, replay duplicate frames, or place values exactly at q-bin boundaries. A particularly plausible implementation deduplicates after dark correction or uses a global geometry cache, so the first run passes while later runs silently inherit dimensions or offsets; another computes variance from already averaged bins and only fails when frame weights differ. Hidden verification also sends setup and frame commands in different legal orders and compares profile checksums on fresh generated seeds, preventing fixture memorization or a hard-coded output path.",
+  "tests": [
+   "A protocol smoke test starts /opt/beam-replay/bin/start.sh, opens one persistent TCP connection to 127.0.0.1:7077, sends begin, setup, frame, commit, and result JSON lines, and checks response framing, acknowledgements, and a nonempty profile.",
+   "A generated single-modality test creates fresh packed detector frames from a hidden seed, obtains the reference reduction, and compares every returned bin center, intensity, count, and variance within the documented tolerances.",
+   "A modality-translation test generates interleaved transmission and fluorescence frames with different hidden normalization factors and checks that the combined profile matches the reference.",
+   "A reorder/idempotence test permutes geometry, dark, and frame requests within the legal protocol order, repeats frame numbers, and checks that the checksum and profile equal the deduplicated reference.",
+   "A geometry-isolation test commits several hidden runs with different dimensions, pixel sizes, beam offsets, wavelengths, and distances in one daemon lifetime, checking that no run inherits state from another.",
+   "A numerical-edge test generates q values on both sides of bin boundaries, negative dark-corrected samples, empty bins, and nonuniform frame weights, checking half-open assignment, zero-count fields, and the documented weighted population variance.",
+   "A recovery test sends malformed base64, truncated frames, missing geometry, unknown modalities, duplicate begin requests, aborts, and result-before-commit requests, and checks that each receives a JSON error while the daemon remains alive and does not publish partial state.",
+   "A scale test generates hidden-seed runs totaling at least 100 runs and 2,000 frames of 256x256 data and checks completion within the container resource budget.",
+   "A fresh-instance test regenerates all payloads and checksums from a verifier-only seed after the solver's changes, ensuring no visible fixture or sample checksum is sufficient."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9",
+   "effect": "Lowering the number of scenarios mostly exercises the visible happy path and simple numerical reduction. Raising it adds more independent generated runs, reorderings, modality mixtures, malformed requests, boundary cases, and long-lived process state, making cache leakage, incorrect transaction ordering, and partial numerical implementations increasingly likely to fail."
+  },
+  "expected_failure_modes": [
+   "The solver reads the source and patches the obvious commit path without probing the opaque decoder or generated data-dependent cases.",
+   "The solver treats frame order as significant even though legal clients replay setup and frames in different orders.",
+   "The solver deduplicates by payload or by arrival position instead of canonical frame number, allowing repeated frames to bias means and variances.",
+   "The solver applies modality normalization before dark subtraction or uses one factor for both modalities.",
+   "The solver uses inclusive upper bin boundaries or rounds q values, producing failures only at generated boundary values.",
+   "The solver computes variance from bin means rather than retaining weighted second moments.",
+   "The solver retains geometry, dark arrays, or decoder buffers globally, contaminating later runs.",
+   "The solver returns a plausible result before commit or crashes on malformed protocol input.",
+   "The solver validates only the supplied fixture and hard-codes its checksum or assumes all detector dimensions are even.",
+   "The solver implements a slow per-pixel Python path that passes small examples but exceeds the scale scenario."
+  ],
+  "predicted_pass_rate": 0.32,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "opaque-binary",
+   "scientific-reduction",
+   "stateful-protocol",
+   "recovery-migration",
+   "hidden-seeds"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the application, documentation, fixtures, and startup files under /opt/beam-replay.",
+   "Read /opt/beam-replay/docs/PROTOCOL.md.",
+   "Read /opt/beam-replay/docs/REDUCTION.md.",
+   "Read /opt/beam-replay/docs/ARCHIVE_FORMAT.md.",
+   "Inventory Python modules and identify daemon, state, reduction, checksum, and protocol code.",
+   "Inspect the daemon entry point and request-dispatch loop.",
+   "Inspect run-state, recovery, geometry-cache, and connection-cleanup paths.",
+   "Inspect modality normalization and weighted-accumulation implementations.",
+   "Inspect start.sh and logging configuration.",
+   "Start the existing daemon and verify that it accepts a persistent TCP connection.",
+   "Send the visible fixture through a raw JSON-lines client and record acknowledgements and checksum differences.",
+   "Generate tiny packed frames and probe detector-unpack to confirm dimensions, signed samples, and error behavior.",
+   "Run the fixture/reference generator to establish expected profile fields and ordering.",
+   "Refactor state so setup, raw frames, and canonical frame identities are run-local and transactional.",
+   "Canonicalize and deduplicate frames by frame_no before dark subtraction and reduction.",
+   "Apply per-modality normalization after dark subtraction and use per-run geometry and half-open q bins.",
+   "Retain weighted sums, weights, and second moments; publish only an immutable committed snapshot.",
+   "Add JSON protocol errors for malformed, incomplete, duplicate-begin, abort, and result-before-commit cases, and clear state on all terminal paths.",
+   "Run syntax checks, restart through start.sh, and replay visible and generated reorder/duplicate/multi-run cases.",
+   "Run boundary, modality, geometry-isolation, malformed-input, and scale checks, then leave start.sh as the service entry point."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction delegates exact field names, legal command order, checksum serialization, numeric precision, and response shapes to documents that are not shown; inconsistent or incomplete documents would make failures invalid.",
+   "The phrase that setup and frame commands may arrive in any permitted order conflicts somewhat with the stated ordered command sequence unless the protocol explicitly defines all legal permutations and how multiple setup commands replace or merge.",
+   "Duplicate begin semantics, simultaneous runs, run association across connections, and whether result is legal on a new connection are not explicitly defined.",
+   "The scale requirement is ambiguous about whether 2,000 frames is per run or aggregate; literal 100 runs times 2,000 256x256 frames may be unreasonable on one CPU, and no concrete timeout or memory budget is specified.",
+   "Exact floating-point tolerances and the treatment of empty-bin values such as zero versus null must be fully specified for deterministic verification.",
+   "The opaque decoder's behavior on malformed and odd-dimension inputs may vary by platform unless the image architecture and error contract are fixed."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is mostly clear, deterministic, and realistic, but the likely repair path is about 20 commands and the planted defects are discoverable by reading the source, matching the stated benchmark observation; genuine difficulty therefore scores only 2. The resulting average is 3.4, below the required 3.6 threshold, and several protocol and scale details could also make individual failures invalid.",
+  "fixes": [
+   "Raise genuine difficulty by making at least one critical defect observable only through generated black-box probes or recovery-history scenarios, rather than exposing all failure locations directly in the source, while retaining clear documentation and a solvable reference path.",
+   "State the complete command schemas, response schemas, legal permutations, duplicate-begin behavior, run/connections model, replacement versus merging rules for repeated setup, and result visibility semantics directly or ensure the referenced documents are explicitly complete.",
+   "Specify checksum serialization, floating-point precision and tolerances, empty-bin representation, malformed-frame behavior, and deterministic ordering in the task contract.",
+   "Define the scale test as an aggregate frame count, provide a concrete timeout and memory budget, and align it with the stated per-run capacity requirement.",
+   "Add a verifier scenario for connection teardown and recovery-history interactions if those are intended requirements; otherwise remove those implications from the description."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-d19257a8f76d",
+     "verdict": "distinct",
+     "reason": "Although both repair stateful JSON-lines replay daemons with opaque binary formats, the candidate's core problem is scientific detector reduction and q-profile accumulation rather than burst-trace reconstruction."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This reference implements a weighted event-time percentile service, whereas the candidate reconstructs detector frames and computes physically corrected radial profiles."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference is a persistent transactional log and catalog recovery problem, while the candidate is an in-memory scientific frame replay and reduction service."
+    },
+    {
+     "ref_id": "ours/official-936e7746aeaa",
+     "verdict": "distinct",
+     "reason": "The reference concerns columnar capsule statistics and query execution, not detector decoding, beam geometry, modality correction, or radial-profile generation."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The reference is a batch transactional database-log replay utility with atomic report generation, unlike the candidate's persistent interactive detector-profile protocol."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-d19257a8f76d",
+     0.16
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.158
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.157
+    ],
+    [
+     "ours/official-936e7746aeaa",
+     0.149
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.147
+    ]
+   ],
+   "cost_usd": 0.0011376
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0038331999999999997
+}

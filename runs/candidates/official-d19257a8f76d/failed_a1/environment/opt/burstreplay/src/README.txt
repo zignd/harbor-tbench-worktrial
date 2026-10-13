@@ -1,0 +1,1 @@
+The service is deliberately distributed across a decoder boundary, a stateful protocol loop, and a report stage. The installed binaries are the supported interface; all input is local JSONL and no listener is required.

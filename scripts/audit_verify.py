@@ -81,6 +81,13 @@ def main() -> int:
         ["git", "rev-parse", "HEAD"], check=False, capture_output=True, text=True, cwd=ROOT
     )
     revision = rev.stdout.strip()
+    clone_path = EVIDENCE / "fresh-clone.json"
+    fresh_clone = json.loads(clone_path.read_text()) if clone_path.exists() else None
+    clone_ok = bool(
+        fresh_clone
+        and fresh_clone.get("all_ok")
+        and all(fresh_clone["tasks"].get(t["task"], {}).get("ok") for t in tasks)
+    )
     checks_ok = bool(tasks) and all(all(v for v in t["checks"].values()) for t in tasks)
     tests_ok = _passed("tests-final.log")
     requirements = {
@@ -140,7 +147,20 @@ def main() -> int:
         )
 
     manifest = {
-        "overall_status": "passed" if (checks_ok and tests_ok and tasks) else "failed",
+        "overall_status": "passed" if (checks_ok and tests_ok and tasks and clone_ok) else "failed",
+        "fresh_clone": {
+            "performed": fresh_clone is not None,
+            "all_ok": clone_ok,
+            "revision": (fresh_clone or {}).get("revision"),
+            "results": {
+                k: {kk: v.get(kk) for kk in ("structure_ok", "oracle_rewards", "nop_rewards", "ok")}
+                for k, v in ((fresh_clone or {}).get("tasks") or {}).items()
+            },
+            "note": (
+                "cloned from the committed revision into a temporary directory; no local host "
+                "files, embedded .git metadata or pre-existing images are required"
+            ),
+        },
         "revision": revision,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "models": MODEL_LABEL,

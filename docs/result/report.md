@@ -188,7 +188,8 @@ The final per-task verdict, package hashes and check results are in `docs/result
 ## 8. Verification and reproducibility
 
 - `bash scripts/validate.sh <task>` for structure; independent `harbor run -a oracle -k 3` and `-a nop` for functional correctness.
-- Fresh-clone builds; no reliance on local host files or cached images.
+- **Fresh-clone verification (`scripts/audit_freshclone.py`, evidence `evidence/fresh-clone.json`):** the repository was cloned at committed revision `9d0ece3` into a temporary directory and, from that clone alone, all five published packages passed `scripts/validate.sh`, **oracle 3/3** and **nop 0**. The clone has no `.env` (credentials are inherited from the process environment and are never committed), no embedded `.git` — four nested histories are committed as file contents plus `.bundle` files — and no pre-existing images.
+- `scripts/check_repo_hygiene.sh`, wired into `make lint`, fails the build on any gitlink, tracked `.env`, committed API key, tracked run output, or file over 20 MB.
 - Immutable approval: `output/<task>/calibration.json` + `verification.json` bound to a content hash of the task package; a directory is not approval (`analysis/package_evidence.py`, tests in `tests/test_package_evidence.py`).
 - Report provenance: current-package gate counts, model-pair isolation, hard-coded Opus labels removed, `approved_shipped` from immutable records (`analysis/report.py`).
 

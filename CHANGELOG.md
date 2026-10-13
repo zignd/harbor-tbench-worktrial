@@ -11,6 +11,8 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 - **Bias I am reporting, not hiding:** I spent the second batch on the one package whose pooled estimate was near the band, after measuring all five. That is selection over *which package to sample*, not over trials: no trial was discarded and no threshold moved after seeing data.
 - **The finding stands.** The pool is still bimodal — per-batch pass counts across the five packages are 0, 0, 4, 5, 5. `repair-log-replay-sql` got its own second independent batch and returned 0/5 again (0 passes in 10 valid trials). The lever that used to land tasks in band was a stated wall-clock budget, which the rubric correctly rejects; removing it moved this package 3/5 → 4/5, and only measuring it twice brought it back inside.
 - **Secondary finding:** in both too-hard packages some failures are labelled `test_overreach` (tests stricter than the instruction), so "too hard" overstates their genuine difficulty.
+- **Fresh-clone verification passed** (`scripts/audit_freshclone.py`, evidence `evidence/fresh-clone.json`): the repo was cloned at committed revision `9d0ece3` into a temp dir and, from the clone alone, all five published packages passed `scripts/validate.sh`, oracle 3/3 and nop 0. The clone has no `.env`, no embedded `.git`, no cached images. First run failed with "No environment file found at: .env" — correct behaviour for the clone, wrong requirement in my script; credentials now come from the process environment.
+- Plan 93/113; `overall_status: "passed"` gates on the fresh-clone result as well.
 - Spend $219.64 of $500; $280.36 remaining.
 
 ### 19:45 -03:00 · Final measurement: the log-replay task re-measured 0/5 twice, closing the last candidate

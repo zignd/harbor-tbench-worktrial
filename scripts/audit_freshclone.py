@@ -29,12 +29,18 @@ def _run(cmd, cwd):
 def _rewards(jobs: Path) -> list[float]:
     out = []
     for f in sorted(jobs.glob("*/result.json")):
-        out.append((json.loads(f.read_text()).get("verifier_result") or {}).get("rewards", {}).get("reward"))
+        out.append(
+            (json.loads(f.read_text()).get("verifier_result") or {})
+            .get("rewards", {})
+            .get("reward")
+        )
     return out
 
 
 def main() -> int:
-    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "docs/result/evidence/fresh-clone.json"
+    out_path = (
+        Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "docs/result/evidence/fresh-clone.json"
+    )
     revision = _run(["git", "rev-parse", "HEAD"], ROOT).stdout.strip()
     clone_parent = Path(tempfile.mkdtemp(prefix="fresh-clone-"))
     clone = clone_parent / "repo"
@@ -47,18 +53,62 @@ def main() -> int:
     results = {}
     for task in sorted(p for p in (clone / "output").iterdir() if p.is_dir()):
         name = task.name
-        entry = {"package_hash": json.loads((task / "verification.json").read_text())["package_hash"]}
+        entry = {
+            "package_hash": json.loads((task / "verification.json").read_text())["package_hash"]
+        }
         v = _run(["bash", "scripts/validate.sh", f"output/{name}"], clone)
         entry["structure_ok"] = "PASSED" in v.stdout
-        entry["structure_tail"] = v.stdout.strip().splitlines()[-1:] or v.stderr.strip().splitlines()[-1:]
-        o = _run(["uv", "run", "--env-file", ".env", "harbor", "run", "-p", f"output/{name}",
-                  "-a", "oracle", "-k", str(ORACLE_RUNS), "-n", "1", "-o", "jobs",
-                  "--job-name", f"clone-{name}-oracle", "-y", "-q"], clone)
+        entry["structure_tail"] = (
+            v.stdout.strip().splitlines()[-1:] or v.stderr.strip().splitlines()[-1:]
+        )
+        o = _run(
+            [
+                "uv",
+                "run",
+                "harbor",
+                "run",
+                "-p",
+                f"output/{name}",
+                "-a",
+                "oracle",
+                "-k",
+                str(ORACLE_RUNS),
+                "-n",
+                "1",
+                "-o",
+                "jobs",
+                "--job-name",
+                f"clone-{name}-oracle",
+                "-y",
+                "-q",
+            ],
+            clone,
+        )
         entry["oracle_rewards"] = _rewards(clone / "jobs" / f"clone-{name}-oracle")
         entry["oracle_ok"] = entry["oracle_rewards"] == [1.0] * ORACLE_RUNS
-        n = _run(["uv", "run", "--env-file", ".env", "harbor", "run", "-p", f"output/{name}",
-                  "-a", "nop", "-k", "1", "-n", "1", "-o", "jobs",
-                  "--job-name", f"clone-{name}-nop", "-y", "-q"], clone)
+        n = _run(
+            [
+                "uv",
+                "run",
+                "harbor",
+                "run",
+                "-p",
+                f"output/{name}",
+                "-a",
+                "nop",
+                "-k",
+                "1",
+                "-n",
+                "1",
+                "-o",
+                "jobs",
+                "--job-name",
+                f"clone-{name}-nop",
+                "-y",
+                "-q",
+            ],
+            clone,
+        )
         entry["nop_rewards"] = _rewards(clone / "jobs" / f"clone-{name}-nop")
         entry["nop_ok"] = entry["nop_rewards"] == [0.0]
         if o.returncode or n.returncode:
@@ -67,7 +117,9 @@ def main() -> int:
         results[name] = entry
 
     manifest = {
-        "revision": revision, "clone": str(clone), "tasks": results,
+        "revision": revision,
+        "clone": str(clone),
+        "tasks": results,
         "all_ok": bool(results) and all(t["ok"] for t in results.values()),
         "note": "clone is disposable; only committed files and Docker build caches from the clone are used",
     }

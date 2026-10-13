@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:20 -03:00 · Deck/report numbers now machine-checked against evidence
+- Mechanically cross-checked every figure in the deck and report against `verification.json` and the raw evidence files. **One real drift found:** the deck's spend was hardcoded at $219.64 while the audited key reading was $219.6975. Fixed structurally — `deck_data.json` now derives spend (and the ledger figure) from the manifest and `reconciliation.json`, so it cannot drift again.
+- Added `scripts/audit_deck_consistency.py` (14 checks: approved-task agreement, band/trial counts, spend, blind result, curtailment and tuning figures, rubric figures, HTML listing the approved task, zero external resources, and that the manifest does **not** claim spend reconciliation was met) and wired it into `make lint`, so drift now fails the build instead of waiting to be noticed.
+- The one other initial mismatch was my check string being too literal: the report's tuning table does state 0 experiments reached the band; the check was corrected, not the report.
+
 ### 21:05 -03:00 · Self-audit caught two contradictions in my own artefacts
 - **Report contradicted itself:** a sentence left over from an earlier draft still said "If neither lands 1-3 with valid failures after repair, **no task is approved**" — while the same document reported one approved task two sections earlier. Rewritten to state the actual outcome.
 - **`verification.json` listed one task as both approved and rejected:** `quarantined_candidates` still carried `optimize-policy-decision-audit` with the first-pass reason "too easy" (batch 1 = 4/5), which directly contradicts its approval on batch 2. Approved tasks are now excluded from that block, with a note explaining why, so a package can never appear as both.

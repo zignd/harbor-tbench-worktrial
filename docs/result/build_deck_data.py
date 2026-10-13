@@ -34,6 +34,7 @@ def build() -> dict:
         if (RESULT / "verification.json").exists()
         else {}
     )
+    reconciliation = _load("reconciliation.json", {})
     verdicts = historical.get("latest_candidate_verdicts", {})
     examples = stylo.get("examples", {})
     generated = stylo.get("pre_audit_generated", {})
@@ -68,7 +69,16 @@ def build() -> dict:
             "examples_code": _mean(examples, "instruction_code_spans"),
             "generated_code": _mean(generated, "instruction_code_spans"),
         },
-        "spend": {"conservative": 219.64, "remaining": 280.36, "this_run_ledger": 16.47},
+        # Derived from the manifest so the deck cannot drift from the audited key reading.
+        "spend": {
+            "conservative": verification.get("spend", {}).get("conservative_last_snapshot") or 0.0,
+            "remaining": round(
+                500.0 - (verification.get("spend", {}).get("conservative_last_snapshot") or 0.0), 2
+            ),
+            "this_run_ledger": reconciliation.get("per_scope", {})
+            .get("official|openai/gpt-5.6-luna", {})
+            .get("usd", 0.0),
+        },
         "approved_tasks": verification.get("approved_tasks", []),
         "output_packages": verification.get("output_packages", []),
         "requirements": verification.get("requirements", {}),

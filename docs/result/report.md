@@ -107,8 +107,10 @@ Stage counts for the current package hash are in `reports/summary.md`. The in-ba
 
 Two audit candidates were brought to full quality approval; approval also requires structure, oracle 3/3, nop and **five judged attempts in the 1–3 band with valid failures only**.
 
-- **`releaseforge` (repaired):** quality approved after removing the timing gate and expanding to 15 deterministic tests; structure, oracle 3/3 and nop pass. **Calibration: 0/5 — too hard** for GPT-5.4-mini, and at least one failure judged invalid (`docs/result/evidence/packager-final-calibration.json`). **Not approved** (out of band).
-- **`optimize-policy-decision-audit` (repaired):** wall-clock gate removed, keeping the correctness/equivalence refactor. Its original five trials were 3/5 with honest passes and valid quoted failures; re-approval requires a fresh quality pass, oracle/nop and a full recalibration on the changed package.
+- **`releaseforge` (repaired):** quality approved after removing the timing gate and expanding to 15 deterministic tests; structure, oracle 3/3 and nop pass. **Calibration: 0/5 — too hard** for GPT-5.4-mini, with one failure judged invalid (`evidence/packager-final-calibration.json`). **Not approved** — out of band.
+- **`optimize-policy-decision-audit` (repaired):** quality approved after removing the wall-clock gate and making verification offline; structure, oracle 3/3 and nop pass. Its original five trials were 3/5, but on the **repaired** package a fresh five-attempt calibration returned **4/5 — too easy** (`evidence/policyfinal-calibration.json`). The single valid failure is `partial_implementation`: *"Requests with no applicable policy must still …"*; all four passes audited honest, none hit the 100-turn cap. **Not approved** — out of band, and the honest reading is that deleting the performance requirement removed most of the difficulty.
+
+This is the central empirical result of the audit: **the performance lever was doing the work**, and the rubric is right that a wall-clock gate is an invalid failure mode. Fixing validity therefore cost the band, and the task cannot be re-difficultied without reintroducing an invalid failure mode or unstated requirements.
 
 The final per-task verdict, package hashes and check results are in `docs/result/verification.json`. If neither lands 1–3 with valid failures after repair, **no task is approved** and this document states that plainly rather than shipping a weak task.
 

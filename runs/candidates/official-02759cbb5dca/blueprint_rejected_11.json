@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "skiplist-index-refactor-go",
+  "title": "Skip-List Range Index Silent Corruption",
+  "scenario": "The data-platform team shipped a major refactor of a compiled Go indexing service last sprint: they replaced a B-tree with a skip-list to cut memory overhead on large datasets. The binary at /app/bin/indexd is the only artifact; the refactored source lives in /app/src across ~1,400 lines. The CI regression suite passes, but the release engineer noticed that range scans on production replay data return results that disagree with the legacy reference binary /app/bin/indexd-ref for a non-trivial fraction of queries.",
+  "instruction_draft": "The refactored skip-list indexing service at /app/bin/indexd produces incorrect results for some range-scan and ranked-retrieval queries. The legacy reference binary /app/bin/indexd-ref is known correct. Both binaries accept the same wire protocol: each line of stdin is a command (INSERT key value, RANGESCAN lo hi, RANK k), and each produces results on stdout. Your task is to repair the source under /app/src so that a freshly compiled indexd matches the reference binary on all inputs, then build the fixed binary in place at /app/bin/indexd. The fixed binary must handle: (1) RANGESCAN lo hi returning every key in [lo, hi] in ascending order with its value; (2) RANK k returning the k-th smallest key (1-indexed) with its value; (3) INSERT being idempotent for duplicate keys (last write wins). The repaired binary must agree with the reference on every query output line.",
+  "requirements": [
+   "RANGESCAN lo hi returns all keys in [lo, hi] inclusive, in ascending order, each as 'key value' on its own line, followed by a blank line",
+   "RANK k returns the k-th smallest key (1-indexed) and its value as 'key value', or 'NOT FOUND' if k exceeds the index size",
+   "INSERT key value is idempotent: duplicate inserts update the stored value",
+   "The compiled binary at /app/bin/indexd must be the fixed build (not the original)",
+   "Output of /app/bin/indexd matches /app/bin/indexd-ref line-for-line on all generated test inputs"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, builds the reference binary from a hidden pristine source into /app/bin/indexd-ref (stripped, no source kept), then builds the broken refactored source from /app/src into /app/bin/indexd",
+   "/app/src contains ~1,400 lines across: main.go (wire protocol, ~180 lines), skiplist/skiplist.go (~420 lines, skip-list core), skiplist/rank.go (~200 lines, augmented rank tree built on top of skip-list), skiplist/scan.go (~160 lines, range iterator), store/store.go (~200 lines, store layer calling skiplist), util/arena.go (~120 lines, arena allocator), plus plausible but uninvolved code in metrics/ and config/",
+   "Bug 1 (data-dependent, not visible by reading one file): rank.go maintains a parallel Fenwick tree for O(log n) RANK queries; during INSERT the Fenwick update uses the node's level (1-based) instead of 1 as the delta, so ranks accumulate incorrectly only when promoted nodes exist \u2014 harmless for small uniform datasets (the CI suite) but wrong for skewed key distributions that trigger level promotions",
+   "Bug 2 (interaction between two files, requires dynamic observation): scan.go's range iterator advances using node.next[0] (the level-0 forward pointer) but after an INSERT that promotes a node, skiplist.go rewrites next[0] to point to the new node's predecessor's next[0] value before updating it, leaving a transient stale pointer; this only manifests when a RANGESCAN follows an INSERT of a key that was promoted to level >= 2 \u2014 invisible without inserting a promoting key then immediately scanning across it",
+   "Bug 3 (build component \u2014 missing): RANK with k larger than the current index size must return 'NOT FOUND\\n' followed by a blank line (matching the reference), but rank.go returns an empty string with no newline, causing output misalignment for all subsequent query responses",
+   "The CI regression suite (in /app/testdata/suite.txt) uses only non-promoting inserts (deterministic level-1 skip-list nodes forced by a seeded PRNG) and only RANK queries for k <= 3 on small indexes, so all three bugs are invisible to it",
+   "A Makefile at /app/Makefile with target 'build' that compiles /app/src into /app/bin/indexd",
+   "/app/bin/indexd-ref is stripped, no source",
+   "Plausible but uninvolved code: metrics/prometheus.go exports skip-list depth histograms, config/config.go reads a YAML tuning file \u2014 neither affects correctness"
+  ],
+  "internal_hint": "Difficulty comes from three interacting sources none of which is visible by reading a single file: (1) the Fenwick-tree delta bug in rank.go only corrupts RANK after promoted insertions \u2014 the engineer must insert enough keys to trigger a level-2+ promotion, observe RANK disagreement, then trace the Fenwick update path across rank.go and skiplist.go to find that node.level is used instead of 1; (2) the scan stale-pointer bug requires inserting a promoting key, then scanning a range that crosses it \u2014 the engineer must observe RANGESCAN disagreement, diff against the reference, then trace the pointer rewrite order in skiplist.go vs. the iterator advance in scan.go; (3) the RANK NOT FOUND output formatting bug is a build-component issue: the engineer must black-box the reference to discover the exact format (line + blank line), then implement it correctly. None of these is findable by grepping for an obvious constant or reading a single file in isolation.",
+  "trap": "A naive fix that catches the NOT FOUND case with a bare newline passes the provided CI suite (small, non-promoting inserts, k<=3) but fails hidden tests with promoting insertions followed by RANK and RANGESCAN queries. An agent that only fixes rank.go's delta bug but misses the scan.go stale-pointer interaction will pass RANK tests but fail RANGESCAN tests on promoted keys. An agent that fixes both bugs but outputs 'NOT FOUND' without the trailing blank line will misalign all subsequent query output lines.",
+  "tests": [
+   "Test generator inserts N keys drawn from a seeded Zipfian distribution (skewed, forces level-2+ promotions with high probability for N>=200), then issues 50 RANGESCAN queries with lo/hi spanning promoted keys, comparing indexd vs indexd-ref output line-for-line",
+   "Test generator inserts keys in random order then issues RANK k for k in [1, N+5] (including out-of-bounds), verifying both the correct key/value and the 'NOT FOUND' line+blank formatting",
+   "Test generator interleaves INSERT and RANGESCAN commands so that each scan immediately follows an insert of a key that the skip-list probabilistically promotes (forced by seeded PRNG with known promotion seeds), checking output agreement",
+   "Test generator performs 1000 INSERT + duplicate INSERT pairs with random keys, then issues RANGESCAN over the full range to verify last-write-wins idempotency and correct ordering",
+   "Build verification: the binary at /app/bin/indexd must be newer than the original (mtime check) and must be a valid ELF/Mach-O executable that responds to a probe INSERT+RANGESCAN within 2 seconds"
+  ],
+  "verifier_knob": {
+   "name": "num_promoting_inserts",
+   "value": "200",
+   "effect": "Raising this increases the probability and count of level-2+ promotions, making both the Fenwick-delta bug and the stale-pointer bug trigger more frequently and across more query pairs; lowering it below ~50 makes both bugs rare enough that a partially fixed binary may pass by luck"
+  },
+  "expected_failure_modes": [
+   "Agent reads rank.go, spots a plausible-looking Fenwick update, patches it to use hardcoded 1 as delta, rebuilds, runs the CI suite (which passes), and submits without generating promoting inputs \u2014 misses the scan.go stale-pointer bug",
+   "Agent fixes both rank.go and scan.go but outputs 'NOT FOUND' without a trailing blank line, causing output misalignment that fails all subsequent-query comparisons in the test suite",
+   "Agent instruments the binary with printf debugging but only tests with small non-promoting inserts (like the CI suite), never observes the stale-pointer bug, and declares the binary fixed after only the Fenwick fix",
+   "Agent correctly identifies that the PRNG seeding controls level promotion and fixes the scan stale-pointer bug, but does so by adding a memory barrier rather than fixing the pointer rewrite order, which works for single-threaded tests but may fail under the verifier's input patterns",
+   "Agent spends most of the hour tracing the uninvolved metrics/ and config/ code looking for the bug, exhausting the time budget before finding all three issues"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "skip-list",
+   "data-structures",
+   "fuzz-equivalence",
+   "refactoring",
+   "algorithmic"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/skiplist/rank.go  # spot Fenwick delta bug: node.level instead of 1",
+   "cat /app/src/skiplist/skiplist.go  # find pointer rewrite order around level promotion",
+   "cat /app/src/skiplist/scan.go  # see iterator uses next[0], confirm stale pointer interaction",
+   "echo -e 'INSERT a 1\\nRANK 999' | /app/bin/indexd-ref  # probe NOT FOUND format",
+   "sed -i 's/node\\.level/1/' /app/src/skiplist/rank.go  # fix Fenwick delta bug",
+   "# Edit skiplist.go: reorder pointer writes so next[0] is updated before predecessor's next[0] is read by iterator",
+   "# Edit rank.go: fix NOT FOUND branch to print 'NOT FOUND\\n\\n' (line + blank line)",
+   "cd /app && make build",
+   "python3 -c \"r=__import__('random').Random(42); [print(f'INSERT {r.randint(1,1000):06d} v{i}') for i in range(200)] + [print('RANGESCAN 000000 999999')]\" | tee /tmp/t.txt | /app/bin/indexd-ref > /tmp/ref.txt",
+   "/app/bin/indexd < /tmp/t.txt > /tmp/got.txt",
+   "diff /tmp/ref.txt /tmp/got.txt  # verify clean",
+   "python3 -c \"[print(f'INSERT {i:04d} v') for i in range(50)] + [print(f'RANK {k}') for k in range(1, 60)]\" | tee /tmp/t2.txt | /app/bin/indexd-ref > /tmp/ref2.txt",
+   "/app/bin/indexd < /tmp/t2.txt > /tmp/got2.txt",
+   "diff /tmp/ref2.txt /tmp/got2.txt  # verify RANK and NOT FOUND formatting"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Bug 1 (Fenwick delta using node.level) is directly visible by reading rank.go alone \u2014 the blueprint's claim that 'none is visible by reading a single file' is false, reducing genuine difficulty significantly",
+   "The PRNG-controlled level promotion mechanism means the scan stale-pointer bug is deterministically reproducible once an agent seeds their test the same way \u2014 not truly dynamic if the agent reads skiplist.go and understands the seeded PRNG",
+   "The blank-line formatting for NOT FOUND could be ambiguous: does 'followed by a blank line' mean one \\n (ending the line) plus one \\n (blank line), i.e., 'NOT FOUND\\n\\n'? The instruction says 'line + blank line' but the exact byte sequence is inferred only from the reference binary, making this a potential source of frustration rather than a reasoning challenge",
+   "Build verification (mtime check) could be flaky if the container clock is skewed or the Makefile uses a cached artifact without updating mtime \u2014 a correct rebuild might spuriously fail the mtime check",
+   "The stale-pointer fix description ('rewrites next[0] to point to the new node's predecessor's next[0] value before updating it') is underspecified in the blueprint itself \u2014 the actual fix in skiplist.go may require understanding the exact insert algorithm, which could vary in implementation and make the fix non-obvious even after locating the bug",
+   "The 'plausible but uninvolved' metrics/ and config/ code is explicitly designed to waste time, which is a valid difficulty lever but could constitute unfair misdirection if the code is sufficiently realistic-looking to consume disproportionate time",
+   "~1400 lines of Go source must be correctly implemented and buildable \u2014 if the Dockerfile build of the broken source has compilation errors introduced accidentally, the task becomes unsolvable rather than hard"
+  ],
+  "verdict": "reject",
+  "reasons": "Bug 1 (Fenwick delta) is directly readable from rank.go alone, contradicting the blueprint's central difficulty claim and reducing the task to a ~14-command speedrun for a skilled agent. The genuine_difficulty score of 3 falls below the required threshold of 4. Additionally, the interaction between the stale-pointer bug and the seeded PRNG is deterministically reproducible once an agent reads skiplist.go, so the 'requires dynamic observation' framing overstates the difficulty. The task has strong bones \u2014 the three-bug structure, fuzz-equivalence testing, and realistic scenario are well-designed \u2014 but needs the bugs to be genuinely cross-file and non-obvious from static reading.",
+  "fixes": [
+   "Make Bug 1 genuinely cross-file: instead of a wrong constant in rank.go, split the Fenwick update logic so the delta computation happens in skiplist.go (using a method that returns node metadata) and rank.go calls it \u2014 the bug requires reading both files and understanding the interface to see that skiplist.go returns node.level when it should return 1",
+   "Replace the NOT FOUND formatting issue with a subtler output-alignment bug: e.g., RANGESCAN emits a trailing blank line but rank.go's NOT FOUND path consumes one input line too many from a buffered reader, causing all subsequent query parsing to be off-by-one \u2014 this requires dynamic observation (running the binary) rather than format-string inspection",
+   "Remove or substantially reduce the 'uninvolved' metrics/ and config/ code, or make it genuinely misleading by having it touch a shared data structure in a way that looks suspicious but is actually harmless \u2014 the current 'plausible but uninvolved' framing is a time-waster rather than a reasoning challenge",
+   "Add a constraint that the agent cannot modify the wire protocol in main.go (or add a test that checks main.go is unchanged), to prevent agents from bypassing the algorithmic bugs with a simpler reimplementation",
+   "Clarify the exact byte format for all output cases (RANGESCAN, RANK found, RANK not-found) explicitly in the instruction with escaped sequences, so formatting ambiguity is not a source of invalid failures"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task fixes a SQL query file for window functions/aggregations; this task repairs Go source code implementing a skip-list data structure for range scans and rank queries."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task builds a TCP audit service with HMAC computation and binary record serialization; this task debugs a skip-list index implementation in Go."
+    },
+    {
+     "ref_id": "terminal-bench-pro/recover-encrypted-db-credentials",
+     "verdict": "distinct",
+     "reason": "That task recovers and decrypts credentials from raw disk blocks; this task repairs a Go skip-list indexing service to fix range scan and rank query correctness."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a refactored ~1,400-line codebase that passes regression tests but produces silently wrong results on broader inputs, with a known-correct reference artifact to diff against, and require fixing the source and rebuilding the binary \u2014 the core debugging workflow is essentially identical despite different data structures (skip-list vs. AES-CTR cipher)."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task involves inheriting a pipeline and building a new HTTP query service on top of a compiled shared library; this task debugs and repairs a Go skip-list implementation to match a reference binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-31ca491030e9",
+     0.163
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.125
+    ],
+    [
+     "terminal-bench-pro/recover-encrypted-db-credentials",
+     0.12
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.114
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.095
+    ]
+   ],
+   "cost_usd": 0.015401999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.060951
+}

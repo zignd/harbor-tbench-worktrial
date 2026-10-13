@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "radix-sort-pipeline-refactor-go",
+  "title": "Radix Sort Pipeline Silent Regression",
+  "scenario": "Your team recently completed a large-scale refactor of a high-throughput log-key sorting service written in Go. The service ingests batches of 64-bit unsigned integer keys, sorts them using a compiled binary that implements an MSD radix sort with counting-sort sub-passes and in-place digit extraction, and emits sorted output to downstream consumers. The refactor touched six files (~1,400 lines total), migrating from a flat single-pass implementation to a recursive digit-dispatch architecture with a shared scratch buffer pool. The CI suite passes, but a release engineer noticed the nightly integration test\u2014which runs on production-scale key distributions\u2014returns wrong results.",
+  "instruction_draft": "The sort service at /app builds to /app/bin/sorter via the Dockerfile. Running it on the sample inputs in /app/testdata produces correct output, but the nightly integration harness reports sorted order violations on production distributions. Your job is to refactor the source in /app/src/ so that /app/bin/sorter correctly sorts any batch of uint64 keys passed via stdin (one decimal key per line) and emits them in ascending order to stdout. The binary must handle batches up to 10 million keys. The digit-dispatch recursion, scratch buffer pool, and CLI interface must not be removed; only correctness must be restored. Rebuild the binary in place after your changes.",
+  "requirements": [
+   "The binary /app/bin/sorter reads uint64 keys (one per line) from stdin and writes them sorted in ascending order (one per line) to stdout.",
+   "Correctness holds for all uint64 values including 0 and 2^64-1.",
+   "Correctness holds for batches with repeated keys.",
+   "Correctness holds for inputs where keys share identical high bytes but differ in low bytes.",
+   "Correctness holds for inputs larger than the scratch buffer pool's per-slab capacity (forces buffer reuse across recursive calls).",
+   "The digit-dispatch recursive architecture and scratch buffer pool remain present in the rebuilt binary.",
+   "The CLI interface (reads stdin, writes stdout) is unchanged."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with golang:1.22 installed via apt or official tarball.",
+   "Source tree at /app/src/ with ~1,400 lines across: main.go, sorter/dispatch.go, sorter/counting.go, sorter/pool.go, sorter/digit.go, sorter/merge.go.",
+   "Dockerfile builds /app/bin/sorter from source at image build time.",
+   "Three planted bugs that are NOT individually visible by static reading of one file and only manifest on specific input distributions:",
+   "Bug 1 (digit.go): The function extractDigit(key uint64, pass int) computes the digit as (key >> (pass * 8)) & 0xFF, but due to a refactor, the pass parameter is now 0-indexed from the MOST significant byte instead of the least. The fix requires swapping the shift direction, but it only goes wrong when the MSB and LSB have different values\u2014test data with keys < 256 all have MSB=0 so they pass.",
+   "Bug 2 (pool.go): The scratch buffer pool reuses slabs by resetting length to 0 but not zeroing the underlying array. The counting sort in counting.go accumulates into the slab without clearing it first, so reused slabs carry stale counts from a previous pass. This only manifests when the pool is exhausted and slabs are recycled\u2014i.e., on large inputs, not on the small test batches.",
+   "Bug 3 (dispatch.go): After a recursive sub-call returns, the dispatcher copies results back from scratch into the input slice using a subtly wrong index range: it uses `copy(keys[lo:hi], scratch[0:])` instead of `copy(keys[lo:hi], scratch[0:hi-lo])`, which silently truncates on the final digit pass when scratch is longer than the partition\u2014this only corrupts output when a partition boundary falls mid-slab.",
+   "Sample testdata in /app/testdata/: small.txt (100 keys, all < 256), medium.txt (10,000 keys, random 16-bit), sorted.txt (pre-sorted 1000 keys). All three pass with the buggy binary.",
+   "A reference Python script /app/reference/sort_check.py that generates random uint64 batches and verifies sorted order\u2014used by tests at verify time.",
+   "The /app/Makefile has a `make build` target that recompiles /app/bin/sorter."
+  ],
+  "internal_hint": "The difficulty comes from three interacting bugs that are each individually invisible at their source location without understanding the full data-flow across the recursive call chain. Bug 1 (digit endianness inversion) only manifests when keys have non-zero high bytes\u2014the test suite uses small keys. Bug 2 (stale slab counts) only manifests when the pool recycles slabs under large input. Bug 3 (copy range off-by-partition) only manifests at partition boundaries that happen not to align with slab size. A naive agent fixes Bug 1 after observing that small keys sort correctly but large random keys don't, and then concludes they are done\u2014but the hidden tests exercise large inputs that trigger Bug 2 and non-aligned partitions that trigger Bug 3. The agent must instrument the code, generate large adversarial inputs (>pool capacity, keys with high bytes set, uneven partition sizes), observe residual failures, and trace each failure to its source. The investigation path requires running the binary on custom-generated inputs, not reading source cold.",
+  "trap": "The shallow trap is: after fixing Bug 1 (digit endianness), the binary correctly sorts all three provided sample files and also passes a naive random test with small keys. An agent that stops here will fail hidden tests that use large batches (>pool capacity triggering Bug 2) and keys with adversarial high-byte patterns combined with non-aligned partition boundaries (triggering Bug 3). The two residual bugs only co-manifest under inputs the agent must actively construct through experimentation.",
+  "tests": [
+   "Generate 50 batches of 10,000 random uint64 keys each (seeded), pipe through /app/bin/sorter, compare output to Python's sorted() \u2014 all must match.",
+   "Generate 5 batches of 2,000,000 keys each (forces pool exhaustion and slab recycling), verify sorted order.",
+   "Generate 10 batches where all keys share identical top 6 bytes but vary in bottom 2 bytes (stresses digit extraction correctness for low passes).",
+   "Generate 10 batches where all keys share identical bottom 6 bytes but vary in top 2 bytes (stresses high-byte extraction).",
+   "Generate batches with exactly 2^k keys for k in [12,14,16,18,20] to hit varied partition boundary alignments.",
+   "Generate a batch containing 0, 1, 2^32-1, 2^63, 2^64-1, and 10M copies of a single repeated key.",
+   "Verify /app/bin/sorter is a compiled ELF binary (not a script) and that dispatch.go and pool.go are present in /app/src/sorter/.",
+   "Verify the binary handles empty input (zero keys) without crashing."
+  ],
+  "verifier_knob": {
+   "name": "batch_count_and_size",
+   "value": "50 batches \u00d7 10,000 keys for small tests; 5 batches \u00d7 2,000,000 for pool-exhaustion tests",
+   "effect": "Raising batch sizes increases the probability of hitting Bug 2 (pool recycling) and Bug 3 (partition boundary misalignment); lowering them to <50,000 keys makes both bugs effectively invisible and the task degenerates to Bug 1 only."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only Bug 1 (digit endianness), verifies on provided samples plus a small random test, submits \u2014 fails hidden large-batch tests due to Bugs 2 and 3.",
+   "Agent fixes Bugs 1 and 2 but misses Bug 3 because the copy range error only manifests on specific partition sizes the agent didn't generate.",
+   "Agent rewrites the sort from scratch (e.g., using sort.Slice), removing the digit-dispatch recursion \u2014 fails the structural requirement test.",
+   "Agent generates large inputs but only checks that output is non-decreasing on a prefix, missing corrupted tails from Bug 3.",
+   "Agent mistakes the pool bug for a concurrency issue and adds mutexes without fixing the missing zero-fill, so Bug 2 persists under sequential large input."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithms",
+   "radix-sort",
+   "refactoring",
+   "fuzz-equivalence",
+   "compiled-binary"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/sorter/digit.go \u2192 spot Bug 1: shift uses pass (LSB-0-indexed) but now MSB-0-indexed",
+   "cat /app/src/sorter/dispatch.go \u2192 spot Bug 3: copy(keys[lo:hi], scratch[0:]) missing hi-lo bound",
+   "cat /app/src/sorter/pool.go + sorter/counting.go \u2192 spot Bug 2: slab not zeroed before counting accumulation",
+   "cat /app/src/main.go \u2192 confirm CLI interface",
+   "Fix digit.go: change (key >> (pass * 8)) to (key >> ((7 - pass) * 8))",
+   "Fix dispatch.go: change scratch[0:] to scratch[0:hi-lo] in copy call",
+   "Fix pool.go or counting.go: zero slab contents before reuse",
+   "make build",
+   "echo -e '255\\n1\\n0\\n18446744073709551615' | /app/bin/sorter  # quick sanity",
+   "python3 -c \"import random; keys=[random.randint(0,2**64-1) for _ in range(10000)]; open('/tmp/t.txt','w').write('\\n'.join(map(str,keys)))\"",
+   "/app/bin/sorter < /tmp/t.txt > /tmp/out.txt",
+   "python3 -c \"keys=sorted(int(l) for l in open('/tmp/t.txt')); out=[int(l) for l in open('/tmp/out.txt')]; print('OK' if keys==out else 'FAIL')\"",
+   "python3 -c \"import random; keys=[random.randint(0,2**64-1) for _ in range(2000000)]; open('/tmp/huge.txt','w').write('\\n'.join(map(str,keys)))\"",
+   "/app/bin/sorter < /tmp/huge.txt > /tmp/huge_out.txt",
+   "python3 -c \"keys=sorted(int(l) for l in open('/tmp/huge.txt')); out=[int(l) for l in open('/tmp/huge_out.txt')]; print('OK' if keys==out else 'FAIL')\"",
+   "for f in /app/testdata/*.txt; do /app/bin/sorter < $f | diff - <(sort -n $f) && echo OK; done"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Bug 3 copy range error (scratch[0:] vs scratch[0:hi-lo]) is immediately visible on a careful cold read of dispatch.go \u2014 a strong agent finds all 3 bugs statically in ~4 file reads, collapsing the intended adversarial-input-generation path to a simple cold-read-and-fix path of ~16 commands",
+   "Bug 1 description is inconsistent: if pass is 0-indexed from MSB, then pass=0 means byte 7 (MSB), and the fix (7-pass)*8 is straightforward \u2014 but the blueprint says it's 'not individually visible by static reading of one file,' which is false since digit.go alone reveals the wrong formula once you know the convention changed",
+   "The pool zeroing fix (Bug 2) could be implemented in either pool.go or counting.go \u2014 if the agent chooses counting.go, the structural check 'pool.go is present' still passes, so this is fine, but the test checking for 'scratch buffer pool' architecture might be fragile if counting.go is rewritten",
+   "2M-key input generation and sorting in Python for verification is slow (30-60+ seconds for sort()) \u2014 could cause timeout issues in a time-limited container, making the large-batch test flaky on slow hardware",
+   "The Dockerfile base (python:3.13-slim-bookworm + golang:1.22 via apt) may have dependency resolution issues or require internet access during image build if Go is not pre-cached; the blueprint should pin the Go tarball URL or use a multi-stage FROM golang image",
+   "The structural test checking for 'digit-dispatch recursive architecture' is vague \u2014 an agent who rewrites dispatch.go but keeps function names would pass, but an agent who legitimately refactors the recursion into an iterative loop might be incorrectly penalized",
+   "sort -n in bash sorts lexicographically for very large numbers; reference verification should use Python or explicit numeric sort to avoid false failures"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score is 3 because all three bugs are statically visible to a careful cold reader across 4 file reads \u2014 particularly Bug 3 (wrong slice bounds in a copy call) which is an obvious off-by-one the moment you read dispatch.go, and Bug 1 which is self-evident once digit.go is read with knowledge that the convention changed. The intended adversarial-input-generation path (the difficulty lever) is bypassed by static analysis in ~16 commands, falling below the genuine_difficulty \u2265 4 threshold. Additionally, there are invalid failure risks around Python verification timeouts on 2M-key batches and the Dockerfile requiring internet access at build time.",
+  "fixes": [
+   "Obfuscate Bug 3 by embedding the wrong index calculation inside a helper function shared with other code paths, so it cannot be spotted by reading dispatch.go alone \u2014 e.g., make the copy use a helper copyPartition(dst, src, count) that has an off-by-one only when count is not a multiple of the slab size",
+   "Make Bug 1 context-dependent: instead of a trivially invertible formula, use a lookup table built at init time that is populated with a subtly wrong endianness \u2014 forcing the agent to instrument and observe rather than read and infer",
+   "Replace Python-based large-batch verification with a compiled Go reference binary or pre-computed checksums to avoid timeout risk on 2M-key inputs, and pin the Go installation to a pre-downloaded tarball in the Docker image to eliminate internet dependency",
+   "Add a fourth bug that only manifests when bugs 1+2 are fixed (e.g., a merge.go boundary error in the merge phase triggered by non-power-of-two partitions) to ensure the agent must run adversarial inputs rather than just cold-read all files"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/recover-encrypted-db-credentials",
+     "verdict": "distinct",
+     "reason": "That task is about filesystem forensics and XOR decryption of credentials; the candidate is about debugging a silent correctness regression in a Go MSD radix sort implementation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-engineer-kvstore-binary-protocol",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a binary network protocol and writing a client; the candidate is about fixing a sorting algorithm bug in Go source code."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "variant",
+     "reason": "Both tasks share the same core scenario structure\u2014a refactored codebase that passes CI sample tests but silently produces wrong results on production-scale data, requiring the agent to identify and fix the regression\u2014differing only in domain (SQL window functions vs. Go radix sort)."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks use the same 'large-scale refactor of ~1400 lines across six files passes regression tests but silently fails on data outside the test corpus' scenario, differing only in domain (AES-CTR encryption vs. radix sort)."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing correct HMAC-SHA256 over a binary WAL record format with TCP networking; the candidate is about fixing a recursive MSD radix sort correctness regression."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/recover-encrypted-db-credentials",
+     0.163
+    ],
+    [
+     "terminal-bench-pro/reverse-engineer-kvstore-binary-protocol",
+     0.116
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.114
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.109
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.103
+    ]
+   ],
+   "cost_usd": 0.015495
+  },
+  "novel": false
+ },
+ "cost_usd": 0.068586
+}

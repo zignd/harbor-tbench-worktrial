@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "Broken K-Way Merge in Release Build",
+  "scenario": "The release pipeline for a log-aggregation service ships a compiled Go binary that performs external k-way merge-sort on large sharded log files. The binary, built inside the Dockerfile, was refactored three weeks ago to support a new variable-length record format, but a silent regression crept in: outputs are correct on the sample fixtures used in CI but silently wrong on inputs that exercise boundary cases the samples never reach. The build is now blocked because the integration test harness\u2014seeded with deterministic but varied inputs\u2014rejects the binary's output on a growing fraction of cases.",
+  "instruction_draft": "You are the release engineer. The service is in /app. A pre-compiled binary /app/bin/mergesort reads a binary-framed log file from stdin and writes merged-sorted records to stdout; its format is documented in /app/docs/format.md. The Go source under /app/cmd/ and /app/internal/ was recently refactored: the binary is the only artifact used at verify time. Your job is to make the binary produce output that is byte-for-byte equivalent to the reference implementation embedded in the test suite for all valid inputs\u2014including inputs with records that span page boundaries, runs of equal keys, empty shards, and record payloads up to the documented maximum length. Build the corrected binary in place at /app/bin/mergesort. The test suite invokes /app/bin/mergesort directly and compares its output against its own reference computation; you must not modify the test suite.",
+  "requirements": [
+   "The binary /app/bin/mergesort must exist and be executable.",
+   "For any valid binary-framed input, the binary's stdout must be byte-for-byte identical to the reference merge-sort order defined in /app/docs/format.md.",
+   "Records with equal sort keys must appear in stable order: by shard index (ascending), then by original position within the shard.",
+   "Records whose payload length equals the documented maximum (65535 bytes) must be handled without truncation or corruption.",
+   "Empty shards (zero records) interspersed among non-empty shards must not cause the binary to crash or produce spurious output.",
+   "Records that straddle an internal 4096-byte page boundary in the framing layer must be reassembled correctly.",
+   "The binary must exit with code 0 on success and non-zero on malformed input."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22 via apt/tar, builds /app/bin/mergesort from source during docker build, and installs pytest + a pure-Python test harness at /app/tests/.",
+   "/app/docs/format.md documents the binary frame format: 4-byte magic, 2-byte shard-count, then per-shard sections each with a 4-byte record-count header; each record is [8-byte key][2-byte payload-length][payload-bytes], little-endian.",
+   "/app/cmd/main.go: entry point, reads shards, calls internal/merger.Merge, writes output.",
+   "/app/internal/merger/merger.go: ~350 lines, implements k-way heap merge; contains a subtle bug introduced in the refactor: when reading records it uses a fixed 4096-byte staging buffer and re-slices it, causing the payload slice to alias the buffer and be overwritten on the next read\u2014corrupting records whose payload extends across a buffer refill.",
+   "/app/internal/framer/framer.go: ~200 lines, page-aligned reader; has a second bug: the page-boundary detection uses `offset % 4096 == 0` but initializes offset to 4 (after the magic), so the first boundary is detected at offset 4092 instead of 4096, misaligning all subsequent boundary checks by 4 bytes\u2014only manifests when a record straddles the first page boundary.",
+   "/app/internal/framer/framer.go also has a correct (unused) alternative implementation left as a commented-out block that the solver can study.",
+   "/app/internal/stable/stable.go: ~150 lines, correct stable-sort tie-breaking helpers, not buggy.",
+   "/app/tests/test_mergesort.py: pytest file; at verify time generates 200 fresh inputs using a seeded PRNG (seed passed as env var TBENCH_SEED by the verifier) covering: normal cases, equal-key runs, max-payload records, empty shards, and records crossing page boundaries; for each it computes the correct answer in Python and diffs against the binary's output.",
+   "/app/tests/fixtures/: three small hand-crafted sample files with corresponding .expected outputs, used for quick smoke tests that the naive fix passes.",
+   "/app/internal/merger/merger.go also contains a third latent issue: the heap comparison for equal keys falls back to shard index correctly, but shard index is recorded as the heap-push order (which matches shard order only because shards are pushed in order)\u2014this is actually correct and is a deliberate red herring to make the solver doubt the stable-sort logic.",
+   "The Dockerfile build command: RUN cd /app && go build -o bin/mergesort ./cmd/",
+   "Total source: ~900 lines across 6 Go files plus docs, fixtures, and test harness."
+  ],
+  "internal_hint": "Difficulty comes from two interacting data-dependent bugs that are invisible without running the code on boundary inputs. Bug 1 (merger.go, alias corruption): the 4096-byte staging buffer is reused without copying payload bytes out before the next Read call; records with payloads that force a second Read overwrite the first record's payload slice in the heap. This only manifests when a shard has records whose cumulative payload crosses a 4096-byte read boundary, which the three sample fixtures never do (all payloads are short). Bug 2 (framer.go, off-by-4 boundary): initializing offset=4 causes the page-boundary sentinel to fire at byte 4092 instead of 4096, corrupting the length field of any record that straddles the first page boundary. Together these corrupt output silently\u2014the heap produces values, just wrong ones. A skilled engineer must: (1) run the binary on the sample fixtures (pass), (2) construct a test input with large payloads to observe corruption, (3) instrument merger.go to trace buffer aliasing, (4) fix by copying payload bytes into a fresh slice, (5) run a page-boundary test to find the framer bug, (6) fix the offset initialization to 0 and adjust the magic-bytes skip logic. Both fixes are 1-3 line changes but finding them requires observation and experimentation.",
+  "trap": "A naive fix that copies the payload slice in the heap's Push method but leaves framer.go's offset=4 initialization will pass all three sample fixtures and even most generated inputs\u2014until the test generates a record that happens to straddle the first page boundary (4096 bytes from the start of the stream). That case is guaranteed to appear in the 200 generated inputs at verify time because the generator specifically includes a boundary-crossing test. Conversely, fixing only framer.go leaves the alias bug active for inputs with payloads totaling >4096 bytes per shard, which also appear in the generated suite.",
+  "tests": [
+   "Smoke test: run binary on each of the three sample fixtures in /app/tests/fixtures/ and compare stdout byte-for-byte against the .expected file.",
+   "Generated normal cases (seeded): 50 inputs with 2-8 shards, 10-500 records each, random 8-byte keys, payloads 1-200 bytes; compare binary output against Python reference sort.",
+   "Equal-key stability (seeded): 30 inputs where multiple records share the same 8-byte key across different shards; verify stable ordering by shard index then position.",
+   "Max-payload stress (seeded): 20 inputs containing records with payload length exactly 65535 bytes; verify no truncation and correct sort order.",
+   "Empty-shard cases (seeded): 20 inputs where 1-3 of the shards have zero records; verify binary doesn't crash and output equals reference.",
+   "Page-boundary cases (seeded): 40 inputs specifically constructed so that at least one record's payload bytes straddle an internal 4096-byte page boundary; verify byte-for-byte match against Python reference.",
+   "Large-shard buffer-alias cases (seeded): 40 inputs where cumulative payload within a single shard exceeds 4096 bytes, forcing multiple buffer refills; verify no payload corruption.",
+   "Exit code test: send a syntactically malformed frame (bad magic bytes) and verify the binary exits non-zero."
+  ],
+  "verifier_knob": {
+   "name": "num_generated_inputs",
+   "value": "200",
+   "effect": "Lowering to 20 reduces coverage of the page-boundary and alias cases, making it possible to pass with only one bug fixed. Raising to 500 increases the probability that both bug classes are hit even with unusual shard sizes."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the buffer-alias bug in merger.go (the more obvious one after reading the code) and passes the sample fixtures, but fails page-boundary generated cases due to the unpatched framer.go offset bug.",
+   "Agent fixes only the framer.go offset bug and misses the alias corruption, passing short-payload generated inputs but failing large-payload shard cases.",
+   "Agent rewrites merger.go's heap logic entirely but introduces a new stable-sort bug (e.g., wrong tie-break direction), failing equal-key stability tests.",
+   "Agent rebuilds the binary but forgets to run `go build` after patching, leaving the old corrupt binary in place.",
+   "Agent is misled by the red-herring shard-index heap comparison and spends time verifying stable.go instead of instrumenting the actual data path."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithmic",
+   "refactoring",
+   "binary-format",
+   "fuzz-equivalence",
+   "buffer-aliasing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/format.md",
+   "cat /app/internal/framer/framer.go  # spot offset=4 initialization bug",
+   "cat /app/internal/merger/merger.go  # spot buffer-alias bug on payload re-slice",
+   "cat /app/internal/stable/stable.go  # confirm not buggy",
+   "cat /app/cmd/main.go",
+   "/app/bin/mergesort < /app/tests/fixtures/sample1.bin | diff - /app/tests/fixtures/sample1.expected  # confirms samples pass with buggy binary",
+   "sed or direct edit merger.go: copy payload bytes before storing in heap (one-liner append([]byte(nil), payload...))",
+   "sed or direct edit framer.go: change offset initialization from 4 to 0, adjust magic-skip to advance offset by 4 after reading magic",
+   "cd /app && go build -o bin/mergesort ./cmd/",
+   "/app/bin/mergesort < /app/tests/fixtures/sample1.bin | diff - /app/tests/fixtures/sample1.expected",
+   "/app/bin/mergesort < /app/tests/fixtures/sample2.bin | diff - /app/tests/fixtures/sample2.expected",
+   "cd /app && python -m pytest tests/ -v"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The framer.go fix is underspecified: changing offset=4 to offset=0 requires compensating logic to skip the 4-byte magic bytes in offset tracking; if the commented-out alternative implementation doesn't cleanly demonstrate the fix, an agent may introduce a new off-by-N error, creating an invalid failure (correct intent, wrong execution due to underspecified fix path).",
+   "The Python reference implementation in the test harness must exactly match the documented format spec\u2014any discrepancy between format.md and the Python sorter's parsing creates an ambiguous ground truth, causing valid fixes to fail.",
+   "The seeded PRNG for generated inputs is described as deterministic but 'seed passed as env var TBENCH_SEED by the verifier'\u2014if the seed mechanism or Python PRNG behavior differs across Python patch versions in the container, page-boundary cases may not reliably appear, making verify-time behavior non-deterministic.",
+   "Both bugs are directly readable in source without running code; the difficulty model assumes agents must observe runtime behavior to find them, but a careful static read of framer.go (offset=4) and merger.go (buffer re-slice without copy) reveals both immediately, making the task easier than intended."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because both bugs are directly visible by static reading of the source files (offset=4 in framer.go is obviously wrong given the format, and buffer aliasing in merger.go is a well-known Go pitfall identifiable on first read), making a 12-command speedrun realistic and falling well below the threshold for frontier-agent failure. The task's difficulty model depends on bugs being invisible without runtime observation, but the source code is transparent enough that a careful read in 2-3 steps exposes both issues. The average score (~3.8) would nominally pass but genuine_difficulty at 2 fails the explicit threshold of 4.",
+  "fixes": [
+   "Obfuscate the bugs by making them non-obvious in source: instead of a bare `offset := 4`, hide the framing logic behind an abstraction layer or spread it across multiple functions so no single read reveals the bug; similarly, make the buffer aliasing occur through an interface or indirect call rather than a direct re-slice.",
+   "Add a third genuine bug (not a red herring) in the heap eviction logic that only manifests under specific multi-shard patterns\u2014require the agent to find all three bugs through runtime observation rather than source inspection, raising the minimum command count above 20.",
+   "Remove or heavily redact the commented-out correct alternative implementation in framer.go, as it currently serves as a direct hint to the fix; replace it with a misleading alternative that looks correct but has a different bug."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 computation over a network protocol with a TCP server, while the candidate is about fixing a k-way merge-sort binary for correctness on boundary cases."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing AES-CTR encryption/decryption correctness in a C library, while the candidate is about fixing a Go k-way external merge-sort binary."
+    },
+    {
+     "ref_id": "terminal-bench-pro/compare-cmake-build-types-performance",
+     "verdict": "distinct",
+     "reason": "That task is a benchmarking exercise across CMake build types, while the candidate is about debugging a silent regression in a merge-sort binary's correctness on boundary inputs."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task involves schema validation and performance of a Node.js NDJSON ingestion pipeline, while the candidate is about fixing a Go binary's merge-sort logic for binary-framed records."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task requires fixing SQL window function queries in a .sql file, while the candidate requires fixing a compiled Go binary performing external k-way merge-sort on binary-framed log files."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.243
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.204
+    ],
+    [
+     "terminal-bench-pro/compare-cmake-build-types-performance",
+     0.162
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.148
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.136
+    ]
+   ],
+   "cost_usd": 0.014775
+  },
+  "novel": true
+ },
+ "cost_usd": 0.050232
+}

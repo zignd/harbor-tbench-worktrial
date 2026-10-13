@@ -6,7 +6,7 @@ UV_RUN := uv run --quiet --env-file .env
 
 TB_REFERENCE_DIR := data/tb-reference
 
-.PHONY: help usage usage-json tb-reference test lint dry-run batch status
+.PHONY: help usage usage-json tb-reference test lint dry-run batch status watch
 
 help: ## List available targets
 	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-12s %s\n", $$1, $$2}'
@@ -39,6 +39,9 @@ BUDGET ?= 20
 
 status: ## One-screen view of background work: processes, containers, authoring turns, ledger, spend
 	@uv run --quiet python -m scripts.status
+
+watch: ## Live status, refreshed every 30 s (Ctrl-C to stop); EVERY=10 to change
+	@uv run --quiet python -m scripts.status --watch $(or $(EVERY),30)
 
 plan: ## Show docs/plan.md checklist progress per phase (ARGS=--remaining lists open items)
 	@bash scripts/track-plan.sh $(ARGS)

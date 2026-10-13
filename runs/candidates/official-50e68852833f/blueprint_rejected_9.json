@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "wav-block-align-recovery",
+  "title": "WAV Container Repair Pipeline",
+  "scenario": "You maintain a tiny in-house audio-processing codebase (~1,200 lines) that ingests WAV files from field sensors, normalizes them, and writes derived analysis files. A colleague pushed a refactor of the WAV reader/writer three months ago and production started silently producing malformed output files. Nobody noticed because the player software compensates for header errors, but downstream batch tools are now rejecting files. The codebase includes a small C extension (compiled, no source) that handles sample-rate conversion, a Python orchestrator, and a WAV header library written from scratch.",
+  "instruction_draft": "Hey, our audio pipeline in /app is producing WAV files that get rejected by strict readers. I've dropped a batch of 'golden' WAV files in /app/reference/ that were recorded before the refactor \u2014 they all pass the external validator. The pipeline reads them, processes them, and writes output to /app/out/. Right now every output file fails validation. The pipeline must produce output WAV files where: (1) the RIFF chunk size equals the total file size minus 8; (2) the fmt chunk's BlockAlign field equals NumChannels * BitsPerSample/8; (3) the data chunk size exactly matches the number of sample bytes that follow; (4) all multi-byte integers in the header are little-endian; (5) the audio samples themselves are bit-for-bit identical to what the sample-rate converter returns. Fix the pipeline so all those hold for any valid mono or stereo, 8-bit or 16-bit, PCM WAV the pipeline might receive.",
+  "requirements": [
+   "RIFF chunk size == total file size - 8",
+   "fmt BlockAlign == NumChannels * BitsPerSample/8",
+   "data chunk size == actual number of sample bytes written after the data header",
+   "all header integers are written little-endian",
+   "audio samples are bit-for-bit identical to the sample-rate converter output"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm with gcc, python3-dev, numpy, scipy pinned",
+   "/app/pipeline/ \u2014 ~1,200-line Python orchestrator: main.py, wav_io.py, normalizer.py, batch.py, config.py (plausible non-involved code in normalizer.py and batch.py)",
+   "/app/pipeline/wav_io.py \u2014 the refactored WAV header library with four silent bugs (see internal_hint); bugs are data-dependent and only manifest on specific channel/bit-depth combinations or specific file sizes; no bug is visible as an obviously wrong constant by eye",
+   "/app/pipeline/srconv.cpython-313-x86_64-linux-gnu.so \u2014 compiled C extension (no source) for sample-rate conversion; takes ndarray, returns ndarray; opaque",
+   "/app/reference/ \u2014 8 golden WAV files: mono-8bit, stereo-8bit, mono-16bit, stereo-16bit at two sample rates each, all produced by a correct implementation and validated",
+   "/app/out/ \u2014 empty; pipeline writes here",
+   "/app/run_pipeline.sh \u2014 runs the pipeline on all reference files",
+   "/app/validate.py \u2014 strict WAV validator that checks all five requirements and prints PASS/FAIL per file",
+   "Bug 1 in wav_io.py: BlockAlign written as NumChannels + BitsPerSample//8 (addition instead of multiplication) \u2014 wrong only when NumChannels > 1 or BitsPerSample != 8, so 8-bit mono passes visually but stereo fails; the bug looks like a plausible shorthand",
+   "Bug 2 in wav_io.py: RIFF chunk size computed before the data chunk is written, using an estimated byte count that is off by 4 (missing the 'data' tag length in the calculation) \u2014 only observable by running the pipeline and checking the header",
+   "Bug 3 in wav_io.py: data chunk size field written as the number of *samples* rather than number of *bytes* (missing * bytes_per_sample factor) \u2014 for 8-bit files samples==bytes so the bug is invisible on 8-bit inputs; only manifests on 16-bit files",
+   "Bug 4 in wav_io.py: a single struct.pack format string uses '>H' (big-endian) for BitsPerSample instead of '<H' \u2014 appears in a block that packs all fmt subfields together, so the surrounding fields are correct little-endian; easy to miss unless you run and inspect",
+   "All four bugs are in wav_io.py but are subtle code-logic errors that require running the pipeline to confirm (wrong arithmetic, wrong sign, wrong endian in one field out of six in a struct.pack call)",
+   "Hidden corpus at verify time: 40 WAV files covering mono/stereo \u00d7 8-bit/16-bit \u00d7 three sample rates \u00d7 various sizes including 0-sample edge case and odd-byte-count handling"
+  ],
+  "internal_hint": "Difficulty comes from 'observe_not_read': Bugs 1, 2, and 3 look locally plausible in source \u2014 '+' vs '*' in an arithmetic expression is hard to flag without context, the RIFF size calculation references a variable set several lines earlier, and the data-chunk byte-count omission is only wrong for 16-bit. Bug 4 is a single character ('>' vs '<') buried in a long struct.pack call. A code-reading agent might spot one but will miss interactions. The correct investigation path: run the pipeline, run validate.py, observe which files fail and which pass, correlate failures with file attributes (stereo? 16-bit?), binary-inspect a failing output header with Python struct.unpack to measure the discrepancy, then trace back to wav_io.py. The compiled srconv.so is a red herring that costs time; the solver must confirm sample data is correct before focusing on the header.",
+  "trap": "A naive agent reads wav_io.py, spots the '+' vs '*' in BlockAlign, fixes that one bug, runs a mono-8bit test (which passes because 1*8//8=1 and 1+1=2 both evaluate to 1 for mono-8bit giving same result accidentally), and declares done. The hidden corpus includes stereo-16bit files where Bug 3 (data chunk byte count) causes rejection, and a file where Bug 4's big-endian BitsPerSample makes strict readers refuse. Any partial fix fails at least 15 of the 40 hidden corpus files.",
+  "tests": [
+   "Run pipeline on hidden corpus of 40 WAV files; validate.py must report PASS for all 40",
+   "Spot-check: stereo 16-bit file \u2014 BlockAlign must equal 4, data chunk size must equal 2 * num_samples",
+   "Spot-check: mono 8-bit 0-sample edge case \u2014 data chunk size must be 0, RIFF chunk size must be 36",
+   "Spot-check: parse BitsPerSample from fmt chunk with struct.unpack('<H',...) and verify it round-trips correctly (catches big-endian bug)",
+   "Verify audio samples: re-read output file samples and compare to srconv.so output called directly on input \u2014 must be bitwise equal",
+   "Verify RIFF chunk size: os.path.getsize(out) - 8 must equal the value at bytes 4-7 of each output file",
+   "At verify time: generate fresh WAV files with random durations (prime-numbered sample counts to stress byte-count arithmetic) and run full pipeline + validate cycle"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "40 files at medium difficulty",
+   "effect": "Increase to 80+ files with more exotic combinations (24-bit placeholder, very short files of 1-3 samples, large files >4MB) to raise difficulty; decrease to 12 files covering only the four main combinations to lower it"
+  },
+  "expected_failure_modes": [
+   "Agent reads wav_io.py, fixes only BlockAlign bug, tests on mono-8bit reference (accidentally passes due to coincidental equivalence), submits \u2014 fails 16-bit corpus files",
+   "Agent fixes BlockAlign and data-chunk bugs but misses the single big-endian field because it reads correctly in the common case and the agent doesn't binary-inspect the output",
+   "Agent spends most of the time reverse-engineering srconv.so (a red herring) instead of focusing on header bugs",
+   "Agent fixes all four bugs in wav_io.py but introduces a new off-by-one in RIFF size calculation when rewriting the size arithmetic",
+   "Agent validates only against the 8 reference files (which may pass after partial fix) and doesn't test edge cases like 0-sample files or very large files"
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "wav",
+   "binary-format",
+   "observe-not-read",
+   "edge-cases",
+   "audio",
+   "recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/wav_io.py",
+   "grep -n 'BlockAlign\\|struct.pack\\|chunk_size\\|data\\|RIFF' /app/pipeline/wav_io.py",
+   "bash /app/run_pipeline.sh",
+   "python /app/validate.py /app/out/*.wav",
+   "python3 -c \"import struct; d=open('/app/out/stereo_16bit_out.wav','rb').read(); print(struct.unpack_from('<4sI4s4sIHHIIHH',d,0))\"",
+   "# Spot Bug 1: BlockAlign uses + instead of * in wav_io.py line ~N",
+   "# Spot Bug 2: RIFF size missing 4 bytes for 'data' tag",
+   "# Spot Bug 3: data chunk size uses num_samples instead of num_samples * bytes_per_sample",
+   "# Spot Bug 4: '>H' for BitsPerSample instead of '<H' in struct.pack",
+   "sed -i 's/NumChannels + BitsPerSample\\/\\/8/NumChannels * BitsPerSample\\/\\/8/' /app/pipeline/wav_io.py",
+   "# Fix RIFF size off-by-4 in wav_io.py",
+   "# Fix data chunk size to multiply by bytes_per_sample",
+   "# Fix '>H' to '<H' in struct.pack fmt block",
+   "bash /app/run_pipeline.sh",
+   "python /app/validate.py /app/out/*.wav",
+   "python3 -c \"import struct; [print(f.name, struct.unpack_from('<I',open(f,'rb').read(),4)[0], __import__('os').path.getsize(f)-8) for f in __import__('glob').glob('/app/out/*.wav')]\"",
+   "# Confirm all 8 reference outputs PASS"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The srconv.so is architecture-specific (x86_64-linux-gnu) \u2014 if the container runs on ARM (Apple Silicon, AWS Graviton), the .so will fail to load and the pipeline cannot run at all, making the task unsolvable in the described environment.",
+   "Bug 4 ('>H' vs '<H') is described as being 'buried in a long struct.pack call' but if the struct.pack call packs all fmt fields in one line, a careful agent trivially spots it by scanning for '>' in a file that should be all little-endian \u2014 it is not genuinely hidden.",
+   "The 0-sample edge case behavior depends on whether the pipeline is designed to handle it; if the Python orchestrator or srconv.so raises an exception on 0-sample input, the edge case is a solvability/environment bug rather than a test the agent can pass by fixing wav_io.py.",
+   "Odd-byte-count WAV files (e.g., mono 8-bit with odd sample count) require a padding byte per the WAV spec; if the task tests for this but the instruction does not mention padding, a correct fix to the four stated bugs could still fail the hidden corpus \u2014 this is ambiguity/test overreach.",
+   "The 'bit-for-bit identical samples' requirement depends on srconv.so being deterministic across runs; if it uses floating-point with non-deterministic rounding or has state, this check could be flaky.",
+   "Platform mismatch: the .so filename contains 'x86_64' but many CI/verify environments now use ARM64; the task would be unrunnable without architecture detection and recompilation from unavailable source."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all four bugs are directly visible by reading wav_io.py \u2014 the 'observe_not_read' label is contradicted by the task's own design, and a skilled agent will find all four bugs in a single careful read of the source file (~17 commands total). Additionally, the compiled .so tied to x86_64 Linux creates a serious portability/solvability risk that could make the task unsolvable on ARM-based verify infrastructure, and the hidden corpus tests for WAV padding bytes (odd sample counts) which are never mentioned in the instructions, constituting test overreach.",
+  "fixes": [
+   "To achieve genuine observe_not_read difficulty, remove the source code for wav_io.py entirely and provide only the compiled .pyc or a shared library, forcing the agent to diagnose bugs purely by running the pipeline and binary-inspecting outputs \u2014 this makes the investigation path genuinely empirical rather than code-reading.",
+   "Replace the x86_64-specific srconv.so with a pure-Python sample-rate converter (or provide source and compile in the Dockerfile), so the task is architecture-independent and buildable on ARM CI infrastructure.",
+   "Explicitly state in the instructions that WAV chunks must be word-aligned (even byte boundary with a padding byte if data chunk is odd-sized) if the hidden corpus tests for this, or remove odd-byte-count files from the hidden corpus to eliminate test overreach.",
+   "To raise genuine_difficulty without changing the observe_not_read framing, introduce one bug that only manifests at a specific prime sample count (e.g., an integer overflow in size arithmetic for large files) that cannot be spotted by code review but only by running the edge-case corpus \u2014 this forces empirical verification even after the obvious source-level fixes."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/c-audio-waveform-reconstruction",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering and synthesizing a waveform from scratch in C; the candidate task is about debugging/fixing incorrect WAV header field calculations in an existing Python pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/synthesize-harmonic-wav-in-c",
+     "verdict": "distinct",
+     "reason": "That task requires algorithmically synthesizing a harmonic waveform in C; the candidate task is about repairing a broken WAV header writer in an existing pipeline."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a CSV chunking/deduplication pipeline; the candidate task involves repairing WAV binary header field calculations in an audio processing pipeline."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "That task involves fixing spectral entropy computation logic in an RNG auditing service; the candidate task involves repairing WAV container header field correctness."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves characterizing a black-box binary normalizer and fixing SQL rollup pipelines; the candidate task involves repairing WAV header field calculations in an audio processing pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/c-audio-waveform-reconstruction",
+     0.429
+    ],
+    [
+     "terminal-bench-pro/synthesize-harmonic-wav-in-c",
+     0.418
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.256
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.112
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.088
+    ]
+   ],
+   "cost_usd": 0.014907
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05555700000000001
+}

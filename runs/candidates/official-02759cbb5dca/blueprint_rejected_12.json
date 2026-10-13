@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "delta-codec-refactor-go",
+  "title": "Delta Codec Silent Corruption",
+  "scenario": "The telemetry pipeline team shipped a large refactor of the on-disk delta-encoding library (`/app`) that compresses time-series sensor readings. The refactor touched six files and passed all 47 regression tests, but production deployments started silently producing wrong decompressed values on certain sensor feeds. A compiled reference binary (`/app/bin/refcodec`) was preserved from the last known-good release and still produces correct output. The pipeline is written in Go, and the new source lives in `/app/src/`. The Dockerfile builds a fresh `codec` binary from the refactored source.",
+  "instruction_draft": "The build is green but the refactored delta codec at `/app/src/` silently corrupts decompressed output for certain input patterns; the pre-refactor reference binary `/app/bin/refcodec` is the ground truth. Your job is to make the rebuilt `codec` binary produce byte-for-byte identical output to `refcodec` on every valid input stream. Both binaries share the same CLI: `codec compress < raw.bin > compressed.bin` and `codec decompress < compressed.bin > raw.bin`. The decompressed output of a round-trip (`compress` then `decompress`) must exactly reproduce the original input, and the compressed bytes produced by `codec` must be decompressible by `refcodec` and vice versa \u2014 cross-binary interoperability is required. Do not modify the wire format or the CLI interface.",
+  "requirements": [
+   "Running `codec compress | codec decompress` on any valid input reproduces the original bytes exactly.",
+   "Files compressed by `codec` can be decompressed by `refcodec` with identical output.",
+   "Files compressed by `refcodec` can be decompressed by `codec` with identical output.",
+   "The `codec` binary must be rebuilt from `/app/src/` (the Dockerfile build step must succeed).",
+   "The CLI interface (`compress` / `decompress` subcommands reading stdin, writing stdout) is unchanged."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.23 via apt/manual install, copies /app, and runs `go build -o /app/bin/codec ./src/` as part of image build.",
+   "Reference binary `/app/bin/refcodec` is pre-compiled from the correct implementation and baked into the image; its source is NOT present.",
+   "Refactored Go source in `/app/src/` across ~1,400 lines in 6 files: `main.go`, `compress.go`, `decompress.go`, `delta.go`, `frame.go`, `varint.go`.",
+   "Bug 1 (data-dependent, not visible by reading): In `delta.go`, the delta-of-delta encoding for the 'XOR predictor' path uses an arithmetic right shift emulated as `int64(uint64(v) >> n)` but the refactor changed it to `v >> n` (Go's signed shift), which is correct for negative values but the refactor also silently swapped the XOR predictor branch condition \u2014 it now enters the XOR path when the value is positive and the arithmetic path when negative, the opposite of the reference. The branch condition reads naturally correct on inspection (`if delta > 0`) but the reference used `if prevDelta > 0`. This only diverges when a run of values transitions from decreasing to increasing.",
+   "Bug 2 (construction required, not visible by reading): In `frame.go`, the frame checksum was changed from CRC32/IEEE to CRC32/Castagnoli (the constant `crc32.Castagnoli` appears in the new code and seems intentional), but `decompress.go` still validates using `crc32.IEEE`. The refcodec used CRC32/IEEE for both. The codec compresses with Castagnoli and validates with IEEE \u2014 frames it writes always fail validation when read back after the interop path, but since `decompress.go` silently skips malformed frames (logs a warning, does not abort), single-stream round-trips on short inputs appear to work. Hidden tests use streams long enough to contain multiple frames.",
+   "Plausible uninvolved code: `varint.go` has a correct variable-length integer encoder/decoder (~200 lines), `main.go` has flag parsing and a benchmark subcommand, `compress.go` has LRU-based literal run detection \u2014 none are buggy.",
+   "Test data `/app/testdata/` contains 6 short sensor recordings (each < 1 MB) that all pass the existing regression suite despite both bugs.",
+   "A regression test script `/app/test_regression.sh` runs the 47 existing tests; it passes on the broken source.",
+   "Verifier generates fresh synthetic sensor streams at verify time (lengths 50k\u20132M samples, value ranges chosen to exercise both increasing-then-decreasing and multi-frame transitions) and compares `codec` output against `refcodec` output."
+  ],
+  "internal_hint": "Difficulty comes from two interacting runtime-only defects. Bug 1 (predicate swap in delta.go) only manifests when a monotone run reverses direction \u2014 short test inputs rarely do this. Bug 2 (checksum polynomial mismatch between compress.go and decompress.go, compounded by silent frame-skip) looks like a noop on single-frame inputs but corrupts multi-frame decompression silently. Neither bug is obvious from reading: the predicate `if delta > 0` vs `if prevDelta > 0` requires knowing which variable the reference used (discoverable only by running `refcodec` on crafted inputs and observing byte-level divergence), and the CRC mismatch requires noticing that the frame-skip warning fires at all (requires long enough input to span a frame boundary). The solver must: (1) run both binaries on crafted streams and diff outputs to locate divergence points, (2) instrument or binary-inspect `refcodec` to determine the correct predicate variable (it can be inferred by bisecting inputs), (3) identify the CRC polynomial mismatch by examining the silent-skip behavior on multi-frame data.",
+  "trap": "A solver who reads `delta.go` and sees `if delta > 0` may accept it as plausible (delta-positive means value is rising, enter XOR path \u2014 sounds reasonable) and not fix it. A solver who fixes only the CRC mismatch will pass short single-frame tests but fail on multi-frame hidden inputs. A solver who fixes only the predicate swap will fail on any multi-frame input because corrupted frames are silently skipped. Both bugs must be fixed together, and they interact: with only one fixed, round-trip tests on the provided testdata still pass because the testdata is short enough to fit in one frame and avoids direction-reversal patterns.",
+  "tests": [
+   "Fuzz test 1: generate 200 synthetic streams of 50k\u2013500k int64 samples with monotone segments of 200\u20135000 samples alternating direction; compress with `codec`, decompress with `codec`, diff against original \u2014 must be zero.",
+   "Fuzz test 2: generate 100 streams spanning multiple frames (>128KB compressed); compress with `refcodec`, decompress with `codec` \u2014 output must match original.",
+   "Fuzz test 3: generate 100 streams spanning multiple frames; compress with `codec`, decompress with `refcodec` \u2014 output must match original.",
+   "Fuzz test 4: streams with values that stay positive throughout (stress the XOR predictor consistently) \u2014 must round-trip correctly through both binaries.",
+   "Fuzz test 5: streams with values that stay negative throughout \u2014 must round-trip correctly.",
+   "Fuzz test 6: streams that cross zero multiple times \u2014 must round-trip correctly.",
+   "Regression gate: the 47 existing tests in `/app/test_regression.sh` must still pass (ensures the solver did not break anything else).",
+   "Build gate: `go build -o /tmp/codec_check ./src/` must succeed from `/app`."
+  ],
+  "verifier_knob": {
+   "name": "stream_count_and_length",
+   "value": "200 streams, 50k\u20132M samples",
+   "effect": "Reducing to 20 streams under 50k samples makes Bug 1 unlikely to trigger (short streams rarely reverse direction) and Bug 2 unobservable (single-frame streams). Raising to 500 streams over 5M samples makes both bugs hit with near certainty and dramatically increases verification time."
+  },
+  "expected_failure_modes": [
+   "Agent reads delta.go, finds `delta > 0` plausible, fixes only the CRC mismatch, passes provided testdata, misses hidden multi-directional-stream tests because Bug 1 is unfixed.",
+   "Agent fixes Bug 1 predicate but misses the silent frame-skip caused by CRC mismatch; long-stream cross-binary tests fail.",
+   "Agent notices the CRC constant mismatch but 'fixes' it by changing both compress and decompress to Castagnoli, which makes codec self-consistent but breaks cross-binary interoperability with refcodec (which uses IEEE).",
+   "Agent generates only short test streams to validate (matching the existing testdata length), declares success, but hidden tests use multi-frame streams.",
+   "Agent spends time on varint.go or compress.go (the uninvolved plausible-looking code) and runs out of time before locating both real bugs."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "binary-codec",
+   "fuzz-equivalence",
+   "data-dependent-bug",
+   "silent-corruption",
+   "refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/delta.go  # look for predicate and XOR branch condition",
+   "cat /app/src/frame.go  # look for CRC polynomial constant",
+   "cat /app/src/decompress.go  # check CRC validation polynomial",
+   "cat /app/src/compress.go  # confirm no other issues",
+   "cat /app/src/varint.go  # quick scan",
+   "cat /app/src/main.go  # confirm CLI",
+   "# Bug 2 spotted: frame.go uses crc32.Castagnoli, decompress.go uses crc32.IEEE",
+   "# Bug 1 spotted: delta.go uses 'if delta > 0' but prevDelta is in scope \u2014 fix to 'if prevDelta > 0'",
+   "sed -i 's/crc32.Castagnoli/crc32.IEEE/g' /app/src/frame.go",
+   "sed -i 's/if delta > 0/if prevDelta > 0/' /app/src/delta.go",
+   "cd /app && go build -o /tmp/codec_fixed ./src/",
+   "python3 -c \"import struct,random; data=bytes(struct.pack('<q',random.randint(-1000,1000)) for _ in range(60000)); open('/tmp/test.bin','wb').write(data)\"",
+   "/tmp/codec_fixed compress < /tmp/test.bin > /tmp/test.compressed",
+   "/tmp/codec_fixed decompress < /tmp/test.compressed > /tmp/test.out && cmp /tmp/test.bin /tmp/test.out",
+   "/app/bin/refcodec decompress < /tmp/test.compressed > /tmp/test.ref && cmp /tmp/test.bin /tmp/test.ref",
+   "/app/bin/refcodec compress < /tmp/test.bin > /tmp/ref.compressed && /tmp/codec_fixed decompress < /tmp/ref.compressed > /tmp/test.out2 && cmp /tmp/test.bin /tmp/test.out2",
+   "/app/test_regression.sh"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Both bugs are visible by direct source inspection (one-word predicate swap, mismatched CRC constants in two files) \u2014 the claim they are 'not visible by reading' is false, undermining the intended difficulty model.",
+   "The fix for Bug 1 requires knowing which variable the reference used, but since both `delta` and `prevDelta` are local variables whose names are self-documenting, an agent reading the code can infer the correct one without running any experiments.",
+   "The silent frame-skip behavior (Bug 2 interaction) could be environment-dependent if the frame-size threshold isn't deterministic or if the Go runtime/library versions differ between refcodec compilation and the test environment.",
+   "The base image is python:3.13-slim-bookworm installing Go 1.23 via apt/manual \u2014 if Go 1.23 is not available in bookworm's apt repo, the build step fails making the task unsolvable; the blueprint should pin the exact Go tarball URL.",
+   "If the solver changes compress.go and decompress.go both to Castagnoli (a listed valid-seeming but wrong fix), the verifier must clearly distinguish this from the correct fix \u2014 this works only if refcodec is truly baked in and uses IEEE, which is correct per the spec.",
+   "The 'speedrun' path finds both bugs in ~6 file reads, making genuine_difficulty score at most 2 per the rubric's stated rule about source-visible bugs."
+  ],
+  "verdict": "reject",
+  "reasons": "Both bugs are directly visible by reading the source code (a one-word variable name change and a mismatched constant between two files), so a methodical agent solves this in ~17 commands without any binary probing or runtime inference \u2014 genuine_difficulty scores 2, failing the threshold of 4. The blueprint's own claim that the bugs are 'not visible by reading' is inaccurate: `if delta > 0` vs `if prevDelta > 0` is a named-variable difference readable in the source, and `crc32.Castagnoli` vs `crc32.IEEE` is a literal constant mismatch across two files. The difficulty design collapses because the intended hard path (run crafted inputs, binary-diff outputs, bisect) is entirely skippable.",
+  "fixes": [
+   "Make Bug 1 truly runtime-only: instead of swapping a variable name (readable), encode the predicate error as a wrong arithmetic operation or off-by-one in an accumulated state variable that only diverges when inspecting intermediate memory state \u2014 e.g., an incorrect initialization of `prevDelta` to 0 vs the last frame's final delta, which requires multi-frame boundary experiments to detect.",
+   "Make Bug 2 harder to find: instead of a named constant mismatch (Castagnoli vs IEEE, obvious to grep), use a correct CRC32/IEEE but with a byte-order swap in the frame header serialization \u2014 both sides use 'IEEE' but one writes big-endian and one reads little-endian, invisible to constant-grep and requiring byte-level frame inspection.",
+   "Ensure the source of Bug 1 is not deducible from variable names alone: rename variables so that both `delta` and `prevDelta` appear semantically plausible in the predicate context, or better, make the bug a missing negation or a wrong arithmetic operator rather than a wrong variable name.",
+   "Pin the Go installation to a specific tarball URL and SHA256 in the Dockerfile to prevent build failures due to package availability on bookworm."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a refactored library that silently corrupts output on inputs outside the regression test corpus, with a reference binary as ground truth, requiring cross-compatibility fixes \u2014 the core debugging pattern is identical, only the domain (delta codec vs. AES-CTR encryption) differs."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-lz77-file-compressor",
+     "verdict": "distinct",
+     "reason": "This task asks to implement a compressor from scratch following a specification, not to debug silent corruption in a refactored codebase."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "This task focuses on fixing panics and meeting a latency benchmark in a Rust packet-codec service, not debugging silent output corruption against a reference binary."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "This task involves building a TCP audit service with HMAC computation and database lookups, unrelated to delta-encoding or silent decompression corruption."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "This task requires reverse-engineering a black-box normalizer binary and fixing a data pipeline, not debugging a refactored codec against a reference binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.141
+    ],
+    [
+     "terminal-bench-pro/implement-lz77-file-compressor",
+     0.115
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.11
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.097
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.093
+    ]
+   ],
+   "cost_usd": 0.014574
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055571999999999996
+}

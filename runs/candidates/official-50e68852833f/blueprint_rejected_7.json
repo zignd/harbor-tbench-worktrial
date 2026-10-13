@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "fixed-point-bitmap-recovery",
+  "title": "BMP Fixed-Point Codec Recovery",
+  "scenario": "You maintain a small embedded image-processing codebase (~1200 lines) that encodes 8-bit grayscale BMP frames into a compact fixed-point wavelet format and decodes them back. The codec has been in production for months, but a colleague recently refactored the integer arithmetic to save memory on a budget microcontroller. Since the refactor, decoded images look fine on the 4\u00d74 and 8\u00d78 test frames everyone uses, but field units are silently producing corrupted output on real sensor data. The codebase is at /app/codec and includes an encoder, decoder, a small CLI runner, and a test harness with sample BMPs.",
+  "instruction_draft": "Hey, our wavelet codec is broken after Jake's refactor last sprint. The encoder and decoder both 'work' on the toy test images but field data is coming back wrong. Can you track down what's off and fix it? The codec should round-trip any valid 8-bit grayscale BMP pixel-perfectly (max absolute pixel error = 0) for lossless mode, and for lossy mode the PSNR should be \u2265 42 dB. Both modes need to handle images whose width or height is not a power of two \u2014 the reference uses symmetric extension padding. Also make sure the codec correctly handles BMPs where the row stride includes padding bytes (BMP rows are padded to 4-byte boundaries). Run `python /app/codec/cli.py encode input.bmp out.wlt && python /app/codec/cli.py decode out.wlt recovered.bmp` to test.",
+  "requirements": [
+   "Lossless mode: decoded BMP is pixel-perfect (max absolute error = 0) vs the original for any valid 8-bit grayscale BMP",
+   "Lossy mode: decoded BMP achieves PSNR \u2265 42 dB vs original for any valid 8-bit grayscale BMP",
+   "Correct handling of BMP row-stride padding (rows padded to 4-byte boundaries) during both encode and decode",
+   "Correct handling of images whose width or height is not a power of two, using symmetric extension padding in the wavelet transform",
+   "The CLI encode/decode round-trip (`cli.py encode` then `cli.py decode`) must produce correct output files"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; pip install numpy pillow",
+   "/app/codec/cli.py: CLI entry point, dispatches to encoder/decoder based on subcommand",
+   "/app/codec/encoder.py: wavelet encoder; contains the refactored fixed-point arithmetic with two planted bugs invisible by inspection on small power-of-two images",
+   "/app/codec/decoder.py: wavelet decoder; contains a matching bug in the inverse fixed-point scaling",
+   "/app/codec/bmp_io.py: BMP reader/writer; contains a bug where row-stride padding is not stripped on read (reads padding bytes as pixel data) \u2014 only manifests when image width is not divisible by 4",
+   "/app/codec/wavelet.py: 1D Haar wavelet forward/inverse; correct mathematically but the fixed-point scaling constants were changed in the refactor to use integer right-shift instead of proper rounding (floor instead of round-half-up), causing accumulating error invisible on 4\u00d74/8\u00d78 but visible on larger images",
+   "/app/codec/tests/: small test BMPs: 4\u00d74, 8\u00d78 grayscale BMPs (all widths divisible by 4, all power-of-two dimensions) \u2014 the sample set that makes bugs invisible",
+   "/app/codec/README.md: documents the fixed-point format: Q8.8 for lossless coefficients, Q4.4 for lossy; documents symmetric extension for non-power-of-two sizes",
+   "Bug 1 (observe_not_read): encoder.py applies the forward fixed-point scale as `coeff >> 8` (floor) instead of `(coeff + 128) >> 8` (round); on 4\u00d74/8\u00d78 the rounding error cancels perfectly in the Haar butterfly but accumulates on larger or odd-sized inputs",
+   "Bug 2 (observe_not_read): decoder.py inverse scale multiplies by 256 but then clips to uint8 before the final IDWT butterfly, truncating intermediate values that legally exceed 255 mid-transform; invisible on the all-flat test images",
+   "Bug 3 (edge_case_inputs): bmp_io.py reads `width * height` bytes ignoring row padding, so a 6-pixel-wide image (stride = 8 bytes) has 2 garbage bytes per row folded into the pixel array; the 4\u00d74 and 8\u00d78 test images have widths divisible by 4 so stride == width and this never fires",
+   "Bug 4 (edge_case_inputs): wavelet.py symmetric extension for odd-length signals reflects with an off-by-one index (uses `signal[-i]` instead of `signal[-i-1]`), producing a wrong border coefficient; power-of-two sizes never trigger the extension path"
+  ],
+  "internal_hint": "Difficulty comes from two levers: (1) observe_not_read \u2014 bugs 1 and 2 are invisible on the provided 4\u00d74/8\u00d78 test BMPs because the rounding error cancels in small power-of-two Haar transforms and the clip-before-butterfly issue only appears when mid-transform values exceed 255, which flat test images never produce; the solver must generate or find larger/varied test images to observe failure. (2) edge_case_inputs \u2014 bugs 3 and 4 only fire on widths not divisible by 4 and on odd-length dimensions respectively, which the sample set deliberately avoids. A skilled engineer: runs the CLI on a 100\u00d773 natural grayscale BMP and sees non-zero pixel errors; instruments encoder/decoder with intermediate prints; reads the Q8.8 spec in README and notices the missing rounding; finds the premature clip in decoder.py by adding an assertion; generates a 6-wide BMP and notices garbage pixels tracing back to bmp_io.py; checks the extension path in wavelet.py against the spec. Fix: (1) `(coeff + 128) >> 8` in encoder; (2) defer uint8 clip to after IDWT in decoder; (3) strip padding bytes in bmp_io reader using stride computation; (4) fix reflection index in wavelet.py.",
+  "trap": "A naive agent encodes and decodes the provided 4\u00d74 and 8\u00d78 test BMPs, sees zero error, and declares success. The hidden verifier uses: (a) a 100\u00d773 natural grayscale BMP (non-power-of-two, triggers bugs 1, 2, 4); (b) a 6\u00d76 BMP (width 6, stride 8, triggers bug 3); (c) a 15\u00d715 BMP with pixel values spanning 0\u2013255 including values that cause mid-transform overflow (triggers bug 2). Fixing only the most obvious bug (the rounding shift) still fails on the stride and reflection tests. The interaction between bugs means partial fixes pass some hidden tests but not all.",
+  "tests": [
+   "Round-trip lossless: encode then decode a 4\u00d74 grayscale BMP (provided sample) \u2192 max absolute pixel error == 0",
+   "Round-trip lossless: encode then decode a 100\u00d773 grayscale BMP with natural image content (generated at verify time with numpy seeded RNG) \u2192 max absolute pixel error == 0",
+   "Round-trip lossless: encode then decode a 6\u00d76 grayscale BMP (width 6, BMP row stride 8 bytes, 2 padding bytes per row) \u2192 max absolute pixel error == 0",
+   "Round-trip lossless: encode then decode a 15\u00d715 grayscale BMP with pixel values uniformly distributed 0\u2013255 \u2192 max absolute pixel error == 0",
+   "Round-trip lossy: encode then decode a 128\u00d7128 grayscale BMP \u2192 PSNR \u2265 42 dB",
+   "Round-trip lossy: encode then decode a 97\u00d7113 grayscale BMP (both dims non-power-of-two) \u2192 PSNR \u2265 42 dB",
+   "Round-trip lossy: encode then decode a 10\u00d710 BMP with row stride 12 (width 10, stride padded to 12) \u2192 PSNR \u2265 42 dB",
+   "BMP round-trip identity: a BMP written and re-read by bmp_io.py has identical pixel arrays to the original numpy array for widths 1 through 20 (verifies stride stripping)",
+   "Wavelet symmetric extension: encode+decode a single-row image of length 7 in lossless mode \u2192 max absolute error == 0 (exercises the off-by-one reflection path)"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "9 tests at default",
+   "effect": "Raise: add more random (width, height) pairs including primes and multiples of 4 to increase coverage of the rounding accumulation bug; add high-contrast images to increase likelihood of mid-transform overflow. Lower: remove the non-power-of-two and odd-stride tests, making it passable with only bugs 1 and 2 fixed."
+  },
+  "expected_failure_modes": [
+   "Agent tests only the provided 4\u00d74/8\u00d78 samples, sees zero error, ships without fixing anything \u2014 fails all non-power-of-two hidden tests",
+   "Agent fixes the rounding shift (bug 1) and the reflection index (bug 4) but misses the premature clip in decoder.py (bug 2) \u2014 passes small-image tests but fails 15\u00d715 high-contrast test",
+   "Agent fixes bugs 1, 2, 4 but misses the BMP stride bug (bug 3) \u2014 fails all tests with width not divisible by 4",
+   "Agent finds bugs 1 and 3 by reading code but misses bug 2 (decoder clip) because it's subtle and the code 'looks like' it clips in the right place \u2014 partial fix passes lossless small tests but fails lossy non-power-of-two",
+   "Agent generates a test image but picks a power-of-two width divisible by 4, never triggering bugs 3 and 4, and declares partial fix complete"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "fixed-point-arithmetic",
+   "BMP",
+   "wavelet",
+   "image-codec",
+   "edge-cases",
+   "observe-not-read"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/codec/README.md",
+   "cat /app/codec/encoder.py  # sees coeff >> 8 (floor) instead of (coeff+128)>>8",
+   "cat /app/codec/decoder.py  # sees premature uint8 clip before IDWT butterfly",
+   "cat /app/codec/bmp_io.py   # sees width*height read ignoring row stride padding",
+   "cat /app/codec/wavelet.py  # sees signal[-i] off-by-one in symmetric extension",
+   "cat /app/codec/cli.py",
+   "sed -i 's/coeff >> 8/(coeff + 128) >> 8/g' /app/codec/encoder.py",
+   "# Edit decoder.py: remove uint8 clip on intermediate buffer, defer clip to after full IDWT",
+   "# Edit bmp_io.py: stride = (width+3)//4*4; read stride bytes per row, take only width bytes",
+   "# Edit wavelet.py: signal[-i] -> signal[-i-1] in symmetric extension",
+   "python /app/codec/cli.py encode /app/codec/tests/4x4.bmp out.wlt && python /app/codec/cli.py decode out.wlt recovered.bmp",
+   "python -c \"from PIL import Image; import numpy as np; a=np.array(Image.open('/app/codec/tests/4x4.bmp')); b=np.array(Image.open('recovered.bmp')); print(np.max(np.abs(a.astype(int)-b.astype(int))))\""
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 1,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'observe_not_read' framing is misleading: all bugs are directly visible by reading source, so an agent that reads code cannot be legitimately trapped by the 4x4/8x8 test samples",
+   "Bug 1 fix (rounding shift) is a single grep-replaceable change, making partial fixes too easy to stumble upon",
+   "The interaction between bugs is described as making partial fixes fail, but a systematic code-reading agent finds all 4 bugs in one pass without needing to observe failures at all",
+   "Seeded RNG images generated at verify time must match exactly what the verifier expects \u2014 if the numpy version or seed behavior differs across Python versions, tests could be flaky",
+   "The 'lossless mode: max absolute error == 0' bar is extremely strict; if there is any floating-point non-determinism in numpy on different hardware, this could produce spurious failures"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty criterion (score 1/5) because all four planted bugs are directly and unambiguously visible by reading the source files \u2014 a code-reading agent solves this in approximately 12 commands without needing to generate test images or observe runtime failures. The 'observe_not_read' difficulty lever is invalidated because the bugs (a missing +128 in a shift, a premature uint8 clip, a stride calculation omission, and an off-by-one index) are classic, recognizable bugs that any skilled reviewer spots on first read. The task as described would only trap agents that refuse to read source code, which is not a meaningful frontier-model failure mode.",
+  "fixes": [
+   "Make bugs genuinely non-obvious by inspection: e.g., make the rounding error appear in a correct-looking helper function with a subtle interaction between two correct-looking steps, or hide the premature clip inside a dtype promotion that looks like it preserves range",
+   "Add a layer of indirection: put the fixed-point constants in a config file with plausible-looking values (e.g., SCALE_FACTOR=255 instead of 256), so the bug is not a syntactic error but a semantic one requiring domain knowledge of Q8.8 format",
+   "Replace the off-by-one index bug with an algorithmically subtle error: e.g., the symmetric extension pads the correct number of samples but in the wrong order (reversed), which looks plausible and is only caught by running on odd-length inputs",
+   "To genuinely earn 'observe_not_read', bugs should pass a careful code review \u2014 consider making the stride bug appear in a helper that is called with an argument that looks like width but is actually stride, requiring the solver to trace call sites rather than just reading the function body",
+   "Increase the sample test set to include some non-power-of-two and non-stride-aligned images so agents cannot rely on the samples being the reason bugs are hidden \u2014 the actual difficulty should come from the bugs' subtlety, not from sample selection"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task involves AES-128-CTR encryption/decryption bugs in a C library, while the candidate is about fixed-point wavelet codec bugs in Python with BMP handling."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is a Rust packet codec with performance benchmarking requirements, while the candidate is a Python wavelet image codec with BMP-specific correctness requirements."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/make-doom-for-mips",
+     "verdict": "distinct",
+     "reason": "That task is about cross-compiling DOOM for MIPS; the candidate is about debugging a Python wavelet image codec."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task involves a network service frame codec with HTTP endpoints, while the candidate is a file-based BMP wavelet codec with different bug patterns."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about a CSV processing pipeline with chunking and deduplication bugs; the candidate is about a wavelet image codec with fixed-point arithmetic and BMP padding bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.125
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.111
+    ],
+    [
+     "terminal-bench-2-1/make-doom-for-mips",
+     0.096
+    ],
+    [
+     "ours/official-aac910462208",
+     0.088
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.062
+    ]
+   ],
+   "cost_usd": 0.013464
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056708999999999996
+}

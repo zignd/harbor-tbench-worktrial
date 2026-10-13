@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "wav-sample-rate-drift-repair",
+  "title": "WAV Resampler Sample-Rate Drift Repair",
+  "scenario": "A small in-house audio telemetry codebase collects 16-bit PCM WAV files from embedded sensors and stores them in a compressed archive format. The system includes a compiled resampler library (shipped without source) that converts sensor recordings to a canonical 44100 Hz before archiving, plus a Python wrapper and a small integrity checker. Archived files that were processed months ago are now being flagged as having incorrect durations, but the problem only appears on certain sample-rate inputs and only when the archive accumulates more than a few files.",
+  "instruction_draft": "Hey, our sensor archive pipeline at /app is broken and I can't figure out what's going on. WAV files we archive end up with wrong playback durations when we pull them back out \u2014 they're either stretched or compressed. The pipeline takes raw sensor WAV files (any sample rate, 16-bit mono), resamples them to 44100 Hz, and stores them in our custom .sra archive format. When we extract and play them back, the duration should match the original recording duration (same wall-clock time, just at 44100 Hz). The archive already has some files in /app/data/archive.sra that were processed before, and we're supposed to keep those compatible. Fix the pipeline so that a round-trip of: ingest a WAV \u2192 resample to 44100 \u2192 archive \u2192 extract \u2192 play back gives the correct duration regardless of the original sample rate. The extracted WAV must have the right number of samples so that duration_seconds = num_samples / 44100 equals the original recording's duration_seconds = original_samples / original_rate.",
+  "requirements": [
+   "A WAV file ingested through the pipeline must, after archiving and extraction, have a duration in seconds equal to original_num_samples / original_sample_rate within a tolerance of 0.01 seconds",
+   "The extracted WAV must be valid 16-bit mono PCM at 44100 Hz",
+   "The pipeline must handle input sample rates that are not simple integer multiples or divisors of 44100 (e.g., 22050, 8000, 11025, 16000, 32000, 48000, 96000, 12000, 6000, 44800)",
+   "Existing entries in /app/data/archive.sra must remain extractable and yield valid WAV files",
+   "The pipeline CLI at /app/pipeline.py must accept ingest and extract subcommands with the same interface it currently exposes"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install apt packages: libsndfile1, ffmpeg; pip install soundfile numpy scipy",
+   "Compiled shared library /app/lib/libresampler.so (no source) that exports: resample_pcm(int16_t* in, int in_len, int in_rate, int out_rate, int16_t* out, int* out_len) \u2014 the library has a bug: it computes out_len as round(in_len * out_rate / in_rate) using integer arithmetic that overflows for long clips (>~30s at high rates) and loses the fractional sample count, causing duration drift. This is only observable by running the library on actual audio data; the bug manifests differently depending on in_len and in_rate values.",
+   "Python script /app/pipeline.py: the main CLI that calls libresampler.so via ctypes for resampling, then writes to /app/lib/archive_io.py for the .sra format",
+   "/app/lib/archive_io.py: reads/writes the custom .sra archive format \u2014 a binary format with a 16-byte header (magic 'SRA1', uint32 num_entries, uint64 index_offset), a data section of concatenated gzip-compressed WAV blobs, and an index table at the end (each entry: uint32 name_len, bytes name, uint64 data_offset, uint32 data_len, uint32 original_sample_rate, uint32 original_num_samples). The archive_io.py has a bug: it stores original_num_samples as a uint32, which overflows silently for recordings longer than ~97 seconds at 44100 Hz (2^32 / 44100 \u2248 97535 samples max before overflow on uint32 but that's actually 97535 seconds \u2014 wait, actually 2^32 samples at 44100 Hz is about 27 hours \u2014 so the overflow should be at 2^16 = 65536 samples stored as uint16 by mistake), so archive_io.py actually uses struct format 'H' (uint16) instead of 'I' (uint32) for original_num_samples, meaning clips longer than 65535 samples (~1.5s at 44100Hz) have their sample count truncated, causing wrong duration on extraction",
+   "/app/data/archive.sra: pre-populated archive with 3 entries at common rates (8000, 16000, 22050 Hz), all short enough that the uint16 truncation doesn't trigger, so the existing archive appears healthy",
+   "/app/data/samples/: directory of sample WAV files at various rates for testing, all short (under 1 second) \u2014 these also don't trigger the bug",
+   "/app/lib/sra_spec.txt: specification document describing the .sra format fields and their types correctly (says uint32 for original_num_samples), giving the solver the ground truth to compare against the buggy implementation",
+   "/app/tests/test_roundtrip.py: a simple roundtrip test using only the provided short sample files \u2014 all pass with the buggy code",
+   "The libresampler.so integer overflow bug is real and observable: for a 48000 Hz input of 48000 samples (1 second), in_len * out_rate = 48000 * 44100 = 2,116,800,000 which is within int32 range but for 96000 Hz input of 96000 samples, 96000 * 44100 = 4,233,600,000 which overflows int32, causing the resampled output to have wrong length. The solver must bypass the buggy library for these cases (e.g., use scipy.signal.resample instead) or correct the output length."
+  ],
+  "internal_hint": "There are two interacting bugs that only manifest on real data outside the sample set. Bug 1 (observe_not_read, in the compiled libresampler.so): the C library uses int32 arithmetic to compute out_len = in_len * out_rate / in_rate; for high sample rates (96kHz) or long recordings, the multiplication overflows before the division, producing a wrong (typically negative or very small) out_len, so the resampled audio has the wrong number of samples. Bug 2 (in archive_io.py, but masked because all provided samples are short): original_num_samples is stored as struct 'H' (uint16, max 65535) instead of 'I' (uint32) as the spec requires; any recording longer than 65535/original_rate seconds has its sample count truncated to 16 bits on storage, and the extracted WAV is built with a wrong duration. The solver must: (1) run the pipeline on high-rate or longer inputs to observe the library overflow (since provided samples are all short at low rates), (2) read the spec to notice the uint16/uint32 discrepancy in archive_io.py, (3) fix archive_io.py to use 'I', (4) work around the libresampler.so overflow by detecting the overflow condition and using scipy/numpy resampling instead. The existing archive.sra must stay readable: since old entries used uint16 storage, the solver must either keep backward compatibility or re-encode them \u2014 the spec says the format always used uint32 so the old entries were written wrong but must be preserved by re-reading them with the old uint16 interpretation and re-writing with uint32 (or document the migration). The verify-time tests generate inputs at 96000 Hz and 2+ second duration to trigger both bugs simultaneously.",
+  "trap": "A naive agent reads archive_io.py, notices nothing wrong with short samples, runs test_roundtrip.py (all pass), and submits without fixing anything. A slightly deeper agent fixes the archive_io.py struct format character but doesn't test the libresampler.so overflow, so high-rate inputs still fail. An agent that only fixes the library workaround but not the struct format fails on recordings longer than 65535/rate seconds. An agent that fixes both but breaks the existing archive.sra entries (which were encoded with uint16) fails the backward compatibility test.",
+  "tests": [
+   "Generate a 2.5-second 96000 Hz sine WAV (240000 samples), ingest it, extract it, verify extracted duration = 240000/96000 = 2.5s \u00b1 0.01s (triggers libresampler overflow)",
+   "Generate a 3-second 48000 Hz WAV (144000 samples > 65535), ingest, extract, verify duration = 3.0s \u00b1 0.01s (triggers uint16 truncation in archive_io.py)",
+   "Generate a 1-second 12000 Hz WAV (12000 samples), ingest, extract, verify duration = 1.0s \u00b1 0.01s (non-multiple-of-44100 rate)",
+   "Generate a 1-second 44800 Hz WAV, ingest, extract, verify duration (stress-tests non-standard rate arithmetic)",
+   "Extract all 3 pre-existing entries from /app/data/archive.sra and verify each yields a valid WAV with duration matching what was originally archived",
+   "Ingest 8 different WAV files at rates [6000, 8000, 11025, 16000, 22050, 32000, 48000, 96000] Hz each 2 seconds long, archive all to one .sra, extract all, verify all durations",
+   "Verify extracted WAVs are valid 16-bit mono PCM at 44100 Hz (check RIFF header fields)"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "8 rates \u00d7 3 durations = 24 inputs",
+   "effect": "Fewer inputs (e.g., 4 rates, short only) let a partial fix pass; more inputs (add 44800, 6000, longer durations) force both bugs to be fixed and backward compatibility maintained"
+  },
+  "expected_failure_modes": [
+   "Agent runs provided test suite (all short, low-rate), sees passing tests, submits without changes",
+   "Agent fixes archive_io.py uint16\u2192uint32 but doesn't discover or work around the libresampler.so integer overflow; high-rate tests fail",
+   "Agent works around library overflow but misses the archive_io.py struct bug; 2-second recordings at 48kHz still fail",
+   "Agent fixes both bugs but breaks backward compatibility with existing archive.sra entries by not handling the old uint16-encoded entries",
+   "Agent uses scipy resampling for all inputs but uses the wrong formula for output length (e.g., round() vs int() causing off-by-one in long clips)"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "binary-format",
+   "audio",
+   "compiled-binary",
+   "observe-not-read",
+   "edge-cases",
+   "resampling"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/lib/sra_spec.txt",
+   "cat /app/lib/archive_io.py",
+   "grep -n 'struct\\|pack\\|unpack' /app/lib/archive_io.py",
+   "cat /app/pipeline.py",
+   "ls /app/data/samples/ && ls /app/data/",
+   "python3 /app/tests/test_roundtrip.py",
+   "# Spot struct 'H' vs spec's uint32 in archive_io.py index entry packing",
+   "# Fix archive_io.py: change 'H' to 'I' for original_num_samples",
+   "# Handle backward compat: add version-aware reader for old uint16-encoded archive.sra",
+   "python3 -c \"import numpy as np; import soundfile as sf; data=np.sin(2*np.pi*440*np.arange(192000)/96000); sf.write('/tmp/t96k.wav', data.astype(np.int16), 96000, subtype='PCM_16')\"",
+   "python3 /app/pipeline.py ingest /tmp/t96k.wav /app/data/archive.sra",
+   "python3 /app/pipeline.py extract t96k.wav /tmp/out96k.wav /app/data/archive.sra",
+   "python3 -c \"import soundfile as sf; d,r=sf.read('/tmp/out96k.wav'); print(len(d)/r, 'expected 2.0')\"",
+   "# Observe wrong duration \u2192 libresampler.so overflow for 96kHz",
+   "# Calculate: 192000*44100=8467200000 > INT32_MAX=2147483647 \u2192 overflow",
+   "# Fix pipeline.py: detect overflow (in_len*out_rate > 2^31-1), use scipy.signal.resample",
+   "python3 -c \"import numpy as np; import soundfile as sf; data=np.sin(2*np.pi*440*np.arange(144000)/48000); sf.write('/tmp/t48k3s.wav', data.astype(np.int16), 48000, subtype='PCM_16')\"",
+   "python3 /app/pipeline.py ingest /tmp/t48k3s.wav /app/data/archive.sra && python3 /app/pipeline.py extract t48k3s.wav /tmp/out48k.wav /app/data/archive.sra",
+   "python3 -c \"import soundfile as sf; d,r=sf.read('/tmp/out48k.wav'); print(len(d)/r, 'expected 3.0')\"",
+   "# Verify all existing entries still extractable",
+   "python3 /app/pipeline.py extract entry1.wav /tmp/e1.wav /app/data/archive.sra && python3 -c \"import soundfile as sf; d,r=sf.read('/tmp/e1.wav'); print(r, len(d))\"",
+   "python3 /app/tests/test_roundtrip.py"
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Backward compatibility migration of old uint16-encoded archive.sra entries is under-specified: fixing the struct format breaks parsing of existing entries unless the solver implements version detection, but the instruction never mentions this requirement explicitly",
+   "The exact overflow detection threshold for libresampler.so depends on whether the compiled library uses signed int32 or unsigned, and different detection strategies (pre-check vs post-check vs always-use-scipy) may produce subtly different sample counts that fail the 0.01s tolerance",
+   "scipy.signal.resample uses FFT-based resampling which may produce a slightly different number of output samples than the integer formula, potentially causing off-by-one failures at the 0.01s tolerance boundary for long clips",
+   "The instruction says 'keep those compatible' for existing archive entries but never specifies the migration strategy, creating ambiguity about whether the solver should re-encode old entries or implement a dual-format reader"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores only 3 because the primary archive_io.py bug (struct 'H' vs 'I') is directly visible by reading source code, matching the pattern that Opus solves 4/4-4/5 times in under 25 commands; the speedrun reaches ~22 commands. The backward compatibility requirement for old uint16-encoded archive.sra entries is under-specified in the instruction, creating invalid failure risk where a technically correct fix breaks existing entries in a way the solver couldn't anticipate from the stated requirements. These two issues together push it below the acceptance threshold.",
+  "fixes": [
+   "Make the libresampler.so bug harder to detect by removing the sra_spec.txt document so the solver cannot directly compare spec vs implementation \u2014 instead provide only runtime behavior as the signal, forcing the solver to generate diverse test inputs independently",
+   "Explicitly state the backward compatibility requirement in the instruction: 'existing entries in archive.sra were written by an older version of the pipeline; your fix must be able to read them correctly' and specify whether re-encoding or dual-format reading is acceptable",
+   "Increase genuine difficulty by making the archive_io.py bug non-obvious (e.g., use a correct struct format but apply an incorrect byte-swap or endianness error, or store sample count in a derived field requiring arithmetic to validate) so it cannot be spotted by simple grep/read of the source",
+   "Add a third interacting bug or constraint (e.g., the .sra index CRC or checksum validation that breaks if entries are migrated naively) to push the solution past 30 commands and genuinely require multi-hypothesis reasoning"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/c-audio-waveform-reconstruction",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering and reconstructing a waveform from scratch in C; the candidate task is about fixing a sample-rate resampling bug in an archive pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-pro/synthesize-harmonic-wav-in-c",
+     "verdict": "distinct",
+     "reason": "That task requires algorithmically synthesizing a harmonic waveform in C; the candidate task is about diagnosing and fixing duration drift in a WAV resampling and archiving pipeline."
+    },
+    {
+     "ref_id": "terminal-bench/rs-archive-clone",
+     "verdict": "distinct",
+     "reason": "That task requires black-box cloning of a binary archive tool; the candidate task is about fixing a sample-rate drift bug in a WAV resampling pipeline that uses a custom archive format."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing row duplication and chunk handling in a CSV processing pipeline; the candidate task is about fixing sample-rate-dependent duration errors in a WAV resampling and archive pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves characterizing a black-box binary normalizer and fixing SQL rollup queries; the candidate task is about fixing WAV sample-rate resampling math to preserve playback duration in a custom archive pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/c-audio-waveform-reconstruction",
+     0.302
+    ],
+    [
+     "terminal-bench-pro/synthesize-harmonic-wav-in-c",
+     0.271
+    ],
+    [
+     "terminal-bench/rs-archive-clone",
+     0.218
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.09
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.079
+    ]
+   ],
+   "cost_usd": 0.015486
+  },
+  "novel": true
+ },
+ "cost_usd": 0.070638
+}

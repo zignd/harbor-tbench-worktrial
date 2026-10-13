@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "Stream Merge-Sort Refactor",
+  "scenario": "Your team ships a Go data-pipeline binary (`/app/bin/sorter`) built inside the Dockerfile. It reads a stream of tagged integer records from stdin and is supposed to emit them in a stable, globally sorted order grouped by tag. Since the last refactor the binary silently produces wrong output on multi-chunk inputs: the CI green-lit it because the smoke test used a single-chunk file that fits entirely in the merge buffer. You are the release engineer who must fix the Go source, rebuild, and ship a correct binary before the next deploy window.",
+  "instruction_draft": "The data-pipeline binary at `/app/bin/sorter` reads a newline-delimited stream from stdin. Each line is either a tag header (`TAG <name>`) or a data record (`DATA <int64>`). All records following a TAG header until the next TAG header belong to that tag. The binary must emit all records in ascending numeric order, preserving the original tag name as a prefix on each output line (`<tag> <int64>`), and records with equal values must appear in the order their tags first appeared in the input (stable by tag-arrival order, not record order within a tag). The binary is compiled from Go sources in `/app/src/`; rebuild it with `go build -o /app/bin/sorter ./cmd/sorter` from `/app/src`. The binary must produce correct output for any number of tags and any volume of records, including inputs where the total record count far exceeds the in-memory merge buffer. Do not change the binary's command-line interface or output format.",
+  "requirements": [
+   "All DATA records are emitted exactly once, with no duplicates or omissions.",
+   "Output lines have the format `<tag> <int64>` with a single space separator.",
+   "Output records are in globally ascending numeric order.",
+   "When two records share the same int64 value, the one whose tag arrived earlier in the input appears first (stable by tag-arrival order).",
+   "Correctness holds for inputs where total record count far exceeds the in-memory merge buffer size (multi-chunk / external-merge path).",
+   "The binary is rebuilt from `/app/src/` using `go build -o /app/bin/sorter ./cmd/sorter`."
+  ],
+  "environment": [
+   "Dockerfile FROM golang:1.22-bookworm; copies `/app/src/` into the image; runs `go build -o /app/bin/sorter ./cmd/sorter` to produce the initial (broken) binary; also installs Python 3 for the test harness.",
+   "Source tree `/app/src/` (~1200 lines across ~8 files): `cmd/sorter/main.go` (entry point, reads stdin, calls pipeline), `internal/pipeline/merge.go` (multi-way merge implementation \u2014 the broken component), `internal/pipeline/chunk.go` (chunk reader/writer using temp files), `internal/pipeline/heap.go` (min-heap over sorted runs), `internal/pipeline/tag.go` (tag-arrival registry), `internal/util/io.go`, `internal/util/parse.go`, plus `go.mod`.",
+   "The planted bug: in `merge.go`, the stability tie-breaking key uses the record's position-within-its-chunk rather than the global tag-arrival index. This produces correct output when all records fit in one chunk (single-chunk path bypasses the external merge), but wrong tag ordering on equal values across chunks.",
+   "A second planted bug: in `heap.go`, the heap's `Less` function compares only the int64 value; when two heap entries have equal values it falls back to comparing the run-file index (an implementation artifact), not the tag-arrival order. This means even after fixing merge.go, a partial fix that copies the run-index as the tiebreak still fails hidden cases where run-file index != tag-arrival order.",
+   "Smoke-test input `/app/testdata/smoke.txt`: a single-chunk input (200 records, 3 tags) where both bugs are dormant \u2014 output looks correct.",
+   "The solver must discover both bugs by running the binary on larger or multi-tag inputs, because neither is visible from reading merge.go or heap.go in isolation without understanding their interaction.",
+   "Python test harness `/app/tests/test_sorter.py` (used by the verifier): generates fresh random inputs at verify time (controlled by `NUM_CASES` and `MAX_RECORDS` knobs), runs the rebuilt binary, and compares output against a Python reference sort."
+  ],
+  "internal_hint": "Root cause 1 (not visible by reading): merge.go stores a `chunkOffset` field as the stability key when writing sorted runs. For single-chunk inputs this field equals the tag-arrival index by coincidence (tags are processed in arrival order within one chunk). For multi-chunk inputs, each chunk is sorted independently and written to a temp file; the chunkOffset resets to zero for each chunk, so the stability key collides across chunks. Root cause 2 (not visible by reading): heap.go's Less breaks ties on `runIndex` (the index of the temp file), which is assigned in the order chunks are flushed \u2014 not the order tags first appeared. After fixing merge.go to propagate the global tag-arrival index through the run files, the heap must also use that arrival index as the tiebreak, not runIndex. The solver must: (1) run the binary on a multi-chunk input to observe wrong output, (2) read merge.go and chunk.go together to understand how stability keys are written into run files, (3) realise tag-arrival index is tracked in tag.go but not threaded through to the run-file record struct, (4) add the arrival index to the on-disk record format, (5) fix heap.go's Less to use it. A solver who only fixes merge.go (root cause 1) will pass the smoke test and simple multi-chunk tests but fail hidden cases with many equal values across chunks whose run-file indices diverge from arrival order.",
+  "trap": "A solver who reads merge.go, spots that chunkOffset is used as a stability key, and replaces it with a monotone counter incremented per record globally will produce correct output for the smoke test and for inputs where each tag's records land in only one chunk. Hidden tests generate inputs where a single tag's records are split across multiple chunks AND equal values appear in records belonging to different tags whose run-file indices do not match their arrival order. Those tests expose that heap.go's tie-break is still wrong even after the merge.go fix. The solver must also fix heap.go and ensure the global arrival index is serialized into every run-file record.",
+  "tests": [
+   "Rebuild test: `go build -o /app/bin/sorter ./cmd/sorter` exits 0 and the binary at `/app/bin/sorter` is executable.",
+   "Smoke test: run binary on `/app/testdata/smoke.txt` (200 records, 3 tags, fits in one chunk) and compare to Python reference \u2014 must match exactly.",
+   "Multi-chunk basic test (generated at verify time): 50,000 records across 20 tags with buffer size forced to 512 records/chunk; verify output is globally sorted and stable.",
+   "Equal-value stress test (generated at verify time): inputs where ~30% of records share the same int64 value across many tags; verify that among equal-value records the output order matches tag-arrival order.",
+   "Large-volume test (generated at verify time, difficulty knob = NUM_CASES): 10 independent random inputs each with 100,000\u2013500,000 records across 50\u2013200 tags; Python reference computes expected output; binary output must match byte-for-byte.",
+   "Adversarial run-order test (generated at verify time): tags are assigned arrival indices 0..N but the chunk-flushing order is deliberately permuted (achieved by choosing record counts so tag A fills a chunk before tag B even though B arrived first); verifies the heap uses tag-arrival index, not run-file index, for tiebreaking.",
+   "No-duplicate / no-omission test: record count in output must equal record count in input for every generated case."
+  ],
+  "verifier_knob": {
+   "name": "NUM_CASES",
+   "value": "10",
+   "effect": "Raising NUM_CASES increases the number of independently generated large random inputs; more cases expose edge cases in the stability logic and reduce the chance a partially correct fix passes by luck. Lowering it to 3 makes the suite faster but easier to pass with a partially correct fix."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only merge.go (root cause 1) and verifies against the smoke test and a quick multi-chunk run; misses that heap.go's tiebreak is still wrong for cases where run-file index diverges from tag-arrival order.",
+   "Solver notices heap.go uses runIndex but replaces it with chunkOffset (a field already in the run record) rather than the true tag-arrival index from tag.go \u2014 passes most cases but fails the adversarial run-order test.",
+   "Solver adds a global counter for stability but forgets to serialize it into the run-file binary record format, so the heap reads stale/zero values after loading runs from disk.",
+   "Solver changes the record struct but does not update both the writer in chunk.go and the reader in heap.go symmetrically, causing a binary decode mismatch that produces garbage output on large inputs.",
+   "Solver verifies only with the provided smoke test and a hand-crafted two-tag example; does not generate multi-chunk adversarial inputs and submits a partial fix."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithmic",
+   "external-merge-sort",
+   "stability",
+   "compiled-binary",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/internal/pipeline/merge.go",
+   "cat /app/src/internal/pipeline/heap.go",
+   "cat /app/src/internal/pipeline/chunk.go",
+   "cat /app/src/internal/pipeline/tag.go",
+   "cat /app/src/cmd/sorter/main.go",
+   "Generate 5000-record multi-chunk input with equal values and run binary to confirm bug",
+   "Compare against Python reference sort to observe wrong tag ordering on equal values",
+   "Edit merge.go: replace chunkOffset stability key with tag-arrival index from tag.Registry",
+   "Edit chunk.go: add arrivalIndex field to on-disk record struct and update binary writer",
+   "Edit heap.go: update binary reader to decode arrivalIndex, fix Less to use arrivalIndex not runIndex",
+   "cd /app/src && go build -o /app/bin/sorter ./cmd/sorter",
+   "Run smoke test and compare to reference",
+   "Run multi-chunk test and compare to reference",
+   "Generate adversarial permuted-chunk input (tag B arrives first, but tag A fills chunk first)",
+   "Run binary on adversarial input and verify tag-arrival order is respected for equal values",
+   "Run large-volume test with 100k+ records across 50 tags to confirm no duplicates/omissions"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The blueprint claims bugs are 'not visible by reading source in isolation' but both bugs (chunkOffset in merge.go, runIndex in heap.go) are directly visible to any competent Go developer reading those files \u2014 this weakens the genuine difficulty claim",
+   "The binary record format is not specified in the instructions, so a solver who writes a different but valid encoding might hit subtle decode mismatches that look like environment flakiness rather than their bug",
+   "The 'buffer size forced to 512 records/chunk' mechanism for the multi-chunk test is not explained \u2014 it's unclear if this is a CLI flag, build tag, or environment variable; if it requires a code change to the binary interface the instruction says not to change, that's contradictory",
+   "Flaky risk: Python test harness generating 'fresh random inputs at verify time' without a fixed seed could produce edge cases that expose unrelated Go stdlib sort stability assumptions or platform-specific int64 parsing differences",
+   "The instruction says 'go build from /app/src' but doesn't mention that chunk.go's binary format change requires updating both read and write paths \u2014 a solver who only half-updates the format will get silent data corruption on large inputs with no clear error message, which could be mistaken for environment issues",
+   "1 CPU / 2 GB constraint with 10 cases of 100k-500k records each in Python may be slow; test timeout not specified"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 3 disqualifies this task \u2014 both bugs are directly visible by reading the source files, contradicting the blueprint's own claim, and a skilled agent reading merge.go and heap.go together would identify chunkOffset and runIndex as the culprits within minutes. The speedrun reaches ~16 commands with the key insight available from source reading, which per the rubric caps genuine_difficulty at 2-3. Additionally, the mechanism for 'forcing buffer size to 512 records/chunk' in tests is unexplained and potentially contradicts the instruction's prohibition on changing the CLI interface.",
+  "fixes": [
+   "Make the bugs invisible by reading: instead of a wrong field name (chunkOffset vs arrivalIndex), plant a subtle off-by-one in tag-arrival registration that only manifests when the same tag appears across a chunk boundary, or use a correct field name but initialize it from a goroutine-local counter rather than the global registry \u2014 requiring dynamic testing rather than static reading to discover",
+   "Clarify the chunk-size forcing mechanism: either expose it as an environment variable (SORTER_CHUNK_SIZE=512) documented in the instruction, or make it a build-time constant that the solver must not change, and explicitly state this in the setup",
+   "Add a fixed random seed to the Python test harness (e.g., seed=42 for reproducibility) and document the expected test runtime to avoid timeout ambiguity on 1CPU/2GB",
+   "To increase genuine_difficulty to 4+, add a third bug where the external merge incorrectly handles the final merge pass when the number of run files exceeds the fan-in limit, requiring the solver to understand k-way merge fan-in reduction \u2014 this bug only appears with 200+ tags and cannot be inferred from reading any single file"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 computation over binary WAL records with TCP networking; the candidate is about fixing an external merge-sort algorithm in Go for a data pipeline."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing AES-128-CTR nonce derivation in a C encryption library; the candidate is about fixing a multi-chunk merge-sort bug in a Go binary."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes chunk-boundary row-dropping and deduplication bugs in a Python CSV pipeline; the candidate fixes a broken external merge-sort ordering algorithm in a Go streaming binary."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task fixes schema validation correctness and performance in a Node.js NDJSON ingestion service; the candidate fixes a stable external merge-sort bug in a Go binary."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task fixes HMAC chain verification logic in an audit-log service; the candidate fixes a multi-chunk merge-sort correctness bug in a Go streaming sorter."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.254
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.153
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.146
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.133
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.104
+    ]
+   ],
+   "cost_usd": 0.014397
+  },
+  "novel": true
+ },
+ "cost_usd": 0.052983
+}

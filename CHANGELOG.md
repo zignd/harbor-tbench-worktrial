@@ -4,6 +4,14 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 22:36 -03:00 · `make status` shows every candidate; `make watch` refreshes it
+- **`make status` now opens with a per-candidate table:**
+  - counts by status (building, gated, rejected, stopped, held, ...) plus the number shipped;
+  - one line per candidate: current phase (blueprint drafts, authoring turn N, gates, red-team, calibrating, tuning), attempt, time since the last ledger event, and the calibration verdict with its outcome string (`p`/`f`/`i` per trial).
+
+  In-flight authoring is read from the live trajectory, because the ledger's author event only lands when a run ends.
+- **`make watch`** (`EVERY=10` to change the interval) refreshes the whole view until Ctrl-C.
+
 ### 22:25 -03:00 · First retuned task calibrates 0/5 for an invalid reason; judge now enforces it; spec-fix path
 - **`8a6e` (log-ingestion-anomaly-pipeline, the first task built under the difficulty retune) calibrated 0/5, too hard.** All 5 failures are the same: Opus added a sensible tie-breaker (`ORDER BY cnt DESC, path ASC`), but the hidden test compares against SQLite's implementation-defined order of tied rows (`ORDER BY cnt DESC` alone). The instruction never states a tie order, so this is the task's fault. **The failure judge had labelled all 5 "valid" (weak_verification)**, even though its prompt already told it to be strict about unstated requirements. Two consequences: the tuner would have started making the task easier for the wrong reason (it had begun, and was stopped), and if that had worked a task with an invalid test could have shipped.
 - **Failure judge, enforced in code:** it must name the requirement the failing check enforces and quote the instruction sentence that states it. A "valid" verdict with no quote is overruled to `test_overreach`. The prompt also lists typical traps: tied or unordered items, unnamed sort keys or tie-breakers, float formatting, implementation-defined defaults. Re-judged with this, all 5 `8a6e` failures are `test_overreach` with no quote (`failure_rejudge` events). The calibration record keeps both verdicts (`verdict_original: too_hard` → `verdict: invalid`).

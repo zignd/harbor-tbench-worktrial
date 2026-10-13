@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "png-chunk-crc-recovery",
+  "title": "PNG Chunk CRC Recovery Tool",
+  "scenario": "A small embedded/systems team wrote a lean in-house PNG post-processing library (~1,200 lines across several modules) to strip metadata, reorder chunks, and repack PNG files for a resource-constrained device. After a recent refactor that consolidated chunk serialization, files produced by the tool are rejected by libpng on-device. The codebase has a chunk writer, a CRC computation module, a pipeline runner, and a CLI wrapper. The bug only manifests on real data because the sample PNGs in the repo all happen to pass a weaker validation check that the device library skips.",
+  "instruction_draft": "Hey, the PNG repacker in `/app/repacker/` is broken \u2014 files it emits get rejected by libpng's strict chunk CRC verifier. The output looks fine visually (we can open them in browsers) but the embedded device refuses them. There's a test PNG in `/app/samples/` and a verifier script at `/app/verify.py` you can use to check chunk CRCs. Fix the repacker so every chunk in its output has a correct CRC-32 per the PNG spec, including the IEND chunk and any ancillary chunks it emits. The fix has to work on all valid PNG inputs, not just the sample.",
+  "requirements": [
+   "Every chunk emitted by the repacker must have a CRC-32 computed over the 4-byte chunk type field concatenated with the chunk data field (not including the length field)",
+   "The CRC-32 polynomial must be the standard ISO 3309 / ITU-T V.42 polynomial (0xEDB88320 reflected, or equivalently initialized to 0xFFFFFFFF and the final value XOR-inverted)",
+   "The IEND chunk must be emitted with a correct CRC of 0xAE426082 (its data is empty, so its CRC is fixed)",
+   "The output PNG must be structurally valid: 8-byte PNG signature, then chunks in order, each with correct 4-byte big-endian length, 4-byte type, data, 4-byte CRC",
+   "All ancillary chunks the repacker optionally emits (tEXt, tIME, any others) must also carry correct CRCs",
+   "The repacker must produce output that libpng's crc-strict mode accepts for any valid single-channel or RGB PNG with any image dimensions"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with libpng-dev, zlib1g-dev, gcc installed",
+   "pip install Pillow",
+   "/app/repacker/ contains: cli.py (~80 lines), pipeline.py (~200 lines), chunk_io.py (~300 lines), crc_util.py (~150 lines), metadata.py (~200 lines), utils.py (~120 lines) \u2014 plausible surrounding code to make investigation non-trivial",
+   "crc_util.py contains the CRC implementation; after the refactor it computes CRC over only the chunk data, omitting the 4-byte chunk type field \u2014 this is the planted bug; the error is data-dependent because chunks with no data (like IEND) and chunks where the type bytes happen to land on multiples produce the same wrong value only sometimes",
+   "chunk_io.py calls crc_util with just the data bytes (bug site), while the PNG spec requires crc(type_bytes + data_bytes)",
+   "The CRC table generation in crc_util.py is correct (polynomial and table are right), only the call site omits the type field",
+   "A secondary bug: crc_util.py initialises the running CRC to 0 instead of 0xFFFFFFFF and does not XOR-invert at the end \u2014 this was present before the refactor but the old code path happened to compensate; after the refactor it surfaces",
+   "/app/samples/sample.png: a small 32x32 RGB PNG whose IDAT CRC accidentally passes the broken computation (chosen to hide both bugs from naive testing on just this file)",
+   "/app/verify.py: a script that reads a PNG and checks each chunk's CRC against a fresh correct computation, printing PASS/FAIL per chunk \u2014 this is the observable oracle",
+   "A compiled reference tool /app/bin/pngcheck (static binary, no source) that exits 0 on valid PNGs and nonzero otherwise \u2014 used by the test harness at verify time",
+   "The verify-time test harness generates fresh PNGs (various sizes, greyscale, RGB, with tEXt chunks, zero-data ancillary chunks) using Pillow, runs them through the repacker, and calls pngcheck on each output"
+  ],
+  "internal_hint": "Two interacting bugs in crc_util.py: (1) CRC is initialised to 0 not 0xFFFFFFFF and not XOR-inverted at the end \u2014 wrong polynomial application; (2) chunk_io.py feeds only the data bytes to the CRC function, missing the required chunk type prefix. Both bugs are invisible on the sample PNG because it was chosen so the IDAT CRC still passes the broken code (the type bytes cancel with the wrong init in this specific case). The solver must run the repacker on several real PNGs and observe chunk-by-chunk CRC failures with verify.py, then trace back to crc_util.py. The fix requires correcting both the init/finalise pattern AND adding type bytes to the CRC input in chunk_io.py. A solver who only reads the code will likely spot bug (2) and miss bug (1) because the table and loop look correct, or vice versa.",
+  "trap": "A solver who fixes only the chunk-type-prefix omission but leaves the wrong CRC init/finalise will pass the sample PNG and most RGB test cases, but fail on PNGs with ancillary chunks whose data length is zero or whose type bytes happen to expose the init error. The hidden corpus specifically includes tEXt chunks, zero-length ancillary chunks, and single-channel (greyscale) PNGs where the broken CRC happens to collide for the type-only case. A solver who fixes only the init/finalise leaves the type-prefix bug, which fails IEND (empty data means CRC = f(type_only) and the wrong value is detectable immediately). The IEND value is fixed and known (0xAE426082), so the test harness checks it explicitly.",
+  "tests": [
+   "Run repacker on sample.png, call pngcheck on output \u2014 must exit 0",
+   "Run repacker on a generated 1x1 greyscale PNG, verify all chunk CRCs with verify.py \u2014 all PASS",
+   "Run repacker on a generated 100x100 RGB PNG with a tEXt chunk containing ASCII metadata, verify all chunk CRCs \u2014 all PASS",
+   "Run repacker on a generated PNG with multiple ancillary chunks including one zero-data chunk, verify all chunk CRCs \u2014 all PASS",
+   "Check that the IEND chunk in any repacker output has CRC bytes exactly 0xAE426082 (big-endian)",
+   "Run repacker on a 256x256 RGB PNG (large IDAT), pngcheck strict mode exits 0",
+   "Run repacker on a PNG with a tIME chunk (8 bytes of data), verify its CRC independently",
+   "Run verify.py on repacker output for 10 corpus PNGs of varying dimensions and colour modes \u2014 all chunks PASS"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "10 PNGs generated at verify time with varying dimensions, colour modes, and ancillary chunk combinations",
+   "effect": "Raising corpus size and chunk variety increases the chance of hitting the specific data patterns that expose whichever bug the solver missed; lowering to just the sample file makes the task trivially passable with one fix"
+  },
+  "expected_failure_modes": [
+   "Solver spots and fixes only the chunk-type-prefix bug in chunk_io.py, misses the wrong CRC init/finalise in crc_util.py \u2014 passes sample and some test PNGs but fails on ancillary chunks where the init error is exposed",
+   "Solver spots only the CRC init/finalise bug, misses the type-prefix omission \u2014 fails IEND check immediately since IEND has empty data and the CRC collapses to a function of type bytes only, exposing the missing type argument",
+   "Solver replaces the custom CRC with Python's zlib.crc32 correctly but forgets to include the type bytes in the call \u2014 same partial failure",
+   "Solver reads crc_util.py and concludes the table looks correct (it is), stops investigating and only patches the init, then shallow-tests on the sample PNG which passes by coincidence",
+   "Solver fixes both bugs in crc_util.py but a third call site in metadata.py for optional chunks still uses the old signature \u2014 ancillary chunk tests fail"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "png",
+   "crc32",
+   "binary-formats",
+   "observe-not-read",
+   "edge-case-inputs",
+   "specification-adherence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/repacker/crc_util.py",
+   "cat /app/repacker/chunk_io.py",
+   "cat /app/repacker/metadata.py",
+   "cat /app/repacker/pipeline.py",
+   "python /app/verify.py /app/samples/sample.png",
+   "# Identify bug 1: crc_util.py init=0 instead of 0xFFFFFFFF, no XOR-invert at end",
+   "# Identify bug 2: chunk_io.py passes only data bytes to CRC, omitting type bytes",
+   "# Identify bug 3: metadata.py has old call site also missing type bytes",
+   "sed/edit crc_util.py: set crc=0xFFFFFFFF, return crc^0xFFFFFFFF",
+   "sed/edit chunk_io.py: pass type_bytes+data to crc function",
+   "sed/edit metadata.py: fix third call site to include type bytes",
+   "python /app/verify.py /app/samples/sample.png",
+   "/app/bin/pngcheck repacker_output.png",
+   "python -c 'generate 1x1 greyscale PNG' && python /app/repacker/cli.py ... && python /app/verify.py output.png",
+   "python -c 'generate 100x100 RGB+tEXt PNG' && python /app/repacker/cli.py ... && python /app/verify.py output.png",
+   "python -c 'check IEND CRC bytes == 0xAE426082 in output'"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The sample.png must be very carefully crafted so the broken CRC computation accidentally produces correct values for that specific file; if miscrafted, the bug is immediately visible on the sample, breaking the 'observe_not_read' premise",
+   "The static pngcheck binary must match the container architecture (linux/amd64 vs arm64); if the wrong binary is included, all pngcheck-based tests are flaky or broken",
+   "The blueprint lists metadata.py as a third call site in 'valid failure modes' but the instruction does not mention metadata.py \u2014 a solver who fixes both primary bugs but misses metadata.py fails a test that the instruction gives no guidance to anticipate, making that failure arguably ambiguous rather than legitimate",
+   "Pillow does not emit tEXt, tIME, or zero-data ancillary chunks by default; the corpus generation harness must use explicit chunk injection (e.g., via pypng or manual binary construction), and if it uses Pillow naively, those test cases may not actually contain the required ancillary chunks",
+   "Two interacting bugs where the sample hides both requires precise byte-level construction of sample.png; automated sample generation at image-build time risks accidentally producing a sample that exposes one or both bugs"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2/5 because both bugs are directly visible in source code (crc_util.py and chunk_io.py), placing this squarely in the 'solved 4/4 times by Opus by reading source' category per the rubric. The 'observe_not_read' framing is undermined by the bugs being readable \u2014 an agent reading the files in a ~16-command speedrun can identify and fix both bugs before even running the repacker. Additionally, the metadata.py third-call-site failure mode is not hinted at in the instruction, creating an ambiguous invalid failure risk. The average score (4+4+5+2+5)/5 = 4.0 passes the average threshold, but genuine_difficulty at 2 fails the minimum-4 requirement.",
+  "fixes": [
+   "Make the bugs non-source-visible: move the CRC logic into a compiled C extension (.so) or a pre-compiled .pyc with no source, so the solver must infer the bug from behavioral observation (running the repacker on various inputs and comparing outputs) rather than reading code \u2014 this would genuinely require the 'observe_not_read' approach and push genuine_difficulty to 4+",
+   "If keeping the bugs in Python source, add 3-4 plausible-but-correct CRC call sites in other modules so the solver cannot simply grep for the single wrong call \u2014 make the code surface area large enough that reading all of it is not faster than testing; increase codebase to ~3000 lines with realistic PNG metadata processing",
+   "Clarify in the instruction that metadata.py ancillary chunk emission is in scope ('the repacker emits optional ancillary chunks from metadata.py') so the third call site is not an ambiguous surprise failure",
+   "Specify how the corpus generation harness injects tEXt/tIME/zero-data chunks (e.g., 'using a provided inject_chunks.py helper') to ensure those test cases reliably contain ancillary chunks regardless of Pillow's default behavior"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about CSV pipeline deduplication and row-count correctness, not PNG chunk CRC computation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-crc32-with-logic-gates",
+     "verdict": "distinct",
+     "reason": "That task implements CRC32 using logic gates in a simulator, not debugging a PNG repacker's CRC computation bug in a real codebase."
+    },
+    {
+     "ref_id": "terminal-bench/rs-archive-clone",
+     "verdict": "distinct",
+     "reason": "That task is about black-box cloning a binary archive tool with Reed-Solomon encoding, not fixing CRC-32 in a PNG chunk writer."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task involves AES-128-CTR nonce derivation bugs in a cryptographic library, not PNG chunk CRC-32 computation."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task is about NetFlow v9 byte aggregation and template state, not PNG chunk serialization or CRC correctness."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.205
+    ],
+    [
+     "terminal-bench-pro/implement-crc32-with-logic-gates",
+     0.13
+    ],
+    [
+     "terminal-bench/rs-archive-clone",
+     0.107
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.075
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.064
+    ]
+   ],
+   "cost_usd": 0.014205
+  },
+  "novel": true
+ },
+ "cost_usd": 0.060615
+}

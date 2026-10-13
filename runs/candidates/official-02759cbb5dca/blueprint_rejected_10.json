@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "interval-sketch-codec-refactor",
+  "title": "Sketch Codec Silent Corruption",
+  "scenario": "Your team ships a Go service that computes approximate quantile sketches over streaming sensor data and serialises them to a compact binary format. After a large refactor that split the original monolith into a pipeline stage library, the CI regression suite (twenty fixed inputs) still passes cleanly. But overnight the release candidate started producing wrong merge results in production: downstream dashboards show quantile estimates that drift up to 40% from the true values on high-cardinality streams. The compiled binary `/app/bin/sketchd` is the production artifact built from the refactored source tree at `/app/src/`.",
+  "instruction_draft": "The release pipeline for `sketchd` is broken. The binary at `/app/bin/sketchd` accepts a newline-delimited stream of float64 values on stdin and, for a given sketch width, outputs a binary-encoded T-digest-style centroid list followed by a CRC32 checksum. When two sketch blobs are merged with `sketchd merge`, the merged result must satisfy these invariants on any input stream of up to 10 000 values drawn from any mixture of uniform, exponential, log-normal, or Pareto distributions:\n\n1. The 0.5-quantile estimate of the merged sketch lies within \u00b12% of the true median of the combined stream.\n2. The 0.05- and 0.95-quantile estimates lie within \u00b15% of the true 5th and 95th percentiles.\n3. The CRC32 appended to every emitted blob matches the preceding bytes.\n4. `sketchd merge` applied to two independently built sketches produces the same binary blob as `sketchd merge` applied in the reverse order (commutativity).\n\nFix the source under `/app/src/` and rebuild with `make -C /app` so the installed binary at `/app/bin/sketchd` satisfies all four invariants. Do not alter the CLI interface or the on-disk binary format.",
+  "requirements": [
+   "Median estimate of merged sketch within \u00b12% of true median for streams up to 10 000 values",
+   "5th and 95th percentile estimates within \u00b15% of true values",
+   "CRC32 appended to every binary blob matches preceding content",
+   "Merge is commutative: merge(A,B) produces identical bytes to merge(B,A)",
+   "Binary at /app/bin/sketchd is rebuilt from fixed source (make -C /app succeeds)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22 via apt, builds the project with `make -C /app` during image build, and copies the binary to /app/bin/sketchd",
+   "Source tree at /app/src/ (~1400 lines across 7 files): sketch/centroid.go, sketch/compress.go, sketch/merge.go, sketch/codec.go, pipeline/stage.go, pipeline/runner.go, cmd/main.go",
+   "sketch/merge.go contains a centroid-ordering bug introduced in the refactor: after splitting centroids from two sketches it sorts by mean but uses an unstable sort; when means are equal it breaks ties by count in descending order instead of ascending, causing the compression step to mis-cluster boundary centroids and shift tail quantiles",
+   "sketch/codec.go contains a CRC32 bug: the checksum is computed over the header bytes only (first 8 bytes) rather than the full payload, so the stored CRC passes on small sketches (where payload \u2264 8 bytes) but silently mismatches on larger ones",
+   "sketch/compress.go contains a weight-accumulation bug that only manifests when a sketch has more than 512 centroids before compression: a uint32 overflow in the running-weight field wraps around, producing a distorted compression boundary that pulls the median estimate high",
+   "The regression suite in /app/testdata/ contains 20 fixed small streams (\u2264200 values, all from uniform distributions) that pass all four checks even with all three bugs present",
+   "A reference Python script /app/tools/true_quantiles.py computes exact quantiles for verification",
+   "Makefile at /app builds the binary deterministically with `go build -o bin/sketchd ./cmd/`",
+   "No source for a helper binary /app/bin/streamgen that generates reproducible seeded streams is provided (it is a pre-built opaque binary used by tests at verify time to produce fresh inputs)"
+  ],
+  "internal_hint": "Difficulty comes from three interacting bugs none of which is visible by inspection alone: (1) the tie-breaking sort comparator in merge.go only misbehaves when two centroids have identical means, which never happens in the 20 uniform-distribution regression streams but is common in Pareto/log-normal streams; the solver must generate high-cardinality Pareto inputs to observe it. (2) The CRC bug passes on all regression inputs because they are small enough that the payload \u2264 8 bytes; the solver must instrument the codec path or diff it against the format spec comment in codec.go which documents 'CRC32 over full frame'. (3) The uint32 overflow only triggers at >512 centroids, requiring streams of >2000 raw values; the solver has to run sketchd on a large stream and observe the median drift, then instrument compress.go. A skilled engineer (a) runs sketchd on a large Pareto stream and compares against true_quantiles.py to observe the drift, (b) bisects to the compress path by checking centroid counts before/after, (c) reads codec.go against its own inline format spec to spot the CRC scope, (d) constructs a stream with duplicate mean centroids to expose the sort tie-break. All three must be fixed for the hidden tests to pass.",
+  "trap": "A naive solver notices the CRC comment discrepancy immediately (it is the most readable clue), fixes it, rebuilds, reruns the 20 regression samples \u2014 all pass. They may also spot and fix the uint32 overflow with a large uniform stream. But the sort tie-break bug in merge.go only surfaces on Pareto/log-normal distributions where centroid means collide after the first compression pass; the hidden tests generate fresh Pareto streams at verify time and the commutativity check will fail because tie-breaking order determines which centroid absorbs mass, producing non-identical bytes and out-of-tolerance quantiles.",
+  "tests": [
+   "For each of 60 verify-time streams (seeded, generated by /app/bin/streamgen with seeds 1-60, mixing uniform, exponential, log-normal and Pareto distributions, lengths 500-10000): build two non-overlapping half-streams into sketch blobs, merge them, compare 0.05/0.5/0.95 quantile estimates against true_quantiles.py output, assert all within tolerance",
+   "For each of 60 verify-time streams: compute merge(A,B) and merge(B,A) and assert the output bytes are identical",
+   "For 20 verify-time streams of length \u22653000 from Pareto(alpha=1.5) distribution: assert median estimate within \u00b12%",
+   "For 10 verify-time streams: assert CRC32 of the full emitted blob payload matches the stored checksum field by re-reading the binary output and recomputing the checksum independently in Python"
+  ],
+  "verifier_knob": {
+   "name": "stream_count_and_variety",
+   "value": "60 streams across 4 distributions, lengths 500-10000",
+   "effect": "Reducing to 20 streams from uniform distributions only makes the task trivially passable with only the CRC fix; increasing variety and count forces all three bugs to be found"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the CRC bug (most readable) and stops after regression tests pass",
+   "Agent fixes CRC and uint32 overflow but misses the sort comparator because the tie-break only triggers on non-uniform distributions not present in their self-tests",
+   "Agent rewrites merge.go entirely using a different algorithm that is correct on uniform inputs but wrong on log-normal due to a different quantile-boundary assumption",
+   "Agent changes the CLI interface or binary format while fixing the bugs, breaking the format contract checked by tests"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithmic",
+   "quantile-sketch",
+   "refactoring",
+   "fuzz-equivalence",
+   "binary-codec"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/sketch/codec.go  # spot CRC-over-header-only vs 'CRC32 over full frame' comment",
+   "cat /app/src/sketch/compress.go  # spot uint32 running-weight field",
+   "cat /app/src/sketch/merge.go  # spot sort comparator with descending-count tie-break",
+   "cat /app/src/sketch/centroid.go /app/src/pipeline/stage.go /app/src/cmd/main.go  # confirm no other bugs",
+   "sed -i 's/crc32.ChecksumIEEE(frame[:8])/crc32.ChecksumIEEE(frame[:len(frame)-4])/' /app/src/sketch/codec.go  # fix CRC scope",
+   "sed -i 's/uint32/uint64/' /app/src/sketch/compress.go  # fix overflow (or targeted edit)",
+   "# Edit merge.go comparator: change 'a.Count > b.Count' to 'a.Count < b.Count' for tie-break",
+   "make -C /app  # rebuild",
+   "echo -e '1.0\\n2.0\\n3.0' | /app/bin/sketchd build --width 100 > /tmp/a.blob  # smoke test build",
+   "echo -e '4.0\\n5.0\\n6.0' | /app/bin/sketchd build --width 100 > /tmp/b.blob",
+   "/app/bin/sketchd merge /tmp/a.blob /tmp/b.blob > /tmp/ab.blob",
+   "/app/bin/sketchd merge /tmp/b.blob /tmp/a.blob > /tmp/ba.blob",
+   "diff /tmp/ab.blob /tmp/ba.blob  # verify commutativity",
+   "python3 /app/tools/true_quantiles.py < /tmp/combined_stream  # verify quantile tolerance"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "streamgen is a pre-built opaque binary with no source \u2014 platform-specific failures, segfaults, or non-deterministic output would cause invalid test failures unrelated to solver correctness",
+   "Byte-exact commutativity check could fail due to non-deterministic Go runtime behavior (map iteration order, goroutine scheduling) even with a correct implementation",
+   "No on-disk binary format spec is provided to the solver; 'do not alter the binary format' invariant may be impossible to verify independently, and verifier could reject valid format-preserving changes",
+   "Go 1.22 via apt on bookworm may require internet access or specific repo pinning not described; build environment reproducibility is not guaranteed",
+   "The 20 regression samples all pass even with all three bugs, which means a solver who only runs those tests gets false confidence \u2014 but this is intended; the risk is if streamgen fails to generate the non-uniform streams needed to catch the sort bug"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: all three bugs are directly visible by reading the source files, and a systematic agent will find and fix all of them in ~14 commands without needing to run any non-uniform distribution tests. The 'trap' only catches agents that stop after fixing one bug and don't read the remaining files, which is not a realistic failure mode for a competent agent. Additionally, the opaque pre-built streamgen binary introduces invalid failure risk that cannot be mitigated by the solver.",
+  "fixes": [
+   "Move at least one bug to a location that requires dynamic observation rather than static reading \u2014 e.g., the sort bug should be in a correct-looking comparator that only misbehaves due to a subtle numeric precision issue requiring instrumentation to detect, not a plainly wrong 'descending instead of ascending' flip",
+   "Replace the opaque pre-built streamgen binary with a Go or Python source file that is compiled/run as part of the test setup, eliminating the platform-specific binary risk and making the test environment fully reproducible from source",
+   "Add a genuine missing-implementation component (the build_component lever) that requires the solver to write new code rather than only fix existing code \u2014 e.g., the merge commutativity fix requires implementing a canonical centroid normalization step that does not exist anywhere in the current source tree",
+   "Introduce a fourth bug that requires cross-file reasoning to find \u2014 e.g., a pipeline/stage.go bug that silently truncates centroids when the pipeline buffer is exactly full, requiring the solver to trace data flow across file boundaries rather than reading each file in isolation"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 over WAL records with TCP serving and database lookups; the candidate is about fixing a T-digest sketch codec with quantile accuracy and CRC integrity."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a black-box normalizer binary and fixing a SQL pipeline; the candidate is about source-level debugging of a Go sketch serialization/merge bug."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-engineer-physics-simulator",
+     "verdict": "distinct",
+     "reason": "That task is black-box reverse engineering of a physics simulator in C; the candidate is white-box source repair of a Go quantile sketch library."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding a silent numerical correctness regression introduced by a refactor that the existing CI suite misses, and fixing the implementation to meet a stated accuracy threshold \u2014 the domain (spectral entropy vs. T-digest sketches) differs but the core problem structure is essentially the same."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve a refactored library that passes regression tests but silently produces wrong results on out-of-corpus inputs, requiring source-level debugging and a rebuild \u2014 the domain (AES-CTR encryption vs. quantile sketches) differs but the underlying challenge is identical."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.129
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.119
+    ],
+    [
+     "terminal-bench-pro/reverse-engineer-physics-simulator",
+     0.098
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.095
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.088
+    ]
+   ],
+   "cost_usd": 0.015978
+  },
+  "novel": false
+ },
+ "cost_usd": 0.061857
+}

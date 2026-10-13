@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "stream-merger-refactor-go",
+  "title": "Stream Merge Refactor: Silent Ordering Bug",
+  "scenario": "Your team ships a compiled Go binary (`/app/bin/smerge`) that merges N sorted integer streams into a single sorted output stream and computes a rolling checksum used downstream by the settlement pipeline. The binary was built from source in the Dockerfile; the source lives in `/app/src/` (~1,400 lines across six files). A recent large-scale refactor that replaced the original k-way merge with a 'faster' priority-queue implementation broke the binary: the nightly CI run produces a wrong checksum on some inputs but passes the smoke test that ships with the repo.",
+  "instruction_draft": "The release pipeline is blocked because `/app/bin/smerge` produces wrong output on some inputs. The binary reads a sequence of sorted integer streams from stdin (format described in `/app/README.md`) and writes a merged sorted stream followed by a final CRC-32C checksum line to stdout. The provided smoke test in `/app/test/smoke_test.sh` passes, but the hidden integration suite does not. Refactor or repair the source so that `make -C /app/src` rebuilds `smerge` and the rebuilt binary produces output byte-for-byte identical to the reference computation for all valid inputs: arbitrary numbers of streams (1 to 64), stream lengths (0 to 50,000 integers each), integer values in the full int64 range including duplicates and negative numbers, and streams that are not strictly increasing (only non-decreasing is guaranteed). The final binary must live at `/app/bin/smerge`.",
+  "requirements": [
+   "Running `make -C /app/src` must succeed and place the rebuilt binary at `/app/bin/smerge`.",
+   "For every generated test input, the merged output must be a non-decreasing sequence containing exactly the multiset union of all input stream elements.",
+   "The CRC-32C checksum line printed by smerge must exactly match the checksum of the merged byte sequence.",
+   "The binary must handle streams with zero elements, a single stream, and up to 64 concurrent streams.",
+   "The binary must correctly handle int64 values including INT64_MIN, INT64_MAX, negative values, and large runs of duplicates.",
+   "Output must be byte-for-byte identical to the reference computation for all valid inputs tested at verify time."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install golang-1.21 make; Go toolchain pinned.",
+   "`/app/src/` contains ~1,400 lines of Go across six files: main.go, merge.go, heap.go, checksum.go, reader.go, writer.go.",
+   "`merge.go` contains the refactored k-way merge using a min-heap; it has two interacting bugs introduced during the refactor: (1) the heap's Less() comparator uses `<` instead of `<=` which causes instability and wrong ordering when duplicate values span stream boundaries, and (2) after a stream is exhausted the heap node is re-pushed with a sentinel value (math.MaxInt64) rather than being removed, which causes the sentinel to appear in the output when all streams happen to have the same final value \u2014 this path is not exercised by the smoke test.",
+   "The sentinel bug only manifests when two or more streams end on the same maximum value AND a subsequent stream also contributes that same value; the smoke test uses streams with distinct last elements.",
+   "`heap.go` implements a generic integer min-heap; it is correct but its `Swap` method has an off-by-one that is masked by the sentinel re-push \u2014 fixing the sentinel without fixing Swap causes a different failure on large inputs.",
+   "`checksum.go` computes CRC-32C using the Castagnoli polynomial; it is correct.",
+   "`/app/Makefile` (or `/app/src/Makefile`) builds with `go build -o /app/bin/smerge ./...`.",
+   "`/app/README.md` documents the wire format: a header line `STREAMS <n>`, then n blocks each beginning with `STREAM <k>` followed by k lines each containing one int64 in decimal, then a blank line.",
+   "`/app/test/smoke_test.sh` tests 3 streams of 10 elements with distinct values and distinct last elements \u2014 passes even with the bugs.",
+   "`/app/bin/smerge` is the pre-built (broken) binary compiled from the buggy source at Docker image build time.",
+   "A reference Python implementation `/app/ref/reference.py` is present and correct; the Go tests compare against it. The verifier runs the rebuilt Go binary and the reference Python side-by-side on fresh inputs."
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the bugs are data-dependent and only visible when the system runs on carefully constructed inputs (duplicate final values across streams, and the specific Swap off-by-one exposed only on large inputs after the sentinel fix), not by reading the code once; and (2) fixing only the obvious Less() comparator leaves the sentinel re-push bug, which the agent may not notice because the smoke test still passes; fixing both the sentinel and Less() but missing the Swap off-by-one causes failures on larger inputs that require instrumenting the heap under load. The agent must: (a) read the README to understand the wire format, (b) experiment with the binary on crafted inputs to observe wrong output, (c) locate merge.go and heap.go as the culprits by diffing expected vs actual output, (d) fix Less() to use strict ordering with a tie-break on stream index, (e) fix the sentinel re-push by properly removing exhausted streams from the heap, and (f) fix the Swap off-by-one in heap.go. All three fixes are necessary and sufficient.",
+  "trap": "The smoke test exercises only streams with distinct elements and distinct final values, so a fix that only corrects Less() passes the smoke test and also passes naive equivalence checks on random inputs with low collision probability. The hidden verifier generates inputs with large runs of duplicates, streams that all end on the same value, and streams of length 0 interspersed with long streams \u2014 these trigger both the sentinel bug and the Swap bug. An agent that runs the smoke test and a few random trials and calls it done will fail the hidden suite.",
+  "tests": [
+   "Test 1 \u2014 basic correctness: generate 100 random test cases with 1\u201310 streams, 0\u20131000 elements each, values in [-10^9, 10^9], run rebuilt smerge and reference.py on each, assert multiset equality and CRC match.",
+   "Test 2 \u2014 duplicate-heavy: generate 50 cases where all streams contain the same value repeated (e.g., all elements = 42, or all = INT64_MIN), assert smerge output is sorted and CRC matches reference.",
+   "Test 3 \u2014 shared final value: generate 30 cases where 2\u20138 streams all end on the identical maximum value; verify no sentinel (INT64_MAX = 9223372036854775807) appears in output and CRC matches.",
+   "Test 4 \u2014 empty streams: generate 20 cases mixing zero-length streams with non-empty ones, including all-empty; verify empty output produces correct empty-sequence CRC.",
+   "Test 5 \u2014 large scale: generate 5 cases with 32\u201364 streams of 20,000\u201350,000 elements each, assert output length equals sum of input lengths, output is non-decreasing, CRC matches reference.",
+   "Test 6 \u2014 int64 extremes: generate 10 cases using INT64_MIN and INT64_MAX as stream values, assert correct ordering around extremes.",
+   "Test 7 \u2014 rebuild check: verify `make -C /app/src` exits 0 and `/app/bin/smerge` is newer than the pre-built binary, i.e., a real rebuild occurred.",
+   "Test 8 \u2014 wire format compliance: verify smerge rejects malformed input (wrong header, non-integer values) with non-zero exit code."
+  ],
+  "verifier_knob": {
+   "name": "num_generated_cases",
+   "value": "200 total across all test categories",
+   "effect": "Raising increases the probability of hitting the exact input shapes that expose each bug; lowering lets a partially-fixed binary pass more easily. At 50 cases the duplicate-final-value trigger becomes rare enough that an incomplete fix sometimes passes; at 500 the Swap off-by-one is nearly certain to be caught on large inputs."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only Less() (the most visible bug when reading merge.go) and stops after the smoke test passes; the sentinel re-push and Swap bugs still cause failures on hidden inputs.",
+   "Agent fixes Less() and the sentinel but misses the heap.Swap off-by-one; small-to-medium inputs pass but large-scale test cases (Test 5) still fail intermittently.",
+   "Agent rewrites merge.go from scratch with a correct heap but introduces a new bug in the wire-format reader (e.g., off-by-one on STREAM block parsing) that fails on zero-length streams.",
+   "Agent tries to replace the Go implementation with a shell script or Python wrapper without rebuilding; the Makefile check (Test 7) catches this.",
+   "Agent misidentifies the Swap off-by-one as a red herring because it is masked in small inputs, and ships a fix that passes 6 of 8 test categories."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithmic",
+   "heap",
+   "refactoring",
+   "fuzz-equivalence",
+   "data-dependent-bug"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/src/merge.go",
+   "cat /app/src/heap.go",
+   "# Identify all three bugs by static reading: Less() comparator, sentinel re-push, Swap off-by-one",
+   "# Fix merge.go: change Less() comparator to include tie-break on stream index, replace sentinel re-push with proper heap removal",
+   "# Fix heap.go: correct the Swap off-by-one index",
+   "make -C /app/src",
+   "bash /app/test/smoke_test.sh",
+   "echo 'STREAMS 2\\nSTREAM 3\\n1\\n3\\n5\\nSTREAM 3\\n2\\n4\\n5\\n' | /app/bin/smerge",
+   "python3 /app/ref/reference.py < same_input",
+   "# Verify outputs match"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "All three bugs are statically visible in source code \u2014 a frontier agent reads merge.go and heap.go and fixes all bugs in one pass without needing crafted inputs, making the 'data-dependent' difficulty narrative ineffective against code-reading agents.",
+   "The Less() bug description is potentially self-contradictory: a min-heap Less() should use strict '<'; saying it 'uses < instead of <=' causing instability is confusing and may indicate a logical error in the blueprint that could make the fix non-obvious in a wrong direction.",
+   "golang-1.21 package availability in python:3.13-slim-bookworm (Debian Bookworm) via apt-get requires golang-1.21 to be in the default apt sources; the package is named 'golang-1.21' in Bookworm but availability should be verified to avoid environment build failures.",
+   "The Swap off-by-one being 'masked by sentinel re-push' creates an order-dependency in fixes that may not hold consistently across all input sizes, potentially creating flaky test outcomes depending on fix ordering.",
+   "The blueprint's own internal hint fully reveals all bug locations and types, meaning any agent that can read the task blueprint (via reflection or system prompt leakage) trivially solves it."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three bugs are statically visible in ~300 lines of Go source across two files, and a frontier agent reading merge.go and heap.go will identify and fix all bugs in a single pass without needing crafted inputs or fuzzing experiments. The 'data-dependent' framing only creates difficulty for black-box testing approaches, not for code-reading agents. Additionally, the Less() bug description contains a potential logical inconsistency (min-heap Less() should use '<'; claiming '<' is wrong is confusing) that could mislead solvers. The task fails the genuine_difficulty threshold of 4 required for acceptance.",
+  "fixes": [
+   "Move the bugs out of plain static visibility: instead of wrong comparator symbols or obvious sentinel misuse, introduce a bug where the heap uses a correct-looking but subtly wrong index calculation (e.g., parent=(i-1)/2 replaced with i/2) that only manifests on heaps of specific sizes \u2014 this cannot be fixed by reading alone.",
+   "Add a binary-only component: provide merge.go as a compiled object file (not source) and require the agent to reverse-engineer the interface from README + tests, then write a correct replacement \u2014 this forces experimental exploration rather than code reading.",
+   "Replace the Less()/sentinel bugs with a race condition or goroutine ordering bug that requires dynamic analysis (e.g., concurrent stream readers with a missing mutex that causes non-deterministic output on streams > 1000 elements) \u2014 static reading won't reveal which synchronization primitive is missing without runtime instrumentation.",
+   "Clarify the Less() bug description to be unambiguous about what 'wrong' means for a min-heap: specify whether the comparator inverts priority or fails to handle equality, and provide the exact signature so the fix direction is clear."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference task involves HMAC-SHA256 computation over WAL records with a TCP service and database lookup, while the candidate involves fixing a k-way merge priority-queue bug in a Go binary."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-engineer-physics-simulator",
+     "verdict": "distinct",
+     "reason": "The reference task requires reverse-engineering a black-box binary to replicate its physics simulation behavior, while the candidate involves debugging and fixing a known source-code bug in a Go merge implementation."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "The reference task involves NetFlow protocol parsing and per-counterparty byte attribution in Python, while the candidate involves fixing a priority-queue k-way merge ordering bug in Go."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference task involves characterizing a black-box normalizer binary and fixing a pipeline to produce correct SQL rollups, while the candidate involves fixing a Go source-level merge algorithm bug."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks share the same structural pattern: a ~1,400-line codebase refactored across six files, a refactor that breaks behavior for inputs outside the regression suite while passing existing tests, and the requirement to fix the source so output matches a reference computation \u2014 only the domain (AES-CTR cipher vs. k-way merge) differs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.138
+    ],
+    [
+     "terminal-bench-pro/reverse-engineer-physics-simulator",
+     0.133
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.13
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.122
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.116
+    ]
+   ],
+   "cost_usd": 0.015312
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055473
+}

@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "fixed-point-png-chunk-recovery",
+  "title": "PNG Chunk CRC Recovery Tool",
+  "scenario": "An embedded/systems developer maintains a small in-house tool suite (~1200 lines across 4 Python files) that reads proprietary sensor logs and converts batches of them into annotated PNG images for offline review on a budget laptop. After a filesystem incident, many PNGs have corrupted chunk CRC fields \u2014 the pixel data and metadata are intact, but the 4-byte CRC at the end of each chunk is wrong, causing every standard viewer and library to reject the files. The codebase has a `recover.py` entry point that is supposed to repair these files in-place, but it was written hastily and produces output that still fails validation on a wide range of real PNG structures.",
+  "instruction_draft": "Hey, our PNG recovery tool at /app/recover.py is busted. It's supposed to read a PNG, find every chunk whose stored CRC doesn't match the actual CRC-32 of its type+data, recompute and patch the correct CRC in-place, and write the fixed file. Works fine on the test PNG we have, but blows up or silently corrupts on anything else. Fix it so it correctly repairs any valid-structure PNG where only the CRC fields are wrong \u2014 chunk type, length fields, and pixel data are all intact. The fixed file must pass `python3 -c \"import png; png.Reader(file=open(f,'rb')).read()\"` for every repaired file.",
+  "requirements": [
+   "recover.py takes a file path argument and repairs CRC fields in-place",
+   "For each PNG chunk, recompute CRC-32 over the 4-byte chunk type concatenated with the chunk data",
+   "Only patch chunks whose stored CRC does not match the recomputed value",
+   "The repaired PNG must pass pypng Reader validation (png.Reader(...).read() succeeds)",
+   "Chunks with already-correct CRCs must not be modified",
+   "All chunks in the file must be processed, including IDAT, IEND, tEXt, zTXt, iTXt, pHYs, gAMA, cHRM, sBIT, tIME, and any ancillary chunks",
+   "The tool must handle multi-IDAT PNGs (chunked image data across several IDAT chunks)",
+   "The tool must handle zero-length data chunks (e.g., IEND) correctly",
+   "The repaired file must have the correct 8-byte PNG signature at offset 0"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "pip install pypng==0.20220715.0 zlib (zlib is stdlib)",
+   "/app/ contains: recover.py, chunk_utils.py, sensor_log_parser.py, image_builder.py, and tests/sample.png",
+   "recover.py is ~120 lines with at least 3 interacting bugs that are only visible on non-trivial PNG structures",
+   "Bug 1 (observe_not_read): The CRC is computed only over chunk data, omitting the 4-byte chunk type prefix \u2014 correct on chunks like IEND (zero data) only by accident when type happens to collide, wrong for all real chunks. This looks right in a naive reading because the variable is named 'chunk_crc' but the slice excludes the type bytes.",
+   "Bug 2 (edge_case_inputs): The length field is read as big-endian but the code uses a wrong struct format string '!i' (signed) instead of '!I' (unsigned), which silently works for all chunks under 2 GB but fails or misparses chunks with length >= 2^31 \u2014 not triggered by the sample but triggered by verifier-generated files with large tEXt payloads.",
+   "Bug 3 (edge_case_inputs): After patching the CRC bytes, the file offset arithmetic is off by one in a loop that tracks position \u2014 it uses `pos += 4 + length + 4` but should use `pos += 8 + length + 4` (missing the length field itself in the stride), causing the second and later chunks to be read from wrong offsets. The sample PNG has only one IDAT so the loop runs once and the bug doesn't fire.",
+   "The sample PNG (tests/sample.png) is a tiny 4x4 grayscale image with a single IDAT chunk and only IHDR+IDAT+IEND \u2014 the minimum structure that exercises none of the three bugs above.",
+   "chunk_utils.py, sensor_log_parser.py, image_builder.py are plausible but uninvolved code (~300 lines each) to make the codebase realistically sized.",
+   "A helper script /app/make_test_png.py is present that generates PNGs with specific structures, to give the solver a way to construct test cases \u2014 but the verifier generates its own."
+  ],
+  "internal_hint": "Three bugs interact: (1) CRC computed without type bytes \u2014 visible only by checking the PNG spec or running on a non-IEND chunk and comparing against zlib.crc32; discovered by instrumenting the CRC computation on a known PNG. (2) Signed vs unsigned struct unpack for length \u2014 only fires on large chunks; discovered by generating a PNG with a large ancillary chunk. (3) Stride arithmetic skips the 4-byte length field, so multi-chunk PNGs get read from wrong offsets; discovered by running on a PNG with 3+ chunks and observing that the second chunk is misidentified. The solver must run the tool on test PNGs they generate, observe the failures, trace back through the code, and fix all three. Fix path: change crc input to type_bytes+data, change '!i' to '!I', change pos stride from 4+length+4 to 8+length+4.",
+  "trap": "A naive fix catches bug 1 (the obvious CRC formula error visible by reading the spec) and the tool passes the sample PNG. But the hidden corpus includes PNGs with: (a) multiple IDAT chunks causing the stride bug to corrupt all chunks after the first, (b) large tEXt/zTXt chunks triggering the signed-int overflow, (c) ancillary chunks in unusual orders. A solver who only validates against tests/sample.png ships a tool that fails 60-70% of the hidden corpus.",
+  "tests": [
+   "Generate 40 PNG files at verify time spanning: 1x1 to 256x256 pixels, 1/2/4/8/16-bit depth, grayscale/RGB/RGBA/palette color types, 1 to 8 IDAT chunks, zero to 5 ancillary chunks (tEXt with payloads up to 100KB, pHYs, gAMA, tIME, iTXt), IEND always last. Corrupt all CRC fields by XORing with 0xDEADBEEF. Run recover.py on each. Verify with pypng.Reader().read() \u2014 must succeed for all 40.",
+   "For each repaired file, verify the 8-byte PNG signature is intact at offset 0.",
+   "Generate 10 PNGs with already-correct CRCs (no corruption). Run recover.py. Verify the output is byte-for-byte identical to input.",
+   "Generate 5 PNGs where only some chunks are corrupted (alternating). Verify only the corrupted chunks are patched and correct CRC chunks are untouched.",
+   "Generate a PNG with a 200KB tEXt chunk (length > 2^17) to exercise the unsigned-int path. Corrupt its CRC. Verify recovery succeeds.",
+   "Generate a PNG with 6 IDAT chunks. Corrupt CRCs on chunks 1, 3, 5. Verify all are repaired and chunks 2, 4, 6 are unchanged.",
+   "Verify that a zero-length IEND chunk with corrupted CRC is correctly repaired to CRC-32 of the 4 type bytes only (no data)."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "40 generated PNGs",
+   "effect": "Raising to 80+ with more color-type and chunk-count combinations catches more partial fixes; lowering to 10 (just multi-IDAT and large-chunk cases) makes it easier to hit by fixing only bugs 1 and 3 while missing bug 2."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the CRC formula (bug 1) by reading the PNG spec, validates on sample.png, ships \u2014 fails all multi-IDAT tests due to stride bug.",
+   "Agent fixes bugs 1 and 3 but doesn't discover the signed-int issue because no test PNG they generate has a chunk large enough to trigger it.",
+   "Agent rewrites recover.py using a library (e.g., construct or struct) but introduces a new off-by-one in the write-back offset when patching CRC bytes in the bytearray.",
+   "Agent fixes the stride but introduces an off-by-one in the CRC patch location (writes 4 bytes at wrong offset), which passes casual inspection but fails byte-exact verification.",
+   "Agent uses pypng to re-read and re-write the file rather than doing surgical in-place patching, which changes chunk ordering or strips ancillary chunks, failing the unchanged-CRC idempotency test."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "png",
+   "crc32",
+   "binary-format",
+   "file-recovery",
+   "specification-adherence",
+   "edge-cases"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/recover.py  # read source, all 3 bugs visible by inspection",
+   "# Bug 1 spotted: CRC = zlib.crc32(data) missing type bytes prefix",
+   "# Bug 2 spotted: struct.unpack('!i', ...) signed instead of '!I'",
+   "# Bug 3 spotted: pos += 4 + length + 4 missing 4-byte length field => should be 8 + length + 4",
+   "sed -i 's/zlib.crc32(data)/zlib.crc32(chunk_type + data)/' /app/recover.py  # fix bug 1",
+   "sed -i \"s/'!i'/'!I'/\" /app/recover.py  # fix bug 2",
+   "sed -i 's/pos += 4 + length + 4/pos += 8 + length + 4/' /app/recover.py  # fix bug 3",
+   "python3 /app/recover.py tests/sample.png",
+   "python3 -c \"import png; png.Reader(file=open('tests/sample.png','rb')).read(); print('OK')\"",
+   "python3 /app/make_test_png.py  # generate multi-chunk PNGs for self-validation",
+   "python3 /app/recover.py [generated_multiIDATtest.png]",
+   "python3 -c \"import png; png.Reader(file=open('generated_multiIDATtest.png','rb')).read(); print('OK')\""
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Bug descriptions in the blueprint are so precise (exact variable names, exact wrong format strings, exact stride expression) that a strong agent reading the spec text could reconstruct the fixes without even reading recover.py \u2014 the task becomes trivia rather than debugging.",
+   "The 'observe_not_read' difficulty lever is misapplied: all bugs are syntactically obvious in the source (a signed vs unsigned format char, a wrong arithmetic expression) and do not require running on real data to discover.",
+   "The trap scenario (agent only fixes bug 1 and validates on sample.png) requires the agent to not read the rest of the source after spotting the first bug \u2014 unlikely for any systematic agent that reads files top to bottom.",
+   "The make_test_png.py helper is present but the verifier generates its own corpus, so the solver has no reliable way to reproduce exact verifier inputs \u2014 could cause subtle failures if the verifier uses PNG structures the helper doesn't generate, though the bugs are fixable by code inspection alone.",
+   "In-place patching of the same file used in the no-corruption idempotency test could be flaky if recover.py opens and writes the file non-atomically and the test checks byte-exact equality \u2014 but this is a test design risk, not ambiguity.",
+   "The blueprint says pypng is installed via 'pip install pypng==0.20220715.0 zlib' \u2014 zlib is stdlib and cannot be pip-installed; this is a build environment error that could make the Docker image fail to build."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because all three bugs are directly readable from the source code with exact variable names and wrong values described in the blueprint itself \u2014 a strong agent reads recover.py, spots all three in one pass, applies three targeted edits, and is done in ~12 commands without needing to run any test PNGs. The 'observe_not_read' lever does not apply when the code simply contains a wrong format string character ('!i' vs '!I') and a wrong constant in an arithmetic expression. Additionally, the build environment has a defect: 'pip install zlib' will fail since zlib is a Python stdlib module not a PyPI package.",
+  "fixes": [
+   "Remove all bug descriptions from the blueprint spec \u2014 do not name the wrong format strings, wrong variable slices, or wrong arithmetic expressions; instead describe only the observable symptom ('the tool silently corrupts multi-chunk PNGs') so the agent must discover bugs empirically.",
+   "Replace the simple typo bugs (signed int format, stride arithmetic) with logic bugs that are not visible by reading the code in isolation \u2014 e.g., a bug that only manifests when two conditions interact at runtime, such as a caching bug that reuses a previous chunk's data when chunk length equals the previous chunk's length.",
+   "Fix the Docker environment: remove 'zlib' from the pip install line (it is stdlib) and verify the image builds cleanly.",
+   "Make the sample.png exercise at least 2 of the 3 bugs so that passing sample.png is a meaningful bar \u2014 currently sample.png exercises none of the three bugs, making it useless as a sanity check and allowing any partial fix to claim success.",
+   "Add a mandatory self-test step in the instruction that requires the solver to run against a multi-IDAT PNG and a large-chunk PNG before submitting, forcing empirical validation rather than code-reading alone."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about CSV pipeline correctness (row deduplication, chunking, validation), not binary file format repair."
+    },
+    {
+     "ref_id": "terminal-bench/rs-archive-clone",
+     "verdict": "distinct",
+     "reason": "That task is about black-box reimplementation of a multi-layer archive tool with Reed-Solomon encoding, not PNG CRC field patching."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/pytorch-model-cli",
+     "verdict": "distinct",
+     "reason": "That task is about implementing an MNIST inference CLI tool, unrelated to PNG chunk CRC recovery."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing AES-128-CTR nonce derivation in a C library for SQLite record encryption, not PNG binary format repair."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task is about NetFlow v9 binary parsing and traffic aggregation correctness, not PNG chunk CRC recomputation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.16
+    ],
+    [
+     "terminal-bench/rs-archive-clone",
+     0.127
+    ],
+    [
+     "terminal-bench-2-1/pytorch-model-cli",
+     0.115
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.095
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.074
+    ]
+   ],
+   "cost_usd": 0.012954
+  },
+  "novel": true
+ },
+ "cost_usd": 0.051084000000000004
+}

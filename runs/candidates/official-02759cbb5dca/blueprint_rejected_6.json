@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "stream-merge-sort-refactor",
+  "title": "External Merge-Sort Refactor in Go",
+  "scenario": "The release pipeline for a data warehouse ETL tool is failing CI because the compiled Go binary `sortd` produces wrong output on the integration test suite after a large refactor landed last week. The repo contains roughly 1,400 lines across seven packages: an external k-way merge-sort engine, a run generator, a priority-queue heap, a record codec, a WAL-style temp-file manager, and glue. The compiled binary ships inside the Docker image; source is present but the test harness compares the binary's output against a reference Go implementation baked into the test suite itself.",
+  "instruction_draft": "Your CI is broken. The `sortd` binary at `/app/bin/sortd` sorts arbitrarily large streams of fixed-width integer records by key using an external k-way merge-sort. After last week's refactor it produces output that is wrong on many inputs.\n\nThe binary reads a binary stream of records from stdin (each record is a little-endian uint64 key followed by a little-endian uint64 value, 16 bytes total) and writes the same records sorted ascending by key to stdout. Duplicate keys must be preserved in stable order (the order they appeared in the input).\n\nFix the source under `/app/src/` and rebuild the binary in place so that `sortd` produces the same output as the reference implementation for all inputs the test suite generates. The binary must be rebuilt with `go build` inside `/app/src/` and the resulting binary must be placed at `/app/bin/sortd`.",
+  "requirements": [
+   "The binary `/app/bin/sortd` reads a binary stream of 16-byte records (little-endian uint64 key, little-endian uint64 value) from stdin.",
+   "It writes the complete set of records to stdout sorted ascending by key.",
+   "Records with equal keys must appear in stable order (preserving their original input order).",
+   "The binary must handle streams that exceed available RAM by using the external merge-sort code path (temp files).",
+   "The binary at `/app/bin/sortd` must be a compiled Go binary built from sources under `/app/src/`."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with Go 1.23 installed via apt or official tarball.",
+   "Directory /app/src/ containing ~1,400 lines across packages: cmd/sortd (main), engine/mergesort, engine/heap, engine/runs, codec, wal, and config.",
+   "The engine/heap package has a subtle bug introduced in the refactor: the Less function in the k-way merge heap compares by key only, discarding the run-index tiebreaker needed for stable sort across equal keys \u2014 so duplicates can emerge in any order.",
+   "A second bug in engine/runs: the run generator flushes the last partial run but forgets to reset the record-count accumulator before starting the next sort pass, causing the merge phase to read one record too few from the final run on inputs whose size is not a multiple of the run capacity.",
+   "A third, data-dependent bug in codec: when a record's value field is exactly 0x0000000000000000, the writer emits only 8 bytes (the key) instead of 16, corrupting all subsequent reads \u2014 this only triggers on inputs that contain a zero-value field, which small sample inputs don't.",
+   "/app/bin/sortd is pre-compiled from the buggy source and placed there by the Dockerfile.",
+   "The Dockerfile also installs the test framework at /app/tests/ as a Python script that uses subprocess, generates random record streams at verify time with a fixed seed derived from the test index (deterministic), runs both the binary and a reference Go program, and byte-compares outputs.",
+   "Reference implementation is a separate compiled binary /app/bin/sortd_ref built from clean source (not editable by the solver) and placed by the Dockerfile.",
+   "Sample inputs provided in /app/samples/ contain only 100 records with no zero-value fields and no duplicate keys \u2014 so the shallow check passes.",
+   "The test suite generates inputs of sizes: 10, 100, 1000, 50000, 500000 records; with and without duplicate keys; with and without zero-value fields; with sizes that are and are not multiples of the run buffer capacity."
+  ],
+  "internal_hint": "There are three interacting bugs, each in a different package, none of which are visible from the sample inputs. (1) engine/heap/heap.go: the Less method returns h.records[i].Key < h.records[j].Key without a secondary comparison on h.records[i].RunIndex < h.records[j].RunIndex, breaking stability \u2014 found by running a medium input with many duplicate keys and diffing output order. (2) engine/runs/generator.go: after flushing a run, n (record count in current run) is reset but totalFlushed is not incremented correctly, so the merge phase computes the wrong record count for the last run \u2014 found by running an input whose size mod runCapacity != 0 and noticing the output is short by exactly (runCapacity - remainder) records. (3) codec/writer.go: the write path checks `if rec.Value == 0 { return writeKey(rec.Key) }` as a mistaken optimization that was introduced in the refactor \u2014 found only on inputs containing records with value == 0. All three must be fixed for the hidden tests to pass. The difficulty source is: (a) bugs are not visible by reading; they manifest only on specific data shapes; (b) all three must be found and fixed (partial fixes pass more cases but not all); (c) the zero-value codec bug is a data-dependent path triggered only by the generated inputs, not the samples.",
+  "trap": "A solver that runs the sample inputs, sees them pass, and stops will fail. A solver who finds and fixes the heap stability bug alone will pass ~60% of generated inputs (those without duplicate keys pass anyway). A solver who finds both heap and runs bugs passes inputs with duplicates and non-multiple sizes, but still fails any input containing a zero-value record. All three bugs must be fixed simultaneously to pass the full generated suite.",
+  "tests": [
+   "Test 1 (smoke): 10 records, no duplicates, no zero values \u2014 passes even the buggy binary; used to confirm the binary runs at all.",
+   "Test 2 (small with duplicates): 200 records generated with ~30% duplicate keys, no zero values \u2014 fails with unfixed heap stability bug.",
+   "Test 3 (non-multiple size): 1000 records whose count mod runCapacity == 7, no duplicates, no zero values \u2014 fails with unfixed runs flush bug.",
+   "Test 4 (zero values): 500 records including ~10% with value field == 0, no duplicates \u2014 fails with unfixed codec bug.",
+   "Test 5 (large stress): 500,000 records with duplicate keys, zero values, and size not a multiple of run capacity \u2014 all three bugs must be fixed.",
+   "Test 6 (large stable): 50,000 records with 100 distinct keys each repeated ~500 times \u2014 verifies stable ordering at scale.",
+   "All tests byte-compare binary output of /app/bin/sortd against /app/bin/sortd_ref on the same stdin; PASS requires exact match."
+  ],
+  "verifier_knob": {
+   "name": "record_count_variety",
+   "value": "[10, 200, 1000, 500, 50000, 500000]",
+   "effect": "Reducing to only [10, 100] allows the naive fix (just the heap) to pass; adding sizes with zero values and non-multiples of run capacity forces all three bugs to be found."
+  },
+  "expected_failure_modes": [
+   "Agent finds and fixes the heap stability bug (most visible on inspection), rebuilds, runs tests, sees improvement but not full pass, then stops or loops without discovering the runs and codec bugs.",
+   "Agent finds the heap and runs bugs but never generates or observes an input with zero-value records, so the codec bug is never triggered and the binary still fails test 4 and 5.",
+   "Agent rewrites the codec or runs package from scratch in a way that fixes the explicit bug but introduces an off-by-one in the run-size computation for large inputs.",
+   "Agent rebuilds the binary but places it in the wrong path or with wrong permissions, causing all tests to fail with a different error.",
+   "Agent instruments the binary but fails to understand that the runs flush bug is only observable on inputs whose size is not a multiple of the run buffer size, so they test with sizes that happen to be multiples and conclude the bug is absent."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "go",
+   "algorithms",
+   "external-sort",
+   "refactoring",
+   "fuzz-equivalence",
+   "data-dependent-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls /app/src/ && find /app/src -name '*.go' | head -20",
+   "cat /app/src/engine/heap/heap.go",
+   "cat /app/src/codec/writer.go",
+   "cat /app/src/engine/runs/generator.go",
+   "cat /app/src/engine/mergesort/mergesort.go",
+   "# Bug 1 found: heap Less() missing RunIndex tiebreaker",
+   "# Bug 2 found: codec writer has 'if rec.Value == 0 { return writeKey }' shortcut",
+   "# Bug 3 found: generator flush doesn't increment totalFlushed correctly",
+   "sed -i 's/h.records\\[i\\].Key < h.records\\[j\\].Key/h.records[i].Key < h.records[j].Key || (h.records[i].Key == h.records[j].Key \\&\\& h.records[i].RunIndex < h.records[j].RunIndex)/' /app/src/engine/heap/heap.go",
+   "# Edit codec/writer.go to remove zero-value shortcut (write full 16 bytes always)",
+   "sed -i '/if rec.Value == 0/,/}/d' /app/src/codec/writer.go",
+   "# Edit generator.go to fix totalFlushed increment",
+   "nano /app/src/engine/runs/generator.go",
+   "cd /app/src && go build -o /app/bin/sortd ./cmd/sortd/",
+   "python3 /app/tests/run_tests.py"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Run buffer capacity constant is never stated in instruction; solver must discover from source, and test 3's 'size mod runCapacity == 7' is opaque without knowing the constant",
+   "Reference binary /app/bin/sortd_ref compiled for specific architecture may fail on ARM-based container hosts (e.g., Apple Silicon CI runners)",
+   "All three bugs are directly readable from source code with standard file inspection \u2014 contradicts the claimed 'not visible by reading' difficulty source, making the task easier than rated",
+   "The sed/regex edits to fix the heap Less() and codec writer may be fragile if the exact code pattern differs from what the blueprint describes; solver would need to adapt",
+   "If go build produces a binary that links differently than the reference (e.g., different Go stdlib version), byte-level output might differ even with correct logic for edge cases like empty input"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 falls below the required minimum of 4. Despite the blueprint's claim that bugs are 'not visible by reading the source,' it then explicitly describes exact readable code patterns (a missing secondary comparison, a visible zero-value branch, a missing increment) that a strong agent will find by reading 3-4 files in sequence \u2014 matching the pattern the rubric identifies as scoring at most 2. The speedrun completes in ~15 commands with no need to generate test inputs or observe runtime behavior. To reach genuine_difficulty \u2265 4, the bugs must require dynamic observation, not source inspection.",
+  "fixes": [
+   "Make bugs non-readable: replace explicit code-pattern bugs with algorithmic logic errors (e.g., an off-by-one in the merge phase's lookahead window that only manifests on specific data distributions) that require constructing or observing inputs to locate \u2014 not grep or read",
+   "Remove the internal hint section's explicit code patterns from the blueprint, and restructure bugs so that reading the source shows plausible-looking but wrong code (e.g., a correct-looking heap invariant that silently breaks stability only when run-indices wrap modulo a buffer size)",
+   "Add a behavioral indirection layer: instead of bugs in clearly-named packages (codec/writer.go for the codec bug), embed them in shared utility code used by multiple paths so the solver must trace execution to identify which code path is faulty",
+   "Require the solver to construct their own test inputs (no reference binary to diff against) using property-based reasoning, so finding all bugs requires both code reading AND experimental validation \u2014 raising the minimum command count above 20"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves HMAC authentication of WAL records over TCP with a C service, whereas the candidate is a Go external merge-sort refactor debug/fix task."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task is a CTF credential-extraction challenge against a Go binary, whereas the candidate is a sorting algorithm correctness fix in Go source."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding and fixing a silent regression introduced by a large refactor in a compiled binary that passes existing regression tests but produces wrong output on broader inputs, differing only in language (C vs Go) and domain (AES-CTR cipher vs external merge-sort)."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task fixes SQL query logic for window functions and aggregations, whereas the candidate fixes a Go external merge-sort algorithm implementation."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task fixes a Node.js log ingestion pipeline for schema validation and performance, whereas the candidate fixes a Go external merge-sort binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.186
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.166
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.164
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.128
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.125
+    ]
+   ],
+   "cost_usd": 0.01404
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05532000000000001
+}

@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "fixed-point-binary-codec-recovery",
+  "title": "Fixed-Point Binary Codec Recovery",
+  "scenario": "You work on a tiny embedded sensor platform. A colleague wrote a C library (`libfpcodec.so`, shipped without source) that packs floating-point telemetry samples into a compact fixed-point binary log format and reads them back. The library has been in production for months and the log files on disk are the only long-term record. Recently someone noticed that round-tripped values are silently wrong for a subset of inputs \u2014 the library returns without error but the decoded floats don't match what was encoded. Your job is to rewrite the codec (encoder + decoder) in Python so it passes an adversarial corpus of encode/decode round-trips and cross-decodes log files already written by the original library.",
+  "instruction_draft": "Hey \u2014 we've been getting complaints that the telemetry logs are corrupted when we read them back through libfpcodec. I can reproduce it but I can't figure out where it goes wrong just by looking at the code. The .so is from an old build and we don't have the source anymore. Can you write a replacement pure-Python codec at /app/codec.py? It needs to expose encode(samples) -> bytes and decode(data) -> list[float] that perfectly round-trips any float list and also correctly reads the existing log files in /app/logs/. The format spec is in the README. Make sure it handles the edge cases \u2014 we've seen weirdness with all-zero inputs and with datasets that have negative values.",
+  "requirements": [
+   "File /app/codec.py exists and is importable as a Python module",
+   "codec.encode(samples) returns bytes in the documented binary format (magic 0x46504C47, uint32 count LE, float32 scale LE, then N\u00d73-byte signed 24-bit LE samples)",
+   "codec.decode(data) correctly sign-extends 24-bit little-endian integers to recover negative values",
+   "Round-trip codec.decode(codec.encode(samples)) reproduces each sample within relative error 1e-5 (or absolute 1e-7 for near-zero values)",
+   "codec.decode applied to each pre-generated file in /app/logs/ returns values matching the ground-truth arrays within the same tolerance",
+   "Edge case: encode/decode of a list of all zeros returns a list of zeros with the same length as input",
+   "Edge case: encode/decode of a list with a single element (positive or negative) round-trips correctly",
+   "Edge case: encode/decode of samples where max absolute value equals exactly 1.0 or is very close to 0 but nonzero",
+   "Edge case: encode/decode of length-1 through length-5 arrays with mixed sign values",
+   "Edge case: samples at or near the \u00b18388607 boundary encode and decode within tolerance"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "Install: gcc, build-essential, python3-dev, cffi (pip)",
+   "Write /app/libfpcodec/libfpcodec.so: a compiled C shared library (no source shipped) implementing two exported C functions: `int fp_encode(double *samples, uint32_t n, uint8_t *out_buf, uint32_t *out_len)` and `int fp_decode(uint8_t *buf, uint32_t len, double *out_samples, uint32_t *out_n)`. The library uses a custom fixed-point binary format: a 4-byte magic (0x46504C47), a 4-byte sample count (little-endian uint32), then each sample encoded as a signed 24-bit integer in little-endian order, scaled by a per-file scale factor stored as a little-endian IEEE 754 float32 at bytes 8-11. The encoding procedure: find max(|sample|) over all samples, compute scale = max_abs / 8388607.0 (2^23 - 1), clamp each sample to [-8388607, 8388607] after dividing by scale and rounding to nearest integer. The PLANTED BUG: the library uses the wrong sign extension when reading 24-bit little-endian integers back: it reads 3 bytes and assembles them as `(b[0] | b[1]<<8 | b[2]<<16)` without sign-extending from bit 23, so any negative sample decodes as a large positive number. A second subtle bug: when all samples are zero, the library sets scale=0 and then the decode divides by zero \u2014 it returns a buffer of zeros but out_n is set to 0 instead of the actual count.",
+   "Write /app/logs/: 6 pre-generated binary log files produced by calling fp_encode through ctypes on representative telemetry datasets (sensor sweeps with negative values, zero runs, near-max values). These files are the ground truth that the solver's decoder must reproduce.",
+   "Write /app/codebase/: ~1200 lines of plausible surrounding Python firmware-management code (log rotator, alert thresholds, config parser, HTTP status endpoint) that imports and uses libfpcodec via ctypes. This is realistic noise; the bugs are only visible when running round-trips.",
+   "Write /app/codebase/fpcodec_wrapper.py: the existing ctypes wrapper around libfpcodec.so, used throughout the codebase.",
+   "Write /app/codebase/test_roundtrip.py: a tiny existing test that only tests positive values \u2014 it passes with the broken library.",
+   "Write /app/README.md: explains the sensor platform, mentions the binary log format (magic, count, scale, 24-bit signed LE samples), says the codec is the load-bearing piece, and asks for a replacement pure-Python implementation at /app/codec.py exposing encode(samples: list[float]) -> bytes and decode(data: bytes) -> list[float].",
+   "Write /app/sample_logs/: 2 example log files with known values (all positive) so the solver can validate their decoder without hitting the bug."
+  ],
+  "internal_hint": "The difficulty is observe_not_read: the bug in libfpcodec.so only manifests when the solver actually calls the library or inspects log files containing negative values. The existing test suite (test_roundtrip.py) uses only positive values and passes. The solver must: (1) notice the existing test doesn't cover negatives, (2) experiment \u2014 call fp_decode on a file containing negative samples and observe garbage, (3) infer the sign-extension bug from the pattern of wrong outputs (large positive numbers where negatives are expected), (4) infer the all-zeros special case from a decode that returns out_n=0. The format spec in the README is correct and complete; the solver needs to implement it faithfully with proper sign extension: after reading 3 bytes into a uint32, if bit 23 is set, OR with 0xFF000000 and reinterpret as int32. The zero-input edge case requires detecting scale==0 and outputting n zeros without dividing. A partial solution that handles positives correctly but misses sign extension will pass the sample_logs (all positive) but fail the adversarial corpus. A solution that misses the all-zeros edge case will fail that specific test. The solver must run the library against /app/logs/ to discover the bug, not just read the spec.",
+  "trap": "A naive agent reads the README format spec, implements encode/decode for the positive-only case, validates against /app/sample_logs/ (which are all positive) and stops. The hidden adversarial corpus contains: (a) arrays with at least one negative value \u2014 these fail if sign extension is wrong, (b) all-zeros arrays \u2014 these fail if scale=0 is not handled, (c) single-element negative arrays, (d) arrays where the most-negative value has higher magnitude than the most-positive. Any implementation that doesn't sign-extend the 24-bit integer will decode negative samples as 2^24 + original_value instead.",
+  "tests": [
+   "Import /app/codec.py; call encode then decode on 50 randomly generated float arrays (seeded RNG, mixed signs, lengths 1-500, values in [-1e6, 1e6]); assert max relative error < 1e-5",
+   "Call decode on each of the 6 pre-generated /app/logs/ files and compare against stored ground-truth numpy arrays; assert max absolute error < 1e-4",
+   "encode([]) -> decode result is [] or has length 0 (zero-length array)",
+   "encode([0.0]*n) -> decode returns list of n zeros for n in {1, 5, 100}",
+   "encode([-1.0]) -> decode returns approximately [-1.0] within 1e-5",
+   "encode([-8388607.0/8388607.0 * x for x in range(-50,51)]) round-trips within tolerance",
+   "Verify the output of encode has correct magic bytes 0x46 0x50 0x4C 0x47 at offset 0",
+   "Verify the output of encode has correct little-endian uint32 sample count at offset 4",
+   "Verify the output of encode has correct little-endian float32 scale at offset 8",
+   "Verify total byte length of encode(samples) equals 12 + 3*len(samples)",
+   "Adversarial: encode/decode 200 arrays where min(samples) < -0.5 * max(|samples|), seeded corpus; all must round-trip within tolerance",
+   "Adversarial: decode(encode(samples)) where samples has exactly one element that is the most-negative float representable in the 24-bit scheme"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 mixed-sign arrays + 6 log files",
+   "effect": "Raising corpus_size to 500+ arrays with more extreme distributions (very small nonzero scale, near-boundary values) reduces pass rate by surfacing additional precision edge cases. Lowering to 20 arrays with mild values makes it easier to pass with a partially correct implementation."
+  },
+  "expected_failure_modes": [
+   "Agent implements decode without sign extension, tests only on /app/sample_logs/ (all positive), declares success \u2014 fails adversarial corpus on any negative-value array",
+   "Agent handles sign extension but forgets the all-zeros (scale=0) edge case \u2014 fails that specific test set",
+   "Agent reads the README spec carefully and implements correctly but makes an off-by-one error in the 24-bit boundary (uses 2^23 instead of 2^23-1 as the max integer) \u2014 subtle precision failures near the extremes",
+   "Agent wraps libfpcodec.so itself as the 'replacement' via ctypes rather than reimplementing \u2014 fails because the library has the sign-extension bug",
+   "Agent implements encode correctly but decode uses struct.unpack for 24-bit integers in a way that doesn't sign-extend (e.g. reads as unsigned then does naive subtraction only when > 2^23, misses the exact 2^23 boundary)"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "binary-format",
+   "fixed-point-arithmetic",
+   "sign-extension",
+   "reverse-engineering",
+   "codec",
+   "embedded"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md  # get complete format spec: magic, count, scale, 3-byte signed 24-bit LE",
+   "cat /app/codebase/fpcodec_wrapper.py  # understand library interface",
+   "cat /app/codebase/test_roundtrip.py  # confirm it only tests positives",
+   "ls /app/logs/ /app/sample_logs/  # inventory files",
+   "python3 -c \"import ctypes; lib=ctypes.CDLL('/app/libfpcodec/libfpcodec.so'); ...\"  # call fp_decode on logs/ file with negatives, observe garbage",
+   "# Observe: negative values return large positive integers \u2192 classic missing sign-extension",
+   "python3 -I -c \"...\"  # hexdump a log file to confirm 3-byte sample layout",
+   "# Write /app/codec.py: encode() packs magic+count+scale+N*3bytes; decode() sign-extends bit23, handles scale==0",
+   "cat > /app/codec.py  # implement encode and decode (~40 lines of Python)",
+   "python3 -I /app/codec.py  # syntax check",
+   "python3 -c \"import sys; sys.path.insert(0,'/app'); from codec import encode,decode; print(decode(encode([1.0,-1.0,0.0])))\"",
+   "python3 -c \"from codec import encode,decode; print(decode(encode([0.0]*5)))\"  # zero edge case",
+   "python3 -c \"from codec import encode,decode; print(decode(encode([-1.0])))\"  # single negative",
+   "python3 -c \"...\"  # decode each /app/logs/ file, compare to ground truth",
+   "python3 -c \"...\"  # run 50 random round-trips with mixed signs",
+   "# All pass; done in ~16 commands"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction to the solver explicitly names both edge cases ('weirdness with all-zero inputs' and 'datasets that have negative values'), so the 'observe_not_read' difficulty lever is undermined \u2014 an agent can solve it by reading the instruction alone without running the library.",
+   "The README spec is described as 'correct and complete', meaning an agent that reads only the README and implements faithfully with standard sign-extension knowledge will pass without needing to discover the bug empirically.",
+   "The internal hint says difficulty is 'observe_not_read' but the instruction draft already telegraphs both bugs; any agent that reads the instruction carefully gets the answer for free.",
+   "Scale factor edge case (scale=0 when all zeros) requires dividing by zero in decode \u2014 if the test harness calls decode on raw encode output and the implementation handles it cleanly, but the test expectation is 'n zeros', there could be ambiguity about whether an empty list or n-length zero list is acceptable for the all-zeros case (the test says 'list of n zeros').",
+   "The 'encode([])' test checks for length 0 result but the format spec requires a 4-byte count of 0 \u2014 a correct implementation returning b'' vs 12 bytes with count=0 could be ambiguous depending on test implementation.",
+   "Ground truth for /app/logs/ files must be stored somewhere accessible to the verifier \u2014 if ground truth arrays are embedded in the test script and the log files are generated at build time with a fixed seed, this is fine; but if the .so has the sign-extension bug, ground truth must be the *pre-bug* correct values, which the .so cannot produce for negative inputs \u2014 the task builder must pre-compute these independently."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score is 2 because the instruction draft explicitly names both bugs ('weirdness with all-zero inputs' and 'datasets that have negative values'), the README spec is described as complete and correct, and a skilled agent can implement the correct codec from the spec alone in ~16 commands without needing to empirically discover anything. The 'observe_not_read' framing is structurally undermined by the instruction's own wording, making this effectively a 'read the spec and implement' task. Additionally, there is a validity risk: the ground truth for /app/logs/ files with negative values cannot come from the buggy .so itself, requiring careful out-of-band generation that must be verified at build time.",
+  "fixes": [
+   "Remove the explicit edge-case hints from the instruction draft \u2014 do not mention 'all-zero inputs' or 'negative values' as known problem areas; let the solver discover these by running the library or inspecting log files.",
+   "Make the README spec deliberately incomplete or slightly misleading about sign representation (e.g., describe samples as 'packed 24-bit values' without specifying signed vs unsigned), forcing the solver to infer signedness from the library's behavior on positive inputs and the log files.",
+   "Replace or supplement the sign-extension bug with a subtler one (e.g., byte-order confusion for the scale factor, or an off-by-one in the count field) that is not guessable from domain knowledge alone and requires empirical testing to isolate.",
+   "Ensure the ground-truth arrays for /app/logs/ are generated independently of the buggy .so (e.g., computed from a reference Python implementation at image build time and stored as .npy files), with build-time verification that they match the expected values.",
+   "Add a second planted bug that is less obvious and not hinted at in the instruction, raising the number of empirical discovery steps required to ~25+."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet-codec service for correctness and performance (Criterion benchmark), not about reverse-engineering a binary format and writing a Python codec."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a C library's AES-CTR encryption bug in a multi-file refactor, not implementing a fixed-point binary codec in Python."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a running HTTP service's frame encoder/decoder with a simple TLV wire format, not about reverse-engineering a .so and writing a fixed-point float compression codec."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service on top of a log-binning engine, not about implementing a binary fixed-point codec."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline and Flask API for GeoIP data, which is entirely unrelated to fixed-point binary codec implementation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ae2e414b859f",
+     0.193
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.154
+    ],
+    [
+     "ours/official-aac910462208",
+     0.154
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.09
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.074
+    ]
+   ],
+   "cost_usd": 0.014532
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057102
+}

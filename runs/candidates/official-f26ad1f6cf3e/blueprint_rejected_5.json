@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "go-audit-codec-reverse",
+  "title": "Audit Log Stream Codec Recovery",
+  "scenario": "A security engineer is auditing a Go-based audit logging service that ingests raw event streams, compresses them with a proprietary frame codec, and writes packed binary audit log files. The codec encoder is a compiled binary with no source; the decoder is written in Go but has a silent data-corruption bug that produces wrong checksums on certain event patterns. The engineer must characterise the encoder's frame format by experiment, derive the correct checksum algorithm by analysis, and write a replacement decoder that passes validation against fresh audit log files generated at verify time.",
+  "instruction_draft": "The audit logging service at /app writes packed binary log files using the encoder at /app/bin/audit-encoder and a Go decoder at /app/decoder/. The decoder currently produces incorrect output for some event streams: event counts, field values, or checksums do not match what the encoder embedded. Reverse-engineer the binary frame format produced by the encoder, identify and fix the decoder bug, and write a standalone Go tool at /app/decoder/cmd/audit-decode/main.go that reads a packed log file from stdin and writes one JSON object per event to stdout. Every event's checksum field must match the value the encoder embedded.",
+  "requirements": [
+   "A Go binary must exist at /app/decoder/cmd/audit-decode/ (buildable with 'go build')",
+   "Running the tool on a packed log file produced by /app/bin/audit-encoder must emit one JSON object per event to stdout",
+   "Each emitted JSON object must contain all fields the encoder embedded: event_id, timestamp, severity, payload, and checksum",
+   "The checksum field in each JSON object must exactly equal the checksum value the encoder stored in the frame header for that event",
+   "The tool must handle log files with zero, one, and many events without crashing or silently dropping events",
+   "The tool must correctly decode events whose payload contains newlines, null bytes, or non-ASCII bytes",
+   "The total event count across all emitted objects must match the frame count the encoder wrote"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install golang-1.21, build-essential",
+   "Compiled binary /app/bin/audit-encoder: a Go program compiled without source, accepts --count N --seed S flags and writes N packed frames to stdout; frame format: 4-byte magic (0xA0D17A00), 4-byte frame-length (LE), 8-byte event_id (LE), 8-byte timestamp (LE unix ns), 1-byte severity, 4-byte payload-length (LE), payload bytes, 4-byte checksum (LE); checksum is CRC32/Castagnoli (CRC32C) over the frame from magic through end of payload, NOT CRC32/IEEE which is the stdlib default",
+   "Broken Go decoder at /app/decoder/ (~600 lines across 4 files): frame parser is structurally correct but uses crc32.NewIEEE() instead of crc32.New(crc32.MakeTable(crc32.Castagnoli)); additionally the payload-length field is read as big-endian instead of little-endian causing wrong field values on payloads >127 bytes",
+   "Sample log file /app/samples/sample.log produced by the encoder with --count 20 --seed 42; payloads in this sample happen to be short enough that the endianness bug does not manifest, creating a false sense of correctness",
+   "Helper script /app/scripts/gen_log.sh that invokes the encoder: 'audit-encoder --count $1 --seed $2 > $3'",
+   "Go module at /app/decoder/go.mod with module name audit/decoder",
+   "README at /app/README.md describing the service architecture but not the exact frame format; it mentions 'CRC32 checksum' without specifying the polynomial, and says fields are 'network byte order' (a deliberate misdirection \u2014 they are actually little-endian)",
+   "Existing tests at /app/decoder/decoder_test.go that only test the 20-event sample and all pass despite the bugs",
+   "A plausible but uninvolved HTTP handler (~300 lines) and config loader (~200 lines) to provide realistic codebase size"
+  ],
+  "internal_hint": "Two independent bugs interact: (1) CRC32 polynomial mismatch \u2014 the encoder uses CRC32C (Castagnoli) while the decoder uses CRC32/IEEE; (2) payload-length is little-endian but the decoder reads it as big-endian. The sample file has only short payloads (all < 128 bytes) so the endianness bug never triggers on it, and CRC32C vs IEEE differs only on the specific byte sequences in the sample which happen to collide. The solver must: generate test files with longer payloads (--count 1 --seed N with varying N until a long payload appears, or use --count 100), observe payload decoding failures, binary-diff expected vs actual frames, and characterise the checksum by trying both polynomials. The README's 'network byte order' claim is a red herring that will send the solver down the wrong path if trusted. The key facts are all discoverable by running the encoder and comparing its output to the decoder's interpretation.",
+  "trap": "A solver who fixes only the CRC32 polynomial will pass all tests on short-payload inputs (including the provided sample) but fail on events with payload length > 127 bytes where the big-endian read gives a wildly wrong length. A solver who fixes only the endianness will still emit wrong checksums. A solver who trusts the README's 'network byte order' claim and switches to big-endian everywhere will break the 8-byte fields that were already parsed correctly. Shallow verification against only the provided 20-event sample passes both bugs undetected.",
+  "tests": [
+   "Build test: 'cd /app/decoder && go build ./cmd/audit-decode/' must succeed with exit 0",
+   "Short-payload correctness: generate a 50-event log with seed 1, run the decoder, verify all 50 JSON objects parse and each checksum field equals the CRC32C of its frame bytes",
+   "Long-payload correctness: generate a 200-event log with seed 99 (which produces payloads up to 400 bytes), verify all 200 events decode with correct payload bytes and matching checksums",
+   "Binary payload correctness: generate a log with seed 7 which produces payloads containing null bytes and high-bit bytes, verify payload field round-trips exactly",
+   "Event count integrity: for logs of size 1, 10, 500 the number of JSON objects emitted equals the number of frames the encoder wrote",
+   "Zero-event file: encoder with --count 0 produces a valid empty file; decoder must emit nothing and exit 0",
+   "Checksum verification at verify time: verifier independently computes CRC32C over each raw frame and compares to the checksum field in the emitted JSON; any mismatch fails the test",
+   "Endianness probe: a 1-event log with seed 300 has payload length exactly 256 (0x00000100 LE vs 0x01000000 BE); verify payload is decoded as 256 bytes not 16777216"
+  ],
+  "verifier_knob": {
+   "name": "number of independent state properties checked",
+   "value": "8 test cases across 3 bug dimensions",
+   "effect": "Reducing to 3 tests (build + short payload + count) allows a CRC32-only fix to pass; increasing to 12 by adding more seed/size combinations stresses edge cases in payload encoding further"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the CRC32 polynomial, verifies against the provided sample (all short payloads), declares success, and fails the long-payload and binary-payload tests",
+   "Agent trusts the README's 'network byte order' claim and switches all integer reads to big-endian, breaking event_id and timestamp fields which were already correct",
+   "Agent discovers the endianness bug but applies the fix to all fields including the ones that were already little-endian, introducing new failures",
+   "Agent reverse-engineers the frame format correctly but guesses CRC32/IEEE instead of CRC32C because IEEE is the Go stdlib default and the README says only 'CRC32'",
+   "Agent writes the decoder from scratch, gets the format right, but uses a different CRC32 table and only notices on long payloads where the polynomial difference is visible",
+   "Agent does not probe the encoder with varied seeds/counts and never encounters a payload long enough to trigger the endianness bug"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "reverse-engineering",
+  "tags": [
+   "go",
+   "binary-format",
+   "reverse-engineering",
+   "checksum",
+   "data-processing",
+   "security-audit"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "ls /app/decoder/",
+   "cat /app/decoder/*.go",
+   "grep -n 'crc32\\|BigEndian\\|LittleEndian\\|payload' /app/decoder/*.go",
+   "xxd /app/samples/sample.log | head -20",
+   "/app/bin/audit-encoder --count 1 --seed 300 | xxd",
+   "Fix crc32.NewIEEE() -> crc32.New(crc32.MakeTable(crc32.Castagnoli)) in decoder source",
+   "Fix binary.BigEndian -> binary.LittleEndian for payload-length read in decoder source",
+   "mkdir -p /app/decoder/cmd/audit-decode",
+   "Write /app/decoder/cmd/audit-decode/main.go (reads stdin, outputs JSON per event using fixed decoder)",
+   "cd /app/decoder && go build ./cmd/audit-decode/",
+   "/app/bin/audit-encoder --count 20 --seed 42 | ./cmd/audit-decode/audit-decode",
+   "/app/bin/audit-encoder --count 200 --seed 99 | ./cmd/audit-decode/audit-decode | wc -l",
+   "/app/bin/audit-encoder --count 0 --seed 1 | ./cmd/audit-decode/audit-decode",
+   "/app/bin/audit-encoder --count 1 --seed 7 | ./cmd/audit-decode/audit-decode"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The claim that seed 300 produces a payload of exactly 256 bytes requires the encoder's PRNG to be deterministic in a very specific way; if the encoder build varies this guarantee breaks the endianness probe test",
+   "The assertion that CRC32C and CRC32/IEEE produce identical results for all 20 frames in the seed-42 sample is a strong coincidence that must be engineered carefully into the encoder; if it doesn't hold, the existing tests would already fail and the 'false sense of correctness' premise collapses",
+   "Both bugs are in readable Go source files, so the 'opaque component' difficulty lever only applies to the encoder binary, not to finding the bugs; any agent that reads the decoder source finds both bugs in under 5 commands, making the elaborate trap structure irrelevant"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because both bugs are directly visible in readable Go source files; a skilled agent runs grep on the decoder source and finds crc32.NewIEEE() and binary.BigEndian in 3-4 commands, making the entire elaborate trap structure (README misdirection, short-payload sample, opaque encoder) irrelevant. The speedrun is ~15 commands and would succeed reliably. To reach genuine_difficulty >= 4, the bugs must not be directly readable from source.",
+  "fixes": [
+   "Remove the decoder source files entirely and provide only a compiled decoder binary alongside the encoder binary; the agent must then characterise both the frame format AND the checksum algorithm purely by experiment (running encoder, diffing outputs, trying candidate implementations), which eliminates the 'just read the source' shortcut",
+   "If source must be provided, obfuscate the bug: instead of a direct crc32.NewIEEE() call, use a custom hash.Hash32 interface backed by IEEE internally, and instead of binary.BigEndian use a custom readUint32 helper that silently reverses bytes, so grep for known symbols doesn't find the bugs",
+   "Add a third independent bug that is not findable by reading the source alone (e.g., the encoder applies a frame-level XOR scramble with a key derived from the event_id, discoverable only by binary analysis of encoder output), ensuring the agent must do actual reverse-engineering even after fixing the readable bugs",
+   "Ensure the 'seed 300 gives exactly 256-byte payload' guarantee is documented as a build-time test in the environment setup script so reviewers can verify it holds"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "DNA storage codec involves error-correction over a deletion channel; the candidate is about reverse-engineering a binary frame format and fixing a checksum bug in a Go decoder."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "The CTF task is about extracting XOR-obfuscated credentials from a Go binary; the candidate is about reverse-engineering a binary frame format and writing a correct decoder."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "variant",
+     "reason": "Both tasks involve reverse-engineering or fixing a binary frame codec (encode/decode cycle, frame headers, checksums) and writing a correct decoder, differing mainly in language and delivery mechanism."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The audit service task focuses on HMAC-SHA256 computation over WAL records with a database lookup, not on reverse-engineering a proprietary binary frame format."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The log ingestion task is about NDJSON schema validation and performance, not binary frame format reverse-engineering or checksum recovery."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.334
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.156
+    ],
+    [
+     "ours/official-aac910462208",
+     0.147
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.125
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.069
+    ]
+   ],
+   "cost_usd": 0.011852999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.052218
+}

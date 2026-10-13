@@ -56,7 +56,16 @@ METATASK_REPAIR_MAX_TURNS = int(os.environ.get("METATASK_REPAIR_MAX_TURNS", "70"
 # (Phase 0: authoring history grew to 104k and cost $2.75). Authoring only; the
 # Opus calibration agent keeps terminus-2's defaults.
 METATASK_SUMMARIZE_THRESHOLD = int(os.environ.get("METATASK_SUMMARIZE_THRESHOLD", "140000"))
-OPUS_CONCURRENCY = int(os.environ.get("OPUS_CONCURRENCY", "3"))
+OPUS_CONCURRENCY = int(os.environ.get("OPUS_CONCURRENCY", "5"))
+# Machine-wide cap on functional gates (docker build + oracle x3 + nop): CPU-heavy, and a
+# CPU-starved oracle looks flaky. Authoring is API-bound and isn't capped this way.
+GATE_CONCURRENCY = int(os.environ.get("GATE_CONCURRENCY", "3"))
+# Eager calibration runs every remaining trial in one wave (fastest wall clock); exact
+# curtailment waves (CALIBRATION_EAGER=0) never pay for a trial that can't change the
+# verdict. Same verdict either way; the report still computes what curtailment saves.
+CALIBRATION_EAGER = os.environ.get("CALIBRATION_EAGER", "1") == "1"
+# Blueprint drafts generated and reviewed at once per round (the review rejects most).
+BLUEPRINT_DRAFTS = int(os.environ.get("BLUEPRINT_DRAFTS", "4"))
 
 # --- Budget (docs/plan.md, "Spend discipline") -----------------------------
 # BUDGET_AUTHORIZED_USD caps total key spend; the reserve is never touched.

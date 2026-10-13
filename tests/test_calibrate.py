@@ -112,3 +112,9 @@ def test_opus_slots_cap_concurrent_trials_across_holders(tmp_path):
         t.join(timeout=5)
     assert not any(t.is_alive() for t in threads)  # all-or-nothing: no deadlock
     assert peak[0] <= 3
+
+
+def test_eager_waves_run_every_remaining_trial_at_once():
+    assert next_wave_size([], concurrency=5, eager=True) == 5
+    assert next_wave_size(["pass", "fail"], concurrency=5, eager=True) == 3
+    assert next_wave_size([], concurrency=3, eager=True) == 3  # still capped by concurrency

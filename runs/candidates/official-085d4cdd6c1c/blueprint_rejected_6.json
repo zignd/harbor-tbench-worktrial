@@ -1,0 +1,158 @@
+{
+ "blueprint": {
+  "slug": "sketch-quantile-calibration-repair",
+  "title": "Quantile Sketch Calibration Repair",
+  "scenario": "A backend developer maintains an in-house streaming percentile service (~1,400 lines of Go across six files) that uses a mergeable count-min sketch variant to answer P50/P90/P99 latency queries over sliding windows. The service ships with a precompiled black-box aggregator binary (`/app/bin/agg`) that compresses raw samples into sketch blobs; the Go service deserializes these blobs and answers quantile queries. Production monitoring shows the P99 estimates have been drifting high by 15-40% for skewed distributions since the aggregator binary was updated three weeks ago, but unit tests (which use uniform random data) still pass. The developer needs to fix the query layer so estimates are accurate to within 5% relative error on any input distribution.",
+  "instruction_draft": "The quantile service at /app returns P50, P90, and P99 estimates that are too high on skewed distributions; all estimates must be within 5% relative error of the true quantile on any input distribution the verifier supplies. Fix the service so it passes the accuracy threshold.",
+  "requirements": [
+   "P50, P90, and P99 estimates returned by the service must each be within 5% relative error of the true quantile",
+   "The fix must work for any input distribution (not just uniform), including heavy-tailed and highly skewed distributions",
+   "The service must continue to start and answer queries after the fix"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, builds the Go service, and places the precompiled /app/bin/agg binary (amd64 ELF, no source) in the image",
+   "/app/server.go: HTTP server exposing POST /ingest (accepts JSON sample arrays) and GET /query?p=99 endpoints (~200 lines)",
+   "/app/sketch/sketch.go: count-min sketch structure with Insert, Merge, Rank methods (~300 lines) \u2014 contains a subtle miscalibration in the Rank() method: it applies a correction factor `* float64(s.totalCount) / float64(s.width)` that was correct for the OLD aggregator blob format but is wrong for the new one which already normalizes counts",
+   "/app/sketch/merge.go: blob deserialization from the aggregator binary output (~150 lines) \u2014 the new agg binary uses a different column-major vs row-major serialization order for the sketch matrix, but merge.go still reads it row-major, silently transposing the sketch",
+   "/app/window/window.go: sliding window management, ring buffer (~200 lines, correct)",
+   "/app/query/query.go: quantile estimation using binary search over Rank() (~250 lines, correct logic but calls the broken Rank)",
+   "/app/main.go: wiring and config (~100 lines, correct)",
+   "/app/cmd/gen/main.go: sample data generator used in tests (~150 lines)",
+   "/app/testdata/uniform_samples.bin: pre-generated uniform samples that the existing unit tests use (these pass because uniform distributions are symmetric and the two bugs partially cancel)",
+   "/app/bin/agg: precompiled agg binary that reads newline-delimited float64 values from stdin and writes a sketch blob to stdout; its --version flag prints '2.1.0'; the new blob format is column-major",
+   "A /app/README.md describing the sketch blob format for agg v1.x (the OLD format), not updated for v2.x",
+   "The existing go test ./... passes on uniform data (the two bugs cancel for symmetric distributions)",
+   "The verifier generates fresh Pareto-distributed, log-normal, and bimodal sample sets at verify time, pipes them through /app/bin/agg, posts the blobs to the service, and checks /query?p=50, /query?p=90, /query?p=99 against ground truth within 5% relative error"
+  ],
+  "internal_hint": "Difficulty comes from two interacting bugs that are NOT visible by reading source alone: (1) the blob deserialization in merge.go reads the sketch matrix in row-major order but agg v2.1.0 writes it column-major \u2014 this is only discoverable by running agg on known data and comparing the deserialized sketch to expected values, or by probing agg --format or --help; (2) the Rank() correction factor in sketch.go double-applies a normalization that agg v2 already performs \u2014 this is only apparent when the combined pipeline produces wrong answers on skewed data, since on uniform data the over-correction in Rank() and the transposition error in merge.go partially cancel. The solver must: (a) notice tests pass on uniform data but fail on skewed; (b) probe the agg binary to understand the v2 blob format (e.g., feed known values and inspect the blob bytes, or check agg --help which documents 'column-major since v2.0'); (c) fix the matrix read order in merge.go; (d) remove or correct the now-double-applied correction factor in Rank(). Fixing only one bug still fails the threshold on skewed inputs because the errors no longer cancel.",
+  "trap": "A solver who fixes only the more obvious bug (e.g., sees the correction factor in Rank() looks suspicious and removes it) will pass on some distributions but fail on heavy-tailed ones because the transposed matrix still scrambles bucket assignments. Conversely, fixing only the column-major deserialization makes estimates worse on uniform data (the partial cancellation is broken) and still fails the threshold on Pareto inputs. The hidden tests use distributions where the two bugs do NOT cancel, so any single-bug fix fails at least one distribution family. Shallow verification against the provided uniform testdata gives a false pass.",
+  "tests": [
+   "Generate 100,000 Pareto(alpha=1.5) samples, pipe through /app/bin/agg, POST blob to /ingest, check GET /query?p=50, ?p=90, ?p=99 each within 5% relative error of numpy.percentile ground truth",
+   "Generate 100,000 log-normal(mu=3, sigma=2) samples, same pipeline, same 5% threshold on P50/P90/P99",
+   "Generate 100,000 bimodal (mixture of Normal(10,1) and Normal(100,5) with 90/10 mix) samples, same pipeline, same 5% threshold",
+   "Verify the service still starts and responds to /query after the fix (basic health check)",
+   "Verify the existing uniform test suite still passes (go test ./... exits 0) so the fix does not break the symmetric case"
+  ],
+  "verifier_knob": {
+   "name": "relative_error_threshold",
+   "value": "0.05 (5%)",
+   "effect": "Lowering to 0.02 requires near-perfect correction of both bugs with no residual; raising to 0.10 allows a solver who fixes only the larger of the two bugs to squeak by on some distributions"
+  },
+  "expected_failure_modes": [
+   "Agent reads sketch.go, spots the correction factor, removes it, tests on uniform data (passes), submits \u2014 fails hidden Pareto/log-normal tests because the matrix transposition is still present",
+   "Agent fixes only the column-major deserialization order, re-runs uniform tests (now slightly worse but still passing), submits \u2014 fails because Rank() still double-applies normalization on skewed inputs",
+   "Agent probes agg binary superficially (strings, --help) but misreads the format documentation and implements a different wrong ordering",
+   "Agent writes a workaround that bypasses agg entirely and recomputes sketches from raw samples \u2014 fails because /ingest only accepts pre-aggregated blobs in production (the verifier only sends blobs)",
+   "Agent correctly identifies both bugs but introduces an off-by-one in the column-major index arithmetic (i*depth+j vs j*width+i confusion), which passes uniform and log-normal but fails Pareto at P99"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "go",
+   "reverse-engineering",
+   "quantile-estimation",
+   "binary-black-box",
+   "interacting-bugs",
+   "mathematical"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/sketch/sketch.go \u2014 spot correction factor in Rank()",
+   "cat /app/sketch/merge.go \u2014 read matrix deserialization loop",
+   "/app/bin/agg --help \u2014 reads 'column-major since v2.0'",
+   "echo -e '1\\n2\\n3\\n4\\n5\\n6' | /app/bin/agg | xxd \u2014 confirm column-major layout",
+   "Edit merge.go: change loop index from blob[i*depth+j] to blob[j*width+i]",
+   "Edit sketch.go: remove '* float64(s.totalCount) / float64(s.width)' from Rank()",
+   "cd /app && go build ./...",
+   "go test ./... \u2014 confirm uniform tests pass",
+   "Start service locally, POST known skewed blob, check /query?p=99 within 5%",
+   "Confirm fix complete"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The --help flag explicitly documents 'column-major since v2.0' per the internal hint, making the harder bug trivially discoverable and collapsing the task to a ~12-command speedrun",
+   "The partial cancellation on uniform data is a nice property but doesn't prevent an agent from finding both bugs independently via --help + source reading in a single pass",
+   "The 5% relative error threshold may be sensitive to sketch width/depth/seed parameters not fully specified in the blueprint, potentially making the threshold flaky depending on exact sketch configuration",
+   "Off-by-one in column-major indexing (i*depth+j vs j*width+i) is listed as a trap but the correct formula is standard and any engineer familiar with matrix layout would get it right immediately",
+   "The verifier's numpy.percentile ground truth vs sketch estimate comparison could be flaky at boundary cases (e.g., exactly 5.0% error) without a specified tolerance buffer"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold (scores 2) because the --help flag explicitly documents the column-major format change, making both bugs discoverable in under 12 commands via straightforward source reading plus one binary probe. The 'interacting bugs that are NOT visible by reading source alone' claim in the internal hint is undermined by the --help documentation, which a competent agent will check immediately. The clever partial-cancellation property doesn't add difficulty once both bugs are independently findable. The average score (3.8) is acceptable but genuine_difficulty at 2 triggers rejection.",
+  "fixes": [
+   "Remove the --help documentation of 'column-major since v2.0' from the agg binary; instead make the format discoverable only by feeding known values and inspecting the blob bytes, requiring the agent to write a probe script and reason about byte layout",
+   "Remove or obfuscate the correction factor comment in sketch.go so it doesn't read as obviously suspicious; make it look like intentional normalization that requires understanding the full pipeline to identify as wrong",
+   "Add a third subtle bug (e.g., an off-by-one in the sliding window boundary that only manifests on bimodal distributions) to raise the number of required discoveries and increase the chance that a partial fix fails",
+   "Make the uniform test cancellation more fragile by using a slightly skewed 'uniform' distribution so agents cannot rely on go test ./... as a reliable partial-correctness signal"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation in a sales service with a misconfigured weight cache, not about quantile sketch calibration for streaming percentile estimation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "That task is about debug/release build differences and memory corruption in C++, unrelated to quantile sketch calibration."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a NetFlow v9 aggregation service with flow record processing bugs, not quantile estimation accuracy."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve a black-box compiled binary that transforms data before a query layer, requiring the agent to characterize the binary's behavior and fix downstream statistical computations (P90/P99 quantiles) to meet accuracy thresholds on hidden inputs."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation correctness and performance in a log ingestion pipeline, not quantile sketch accuracy."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.145
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.12
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.093
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.087
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.084
+    ]
+   ],
+   "cost_usd": 0.010494
+  },
+  "novel": false
+ },
+ "cost_usd": 0.043686
+}

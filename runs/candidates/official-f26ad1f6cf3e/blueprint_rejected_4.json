@@ -1,0 +1,168 @@
+{
+ "blueprint": {
+  "slug": "go-audit-log-compressor-reversal",
+  "title": "Audit Log Compressor Protocol Reversal",
+  "scenario": "A security engineer is auditing a Go-based log aggregation service that ingests raw audit events, passes them through a compiled compressor plugin (no source available), and writes the output to rolling `.alz` archive files. The engineer has discovered that the production archives are unreadable by any standard tool and needs to write a decompressor so that forensic analysis can proceed. The environment contains the compiled plugin binary, several sample `.alz` archive files of known plaintext, a Go service skeleton, and a verifier that will test the decompressor against fresh archives generated at verify time.",
+  "instruction_draft": "A compiled audit-log compressor at `/app/bin/alz-compress` transforms raw newline-delimited JSON event logs into `.alz` archive files. Write a Go program at `/app/cmd/alz-decompress/main.go` that reads an `.alz` file from stdin and writes the original newline-delimited JSON to stdout, exactly reproducing every byte of the original input. The program must build with `go build ./cmd/alz-decompress/` from `/app` and decompress any archive produced by the compressor.",
+  "requirements": [
+   "A Go source file exists at `/app/cmd/alz-decompress/main.go` and builds successfully with `go build ./cmd/alz-decompress/` from `/app`.",
+   "Running `./alz-decompress < sample.alz` reproduces the original newline-delimited JSON byte-for-byte for every provided sample archive.",
+   "The decompressor correctly handles archives produced by the compressor from inputs of varying sizes, including single-line, multi-line, empty-field, and high-entropy payloads generated at verify time.",
+   "The decompressor correctly handles archives whose uncompressed size is not a multiple of any obvious block boundary.",
+   "The decompressor exits with code 0 on valid input and non-zero on truncated or structurally invalid input."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install golang-1.22, build-essential via apt.",
+   "Place compiled binary `/app/bin/alz-compress` (no source): reads stdin (newline-delimited JSON), writes `.alz` to stdout. The format: 4-byte magic `ALZ\\x01`; then a stream of variable-length blocks, each: 2-byte little-endian block length N, then N bytes of payload compressed with a non-standard variant of LZ77 (offset field is 13 bits, length field is 3 bits within a 2-byte back-reference token, literals are emitted with a 0-bit flag prefix byte before each run of up to 255 literal bytes); a final block of length 0 terminates the stream. The back-reference distance is measured from the current output position, not from the end of a sliding window \u2014 this is the key deviation from standard LZ77 that naive implementations get wrong on wrap-around cases.",
+   "Place five sample archives under `/app/testdata/`: `small.alz` (3 JSON lines, ~200 bytes uncompressed), `medium.alz` (~500 JSON lines, ~80 KB), `large.alz` (~5000 JSON lines, ~800 KB), `highentropy.alz` (JSON with base64-encoded random values, low compression ratio), `empty_fields.alz` (JSON lines with many empty string values, high compression ratio). Place corresponding `.json` originals alongside each.",
+   "Place a Go module at `/app/go.mod` with module name `auditlogger` and a stub service at `/app/internal/service/service.go` (~300 lines of plausible log-routing code) to make the repo feel realistically sized.",
+   "Place `/app/README.md` describing the service but not the archive format.",
+   "Place `/app/internal/format/format_notes.txt` containing partial, slightly misleading format notes written by a departed engineer (mentions LZ77, mentions 2-byte tokens, but incorrectly states the offset field is 12 bits and does not mention the distance-from-current-position semantics).",
+   "The verifier script generates fresh `.alz` archives at verify time by invoking `/app/bin/alz-compress` on seeded-random JSON payloads (using Python's `random` with fixed seeds 1001\u20131010), then pipes each through the solver's built binary and diffs against the original."
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources: (1) the opaque compiled binary must be characterised by experiment \u2014 the solver cannot read the compressor source and must infer the exact binary format by feeding known inputs and inspecting outputs; (2) the format has a subtle mathematical deviation from standard LZ77: back-reference offsets are measured from the current write position rather than from the end of the sliding window, which means the decompressor must track absolute output position rather than using a circular buffer with modular indexing. The notes file gives wrong bit-field widths (12 bits vs 13 bits) as a red herring. A solver who reads the notes file and implements 12-bit offsets will pass the small samples (which never exceed 4 KB and thus fit in 12 bits) but fail the medium and large archives. The correct approach: (a) run `xxd` on the magic bytes to confirm the header; (b) feed single-literal inputs and multi-literal inputs to locate the literal-run encoding; (c) feed highly repetitive inputs (e.g., 1000 copies of the same JSON line) to force back-references and measure the bit widths by binary search on input size; (d) compare offset semantics between a 4 KB input and a 5 KB input to detect the non-circular distance model; (e) implement the decompressor in Go with those exact parameters.",
+  "trap": "A solver who trusts the `format_notes.txt` file and implements 12-bit offsets will correctly decompress `small.alz` and `highentropy.alz` (both fit within 4096 bytes of back-reference range) but silently produce wrong output for `medium.alz`, `large.alz`, and the verify-time generated archives that exceed 4 KB. The verifier checks all five sample archives plus ten fresh archives; a 12-bit implementation passes 2/15 checks and fails 13/15. Additionally, a solver who uses a circular sliding-window buffer (standard LZ77) rather than an absolute-position distance model will produce correct output for inputs where no back-reference spans a window boundary but wrong output for the verify-time inputs that do.",
+  "tests": [
+   "Build test: `cd /app && go build ./cmd/alz-decompress/` exits 0 and produces a binary.",
+   "Small archive: `./alz-decompress < /app/testdata/small.alz | diff - /app/testdata/small.json` exits 0.",
+   "Medium archive (>4 KB, exercises 13-bit offsets): `./alz-decompress < /app/testdata/medium.alz | diff - /app/testdata/medium.json` exits 0.",
+   "Large archive: `./alz-decompress < /app/testdata/large.alz | diff - /app/testdata/large.json` exits 0.",
+   "High-entropy archive: `./alz-decompress < /app/testdata/highentropy.alz | diff - /app/testdata/highentropy.json` exits 0.",
+   "Empty-fields archive: `./alz-decompress < /app/testdata/empty_fields.alz | diff - /app/testdata/empty_fields.json` exits 0.",
+   "Verify-time seeds 1001\u20131010: for each seed, generate JSON with Python random, compress with `/app/bin/alz-compress`, pipe through solver, diff against original \u2014 all 10 must pass (these include inputs sized 1 KB, 6 KB, 12 KB, 50 KB, 200 KB at varying repetition ratios to stress both offset width and distance model).",
+   "Invalid input test: `echo 'GARBAGE' | ./alz-decompress; [ $? -ne 0 ]` \u2014 bad magic bytes cause non-zero exit.",
+   "Truncated input test: truncate a valid archive at byte 10 and verify non-zero exit code."
+  ],
+  "verifier_knob": {
+   "name": "number of verify-time archive sizes",
+   "value": "10 archives covering 1 KB to 200 KB",
+   "effect": "Raising to 20 archives with sizes up to 1 MB adds more stress on the distance model and literal-run edge cases; lowering to 3 small archives under 4 KB makes the 12-bit trap invisible and the task much easier."
+  },
+  "expected_failure_modes": [
+   "Agent trusts `format_notes.txt`, implements 12-bit offsets, passes small samples, fails medium/large and all verify-time archives over 4 KB.",
+   "Agent correctly identifies 13-bit offsets but implements a circular sliding-window buffer (standard LZ77), producing wrong output for archives where a back-reference distance crosses a 32 KB window boundary.",
+   "Agent implements the decompressor correctly for the provided samples but misses the 2-byte block-length framing and instead tries to parse the entire payload as a flat bitstream, which works coincidentally for small files but breaks on block boundaries in large files.",
+   "Agent builds a Python decompressor instead of Go, failing the build test.",
+   "Agent does not experiment systematically with the binary, guesses a standard zlib/LZ4 format, and fails to reproduce any archive."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "reverse-engineering",
+  "tags": [
+   "go",
+   "reverse-engineering",
+   "compression",
+   "data-processing",
+   "systems-programming",
+   "security"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "xxd /app/bin/alz-compress | head -5  # confirm it's a binary",
+   "echo '{\"a\":1}' | /app/bin/alz-compress | xxd  # single-line input, inspect magic + structure",
+   "python3 -c \"print('{\\\"a\\\":1}')\" | /app/bin/alz-compress | xxd  # same with newline",
+   "cat /app/internal/format/format_notes.txt  # read notes (misleading)",
+   "python3 -c \"import sys; sys.stdout.buffer.write(b'{\\\"k\\\":\\\"v\\\"}\\n' * 500)\" | /app/bin/alz-compress | xxd | head -80  # force back-refs, inspect token structure",
+   "python3 -c \"import sys; sys.stdout.buffer.write(b'A'*4096)\" | /app/bin/alz-compress | xxd  # stress 12-bit boundary",
+   "python3 -c \"import sys; sys.stdout.buffer.write(b'A'*4097)\" | /app/bin/alz-compress | xxd  # cross 4096 boundary, check if offset wraps or extends to 13 bits",
+   "python3 -c \"import sys; sys.stdout.buffer.write(b'A'*8192)\" | /app/bin/alz-compress | xxd  # larger, confirm 13-bit",
+   "# Analyze: parse block length (2-byte LE), then payload bytes; identify flag byte=0x00 for literals, non-zero for back-refs; extract bit fields",
+   "# Determine: token = 2 bytes, bits [15:3]=offset(13 bits), bits[2:0]=length(3 bits); distance from current output position",
+   "mkdir -p /app/cmd/alz-decompress",
+   "cat > /app/cmd/alz-decompress/main.go  # implement: read magic, loop blocks, parse flag+literals or back-ref tokens, output bytes",
+   "cd /app && go build ./cmd/alz-decompress/",
+   "./alz-decompress < /app/testdata/small.alz | diff - /app/testdata/small.json",
+   "./alz-decompress < /app/testdata/medium.alz | diff - /app/testdata/medium.json",
+   "./alz-decompress < /app/testdata/large.alz | diff - /app/testdata/large.json",
+   "./alz-decompress < /app/testdata/highentropy.alz | diff - /app/testdata/highentropy.json",
+   "./alz-decompress < /app/testdata/empty_fields.alz | diff - /app/testdata/empty_fields.json",
+   "# Fix any failures (likely distance model or bit layout)",
+   "echo 'GARBAGE' | ./alz-decompress; [ $? -ne 0 ] && echo OK"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact bit layout within the 2-byte back-reference token (which 13 bits are offset, which 3 are length, and their order) is not specified in the instruction \u2014 a solver could infer a different but internally consistent layout from experiments, implement it correctly, and still fail if the binary uses a different layout than what they inferred.",
+   "The flag/prefix byte semantics for literal runs are underspecified: the instruction says '0-bit flag prefix byte before each run' which is contradictory (a 0-bit flag in a byte?). The actual encoding (e.g., flag byte value, whether it encodes the run length) must be inferred from binary analysis and could be misread.",
+   "The compiled binary must be built by the task author with the exact format described, including the non-standard distance semantics. Any bug in the binary (e.g., off-by-one in offset calculation) would make the task unsolvable or produce inconsistent verifier results.",
+   "Maximum block size is unspecified \u2014 if the compressor emits blocks of varying sizes and the solver assumes a fixed block size, they may misparse block boundaries on large inputs.",
+   "The solvability under 1 hour is questionable: correctly inferring a custom binary format with a subtle non-standard semantic (absolute position vs. sliding window) from black-box experiments typically takes 2-4 hours for a skilled engineer, making the task potentially too hard to be fair."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the solvability threshold: correctly reverse-engineering a custom binary format with a deliberately misleading notes file and a subtle non-standard distance model from a compiled binary is realistically a 2-4 hour task, not under an hour. Additionally, the instruction has critical underspecification \u2014 the exact bit layout of the 2-byte back-reference token and the literal-run flag byte semantics are not described, meaning a solver could do everything right experimentally but still fail if their inferred layout differs from the binary's actual layout in ways that only manifest on specific inputs. The speedrun reaches ~20 commands but several of those commands require substantial offline analysis that cannot be compressed further.",
+  "fixes": [
+   "Reduce solvability burden: provide a partial format specification (e.g., confirm the magic bytes, block framing, and that tokens are 2 bytes) while keeping the bit-field widths and distance semantics as the reverse-engineering challenge. This makes the task solvable in under an hour while preserving genuine difficulty.",
+   "Specify the exact bit layout of the 2-byte back-reference token in the internal hint (not the instruction) and ensure the binary is built to match exactly \u2014 this prevents invalid failures from ambiguous bit ordering.",
+   "Fix the contradictory 'flag prefix byte' description: clarify whether the flag is a full byte value (e.g., 0x00 = literal run follows, with next byte being count) or a bit within a stream, and ensure this is discoverable from small experiments.",
+   "Add a format discovery hint to the instruction (without giving away the answer): e.g., 'The format uses a block-framed structure; each block begins with a 2-byte length field' \u2014 this reduces the search space without eliminating the core reverse-engineering challenge of the token format and distance semantics.",
+   "Extend the time estimate in the scenario description to 'a few hours' and reduce verify-time archives from 10 to 5 to make the task more tractable while keeping it hard."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "That task reverses a stream cipher to implement encryption given a decryption source, while the candidate reverses a binary compressor format with no source available to implement decompression."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task extracts XOR-obfuscated credentials from Go source/binary to authenticate a tool, while the candidate reverse-engineers a binary compression format to build a decompressor."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-lz77-file-compressor",
+     "verdict": "distinct",
+     "reason": "That task implements a compressor from a fully specified LZ77 format, while the candidate must reverse-engineer an unknown binary format from a black-box compressor binary."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task implements an HMAC-based TCP audit service with WAL record serialization, while the candidate reverse-engineers a proprietary archive compression format."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task characterizes a normalizer binary's calibration curve to fix SQL rollup queries, while the candidate reverse-engineers a binary compression format to build a decompressor."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.154
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.149
+    ],
+    [
+     "terminal-bench-pro/implement-lz77-file-compressor",
+     0.145
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.082
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.06
+    ]
+   ],
+   "cost_usd": 0.013026
+  },
+  "novel": true
+ },
+ "cost_usd": 0.068403
+}

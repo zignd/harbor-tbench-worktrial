@@ -27,6 +27,7 @@ from generator import pipeline
 from generator.blueprint import Blueprint
 from generator.spec import TaskSpec, sample_specs
 from scripts.calibrate_candidates import calibrate_one
+from scripts.tune_candidates import tune_one
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 FIXTURE_TASK = (
@@ -131,6 +132,11 @@ def main() -> int:
         action="store_true",
         help="calibrate each candidate against Opus as soon as it passes every gate",
     )
+    parser.add_argument(
+        "--tune",
+        action="store_true",
+        help="with --calibrate: tune a too-easy/too-hard task right away (up to 2 rounds)",
+    )
     parser.add_argument("--dry-run", action="store_true", help="no model calls (fixtures)")
     args = parser.parse_args()
 
@@ -157,6 +163,8 @@ def main() -> int:
         if status.get("status") == "gated" and args.calibrate and not args.dry_run:
             if not (cand.dir / "calibration.json").exists():  # gated before a crash
                 calibrate_one(cand.dir, ledger)
+            if args.tune:  # no-op unless calibrated too easy/hard and not yet tuned
+                tune_one(cand.dir, ledger)
             return None
         if status and status.get("status") != "building":  # resume: already ran to a final status
             print(f"{cand.cand_id}  (already {status['status']})")
@@ -176,8 +184,10 @@ def main() -> int:
                 Event("error", cand.cand_id, {"error": f"{type(e).__name__}: {e}"[:2000]})
             )
         if args.calibrate and cand.status == "gated" and not args.dry_run:
-            # Straight to calibration: a gated task no longer waits for a separate run.
+            # Straight to calibration (and tuning): a gated task no longer waits for a run.
             calibrate_one(cand.dir, ledger)
+            if args.tune:
+                tune_one(cand.dir, ledger)
         cost = sum(e.cost_usd for e in ledger.events(task=cand.cand_id))
         slug = cand.blueprint.slug if cand.blueprint else "-"
         print(f"{cand.cand_id}  {slug:40}  {cand.status:9}  ${cost:.2f}", flush=True)

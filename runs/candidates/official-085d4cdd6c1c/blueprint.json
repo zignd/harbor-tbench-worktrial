@@ -1,59 +1,58 @@
 {
- "slug": "histogram-quantile-fastpath-bug",
- "title": "HDR Histogram Quantile Fastpath Corruption",
- "scenario": "A backend developer maintains an in-house metrics aggregation service written in Go. The service collects latency samples, builds HDR histograms, and exposes P50/P95/P99 quantiles over an HTTP endpoint. A compiled shared library `libhdrhist.so` provides the core bucket-index and inverse-CDF math; the Go layer calls it via cgo. After a recent 'performance optimization' patch to the shared library, P99 values started reporting suspiciously low on heavy-tailed distributions in production, but unit tests on synthetic uniform data pass. The source for the shared library is not present in the repository.",
- "instruction_draft": "The metrics service at /app reports incorrect P99 latency quantiles for heavy-tailed workloads; P50 and P95 are accurate but P99 is consistently too low. Make the service return correct quantile values for all percentiles (P50, P95, P99) on any input distribution. The corrected service must compute each quantile within 2% relative error of the true value and respond to /metrics in under 150 ms at 10,000 samples/request on the provided hardware.",
+ "slug": "sketch-quantile-calibration-repair",
+ "title": "Quantile Sketch Calibration Repair",
+ "scenario": "A backend developer maintains an in-house streaming percentile service (~1,400 lines of Go across six files) that uses a mergeable count-min sketch variant to answer P50/P90/P99 latency queries over sliding windows. The service ships with a precompiled black-box aggregator binary (`/app/bin/agg`) that compresses raw samples into sketch blobs; the Go service deserializes these blobs and answers quantile queries. Production monitoring shows the P99 estimates have been drifting high by 15-40% for skewed distributions since the aggregator binary was updated three weeks ago, but unit tests (which use uniform random data) still pass. The developer needs to fix the query layer so estimates are accurate to within 5% relative error on any input distribution.",
+ "instruction_draft": "The quantile service at /app returns P50, P90, and P99 estimates that are too high on skewed distributions; all estimates must be within 5% relative error of the true quantile on any input distribution the verifier supplies. Fix the service so it passes the accuracy threshold.",
  "requirements": [
-  "P50 quantile is within 2% relative error of the true value for all test distributions",
-  "P95 quantile is within 2% relative error of the true value for all test distributions",
-  "P99 quantile is within 2% relative error of the true value for all test distributions",
-  "The /metrics HTTP endpoint responds in under 150 ms when processing 10,000 samples per request",
-  "Correctness holds for heavy-tailed (Pareto), bimodal, and uniform distributions generated at verify time"
+  "P50, P90, and P99 estimates returned by the service must each be within 5% relative error of the true quantile",
+  "The fix must work for any input distribution (not just uniform), including heavy-tailed and highly skewed distributions",
+  "The service must continue to start and answer queries after the fix"
  ],
  "environment": [
-  "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, gcc, and build tools",
-  "~1400 lines of Go across: cmd/server/main.go (HTTP handler, sample ingestion), internal/histogram/histogram.go (HDR bucket logic calling cgo), internal/aggregator/aggregator.go (windowed aggregation), internal/reporter/reporter.go (quantile formatting), internal/config/config.go (tuning knobs)",
-  "A pre-built binary-only libhdrhist.so in /app/lib/ with header /app/lib/hdrhist.h; no C source present",
-  "The shared library exports: hdr_bucket_index(double value, int precision) -> int, hdr_inverse_cdf(double* counts, int num_buckets, int precision, double quantile) -> double",
-  "The planted bug: hdr_inverse_cdf interpolates linearly within the final bucket using (rank - cumulative) / bucket_count, but the final high-value bucket uses a bucket width computed with the wrong exponent\u2014it uses precision bits instead of (precision-1) bits in the sub-bucket width formula, causing the interpolated value inside the last occupied bucket to be ~half the correct value; this only matters when the target quantile falls in a high-value bucket, which uniform and low-percentile queries rarely trigger",
-  "histogram.go calls hdr_inverse_cdf directly for all quantiles; the Go wrapper passes precision=4",
-  "A working reference implementation hdr_inverse_cdf_ref() is also exported from libhdrhist.so but is not called by the Go code (discoverable by running 'nm -D /app/lib/libhdrhist.so')",
-  "A sample generator at /app/scripts/gen_samples.py that produces uniform, Pareto(alpha=1.5), and bimodal distributions as JSON",
-  "A test harness at /app/scripts/check_quantiles.py that calls the running service and computes relative error vs. scipy ground truth",
-  "The service runs correctly (builds, starts) but returns wrong P99 on heavy-tailed inputs",
-  "Logs show no errors; the bug is purely numerical and only manifests when the 99th-percentile rank lands in a high-value HDR bucket"
+  "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, builds the Go service, and places the precompiled /app/bin/agg binary (amd64 ELF, no source) in the image",
+  "/app/server.go: HTTP server exposing POST /ingest (accepts JSON sample arrays) and GET /query?p=99 endpoints (~200 lines)",
+  "/app/sketch/sketch.go: count-min sketch structure with Insert, Merge, Rank methods (~300 lines) \u2014 contains a subtle miscalibration in the Rank() method: it applies a correction factor `* float64(s.totalCount) / float64(s.width)` that was correct for the OLD aggregator blob format but is wrong for the new one which already normalizes counts",
+  "/app/sketch/merge.go: blob deserialization from the aggregator binary output (~150 lines) \u2014 the new agg binary uses a different column-major vs row-major serialization order for the sketch matrix, but merge.go still reads it row-major, silently transposing the sketch",
+  "/app/window/window.go: sliding window management, ring buffer (~200 lines, correct)",
+  "/app/query/query.go: quantile estimation using binary search over Rank() (~250 lines, correct logic but calls the broken Rank)",
+  "/app/main.go: wiring and config (~100 lines, correct)",
+  "/app/cmd/gen/main.go: sample data generator used in tests (~150 lines)",
+  "/app/testdata/uniform_samples.bin: pre-generated uniform samples that the existing unit tests use (these pass because uniform distributions are symmetric and the two bugs partially cancel)",
+  "/app/bin/agg: precompiled agg binary that reads newline-delimited float64 values from stdin and writes a sketch blob to stdout; its --version flag prints '2.1.0'; the new blob format is column-major",
+  "A /app/README.md describing the sketch blob format for agg v1.x (the OLD format), not updated for v2.x",
+  "The existing go test ./... passes on uniform data (the two bugs cancel for symmetric distributions)",
+  "The verifier generates fresh Pareto-distributed, log-normal, and bimodal sample sets at verify time, pipes them through /app/bin/agg, posts the blobs to the service, and checks /query?p=50, /query?p=90, /query?p=99 against ground truth within 5% relative error"
  ],
- "internal_hint": "Difficulty comes from two sources: (1) NOT VISIBLE BY READING\u2014the wrong exponent in the sub-bucket width formula only fires when the quantile target falls in a high-value bucket, so reading histogram.go reveals nothing wrong; the agent must run the service against a heavy-tailed distribution and observe that P99 is ~50% of the true value while P95 is correct, then reason about what mathematical property could cause exactly a 2x underestimate only at high percentiles; (2) SUBSTANTIAL CONSTRUCTION\u2014once the agent discovers via 'nm -D' that hdr_inverse_cdf_ref() exists in the .so, they must either (a) patch histogram.go to call hdr_inverse_cdf_ref() instead, or (b) re-implement a correct pure-Go inverse CDF that matches HDR histogram math. The ordered procedure trap: if the agent implements a naive linear-scan quantile in Go without understanding the HDR bucket structure, it will be correct but too slow (>150ms) at 10k samples because iterating all 2^(precision)*range buckets naively is O(buckets). A correct solution must understand the HDR two-level bucket structure to hit the performance bar.",
- "trap": "A naive solution replaces hdr_inverse_cdf with a sort-and-scan over raw samples\u2014this gives correct quantiles but violates the 150ms latency constraint at 10,000 samples. A partially correct solution switches to hdr_inverse_cdf_ref() but only for P99 (hardcoded), failing on verify-time inputs that use non-standard percentiles like P99.5. The hidden tests use Pareto(alpha=1.2) which puts >40% of mass above the P95 bucket boundary, stressing the interpolation path that uniform distributions never reach.",
+ "internal_hint": "Difficulty comes from two interacting bugs that are NOT visible by reading source alone: (1) the blob deserialization in merge.go reads the sketch matrix in row-major order but agg v2.1.0 writes it column-major \u2014 this is only discoverable by running agg on known data and comparing the deserialized sketch to expected values, or by probing agg --format or --help; (2) the Rank() correction factor in sketch.go double-applies a normalization that agg v2 already performs \u2014 this is only apparent when the combined pipeline produces wrong answers on skewed data, since on uniform data the over-correction in Rank() and the transposition error in merge.go partially cancel. The solver must: (a) notice tests pass on uniform data but fail on skewed; (b) probe the agg binary to understand the v2 blob format (e.g., feed known values and inspect the blob bytes, or check agg --help which documents 'column-major since v2.0'); (c) fix the matrix read order in merge.go; (d) remove or correct the now-double-applied correction factor in Rank(). Fixing only one bug still fails the threshold on skewed inputs because the errors no longer cancel.",
+ "trap": "A solver who fixes only the more obvious bug (e.g., sees the correction factor in Rank() looks suspicious and removes it) will pass on some distributions but fail on heavy-tailed ones because the transposed matrix still scrambles bucket assignments. Conversely, fixing only the column-major deserialization makes estimates worse on uniform data (the partial cancellation is broken) and still fails the threshold on Pareto inputs. The hidden tests use distributions where the two bugs do NOT cancel, so any single-bug fix fails at least one distribution family. Shallow verification against the provided uniform testdata gives a false pass.",
  "tests": [
-  "Verify-time test 1: POST 10,000 samples from Pareto(alpha=1.2, seed=42) to /ingest, then GET /metrics?p=0.99; check relative error |reported - scipy_true| / scipy_true < 0.02",
-  "Verify-time test 2: POST 10,000 samples from bimodal (50% N(100,10) + 50% N(10000,500), seed=7) to /ingest, then GET /metrics?p=0.95 and p=0.99; both within 2% relative error",
-  "Verify-time test 3: POST 10,000 samples from uniform(1, 1e6, seed=99) to /ingest, then GET /metrics?p=0.50; within 2% relative error",
-  "Verify-time test 4: POST 10,000 samples from Pareto(alpha=1.5, seed=13) then time GET /metrics?p=0.99; wall time must be under 150ms (measured 5 times, median used)",
-  "Verify-time test 5: GET /metrics?p=0.995 on Pareto(alpha=1.2, seed=99) data; P99.5 within 2% relative error (catches hardcoded-percentile solutions)",
-  "Verify-time test 6: Correctness on fresh seed (seed=2025) Pareto(alpha=1.3) at P99 to confirm no seed-specific overfitting"
+  "Generate 100,000 Pareto(alpha=1.5) samples, pipe through /app/bin/agg, POST blob to /ingest, check GET /query?p=50, ?p=90, ?p=99 each within 5% relative error of numpy.percentile ground truth",
+  "Generate 100,000 log-normal(mu=3, sigma=2) samples, same pipeline, same 5% threshold on P50/P90/P99",
+  "Generate 100,000 bimodal (mixture of Normal(10,1) and Normal(100,5) with 90/10 mix) samples, same pipeline, same 5% threshold",
+  "Verify the service still starts and responds to /query after the fix (basic health check)",
+  "Verify the existing uniform test suite still passes (go test ./... exits 0) so the fix does not break the symmetric case"
  ],
  "verifier_knob": {
-  "name": "performance_threshold_ms",
-  "value": "150",
-  "effect": "Lowering to 80ms forces the agent to understand HDR bucket math deeply enough to avoid any O(n_samples) path; raising to 500ms allows a sorted-array fallback and reduces difficulty to pure correctness"
+  "name": "relative_error_threshold",
+  "value": "0.05 (5%)",
+  "effect": "Lowering to 0.02 requires near-perfect correction of both bugs with no residual; raising to 0.10 allows a solver who fixes only the larger of the two bugs to squeak by on some distributions"
  },
  "expected_failure_modes": [
-  "Agent reads histogram.go, finds no bug, concludes the issue is in aggregator.go and wastes time chasing windowing logic",
-  "Agent discovers hdr_inverse_cdf_ref but switches only the P99 call site, failing on P99.5 hidden test",
-  "Agent implements correct quantile math but uses sort+scan over raw samples, passing correctness tests but failing the 150ms latency bar",
-  "Agent patches the Go side with a correct-looking HDR interpolation but uses wrong sub-bucket width formula independently (same bug class), still failing on Pareto inputs",
-  "Agent verifies only on the provided uniform sample generator (which passes even with the bug) and submits without testing heavy-tailed distributions"
+  "Agent reads sketch.go, spots the correction factor, removes it, tests on uniform data (passes), submits \u2014 fails hidden Pareto/log-normal tests because the matrix transposition is still present",
+  "Agent fixes only the column-major deserialization order, re-runs uniform tests (now slightly worse but still passing), submits \u2014 fails because Rank() still double-applies normalization on skewed inputs",
+  "Agent probes agg binary superficially (strings, --help) but misreads the format documentation and implements a different wrong ordering",
+  "Agent writes a workaround that bypasses agg entirely and recomputes sketches from raw samples \u2014 fails because /ingest only accepts pre-aggregated blobs in production (the verifier only sends blobs)",
+  "Agent correctly identifies both bugs but introduces an off-by-one in the column-major index arithmetic (i*depth+j vs j*width+i confusion), which passes uniform and log-normal but fails Pareto at P99"
  ],
  "predicted_pass_rate": 0.25,
  "difficulty": "hard",
  "category": "performance-optimization",
  "tags": [
   "go",
-  "cgo",
-  "numerical-methods",
-  "histogram",
   "reverse-engineering",
-  "performance"
+  "quantile-estimation",
+  "binary-black-box",
+  "interacting-bugs",
+  "mathematical"
  ]
 }

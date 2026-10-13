@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "audit-log-transform-recovery",
+  "title": "Audit Log Transform Recovery",
+  "scenario": "A security engineer is auditing a high-throughput event logging service. The service writes compressed audit records to `/data/audit.bin` using a proprietary encoding applied by a compiled encoder binary at `/usr/local/bin/audit-encode`. The encoder source was lost; only the binary ships with the service. A reference decoder was never written. The engineer must characterise the encoding by experiment and implement a correct Go decoder at `/app/decoder/main.go` that reproduces the original plaintext records for any valid encoded input.",
+  "instruction_draft": "The compiled binary `/usr/local/bin/audit-encode` encodes audit records from a newline-delimited plaintext file and writes the result to stdout. Reverse-engineer its encoding by experiment, then implement a Go program at `/app/decoder/main.go` that reads an encoded file from its first argument and writes the recovered plaintext records, one per line, to stdout. The program must build with `go build` and produce correct output for any encoded file the encoder could have produced.",
+  "requirements": [
+   "A Go source file exists at `/app/decoder/main.go` and compiles successfully with `go build ./...` in `/app/decoder/`.",
+   "Running `/app/decoder/decoder <encoded_file>` on any file produced by `audit-encode` prints the original plaintext records, one per line, to stdout with no extra whitespace.",
+   "The decoder correctly handles records of length 1 through at least 4096 bytes.",
+   "The decoder correctly handles files containing between 1 and at least 10000 records.",
+   "The decoder correctly recovers records that contain arbitrary printable ASCII including spaces, punctuation, and digits.",
+   "The decoder produces output byte-for-byte identical to the original input that was fed to the encoder."
+  ],
+  "environment": [
+   "Compile a Go binary `/usr/local/bin/audit-encode` (source NOT placed in container) that implements: (1) for each input line (record), compute rotation_amount = (record_index * 7 + 3) % 8, where record_index is 0-based; (2) apply a byte-wise left bit-rotation of rotation_amount to every byte in the record; (3) apply run-length encoding to the rotated bytes using a 2-byte escape sequence: 0xFF followed by count (1 byte) followed by the repeated value (1 byte), only for runs of 3 or more identical bytes; (4) encode the byte length of the RLE result as a variable-length little-endian base-128 integer (1-5 bytes, MSB of each byte is continuation bit, same as protobuf varint); (5) write the varint length prefix followed by the RLE-encoded rotated bytes to stdout. The file format is simply these records concatenated with no separator.",
+   "Place a sample encoded file at `/data/audit.bin` produced by encoding `/data/sample_records.txt` (50 records, short strings 8-40 chars, no runs of 3+ identical bytes after rotation, all record indices 0-49 so rotation_amount cycles through values \u2014 deliberately chosen so runs and varint multi-byte cases are NOT exercised in the sample).",
+   "Place `/data/sample_records.txt` (the original plaintext, 50 lines) so the engineer can verify their decoder against a known answer.",
+   "Create `/app/decoder/` as an empty directory with a `go.mod` file (`module decoder`, `go 1.21`).",
+   "Install Go 1.21 in the container.",
+   "Do NOT place the encoder source anywhere in the container.",
+   "Add a helper script `/usr/local/bin/audit-encode` that is the compiled binary only.",
+   "The encoder binary must be statically compiled so `strings`, `strace`, `objdump` are usable but yield no direct algorithmic disclosure (strip debug symbols, no embedded format strings describing the algorithm)."
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources. First, the opaque binary: the rotation amount is record-index-dependent (not constant), which only becomes apparent when the engineer encodes multiple known records and compares byte-by-byte \u2014 a naive assumption of a fixed rotation or XOR will pass the sample but fail on hidden inputs. The RLE scheme and varint length prefix must also be characterised by encoding records with long runs. Second, the build requirement: the decoder must correctly invert all three transform stages (varint decode \u2192 RLE decode \u2192 bit-unrotate with index-dependent amount). The sample deliberately avoids multi-byte varints and RLE triggers, so shallow verification against the sample will miss both. A skilled engineer: (1) encodes single known records of 1, 2, 3 bytes with `echo -n 'A' | audit-encode | xxd` etc., (2) notices the first byte of record 0 is rotated 3 bits left, record 1 is rotated 10%8=10\u21922? No: (0*7+3)%8=3, (1*7+3)%8=2, (2*7+3)%8=1, (3*7+3)%8=0, (4*7+3)%8=7 \u2014 so the rotation is NOT monotone and is not a simple cycle, requiring careful measurement; (3) encodes a record with 5 identical bytes to discover RLE; (4) encodes a record of 200 bytes to trigger 2-byte varint. The construction difficulty: implementing bit-rotation inversion (right-rotate by rotation_amount), correct RLE decoder, and protobuf-style varint decoder in Go, all correctly composed.",
+  "trap": "A solver who only verifies against `/data/audit.bin` (50 short records, no RLE triggers, all single-byte varints, rotation amounts 3,2,1,0,7,6,5,4,3,... cycling) will likely assume a fixed rotation of 3 bits (the first record's rotation) or discover the cycle pattern but implement it as monotone-decreasing. They will pass the 50-record sample but fail on: (1) hidden files where the record index is large enough that rotation_amount=0 (no rotation), (2) records with runs of 3+ identical bytes that trigger RLE, (3) encoded files with records longer than 127 bytes that use 2-byte varint length prefixes. A solver who guesses XOR instead of rotation will also fail all hidden tests.",
+  "tests": [
+   "Build test: `cd /app/decoder && go build -o decoder ./...` exits 0.",
+   "Sample regression: `/app/decoder/decoder /data/audit.bin` output matches `/data/sample_records.txt` byte-for-byte.",
+   "Rotation=0 case: verifier encodes a file where record index 3 is present (rotation (3*7+3)%8=24%8=0, i.e., no rotation); decoder must recover the record unchanged.",
+   "Large-rotation case: verifier encodes records at indices where rotation_amount=7 (index where (i*7+3)%8=7, i.e., i=4: (4*7+3)=31, 31%8=7); decoder must correctly right-rotate by 7 (= left-rotate by 1).",
+   "RLE trigger: verifier encodes a record containing a run of 8 identical bytes (e.g., 'AAAAAAAA' at an index where post-rotation bytes are identical); decoder must expand the run correctly.",
+   "Multi-byte varint: verifier encodes a record of 200 bytes; the varint length prefix is 2 bytes (0xC8 0x01 for 200 in protobuf varint); decoder must parse this correctly.",
+   "Combined stress: verifier encodes a 500-record file with varied record lengths (1-300 bytes), some with runs, exercising all rotation amounts and 2-byte varints; decoder output must match original exactly.",
+   "Single-record file: verifier encodes a file with exactly one record of 1 byte; decoder must emit exactly one line.",
+   "10000-record file: verifier encodes 10000 short records; decoder must produce all 10000 lines correctly.",
+   "Arbitrary punctuation: verifier encodes records containing `!@#$%^&*()` and verifies round-trip."
+  ],
+  "verifier_knob": {
+   "name": "number_of_independent_state_properties_checked",
+   "value": "8 independent property checks (rotation=0, rotation=7, RLE, 2-byte varint, combined stress, single record, 10000 records, punctuation)",
+   "effect": "Reducing to 3 checks (sample regression + one rotation case + one varint case) makes it easier since the solver can get partial credit; raising to 12 by adding checks for 3-byte varints (records > 16383 bytes), RLE with count=255, and records where every byte triggers RLE makes it harder."
+  },
+  "expected_failure_modes": [
+   "Assumes fixed rotation amount (3, from first record) \u2014 passes sample, fails all hidden tests with different record indices.",
+   "Discovers rotation cycles but implements it as (index % 8) * something rather than (index * 7 + 3) % 8 \u2014 passes a few hidden tests by coincidence, fails most.",
+   "Correctly implements rotation but assumes no compression layer exists (sample has no RLE triggers) \u2014 fails all hidden tests with runs.",
+   "Correctly implements rotation and RLE but implements length prefix as big-endian fixed 4 bytes (reasonable assumption) instead of protobuf varint \u2014 fails all hidden tests.",
+   "Implements protobuf varint correctly for 1-byte case but uses wrong continuation-bit logic for multi-byte case \u2014 fails records > 127 bytes.",
+   "Implements all three stages correctly but composes them in wrong order (e.g., RLE-decode then varint instead of varint-decode then RLE-decode) \u2014 fails everything.",
+   "Does not build cleanly with `go build` due to import errors or syntax issues."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "reverse-engineering",
+  "tags": [
+   "reverse-engineering",
+   "binary-format",
+   "go",
+   "data-processing",
+   "systems-programming",
+   "security"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "echo -n 'A' | audit-encode | xxd",
+   "echo -n 'B' | audit-encode | xxd",
+   "printf 'A\\nA\\n' | audit-encode | xxd",
+   "printf 'A\\nA\\nA\\nA\\nA\\n' | audit-encode | xxd",
+   "# Deduce rotation pattern 3,2,1,0,7,6,5,4 = (3-i)%8 = (i*7+3)%8",
+   "printf 'AAAAAAAA\\n' | audit-encode | xxd",
+   "# Observe 0xFF RLE escape in output",
+   "python3 -c \"print('A'*200, end='')\" | audit-encode | xxd | head",
+   "# Observe 2-byte varint prefix 0xC8 0x01",
+   "cat /data/sample_records.txt",
+   "xxd /data/audit.bin | head -20",
+   "cat > /app/decoder/main.go << 'EOF'\n# write Go decoder: parse varint, decode RLE, unrotate bits\nEOF",
+   "cd /app/decoder && go build -o decoder ./...",
+   "./decoder /data/audit.bin | diff - /data/sample_records.txt",
+   "# Fix any issues",
+   "go build -o decoder ./...",
+   "./decoder /data/audit.bin | diff - /data/sample_records.txt",
+   "# Verify edge cases with manual test inputs"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Sample construction constraint ('no runs of 3+ identical bytes after rotation') is fragile and hard to verify during environment build; a bug in sample generation causes spurious regression failures.",
+   "Go binaries are notoriously hard to fully strip \u2014 function names and type info often survive stripping, potentially leaking 'rotateLeft', 'runLengthEncode', 'putVarint' symbol names and undermining the reverse-engineering premise.",
+   "The formula (i*7+3)%8 is mathematically identical to (3-i)%8 for all i, so the 'wrong formula' trap is weaker than described \u2014 any agent who correctly measures the pattern will implement a correct formula regardless of which form they use.",
+   "RLE trigger test requires constructing inputs where post-rotation bytes form runs; if the verifier uses a naive input like 'AAAAAAAA' at index 0 (rotation=3), rotated 'A'=0x41 left 3 = 0x0A, all identical, so it works \u2014 but this dependency on rotation amount must be carefully managed in test construction.",
+   "The environment build complexity (stripped binary, carefully crafted sample, specific Go version) creates significant risk of environment bugs that cause valid solutions to fail."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores only 3 because the experimental path is straightforward (~18 commands), the rotation formula trap dissolves mathematically (both candidate formulas are equivalent), and a systematic agent will discover all three encoding layers with targeted experiments. The solvability score is also borderline at 3 due to fragile environment construction requirements (stripped Go binary, carefully crafted sample with specific rotation properties). The task does not reliably achieve the 'hard' difficulty rating it claims.",
+  "fixes": [
+   "Increase genuine difficulty by adding a 4th encoding layer (e.g., a record-index-dependent XOR key derived from a non-obvious function) or by making the RLE scheme more subtle (e.g., the escape byte is itself rotation-dependent), forcing more experimental iterations.",
+   "Replace the stripped-binary approach with a truly opaque component (e.g., a network service or a binary that reads from a file and writes to another file with no stdin/stdout, making strace more complex) to raise the reverse-engineering bar.",
+   "Make the rotation formula genuinely non-trivial to distinguish from alternatives by using a formula where different candidate formulas diverge earlier (e.g., use a lookup table or a formula like (i*3+5)%7 that doesn't have a simple additive inverse).",
+   "Simplify the environment build requirements to reduce fragility: use a pre-built Docker image with the encoder binary already present, and provide a checksum for the sample file to verify correct environment setup."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "DNA storage codec involves designing both encoder and decoder with error-correction for a noisy channel, whereas this task is about reverse-engineering an unknown binary encoding by black-box experimentation."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The audit service task involves implementing HMAC-SHA256 over a known binary format with a TCP server, not reverse-engineering an unknown encoding scheme."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "variant",
+     "reason": "Both tasks require reverse-engineering a lost encoding/encryption algorithm from a surviving binary and implementing the inverse transform, differing mainly in that this task involves black-box experimentation on a binary rather than reading surviving source code."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The log ingestion task is about fixing bugs in a known NDJSON validation pipeline, not reverse-engineering an unknown encoding."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The NetFlow aggregation task involves repairing a known Rust service with specific query semantics, unrelated to reverse-engineering an unknown binary encoding."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.324
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.187
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.185
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.097
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.082
+    ]
+   ],
+   "cost_usd": 0.012228
+  },
+  "novel": false
+ },
+ "cost_usd": 0.057615
+}

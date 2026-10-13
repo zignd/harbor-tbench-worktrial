@@ -27,11 +27,14 @@ from analysis.ledger import Event, Ledger, hash_dir
 from evaluator.harbor_runner import run_with_retries
 from evaluator.quality import run_check
 from evaluator.redteam import redteam
+from evaluator.slots import machine_slots
 from generator.author import collect_package, make_task_toml, render_metatask
 from generator.blueprint import Blueprint, gate_blueprint, make_blueprint
 from generator.config import (
+    BLUEPRINT_DRAFTS,
     CANARY_LINE,
     DEV_MODE,
+    GATE_CONCURRENCY,
     JOBS_DIR,
     METATASK_MAX_TURNS,
     METATASK_REPAIR_MAX_TURNS,
@@ -49,7 +52,7 @@ from validator.validate import validate_task
 
 MAX_REPAIRS = 2
 # Blueprints are cheap (~$0.13) next to a build (~$4-6); the difficulty review rejects most.
-BLUEPRINT_TRIES = 4
+BLUEPRINT_ROUNDS = 2  # of BLUEPRINT_DRAFTS parallel drafts each
 ORACLE_RUNS = 3
 EXPECTED_AUTHOR_USD = 3.0
 EXPECTED_CHECK_USD = 0.2
@@ -107,51 +110,71 @@ def _rejection_feedback(decision: dict) -> str:
     return "; ".join(parts)
 
 
+def _draft(cand: Candidate, ledger: Ledger, index, concepts: str, feedback, attempt: int):
+    """One blueprint draft and its review. Returns (blueprint, decision)."""
+    budget.check(0.3)
+    t0 = time.monotonic()
+    bp, cost = make_blueprint(cand.spec, concepts, feedback=feedback)
+    _record(
+        ledger,
+        cand,
+        "blueprint",
+        {"slug": bp.slug, "predicted": bp.predicted_pass_rate, "attempt": attempt},
+        cost,
+        t0,
+        cand.spec.spec_id,
+    )
+    t0 = time.monotonic()
+    decision = gate_blueprint(bp, cand.spec, index)
+    _record(
+        ledger,
+        cand,
+        "blueprint_gate",
+        {
+            "accepted": decision["accepted"],
+            "scores": decision["review"].get("scores"),
+            "novel": decision["novelty"]["novel"],
+            "attempt": attempt,
+        },
+        decision["cost_usd"],
+        t0,
+        cand.spec.spec_id,
+    )
+    return bp, decision
+
+
 def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
-    """Blueprint + review + novelty gate; one retry told why the first was rejected."""
+    """Blueprint drafts + review + novelty gate, BLUEPRINT_DRAFTS at a time.
+
+    The difficulty review rejects most drafts, so each round drafts several in
+    parallel and keeps the first accepted one. A round with none accepted feeds
+    every rejection reason into the next round (BLUEPRINT_ROUNDS at most).
+    """
     index = novelty.gate_index(CANDIDATES_DIR, cand.cand_id)
     # Our own earlier tasks go in the "must not resemble" list too: without them, specs in
     # unrelated domains drifted back to the same ledger-reconciliation idea.
     concepts = novelty.concept_list(index)
+    cand.save("spec.json", cand.spec.model_dump())
     feedback = None
-    earlier = len(list(cand.dir.glob("blueprint_rejected_*.json")))  # keep earlier evidence
-    for attempt in range(earlier + 1, earlier + BLUEPRINT_TRIES + 1):
-        budget.check(0.3)
-        t0 = time.monotonic()
-        bp, cost = make_blueprint(cand.spec, concepts, feedback=feedback)
-        cand.blueprint = bp
-        cand.save("spec.json", cand.spec.model_dump())
-        cand.save("blueprint.json", bp.model_dump())
-        _record(
-            ledger,
-            cand,
-            "blueprint",
-            {"slug": bp.slug, "predicted": bp.predicted_pass_rate, "attempt": attempt},
-            cost,
-            t0,
-            cand.spec.spec_id,
-        )
-        t0 = time.monotonic()
-        decision = gate_blueprint(bp, cand.spec, index)
-        cand.save("blueprint_gate.json", decision)
-        _record(
-            ledger,
-            cand,
-            "blueprint_gate",
-            {
-                "accepted": decision["accepted"],
-                "scores": decision["review"].get("scores"),
-                "novel": decision["novelty"]["novel"],
-                "attempt": attempt,
-            },
-            decision["cost_usd"],
-            t0,
-            cand.spec.spec_id,
-        )
-        if decision["accepted"]:
-            return True
-        cand.save(f"blueprint_rejected_{attempt}.json", {"blueprint": bp.model_dump(), **decision})
-        feedback = _rejection_feedback(decision)
+    attempt = len(list(cand.dir.glob("blueprint_rejected_*.json")))  # keep earlier evidence
+    for _ in range(BLUEPRINT_ROUNDS):
+        attempts = list(range(attempt + 1, attempt + BLUEPRINT_DRAFTS + 1))
+        attempt = attempts[-1]
+        with ThreadPoolExecutor(max_workers=BLUEPRINT_DRAFTS) as pool:
+            futures = [
+                pool.submit(_draft, cand, ledger, index, concepts, feedback, a) for a in attempts
+            ]
+            drafts = [f.result() for f in futures]
+        reasons = []
+        for a, (bp, decision) in zip(attempts, drafts, strict=True):
+            if decision["accepted"]:
+                cand.blueprint = bp
+                cand.save("blueprint.json", bp.model_dump())
+                cand.save("blueprint_gate.json", decision)
+                return True
+            cand.save(f"blueprint_rejected_{a}.json", {"blueprint": bp.model_dump(), **decision})
+            reasons.append(f"[{bp.slug}] {_rejection_feedback(decision)}")
+        feedback = " || ".join(reasons)[:6000]
     cand.status = "rejected"
     return False
 
@@ -288,14 +311,16 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
     """
     h = hash_dir(cand.task_dir)
     tag = f"claude-gate-{cand.cand_id}-a{attempt}".lower()
-    t0 = time.monotonic()
-    problems, structure_ok, built = gate_static(cand.task_dir, tag)
-    _record(ledger, cand, "gate_static", {"problems": problems}, 0.0, t0, h)
-    if built:
+    # Image build, leak scan and oracle/nop are the CPU-heavy part: one machine-wide slot each.
+    with machine_slots(1, GATE_CONCURRENCY, Path(JOBS_DIR) / ".gate-slots"):
         t0 = time.monotonic()
-        found, result = gate_functional(cand.task_dir, f"gate-{cand.cand_id}-a{attempt}")
-        _record(ledger, cand, "gate_functional", {**result, "problems": found}, 0.0, t0, h)
-        problems += found
+        problems, structure_ok, built = gate_static(cand.task_dir, tag)
+        _record(ledger, cand, "gate_static", {"problems": problems}, 0.0, t0, h)
+        if built:
+            t0 = time.monotonic()
+            found, result = gate_functional(cand.task_dir, f"gate-{cand.cand_id}-a{attempt}")
+            _record(ledger, cand, "gate_functional", {**result, "problems": found}, 0.0, t0, h)
+            problems += found
     if not structure_ok:
         return problems
     if problems:  # broken package: quality findings still go into the same repair round

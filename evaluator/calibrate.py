@@ -16,9 +16,6 @@ Trials run in waves no larger than the fewest trials that could still reach a
 verdict, so curtailment never pays for a trial whose result can't matter.
 """
 
-import fcntl
-import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -41,8 +38,15 @@ def decide(outcomes: list[str], n_runs: int = N_RUNS) -> str | None:
     return None
 
 
-def next_wave_size(outcomes: list[str], concurrency: int, n_runs: int = N_RUNS) -> int:
-    """Largest wave that can't overshoot the earliest possible verdict."""
+def next_wave_size(
+    outcomes: list[str], concurrency: int, n_runs: int = N_RUNS, eager: bool = False
+) -> int:
+    """Largest wave that can't overshoot the earliest possible verdict.
+
+    With `eager`, every remaining trial up to `concurrency` (fastest wall clock).
+    """
+    if eager:
+        return max(1, min(concurrency, n_runs - len(outcomes)))
     passes = outcomes.count(LEGIT_PASS)
     fails = outcomes.count(VALID_FAIL)
     to_easy = (n_runs - 1) - passes
@@ -99,37 +103,11 @@ def unfinished_trials(ledger, name: str) -> list[dict]:
     return trials
 
 
-@contextmanager
 def opus_slots(k: int, total: int, lock_dir: Path, poll_s: float = 5.0):
-    """Hold k of `total` machine-wide trial slots while a wave runs.
+    """Hold k of `total` machine-wide Opus trial slots while a wave runs."""
+    from evaluator.slots import machine_slots
 
-    Several batch processes calibrate at once, but the machine runs at most `total`
-    Opus trials. Slots are flock'd files, so a crashed holder frees its slots. A wave
-    takes all k slots or none (then waits), so two waits can't deadlock.
-    """
-    k = min(k, total)
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    while True:
-        held = []
-        for i in range(total):
-            f = (lock_dir / f"slot{i}").open("w")
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held.append(f)
-            except BlockingIOError:
-                f.close()
-            if len(held) == k:
-                break
-        if len(held) == k:
-            break
-        for f in held:
-            f.close()
-        time.sleep(poll_s)
-    try:
-        yield
-    finally:
-        for f in held:
-            f.close()
+    return machine_slots(k, total, lock_dir, poll_s)
 
 
 def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Calibration:
@@ -141,7 +119,14 @@ def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Ca
     from analysis import budget
     from analysis.ledger import Event
     from evaluator.harbor_runner import run_with_retries
-    from generator.config import EVAL_AGENT, EVAL_MODEL, JOBS_DIR, MAX_TURNS, OPUS_CONCURRENCY
+    from generator.config import (
+        CALIBRATION_EAGER,
+        EVAL_AGENT,
+        EVAL_MODEL,
+        JOBS_DIR,
+        MAX_TURNS,
+        OPUS_CONCURRENCY,
+    )
 
     concurrency = concurrency or OPUS_CONCURRENCY
     cal = Calibration(task=name)
@@ -151,7 +136,7 @@ def calibrate(task_dir, name: str, ledger, concurrency: int | None = None) -> Ca
         cal.trials.append(t)
     wave = len(cal.outcomes)  # waves hold >= 1 trial, so new job names never collide
     while (verdict := decide(cal.outcomes)) is None:
-        k = next_wave_size(cal.outcomes, concurrency)
+        k = next_wave_size(cal.outcomes, concurrency, eager=CALIBRATION_EAGER)
         budget.check(EXPECTED_OPUS_TRIAL_USD * k)
         wave += 1
         with opus_slots(k, OPUS_CONCURRENCY, Path(JOBS_DIR) / ".opus-slots"):

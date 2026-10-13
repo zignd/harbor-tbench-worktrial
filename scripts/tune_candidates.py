@@ -8,11 +8,28 @@ for invalid reasons needs repair, not a difficulty change.
 
 import argparse
 import json
+from pathlib import Path
 
 from analysis.ledger import Ledger
 from analysis.tuner import tune_candidate
 from generator.pipeline import CANDIDATES_DIR
 from scripts.calibrate_candidates import ship
+
+
+def tune_one(cand_dir: Path, ledger, rounds: int = 2) -> dict | None:
+    """Tune one calibrated near-miss (too easy / too hard) and ship it if it lands in band."""
+    cal_file = cand_dir / "calibration.json"
+    if not cal_file.exists() or (cand_dir / "tuning.json").exists():
+        return None
+    if json.loads(cal_file.read_text())["verdict"] not in ("too_easy", "too_hard"):
+        return None
+    record = tune_candidate(cand_dir, ledger, max_rounds=rounds)
+    shipped = None
+    if record["final"] == "learnable":
+        shipped = ship(cand_dir, json.loads(cal_file.read_text()))
+    steps = " -> ".join([record["start"]] + [r["result"] for r in record["rounds"]])
+    print(f"{cand_dir.name}  {steps}" + (f"  -> {shipped}" if shipped else ""), flush=True)
+    return record
 
 
 def main() -> int:
@@ -29,12 +46,7 @@ def main() -> int:
             continue
         if json.loads(cal_file.read_text())["verdict"] not in ("too_easy", "too_hard"):
             continue
-        record = tune_candidate(cand_dir, ledger, max_rounds=args.rounds)
-        shipped = None
-        if record["final"] == "learnable":
-            shipped = ship(cand_dir, json.loads(cal_file.read_text()))
-        rounds = " -> ".join([record["start"]] + [r["result"] for r in record["rounds"]])
-        print(f"{cand_dir.name}  {rounds}" + (f"  -> {shipped}" if shipped else ""), flush=True)
+        tune_one(cand_dir, ledger, rounds=args.rounds)
     return 0
 
 

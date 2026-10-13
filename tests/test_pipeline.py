@@ -133,6 +133,7 @@ def test_rejected_blueprint_is_retried_once_with_the_reason(tmp_path, monkeypatc
     ])  # fmt: skip
     monkeypatch.setattr(pipeline, "make_blueprint", fake_make)
     monkeypatch.setattr(pipeline, "gate_blueprint", lambda bp, spec, index: next(decisions))
+    monkeypatch.setattr(pipeline, "BLUEPRINT_DRAFTS", 1)  # one draft per round: ordered calls
     cand = pipeline.Candidate(sample_specs(1, seed=9)[0])
     assert pipeline.stage_blueprint(cand, Ledger(tmp_path / "l.jsonl"))
     assert prompts[0] == ("- ours/x: ledger", None)
@@ -222,3 +223,25 @@ def test_changed_package_is_not_mistaken_for_the_authored_one(env):
     shutil.copytree(TASK, cand.task_dir)
     ledger.append(Event("author", cand.cand_id, {"attempt": 1, "outcome": "pass"}, inputs_hash="x"))
     assert not pipeline.authored_unchanged(cand, ledger, 1)
+
+
+def test_parallel_drafts_keep_an_accepted_one_and_record_the_rest(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "CANDIDATES_DIR", tmp_path / "candidates")
+    monkeypatch.setattr(pipeline.budget, "check", lambda expected: None)
+    monkeypatch.setattr(pipeline.novelty, "gate_index", lambda d, e="": None)
+    monkeypatch.setattr(pipeline.novelty, "concept_list", lambda index=None: "")
+    monkeypatch.setattr(pipeline, "make_blueprint", lambda spec, c, feedback=None: (BLUEPRINT, 0.1))
+    calls = iter(range(100))
+
+    def gate(bp, spec, index):
+        ok = next(calls) == 2  # exactly one of the four parallel drafts is accepted
+        return {"accepted": ok, "review": {"accepted": ok, "scores": {}},
+                "novelty": {"lexical_flags": [], "judge": {"verdicts": []}, "novel": True},
+                "cost_usd": 0.0}  # fmt: skip
+
+    monkeypatch.setattr(pipeline, "gate_blueprint", gate)
+    cand = pipeline.Candidate(sample_specs(1, seed=15)[0])
+    ledger = Ledger(tmp_path / "l.jsonl")
+    assert pipeline.stage_blueprint(cand, ledger)
+    assert len(list(cand.dir.glob("blueprint_rejected_*.json"))) == 3
+    assert len(ledger.events(stage="blueprint_gate")) == 4

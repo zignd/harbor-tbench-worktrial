@@ -195,8 +195,8 @@ least 3.6."""
 
 RETRY_SECTION = """
 
-## A previous blueprint for this spec was rejected
-Reason: {feedback}
+## Previous blueprints for this spec were rejected
+Reasons: {feedback}
 Write a substantially different task: a different system, failure and investigation path, not a
 rewording of the rejected one."""
 

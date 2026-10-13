@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "quantile-sketch-merge-repair",
+  "title": "Fix the Broken Quantile Sketch Merge Engine",
+  "scenario": "A backend developer at a metrics platform notices that their P99 latency alerts have been firing incorrectly since a dependency upgrade three weeks ago. The in-house codebase at /app contains a Go service that ingests timestamped latency samples, merges t-digest sketch summaries across shards, and answers quantile queries. A pre-compiled C shared library (libsketch.so, no source) handles the low-level sketch serialization and merge arithmetic. The service has a correctness test that passes on the sample fixture but production quantile estimates are wildly off on skewed distributions.",
+  "instruction_draft": "The quantile query service at /app returns incorrect P50, P95, and P99 estimates for skewed latency distributions. Fix the service so that every quantile query on any input distribution returns a value within 2% relative error of the true quantile. The service must answer 10,000 quantile queries per second on a single core.",
+  "requirements": [
+   "Every quantile query returns a value within 2% relative error of the true quantile across uniform, log-normal, Pareto, and bimodal distributions",
+   "The service handles at least 10,000 quantile queries per second on a single core",
+   "The fix must work for any compression parameter between 50 and 500 passed at startup",
+   "Merged sketches from multiple shards must be as accurate as a single-shard sketch over the same data"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, gcc, and build tools",
+   "/app/cmd/server/main.go: HTTP server that accepts POST /ingest (JSON array of float64 samples), POST /merge (merges two named sketches), GET /query?name=X&q=0.99 (returns quantile estimate)",
+   "/app/internal/sketch/sketch.go: Go wrapper that calls libsketch.so via cgo for centroid insertion, serialization, and merge; calls a pure-Go bisection for query",
+   "/app/internal/sketch/merge.go: the merge logic that reassembles centroids after calling the C merge routine \u2014 contains a scaling bug introduced during the dependency bump: centroid weights are multiplied by the compression parameter delta instead of left unchanged during post-merge normalization, causing mean positions to be correct but weight sums to be wrong, which corrupts subsequent quantile interpolation",
+   "/app/lib/libsketch.so: precompiled C shared library (no source) implementing t-digest centroid insertion and a low-level buffer merge; exports sketch_new, sketch_add, sketch_merge_buffers, sketch_serialize, sketch_deserialize, sketch_centroid_count, sketch_get_centroids",
+   "/app/lib/sketch.h: header with the C API; sketch_get_centroids fills a caller-allocated array of {double mean, double weight} structs",
+   "/app/internal/sketch/query.go: pure-Go quantile interpolation over the centroid array \u2014 correct algorithm but depends on centroid weights being accurate",
+   "/app/test/correctness_test.go: tests only a uniform distribution with n=1000 and a single shard; passes even with the bug because the bug only manifests when the merge path is exercised (single-shard path skips merge)",
+   "/app/test/fixture_uniform.json: 1000 samples from Uniform(0,1000); used by the passing test",
+   "/app/bench/bench.go: a small benchmark harness that measures query throughput using go test -bench",
+   "/app/scripts/smoke.sh: sends a few requests to localhost:8080 and prints results; does not exercise the merge path",
+   "The bug is in merge.go line ~47: `c.Weight *= delta` should be `// c.Weight unchanged`; but delta is a float64 read from the sketch header, so the agent must understand what it represents to know the correct fix",
+   "Additional plausible-but-wrong code: query.go has a comment suggesting the weights are 'compressed counts' which might mislead the agent into thinking a different normalization is needed",
+   "The service also has a subtle secondary issue: the merge path sorts centroids by mean after merging but uses an unstable sort, which causes non-determinism in equal-mean centroid ordering \u2014 this affects accuracy but not correctness on the verifier distributions; agents who find only this issue will still fail the 2% threshold on Pareto inputs",
+   "Performance: the pure-Go bisection in query.go is O(n) linear scan instead of binary search; this causes the throughput to fall below 10k QPS when compression=500 (500 centroids); agents must also fix this to pass the throughput bar",
+   "~1400 lines total across 8 Go files plus header"
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources that are NOT visible by reading: (1) the merge weight-scaling bug only manifests on the merge code path, which the sample test never exercises \u2014 the agent must instrument or experiment to discover it; and (2) the throughput failure only appears at high compression parameters, which the sample benchmark does not test. The root causes are: (a) merge.go multiplies centroid weights by delta (the t-digest compression parameter, a normalization hint stored in the sketch header) after deserialization \u2014 this is wrong because delta controls centroid count limits during insertion, not a weight scale factor; the agent must understand t-digest math to know that weights are raw sample counts and must not be scaled; (b) query.go does a linear scan O(n) over centroids instead of binary search, which is fine for compression=100 but fails the 10k QPS bar at compression=500. The agent must: (1) run the service and issue merge requests to observe the error, (2) probe libsketch.so with nm/objdump to understand what sketch_get_centroids returns, (3) derive from t-digest theory that weights should be unchanged, (4) fix merge.go, (5) profile the query path and replace linear scan with binary search.",
+  "trap": "A naive agent fixes the weight scaling bug by setting c.Weight = 1.0 (treating all centroids as equal weight), which makes uniform and bimodal distributions pass but fails Pareto because the heavy tail requires accurate weight accumulation. An agent who only fixes the merge bug but not the linear scan passes correctness but fails throughput at compression=500. An agent who fixes the scan but not the merge passes throughput but fails correctness on any multi-shard test. The hidden verifier generates fresh random seeds for each distribution and tests compression=50, 200, and 500 in combination with 2, 4, and 8 shards.",
+  "tests": [
+   "Correctness test: verifier generates 100k samples from each of Uniform, LogNormal(0,2), Pareto(1.5), and Bimodal(mixture) with a fresh random seed; splits into 4 shards; ingests each shard separately; merges all four; queries P50, P75, P90, P95, P99; checks each result is within 2% relative error of numpy.quantile on the full dataset",
+   "Merge idempotence test: verifier checks that merging a sketch with itself and querying P99 gives the same result as the original sketch queried at P99 (within tolerance)",
+   "Compression parameter test: repeats correctness test with compression=50, 200, and 500 at startup; all must pass the 2% bar",
+   "Throughput test: verifier injects a pre-built sketch with compression=500 and issues 20,000 GET /query requests in a tight loop using a Go benchmark harness; measures wall-clock QPS; requires >= 10,000 QPS",
+   "Single-shard baseline: verifier confirms single-shard (no merge) path still works correctly after the fix, to catch agents who broke the insertion path while fixing merge"
+  ],
+  "verifier_knob": {
+   "name": "relative_error_threshold",
+   "value": "0.02 (2%)",
+   "effect": "Lowering to 0.005 (0.5%) requires the agent to also fix the unstable sort in the merge path and tune compression; raising to 0.05 (5%) makes the weight bug less likely to be caught on Pareto, making the task easier"
+  },
+  "expected_failure_modes": [
+   "Agent fixes weight bug by zeroing or normalizing weights to 1.0 instead of leaving them as raw counts \u2014 passes uniform, fails Pareto tail",
+   "Agent finds and fixes only the merge weight bug but misses the O(n) query scan \u2014 passes correctness, fails throughput at compression=500",
+   "Agent replaces libsketch.so calls with a pure-Go t-digest reimplementation that is correct but too slow \u2014 fails throughput bar",
+   "Agent instruments only the single-shard path (which the sample test uses) and concludes the service is correct \u2014 never discovers the merge bug",
+   "Agent reads the 'compressed counts' comment in query.go and introduces an additional normalization that partially cancels the weight bug on log-normal but not Pareto",
+   "Agent fixes both bugs but breaks the binary search boundary condition for the last centroid \u2014 fails P99 on distributions with heavy right tails"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "go",
+   "systems-programming",
+   "quantile-estimation",
+   "reverse-engineering",
+   "performance",
+   "mathematical"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/internal/sketch/merge.go",
+   "cat /app/internal/sketch/query.go",
+   "cat /app/internal/sketch/sketch.go",
+   "cat /app/lib/sketch.h",
+   "grep -n 'delta\\|Weight\\|weight' /app/internal/sketch/merge.go",
+   "# Identify line ~47: c.Weight *= delta \u2014 remove the multiplication",
+   "sed -i 's/c\\.Weight \\*= delta/\\/\\/ c.Weight unchanged/' /app/internal/sketch/merge.go",
+   "grep -n 'bisect\\|scan\\|for.*centroid\\|linear' /app/internal/sketch/query.go",
+   "# Identify O(n) linear scan in query.go, replace with binary search over cumulative weights",
+   "# Edit query.go: precompute cumulative weight prefix sums, use sort.Search for binary search",
+   "vi /app/internal/sketch/query.go  # implement binary search over cumulative weights",
+   "cd /app && go build ./...",
+   "go test ./test/... -v",
+   "go test ./bench/... -bench=. -benchtime=5s",
+   "# Verify throughput >= 10k QPS at compression=500",
+   "# Start server with compression=500, run smoke.sh, issue merge requests manually to verify correctness"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The libsketch.so is precompiled with no source \u2014 if it has architecture-specific issues (e.g., built for x86_64 but container runs arm64), the entire task is unsolvable regardless of Go fixes; the blueprint does not specify the target architecture or guarantee the .so is compatible.",
+   "The 10k QPS threshold on 'a single core' is environment-sensitive: container CPU speed, scheduling jitter, and Go runtime overhead vary; a correct binary search implementation might narrowly miss 10k QPS on a slow CI machine, causing a valid solution to fail.",
+   "The merge idempotence test (merging a sketch with itself) may expose edge cases in libsketch.so's sketch_merge_buffers that are unrelated to the Go bugs \u2014 if the C library has its own idempotence bug, the agent cannot fix it without source.",
+   "The 2% relative error threshold is tight for Pareto(1.5) at P99 with only 4 shards of 25k samples each \u2014 t-digest accuracy at extreme quantiles on heavy-tailed distributions is probabilistic; a correct implementation might occasionally exceed 2% due to sampling variance in the verifier's fresh random seeds.",
+   "The blueprint says the unstable sort 'affects accuracy but not correctness on the verifier distributions' \u2014 this is an assertion that could be wrong for some random seeds, making the task flaky if the verifier's Pareto seed happens to expose the non-determinism.",
+   "The instruction says 'fix the service' but does not explicitly state that modifying merge.go and query.go are the only permitted changes \u2014 an agent who rewrites the entire sketch layer in pure Go might produce a correct but slow solution that fails throughput, which is a valid failure, but the instruction's framing could be read as permitting any approach."
+  ],
+  "verdict": "reject",
+  "reasons": "The speedrun reaches a plausible solution in ~16 commands because both bugs are directly visible by reading merge.go (the weight scaling line) and query.go (the linear scan), which the blueprint itself describes in plain text \u2014 this matches the 'visible by reading source' pattern that scores genuine_difficulty at most 2. The solvability is also borderline: the precompiled libsketch.so with no architecture guarantee and a tight 10k QPS threshold on unspecified hardware create real risk of environment-induced failures unrelated to the agent's correctness. The combination of low genuine difficulty and invalid failure risks from the .so binary and QPS flakiness makes this task unsuitable as-is.",
+  "fixes": [
+   "Obscure the merge bug: instead of a single obvious line `c.Weight *= delta`, spread the error across a multi-step normalization function that reads delta from a header struct, applies it conditionally based on a version field, and has a plausible-sounding comment \u2014 this forces the agent to trace data flow rather than grep for the bug.",
+   "Add architecture guarantee and pin the libsketch.so build: include a Makefile target that recompiles libsketch.so from embedded C source during Docker build (source provided but obfuscated/minified), eliminating the ABI risk while keeping the 'no readable source' flavor.",
+   "Raise the QPS threshold to 50k or add a latency P99 < 100\u00b5s requirement, and make the benchmark harness part of the verifier with a fixed CPU affinity (taskset) to reduce flakiness; alternatively, express the performance requirement as algorithmic complexity (O(log n) per query) verified by measuring at compression=50 vs compression=500 and checking the ratio.",
+   "Remove the blueprint's explicit description of the bug location ('merge.go line ~47: c.Weight *= delta should be...') from the internal hint section \u2014 even though it's marked internal, the reviewer speedrun shows the bug is trivially findable by reading, so the task needs structural obscurity, not just documentation obscurity."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted sales aggregation in a database service, not quantile sketch merging."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NetFlow v9 UDP/TCP aggregation, not quantile sketch correctness."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "That task is about debug/release build memory corruption in C++, not quantile sketch merging in Go."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a log ingestion pipeline with schema validation, not quantile sketch accuracy."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a binary frame codec service, not quantile sketch merging."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.118
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.111
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.1
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.084
+    ],
+    [
+     "ours/official-aac910462208",
+     0.057
+    ]
+   ],
+   "cost_usd": 0.009498
+  },
+  "novel": true
+ },
+ "cost_usd": 0.037773
+}

@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 22:45 -03:00 · Documented commands are now checked, not just written
+- I had just expanded the report's reproduction section - which is itself an instance of the failure this audit keeps finding: writing a claim without running it. So the claim is now machine-checked.
+- `scripts/audit_deck_consistency.py` (already in `make lint`) gained a 15th check: **every module and script named in the report's reproduction section must exist**. It catches documenting a command that does not exist or was renamed.
+- **Negative-tested, not assumed:** injecting a fake `scripts.does_not_exist` line into the report makes the check fail and name the missing module; removing it returns the suite to 15/15. The check is proven to be capable of failing.
+- Also verified the documented rebuild chain (`analysis.report` -> `audit_verify` -> `build_deck_data` -> `build_deck.js`) regenerates `reports/summary.md`, `summary.json`, `deck_data.json` and `presentation.html` **byte-identically** for the same commit - the property that was silently broken when the generator erased the audited header.
+
 ### 22:25 -03:00 · Regenerating the report used to destroy the audited header; now the generator emits it
 - Ran `python -m analysis.report` as an end-to-end check of item 6 and found it **overwrote `reports/summary.md`, wiping the curated audited-outcome header and per-trial table**. The prose I had written there was not reproducible: anyone running the documented command would have silently erased it.
 - Fixed structurally, the same lesson as the hardcoded deck spend: the preamble now lives in `analysis/report.py::audited_outcome_md()` and is **derived from the immutable records in `output/`** - approved task, package hash, honest pass count, the pooled two-batch rate, the failure modes, and the list of published-but-unapproved packages. It states "no approved task" if `output/` is empty rather than going stale.

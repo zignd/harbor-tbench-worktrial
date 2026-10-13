@@ -34,7 +34,24 @@ def main() -> int:
     learned = sum(1 for r in tuning if r.get("any_round_learnable"))
     pair = curtail.get("current_pair", {})
 
+    # Every module and script the report's reproduction section tells a reader to run must exist.
+
+    referenced = set(re.findall(r"scripts/[a-z_]+\.py", report))
+    referenced |= set(re.findall(r"-m ([a-z_][a-z0-9_]*(?:\.[a-z_]+)?)", report))
+    missing_modules = []
+    for name in sorted(referenced):
+        path = ROOT / name if "/" in name else None
+        rel = name if path else ROOT / Path(*name.split("."))
+        exists = (
+            (path or rel).with_suffix(".py").exists()
+            or (path or rel / "__init__.py").exists()
+            or (path or rel).is_dir()
+        )
+        if not exists:
+            missing_modules.append(name)
+
     checks = {
+        "every module named in the reproduction section exists": not missing_modules,
         "deck and manifest agree on approved tasks": [
             t["task"] for t in deck.get("approved_tasks", [])
         ]
@@ -81,6 +98,8 @@ def main() -> int:
         .get("acceptance_met")
         is False,
     }
+    if missing_modules:
+        print(f"     missing: {missing_modules}")
     for name, ok in checks.items():
         print(f"{'ok  ' if ok else 'FAIL'} deck/report consistency: {name}")
     failed = [n for n, ok in checks.items() if not ok]

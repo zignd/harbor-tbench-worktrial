@@ -11,7 +11,7 @@ import subprocess
 from pathlib import Path
 
 from evaluator.harbor_runner import _harbor_bin, parse_job
-from generator.config import JOBS_DIR, MODEL
+from generator.config import JOBS_DIR, MODEL, QUALITY_ADVICE_ONLY
 
 RUBRIC = Path(__file__).resolve().parents[1] / "generator" / "quality_rubric.toml"
 
@@ -19,7 +19,7 @@ RUBRIC = Path(__file__).resolve().parents[1] / "generator" / "quality_rubric.tom
 # instruction/test alignment, determinism, anti-cheating and valid failure modes. Format
 # criteria (structured_data_schema, file_reference_mentioned) are advisory: the full rubric
 # blocks 5 of AfterQuery's own 6 example tasks, so it rejects tasks a human reviewer accepts.
-BLOCKING = {
+DEFAULT_BLOCKING = {
     "behavior_in_task_description",
     "behavior_in_tests",
     "anti_cheating_measures",
@@ -28,6 +28,8 @@ BLOCKING = {
     "deterministic_tests",
     "valid_failure_modes",
 }
+# A speed-focused run may demote some criteria to advice via config.QUALITY_ADVICE_ONLY.
+BLOCKING = DEFAULT_BLOCKING - set(QUALITY_ADVICE_ONLY)
 
 
 def run_check(task_dir: Path, job_name: str, jobs_dir: Path | str = JOBS_DIR) -> dict:

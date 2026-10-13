@@ -46,6 +46,7 @@ from generator.config import (
     METATASK_SUMMARIZE_THRESHOLD,
     MODEL,
     MODEL_LABEL,
+    ORACLE_RUNS,
     OUTPUT_DIR,
     RUN_MODE,
     RUNS_DIR,
@@ -61,7 +62,6 @@ from validator.validate import validate_task
 MAX_REPAIRS = 2
 # Blueprints are cheap (~$0.13) next to a build (~$4-6); the difficulty review rejects most.
 BLUEPRINT_ROUNDS = 2  # of BLUEPRINT_DRAFTS parallel drafts each
-ORACLE_RUNS = 3
 EXPECTED_AUTHOR_USD = 3.0
 EXPECTED_CHECK_USD = 0.2
 EXPECTED_REDTEAM_USD = 2.0

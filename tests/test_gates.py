@@ -142,3 +142,25 @@ def test_unstated_interfaces_are_flagged():
     assert not any(m.startswith("path") for m in missing)  # both paths are stated
     # discoverable in the environment is fine
     assert unstated_interfaces(instruction, tests, "usage: audit --strict  port 8085", set()) == []
+
+
+def test_quality_advice_only_demotes_a_blocking_criterion():
+    from evaluator import quality
+
+    assert "behavior_in_tests" in quality.DEFAULT_BLOCKING
+    assert quality.BLOCKING == quality.DEFAULT_BLOCKING - set(quality.QUALITY_ADVICE_ONLY)
+
+
+def test_oracle_runs_defaults_to_three_when_unset(monkeypatch):
+    import importlib
+
+    monkeypatch.delenv("ORACLE_RUNS", raising=False)
+    from generator import config
+
+    reloaded = importlib.reload(config)
+    assert reloaded.ORACLE_RUNS == 3
+    monkeypatch.setenv("ORACLE_RUNS", "2")
+    reloaded = importlib.reload(config)
+    assert reloaded.ORACLE_RUNS == 2
+    monkeypatch.delenv("ORACLE_RUNS", raising=False)
+    importlib.reload(config)

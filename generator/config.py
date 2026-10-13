@@ -85,6 +85,17 @@ TUNE_BREADTH = os.environ.get("TUNE_BREADTH", "1") == "1"
 # Blueprint drafts generated and reviewed at once per round (the review rejects most).
 BLUEPRINT_DRAFTS = int(os.environ.get("BLUEPRINT_DRAFTS", "2"))
 
+# --- Speed levers (env only; defaults keep the strict behaviour) ------------
+# Oracle runs in the functional gate (default 3/3). 2 makes the gate ~1/3 cheaper but weakens the
+# determinism guarantee; shipped tasks are still re-verified with oracle 3/3 outside the pipeline.
+ORACLE_RUNS = int(os.environ.get("ORACLE_RUNS", "3"))
+# Quality-rubric criteria to demote from blocking to advice for a speed-focused run. Empty = the
+# strict default (every criterion in evaluator.quality.BLOCKING blocks). A demoted criterion is still
+# reported and fed to the repair round as advice.
+QUALITY_ADVICE_ONLY = tuple(
+    s.strip() for s in os.environ.get("QUALITY_ADVICE_ONLY", "").split(",") if s.strip()
+)
+
 # --- Budget (docs/plan.md, "Spend discipline") -----------------------------
 # BUDGET_AUTHORIZED_USD caps total key spend; the reserve is never touched.
 BUDGET_AUTHORIZED_USD = float(os.environ.get("BUDGET_AUTHORIZED_USD", "380"))

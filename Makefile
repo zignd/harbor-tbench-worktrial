@@ -52,6 +52,9 @@ test: ## Run unit tests
 lint: ## Lint pipeline code (AfterQuery's validator/validate.py excluded)
 	@uv run --quiet ruff check . --exclude validator/validate.py
 
+calibrate: ## Calibrate every gated candidate in one wave (wider than per-batch; uses OPUS_CONCURRENCY)
+	@$(UV_RUN) python -m scripts.calibrate_candidates
+
 dry-run: ## Run the batch pipeline with fixtures instead of model calls (free; real gates)
 	@uv run --quiet python -m scripts.run_batch --n 1 --dry-run
 

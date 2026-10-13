@@ -4,6 +4,12 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 22:25 -03:00 · Regenerating the report used to destroy the audited header; now the generator emits it
+- Ran `python -m analysis.report` as an end-to-end check of item 6 and found it **overwrote `reports/summary.md`, wiping the curated audited-outcome header and per-trial table**. The prose I had written there was not reproducible: anyone running the documented command would have silently erased it.
+- Fixed structurally, the same lesson as the hardcoded deck spend: the preamble now lives in `analysis/report.py::audited_outcome_md()` and is **derived from the immutable records in `output/`** - approved task, package hash, honest pass count, the pooled two-batch rate, the failure modes, and the list of published-but-unapproved packages. It states "no approved task" if `output/` is empty rather than going stale.
+- Verified regeneration is idempotent: running it twice produces byte-identical output and the preamble survives. `approved_outputs()` correctly returns `['optimize-policy-decision-audit']`, and the generated summary contains no hard-coded Opus labels.
+- `reports/summary.md` therefore no longer depends on a human remembering to re-add the preamble.
+
 ### 22:05 -03:00 · Verified presenter notes and README links; fixed a stale note
 - Checked all 11 slides carry substantive presenter notes (all do) and that every file reference in `docs/result/README.md` resolves (all do; the one flagged `calibration.json` is descriptive prose, not a link).
 - **Caught a stale presenter note:** slide 6 said "Three landed in band for this solver", which contradicts the audited count of one approved task. The slide body was already labelled "historical candidate records, not approvals", but the spoken note did not carry that caveat — exactly the kind of drift a presenter would read out loud. Rewritten to say three were labelled learnable in the ledger but only one survives the audit, and to point at the audited number.

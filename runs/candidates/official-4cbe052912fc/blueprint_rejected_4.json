@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "crypto-hash-migration-refactor",
+  "title": "Cryptographic Hash Algorithm Migration",
+  "scenario": "A scientific computing platform is migrating its data-integrity pipeline from MD5/SHA1 to modern algorithms (SHA-256, SHA-3, BLAKE2b). The pipeline is a ~1200-line Go service that ships as a compiled binary in the Docker image (no source in the container). It reads scientific dataset manifests, verifies embedded checksums, transforms data, and signs output records. The binary exposes a well-documented CLI and HTTP API. The platform engineer needs a replacement service built from scratch in Go that is wire-compatible with the binary's I/O protocol but uses only approved modern hash algorithms.",
+  "instruction_draft": "Hey, we're finally killing MD5 and SHA1 in the integrity pipeline. The old binary is at /app/bin/hashpipe \u2014 it reads a JSON manifest from stdin or a file and writes a signed output manifest to stdout. I need you to write a replacement Go service at /app/replacement/main.go that is fully compatible with hashpipe's I/O format, but uses SHA-256, SHA-3-256, or BLAKE2b-256 instead of MD5/SHA1 for all hash fields. The replacement must: accept the same manifest format as input, produce output manifests that pass the hashpipe verifier (run with --verify flag against your output), correctly handle every hash field in the manifest including nested dataset entries and the top-level signature field, and reject any input manifest that contains an MD5 or SHA1 hash that doesn't match the referenced data. Build and install it so running /app/replacement/hashpipe produces correct output. The pipeline will be tested against a corpus of manifests including edge cases.",
+  "requirements": [
+   "Replacement binary exists at /app/replacement/hashpipe and is executable",
+   "Replacement reads JSON manifests from stdin or a file path argument in the same format as the original binary",
+   "Replacement produces output manifests that pass /app/bin/hashpipe --verify",
+   "All hash fields in output use SHA-256, SHA-3-256, or BLAKE2b-256 \u2014 never MD5 or SHA1",
+   "Replacement correctly processes nested dataset entries (multi-level manifest trees)",
+   "Replacement rejects manifests where an embedded MD5 or SHA1 hash does not match the referenced data content",
+   "The top-level signature field in output manifests is computed correctly over the canonical form of the payload",
+   "Replacement handles manifests with zero entries, single entries, and entries whose data is empty bytes",
+   "Replacement handles the case where an input manifest entry specifies a hash algorithm the replacement does not support \u2014 it must emit a structured error, not panic",
+   "Round-trip: piping replacement output through /app/bin/hashpipe --verify returns exit 0"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base, with golang:1.22 installed via apt or official tarball",
+   "Compiled Go binary /app/bin/hashpipe (no source) that implements a JSON manifest protocol: reads {version, entries:[{path, algo, digest, size}], signature} from stdin; --verify mode re-hashes referenced data files and checks all digests and the top-level HMAC signature; the binary uses a hardcoded HMAC key embedded at compile time, discoverable by probing the binary's --selftest or by observing the protocol",
+   "The binary supports --selftest flag that runs a self-consistency check and prints the HMAC key in a structured log line (the key fact hidden in plain sight from running, not reading)",
+   "Sample manifest files at /app/samples/ containing two well-formed manifests with MD5/SHA1 digests and one intentionally malformed manifest",
+   "/app/testdata/ directory pre-populated with ~20 small binary data files referenced by the manifests",
+   "Documentation file /app/docs/protocol.md describing the manifest JSON schema, the canonicalization rule for signature computation (sorted keys, no whitespace), and the HMAC-SHA1 algorithm used for the top-level signature (which must be upgraded to HMAC-SHA256 in the replacement)",
+   "A verifier script at /app/verify.sh that runs the hidden test corpus through the replacement binary and checks output against the original binary's --verify mode",
+   "Go module skeleton at /app/replacement/go.mod with module name 'hashpipe-replacement' and golang.org/x/crypto dependency pinned",
+   "~800 lines of plausible but unrelated Go utility code in /app/replacement/internal/ (logging, config parsing, metrics) to make the codebase feel realistic and require the solver to identify what matters"
+  ],
+  "internal_hint": "Difficulty comes from two sources that only reveal themselves at runtime, not by reading files. First: the HMAC key used for the top-level signature is not in any config file or source \u2014 it is embedded in the compiled binary. The solver must run /app/bin/hashpipe --selftest and parse its output to extract the key ('HMAC-KEY: <hex>'). Without this, the replacement's output manifests will fail --verify on the signature field for any input. Second: the canonicalization rule is 'sorted keys, no whitespace' but also requires that nested entry digests be re-encoded in the output using the new algorithm while the *path* and *size* fields are preserved verbatim \u2014 if the solver recalculates size from the file rather than propagating from input, entries with trailing-zero-padded files will produce wrong sizes. The edge cases the corpus probes: (a) empty-data entries (size=0, digest must be the hash of empty bytes), (b) entries with uppercase hex digests in input (must be normalized to lowercase in output), (c) manifests where the input HMAC over MD5 digests is valid but the replacement must re-sign over the new digests, (d) the unsupported-algorithm error path, (e) manifests with duplicate paths (last entry wins per protocol.md).",
+  "trap": "A naive solver reads the sample manifests, implements the schema, and gets the sample roundtrip working. It fails the hidden corpus because: (1) it hardcodes a wrong or missing HMAC key instead of extracting it from --selftest, making all signatures invalid on the verifier; (2) it computes size from disk rather than preserving input size, breaking zero-padded entries; (3) it doesn't normalize hex case, failing the uppercase-digest edge case; (4) it panics on unsupported-algorithm entries instead of emitting structured errors; (5) it processes duplicate-path entries in insertion order rather than last-wins.",
+  "tests": [
+   "Build test: /app/replacement/hashpipe exists and is executable",
+   "Round-trip on sample manifests: replacement output passes /app/bin/hashpipe --verify with exit 0",
+   "Algorithm rejection: output manifests contain no 'md5' or 'sha1' in any algo field",
+   "HMAC signature validity: 50 randomly generated manifests at verify time are signed correctly (requires correct HMAC key from --selftest)",
+   "Empty-data entry: manifest with one entry referencing an empty file produces digest equal to SHA-256('') = e3b0c44298...",
+   "Uppercase hex normalization: input manifest with uppercase digest hex produces output with lowercase hex, still passing --verify",
+   "Size preservation: manifest entry for a file padded to 1024 bytes reports size=1024 in output regardless of how the replacement reads the file",
+   "Unsupported algorithm: manifest with algo='whirlpool' produces a JSON error object on stderr and exit code 2, not a panic",
+   "Duplicate path: manifest with two entries for the same path produces output with only one entry for that path, using the last-occurrence values",
+   "Nested entries: manifests with 3-level nested 'children' arrays are processed recursively, all hashes upgraded, all signatures recomputed",
+   "Corpus sweep: 200-entry adversarial corpus at verify time containing tricky cases; all benign manifests pass --verify, all malformed (hash mismatch) manifests are rejected with non-zero exit"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 manifests with full edge-case coverage",
+   "effect": "Reducing to 20 manifests with only basic cases makes it much easier (no uppercase/duplicate/empty/unsupported-algo edge cases); raising to 500 with more nested structures and algorithm combinations makes it harder"
+  },
+  "expected_failure_modes": [
+   "Solver doesn't run --selftest and guesses or omits the HMAC key, producing manifests that fail --verify on all corpus inputs",
+   "Solver preserves the MD5/SHA1 entries for input verification but forgets to re-sign the output under HMAC-SHA256 with the correct key",
+   "Solver computes file size from disk rather than propagating input size, breaking padded-file edge cases",
+   "Solver doesn't normalize hex case from input, failing uppercase-digest corpus entries",
+   "Solver panics or produces wrong output on the unsupported-algorithm error path",
+   "Solver ignores duplicate-path semantics and produces multi-entry output for duplicate paths",
+   "Solver implements flat manifest handling but misses recursive nested children arrays"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "binary-reverse",
+   "protocol",
+   "refactoring",
+   "scientific-computing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/protocol.md \u2014 read full protocol spec including canonicalization and HMAC algorithm",
+   "/app/bin/hashpipe --selftest \u2014 extract HMAC key from 'HMAC-KEY: <hex>' log line",
+   "cat /app/samples/*.json \u2014 read all sample manifests to understand JSON schema and nested structure",
+   "ls /app/testdata/ \u2014 inventory test data files",
+   "cat /app/replacement/go.mod \u2014 confirm module name and golang.org/x/crypto pin",
+   "ls /app/replacement/internal/ \u2014 survey existing utility code (mostly ignore)",
+   "Write /app/replacement/main.go implementing: stdin/file arg parsing, nested manifest traversal, MD5/SHA1 input verification with rejection, SHA-256 upgrade of all algo fields, input-size preservation (not stat), lowercase hex normalization, last-wins dedup on duplicate paths, unsupported-algo structured error to stderr + exit 2, HMAC-SHA256 canonical signature with extracted key, recursive children handling",
+   "cd /app/replacement && go build -o hashpipe . \u2014 build binary",
+   "/app/replacement/hashpipe /app/samples/manifest1.json | /app/bin/hashpipe --verify \u2014 round-trip sample 1",
+   "/app/replacement/hashpipe /app/samples/manifest2.json | /app/bin/hashpipe --verify \u2014 round-trip sample 2",
+   "Test unsupported algo: craft minimal JSON with algo='whirlpool', pipe to replacement, verify exit 2 and JSON error on stderr",
+   "Test empty-data entry: craft manifest with size=0 entry, verify digest = SHA-256 of empty bytes",
+   "/app/verify.sh \u2014 run full verification harness"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The --selftest flag 'prints the HMAC key in a structured log line' effectively eliminates the primary difficulty lever \u2014 it reduces to a single command, not genuine runtime inference",
+   "Protocol.md explicitly documents all canonicalization rules, making the second difficulty lever also read-visible rather than observe-not-read",
+   "The instruction itself lists all edge cases (size preservation, hex normalization, duplicate-path, unsupported algo), so a careful reader of the task instructions \u2014 not just the environment \u2014 has a complete checklist, undermining the 'trap'",
+   "The 200-entry adversarial corpus is hidden but generated at verify time \u2014 if the corpus generator has bugs or makes assumptions about the binary's behavior that differ from the protocol.md spec, valid correct solutions could fail",
+   "Building from python:3.13-slim-bookworm with golang:1.22 installed via apt may have dependency or version issues; pinned go module with golang.org/x/crypto must be available offline \u2014 if network access is needed at build time this breaks",
+   "The HMAC key extraction via --selftest is a critical single point of failure: if the selftest output format is even slightly different from 'HMAC-KEY: <hex>', the solver may miss it, but this is ambiguity in the environment spec, not genuine difficulty",
+   "50 randomly generated manifests for HMAC signature validity test introduces flakiness if the random seed or generation logic has edge cases not covered by the protocol spec",
+   "Nested 'children' arrays are mentioned in requirements but the JSON schema in the protocol.md may or may not fully specify them \u2014 if the schema description is incomplete, the solver may implement a wrong nesting model that passes samples but fails corpus"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores only 3 because the two primary difficulty levers are both neutralized: the HMAC key is explicitly printed by --selftest (one command), and the protocol.md documents all canonicalization rules, making both 'hidden' facts read-visible rather than observe-not-read. The speedrun reaches a complete solution in ~13 commands, well under the 20-command threshold for genuine_difficulty \u2265 4. Additionally, the instruction itself enumerates all edge cases in the requirements and hint sections, so a careful reader has a complete implementation checklist without any runtime exploration.",
+  "fixes": [
+   "Remove the --selftest flag entirely and do not document the HMAC key anywhere \u2014 force the solver to extract it by binary inspection (strings, ltrace, or crafting known-plaintext manifests and observing signatures) to restore the observe-not-read difficulty",
+   "Remove or obfuscate the protocol.md canonicalization rules \u2014 describe the schema but omit the exact sorting/whitespace/encoding rules, requiring the solver to infer them from binary behavior by differential testing",
+   "Remove the edge-case enumeration from the instruction text; let the solver discover size-preservation, hex-normalization, and duplicate-path semantics only by running the binary against crafted inputs, not by reading a task description that names them explicitly",
+   "Add a second HMAC layer or key rotation hint that requires correlating two runtime observations (e.g., the key changes based on a version field in the manifest), increasing the number of runtime inference steps required",
+   "Ensure the Go module and all dependencies are vendored or available in the Docker image without network access, and specify this explicitly to eliminate build-environment flakiness"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/compute-image-hash-chain",
+     "verdict": "distinct",
+     "reason": "That task is a simple multi-stage SHA-256 hash chain computation on a file; the candidate requires reverse-engineering a binary's I/O protocol and building a wire-compatible Go service with algorithm migration logic."
+    },
+    {
+     "ref_id": "terminal-bench-pro/detect-c-feature-flags",
+     "verdict": "distinct",
+     "reason": "That task is about static binary analysis to detect compile-time feature flags; the candidate is about building a wire-compatible replacement service with cryptographic algorithm migration."
+    },
+    {
+     "ref_id": "terminal-bench-pro/train-disruption-model-with-hash-chain",
+     "verdict": "distinct",
+     "reason": "That task is ML model training with SHA-256 integrity hashing; the candidate is about reverse-engineering a binary's JSON protocol and writing a compatible Go replacement service."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing HMAC-SHA256 over a binary WAL record format via TCP; the candidate is about reverse-engineering a JSON manifest pipeline binary and building a compatible Go replacement with hash algorithm migration."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a CSV chunking pipeline with deduplication and validation bugs; the candidate is about reverse-engineering a binary's I/O protocol and building a cryptographic algorithm migration service."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/compute-image-hash-chain",
+     0.21
+    ],
+    [
+     "terminal-bench-pro/detect-c-feature-flags",
+     0.158
+    ],
+    [
+     "terminal-bench-pro/train-disruption-model-with-hash-chain",
+     0.139
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.09
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.079
+    ]
+   ],
+   "cost_usd": 0.014277000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05382000000000001
+}

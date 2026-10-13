@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-c-service-repair",
+  "title": "Revenue Rollup Service Repair",
+  "scenario": "An analyst noticed that monthly revenue totals from the in-house C reporting service stopped matching the raw transaction CSV exports three weeks ago after a 'minor performance patch'. The service is a small (~1,400-line) C daemon that reads transaction records over a Unix socket, maintains running aggregates keyed by account and period, and answers query requests with serialized summaries. It compiles and runs without crashing, but the numbers are consistently wrong in ways that vary by account size and query timing.",
+  "instruction_draft": "The rollup service at /app/rollupd answers account-period aggregate queries over a Unix socket at /tmp/rollup.sock using the protocol documented in /app/docs/protocol.md. Fix it so that for every account, the reported total_cents equals the sum of all transaction amounts in that account's records, the record_count equals the number of transactions ingested, and the period boundary (month-start epoch) is correct for each transaction's timestamp.",
+  "requirements": [
+   "total_cents for each account-period key equals the exact sum of all ingested transaction amounts for that account in that calendar month",
+   "record_count for each account-period key equals the exact number of transactions ingested for that account in that calendar month",
+   "The period field in query responses contains the Unix timestamp of the first second of the correct UTC calendar month",
+   "The service correctly handles accounts that have transactions spanning multiple months, reporting each month separately",
+   "The service correctly handles large transaction amounts (up to 10^9 cents per transaction) without overflow",
+   "Query responses are serialized in the format documented in /app/docs/protocol.md"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, socat, and python3",
+   "/app/rollupd/ contains: main.c (socket accept loop and dispatch), ingest.c (CSV line parser and aggregate updater), query.c (serializer for query responses), rollup.h (shared structs and constants), Makefile",
+   "Total source ~1,400 lines including plausible-but-uninvolved config parsing and logging code",
+   "Bug 1 (data-dependent, not visible by reading): ingest.c uses a hash table keyed by account_id XOR'd with a right-shifted period; the shift amount was changed from 16 to 32 in the 'performance patch', causing accounts whose IDs differ only in the upper 32 bits to collide into the same bucket, silently merging their aggregates. The bug only manifests when the verifier sends accounts whose IDs hash-collide under the new shift.",
+   "Bug 2 (interacting with Bug 1): query.c serializes total_cents as a 32-bit signed integer (int32_t) cast from the accumulator which is int64_t; this truncates any account whose total exceeds ~2.1 billion cents. This bug was present before the patch but was hidden because colliding accounts produced totals that happened to stay under the threshold. Fixing Bug 1 exposes this truncation for large accounts.",
+   "The two bugs interact: fixing only the hash collision makes large-account totals appear (they were split across buckets before) but those totals now overflow the 32-bit serialization field, so results are still wrong for a different subset of accounts.",
+   "/app/docs/protocol.md documents the wire format: INGEST lines as 'I <account_id_hex> <timestamp_unix> <amount_cents>\\n', QUERY as 'Q <account_id_hex> <period_epoch>\\n', response as 'R <total_cents> <record_count> <period_epoch>\\n', error as 'E <message>\\n'",
+   "/app/sample_data/transactions.csv contains 200 transactions across 8 accounts for manual testing; amounts are all small so neither bug triggers on the sample",
+   "/app/tools/ingest.py and /app/tools/query.py are helper scripts for manual testing against the socket",
+   "/app/Makefile builds rollupd from source with 'make -C rollupd'",
+   "A startup script /app/run.sh compiles and starts the daemon"
+  ],
+  "internal_hint": "Root cause 1 (not visible by reading, only triggers on specific account ID pairs): In ingest.c, the hash key is computed as `account_id ^ (period >> 32)`. Since period is a 32-bit epoch aligned to month boundaries, `period >> 32` is always 0, so the period contributes nothing to the hash. Accounts that share the same lower 32 bits of their 64-bit ID collide regardless of period. The verifier uses account IDs like 0x0000000100000042 and 0x0000000200000042 which collide. The solver must run the service against collision-triggering IDs to observe the merge, then trace it to the hash function. Root cause 2 (only appears after fixing root cause 1): In query.c, the response serializer does `printf(\"R %d ...\", (int32_t)node->total_cents, ...)`. Once collision is fixed, accounts that were split now accumulate correctly and their totals exceed INT32_MAX, producing negative or truncated values. The fix is `PRId64` with the int64_t accumulator directly. Ordered procedure: the solver must (1) observe wrong totals on collision accounts, (2) find and fix the hash key, (3) retest and observe overflow on large accounts, (4) find and fix the serialization cast. Fixing them in the wrong order or missing step 3 leaves tests failing.",
+  "trap": "The sample data /app/sample_data/transactions.csv uses 8 accounts with IDs that do not collide under either hash and with amounts well below INT32_MAX. A solver who fixes the hash function and validates only against the sample data will see all correct outputs and stop. The verifier generates fresh account IDs that do collide (same lower 32 bits, different upper 32 bits) and sends large-amount transactions (total > 2^31 cents per account). A solver who fixes only the serialization without fixing the hash will also pass the sample but fail on collision accounts. Both bugs must be fixed and the fix must be validated against adversarial inputs the solver has to construct deliberately.",
+  "tests": [
+   "Verifier generates 4 account ID pairs where each pair shares lower 32 bits (e.g. 0x0000000100000007 and 0x0000000200000007): ingests 10 transactions to each, queries both, checks that each reports exactly its own sum and count (collision test)",
+   "Verifier generates 2 accounts with 5 transactions each totaling 2,500,000,000 cents (above INT32_MAX): checks that query response total_cents matches exactly (overflow test)",
+   "Verifier ingests transactions for 3 accounts spanning 3 calendar months each, queries all 9 account-period combinations, checks period field is correct month-start epoch and totals match per-month sums (period boundary test)",
+   "Verifier re-runs all the above after sending a SIGHUP to the daemon (no restart) to confirm state is persistent across signal",
+   "Verifier sends a malformed INGEST line and checks the service responds with 'E ...' and continues serving subsequent valid requests (error recovery test)"
+  ],
+  "verifier_knob": {
+   "name": "collision_accounts",
+   "value": "4 colliding pairs",
+   "effect": "Raising the number of colliding account pairs increases the chance a partial fix (hash fixed but overflow not) is caught; lowering to 1 pair makes the task easier because a lucky account ID choice might not trigger the large-total overflow"
+  },
+  "expected_failure_modes": [
+   "Agent finds and fixes the hash bug by reading ingest.c, validates against sample data, does not instrument the service with collision-triggering IDs, misses overflow bug entirely",
+   "Agent fixes the serialization format by grep-searching for int32_t casts, validates totals look right on small amounts, misses the hash collision because it never runs the service on colliding IDs",
+   "Agent fixes both bugs but recompiles without running the service, tests only via the sample data loader, and the verifier catches unhandled edge cases in the period epoch computation (off-by-one on month boundary due to timezone assumption)",
+   "Agent observes wrong totals, suspects a floating-point issue, rewrites accumulation in double, which introduces rounding errors on large cent amounts and fails the exact-match tests"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "service-repair",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "two-interacting-bugs",
+   "data-dependent",
+   "protocol",
+   "feature-iteration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/protocol.md",
+   "cat /app/rollupd/rollup.h",
+   "cat /app/rollupd/ingest.c  # spot: account_id ^ (period >> 32) \u2014 period is 32-bit so >>32 always yields 0",
+   "cat /app/rollupd/query.c   # spot: (int32_t)node->total_cents truncation",
+   "cat /app/rollupd/main.c",
+   "# Fix ingest.c: change hash key from account_id ^ (period >> 32) to account_id ^ (uint64_t)period",
+   "# Fix query.c: change printf format from %d with (int32_t) cast to %lld or PRId64 with int64_t",
+   "make -C /app/rollupd",
+   "/app/run.sh &",
+   "python3 /app/tools/ingest.py 0x0000000100000042 <ts> <amount>",
+   "python3 /app/tools/ingest.py 0x0000000200000042 <ts> <amount>",
+   "python3 /app/tools/query.py 0x0000000100000042 <period>  # verify no collision",
+   "python3 /app/tools/ingest.py 0x0000000100000001 <ts> 600000000 (x5 = 3B cents total)",
+   "python3 /app/tools/query.py 0x0000000100000001 <period>  # verify no overflow"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The blueprint claims Bug 1 is 'not visible by reading, only triggers on specific account ID pairs' but `account_id ^ (period >> 32)` where period is a 32-bit value is trivially visible as a dead no-op by static code reading \u2014 any engineer reading ingest.c spots it immediately.",
+   "Both bugs are greppable in ~2 file reads (int32_t cast and >> 32 shift on 32-bit value), making the task solvable in ~14 commands, well under the 20-command threshold for genuine_difficulty \u2265 3.",
+   "The 'trap' only catches agents who fix without reading source \u2014 methodical agents who read all files before fixing bypass it entirely, making the trap ineffective at raising difficulty.",
+   "SIGHUP persistence test: the blueprint says 'confirm state is persistent across signal' but doesn't specify what SIGHUP should do (reload config? ignore?). If the daemon exits on SIGHUP, the test design is ambiguous \u2014 the instruction doesn't document expected SIGHUP behavior.",
+   "Period epoch computation: the instruction says 'first second of the correct UTC calendar month' but doesn't specify what the C code uses for timezone. If the daemon uses localtime() internally, the period test could be flaky depending on container timezone settings.",
+   "The requirement that fixing Bug 1 'exposes' Bug 2 assumes an ordered discovery path, but since both are visible by reading source, an agent fixes both simultaneously without the dramatic reveal, making the 'interacting bugs' difficulty lever not actually realized."
+  ],
+  "verdict": "reject",
+  "reasons": "The core difficulty premise is broken: both bugs are statically visible by reading 5 source files (~14 commands to full solution), directly contradicting the blueprint's own claim that Bug 1 is 'not visible by reading.' The two-interacting-bugs difficulty lever requires that fixing Bug 1 reveals Bug 2, but an engineer who reads all source files first fixes both simultaneously, bypassing the intended discovery sequence entirely. The SIGHUP behavior and timezone assumption in period epoch computation introduce invalid failure risks not addressed in the instruction.",
+  "fixes": [
+   "Make Bug 1 non-obvious by reading: replace the trivially-dead `period >> 32` with a plausible-looking but incorrect normalization, e.g. using the wrong struct field, a pointer aliasing error, or an off-by-one in bucket indexing that requires runtime observation to detect.",
+   "Make the collision only observable at runtime: e.g. have the hash function appear correct statically but produce collisions due to implicit integer promotion or unsigned/signed mixing that requires running with specific inputs to manifest, not a dead shift that any reader spots.",
+   "Specify SIGHUP behavior explicitly in /app/docs/protocol.md or /app/run.sh comments, and ensure the test's SIGHUP expectation matches the daemon's actual signal handler.",
+   "Ensure the period epoch computation in the C code explicitly uses UTC (gmtime, not localtime) and document this in the protocol spec, or set TZ=UTC in the container to eliminate timezone flakiness.",
+   "Add a third, non-code bug (e.g. the Makefile optimization flag that changes struct alignment, causing a protocol wire-format mismatch) that is genuinely invisible without running the service, to ensure at least one bug truly requires runtime investigation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/detect-corrupted-blockchain-transaction",
+     "verdict": "distinct",
+     "reason": "That task is about finding a corrupted hash in a blockchain ledger by verifying hash integrity, not debugging a C daemon's aggregation logic."
+    },
+    {
+     "ref_id": "terminal-bench-pro/parse-bitcoin-tx-to-json",
+     "verdict": "distinct",
+     "reason": "That task is about parsing raw Bitcoin transaction hex into JSON, with no aggregation, daemon debugging, or C source repair involved."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-sales-processor-engine",
+     "verdict": "distinct",
+     "reason": "That task asks for a fresh Python implementation of a sales processing class with business rules, not debugging a broken C daemon's aggregation bugs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "variant",
+     "reason": "Both tasks involve finding and fixing a bug in a compiled C aggregation service whose summed totals no longer match raw records, with the fix required in source code and a rebuild; the candidate adds Unix-socket protocol, overflow handling, and multi-period bucketing but the core problem is the same class of 'broken C aggregator' debugging."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about an HMAC-SHA256 audit service over TCP with WAL record serialization and refund resolution, not a revenue-rollup aggregation bug in a C daemon."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/detect-corrupted-blockchain-transaction",
+     0.145
+    ],
+    [
+     "terminal-bench-pro/parse-bitcoin-tx-to-json",
+     0.145
+    ],
+    [
+     "terminal-bench-pro/implement-sales-processor-engine",
+     0.14
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.123
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.111
+    ]
+   ],
+   "cost_usd": 0.014115
+  },
+  "novel": false
+ },
+ "cost_usd": 0.04983
+}

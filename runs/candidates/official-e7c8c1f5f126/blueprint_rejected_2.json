@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "entropy-audit-hash-accumulator",
+  "title": "Entropy Audit Hash Accumulator",
+  "scenario": "A security engineer is auditing a service that collects entropy measurements from hardware sensors and accumulates them into rolling hash digests for compliance reporting. The repository contains a Python processing pipeline (~1,400 lines across 6 modules) with a git history of ~40 commits showing the service was recently refactored. Audit logs have started producing incorrect digest values in production, but the test suite passes, and there is no reproduction case in the bug tracker.",
+  "instruction_draft": "```\n$ python run_audit.py --validate last_report.json\nWARNING: digest mismatch on window 3 (got a4f8c2..., expected 9b31e7...)\nWARNING: digest mismatch on window 7 (got 00c441..., expected f2190a...)\nPASS: 8 of 10 windows matched\n```\n\nThe entropy audit service at `/app` accumulates sensor readings into per-window Merkle-style hash chains and emits a final cross-window digest for compliance sign-off. Two windows in every ten are wrong in production but the unit tests pass on the fixtures in `/app/tests/`.\n\nYour task: implement a corrected accumulator at `/app/audit_engine/accumulator.py` (you may add helpers anywhere under `/app/audit_engine/`) such that:\n\n1. For any batch of sensor readings (integers in [0, 2^32)) of length N (1 \u2264 N \u2264 10,000), the per-window rolling digest equals the HMAC-SHA256 of the concatenated little-endian 4-byte encodings of the readings in that window, keyed by the final digest of the *previous* window (the first window uses a 32-byte zero key).\n2. The cross-window digest is the SHA-256 hash of the XOR-fold of all per-window digests (XOR each 32-byte digest together byte-by-byte across all windows).\n3. Window boundaries are determined by a configurable stride S (default 256). If N is not divisible by S, the last partial window is included and padded with zero-value readings to the next multiple of S before hashing.\n4. The accumulator must handle sensor readings supplied out of temporal order (each reading carries a uint32 sequence number); readings must be sorted by sequence number before windowing.\n5. The corrected accumulator must agree with the reference binary `/app/bin/ref_accumulator` on all inputs to within a byte-exact match of both the per-window digests list and the cross-window digest.\n\nAfter fixing the accumulator, run `/app/run_audit.py --validate last_report.json` and confirm it exits 0 with all windows matched.",
+  "requirements": [
+   "Per-window digest: HMAC-SHA256 of concatenated little-endian 4-byte sensor readings in the window, keyed by the previous window's final digest (first window key = 32 zero bytes).",
+   "Cross-window digest: SHA-256 of the XOR-fold of all per-window 32-byte digests.",
+   "Window stride S=256 by default; partial last window is zero-padded to the next multiple of S.",
+   "Readings supplied out of order must be sorted ascending by their uint32 sequence number before windowing.",
+   "Accumulator output must match the reference binary `/app/bin/ref_accumulator` byte-exactly on all inputs, including hidden verify-time inputs with varying N, S, and out-of-order sequences.",
+   "Running `/app/run_audit.py --validate last_report.json` must exit 0 with all windows matched."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install: numpy, pytest, hmac (stdlib); no internet.",
+   "`/app/audit_engine/accumulator.py` \u2014 the broken implementation (~180 lines). Bugs planted: (a) window padding uses the *ceiling* rounded-up count but then hashes only the *original* un-padded readings (off-by-omission); (b) the HMAC key for each window is derived from the *current* window index integer instead of the previous window's digest; (c) readings are sorted by *value* not by sequence number when the list is unsorted. Each bug manifests only on specific input shapes, so the provided fixtures (all length exactly 256, already sorted, no partial windows) pass the unit tests.",
+   "`/app/audit_engine/collector.py`, `/app/audit_engine/reporter.py`, `/app/audit_engine/signer.py`, `/app/audit_engine/schema.py`, `/app/audit_engine/utils.py` \u2014 plausible supporting code (~900 lines total, not involved in the bugs).",
+   "`/app/tests/` \u2014 unit tests with fixtures: all windows exactly 256 readings, pre-sorted, no partial windows; tests pass with buggy code.",
+   "`/app/run_audit.py` \u2014 CLI that loads sensor data from JSON, calls the accumulator, compares to stored expected digests.",
+   "`/app/last_report.json` \u2014 a compliance report with 10 windows; windows 3 and 7 use out-of-order readings and a partial last window, exposing bugs (b) and (c) and (a) respectively.",
+   "`/app/bin/ref_accumulator` \u2014 a compiled Python-zipapp binary (no source) that implements the correct specification; callable as `python /app/bin/ref_accumulator <json_input_file>` and prints JSON with `window_digests` (list of hex strings) and `cross_window_digest` (hex string).",
+   "Git history: ~40 commits; the three bugs were introduced together in commit ~12 commits ago under the message 'refactor: vectorise accumulator for performance'; earlier commits have the correct (slower) implementation which can be read in git log but whose code was overwritten.",
+   "The git history of accumulator.py shows the pre-refactor correct logic in plain Python, discoverable via `git log -p -- audit_engine/accumulator.py`."
+  ],
+  "internal_hint": "Difficulty sources: (1) not visible by reading alone \u2014 each bug only activates on specific data shapes absent from the test fixtures, so the solver must run the accumulator against the reference binary on crafted inputs to observe divergence; (2) ordered procedure \u2014 there are three interacting bugs; fixing (b) first (key derivation) changes which windows are wrong, so fixing (a) and (c) out of order or partially produces a solution that passes some generated inputs but fails others. The reference binary is an opaque zipapp. The solver must: (i) find a failing input (no repro given \u2014 must craft one with out-of-order readings or partial window); (ii) diff output against ref binary to isolate which property is wrong; (iii) discover from git history what the original logic was; (iv) implement all three fixes in the correct order (sort by seq number \u2192 pad window correctly \u2192 key from previous digest). A partial fix that addresses only one or two bugs will pass the provided report but fail hidden tests with adversarial input shapes.",
+  "trap": "A naive solver reads the accumulator source, spots the most obvious bug (e.g., the HMAC key), fixes it, reruns `--validate last_report.json`, sees 9/10 or 10/10 match (depending on which window indices happen to align), and calls it done. The hidden tests use inputs with: (i) N not divisible by S (exercises padding bug), (ii) readings supplied with shuffled sequence numbers (exercises sort bug), and (iii) window counts > 1 (exercises key chaining bug). All three must be correct simultaneously for byte-exact agreement with the reference binary across all hidden inputs.",
+  "tests": [
+   "Verifier calls ref_accumulator and the solver's accumulator on 20 randomly generated inputs with N in {100, 256, 511, 512, 1000, 2048, 10000}, S in {64, 256, 512}, and readings shuffled by sequence number; checks byte-exact match of window_digests list and cross_window_digest for each.",
+   "Verifier checks the first-window key is 32 zero bytes by supplying a single-window input (N=1) and comparing HMAC-SHA256(b'\\x00'*32, little-endian(reading)) against solver output.",
+   "Verifier checks padding: supplies N=300, S=256, verifies window 0 has 256 readings and window 1 is padded with 212 zero readings before hashing (digest must match ref_accumulator).",
+   "Verifier checks out-of-order handling: supplies 512 readings with sequence numbers in reverse order; result must match the same readings supplied in forward order.",
+   "Verifier runs `/app/run_audit.py --validate last_report.json` and checks exit code 0 and stdout contains '10 of 10 windows matched'.",
+   "Verifier checks cross-window digest: supplies a 3-window input, manually computes expected XOR-fold of the 3 per-window digests from ref_accumulator output, verifies SHA-256 of that fold matches solver's cross_window_digest."
+  ],
+  "verifier_knob": {
+   "name": "hidden_input_adversarialism",
+   "value": "20 inputs with varied N, S, shuffled sequences",
+   "effect": "Reducing to only N divisible by S and pre-sorted inputs makes the partial-window and sort bugs invisible, dropping difficulty to ~easy. Increasing to larger N and more shuffle patterns makes even partially correct solutions fail more reliably."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the HMAC key derivation bug (most visible in source), passes the provided report, but fails hidden tests with partial windows or out-of-order sequences.",
+   "Solver reads git history, finds the old implementation, ports it forward but misses that the old code also had a subtly different XOR-fold order (pre-refactor code XOR'd in reverse window order) \u2014 actually the new code has the right fold order but wrong key, so copying old code verbatim produces a different bug.",
+   "Solver uses the reference binary to test only the exact shape from last_report.json, doesn't generate adversarial shapes, misses the padding and sort bugs.",
+   "Solver fixes all three bugs but introduces an off-by-one in the partial window padding calculation (rounds up with math.ceil but uses wrong base), which only fails for specific N values not in the provided fixtures.",
+   "Solver verifies against ref_accumulator on a few hand-crafted inputs, gets byte-exact match on those, but the hidden tests use a different S value (S=64) not tested by the solver, exposing a remaining stride calculation error."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "security-audit",
+  "tags": [
+   "cryptography",
+   "data-processing",
+   "git-archaeology",
+   "scientific-computing",
+   "opaque-binary",
+   "ordered-procedure"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/audit_engine/accumulator.py",
+   "git log --oneline -- audit_engine/accumulator.py",
+   "git show <refactor_commit>^:audit_engine/accumulator.py",
+   "python /app/bin/ref_accumulator /tmp/test_input.json  # understand output format",
+   "# Read spec: identify all 3 bugs from comparison of old code + spec",
+   "# Edit accumulator.py: fix sort (by seq_number), fix padding (include zeros in hash), fix HMAC key (use prev digest not index)",
+   "python /app/run_audit.py --validate last_report.json",
+   "# confirm exit 0, 10/10 matched"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Reference zipapp binary must be built correctly and exactly match the spec; any deviation makes the task unsolvable or ambiguous",
+   "Git history must be carefully constructed so pre-refactor correct code is actually present and readable; a mistake here gives away the answer trivially or blocks recovery",
+   "Test fixtures must be precisely designed to avoid accidentally exercising any of the three bugs; if a fixture catches even one bug, the test-pass framing breaks",
+   "The 'expected valid failure mode' section contains an internal contradiction about XOR-fold order in old vs new code, which could confuse task builders during environment construction",
+   "The instruction states the spec completely enough that an agent can implement the correct solution without ever using the reference binary or git history, undermining the intended difficulty levers"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three bugs are enumerated in the instruction itself, the correct implementation is directly recoverable from git history in 2 commands, and a careful agent reading the spec can fix all three bugs simultaneously in ~8 commands without needing adversarial input crafting or the reference binary. The 'ordered procedure' and 'no repro given' difficulty levers are undermined by a spec that fully describes the correct behavior. The task also fails the automatic cap: fewer than 20 speedrun commands means genuine_difficulty cannot exceed 2.",
+  "fixes": [
+   "Remove the explicit bug enumeration from the blueprint's environment description\u2014bugs should be discoverable only by running code, not by reading the task description",
+   "Make the spec incomplete in a realistic way: omit or obscure the exact padding/key/sort requirements so the agent must infer them from the reference binary by experimentation, not from a written spec",
+   "Introduce a fourth subtle bug that is NOT mentioned anywhere (e.g., endianness on a specific platform edge case, or a HMAC truncation) that only the reference binary exposes, requiring actual adversarial input generation",
+   "Remove or corrupt the pre-refactor git history so agents cannot simply copy the old correct implementation\u2014instead leave only partial hints in commit messages",
+   "Ensure the instruction does NOT list all three bugs explicitly; the scenario should describe symptoms only (wrong digests on windows 3 and 7) without characterizing the nature of the bugs"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/implement-lz77-file-compressor",
+     "verdict": "distinct",
+     "reason": "LZ77 compression is a fundamentally different algorithm and problem domain from HMAC-SHA256 hash chain accumulation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/recover-encrypted-db-credentials",
+     "verdict": "distinct",
+     "reason": "Disk block recovery and XOR decryption of credentials is a completely different problem from building a rolling HMAC hash accumulator."
+    },
+    {
+     "ref_id": "terminal-bench/embedding-drift-monitor",
+     "verdict": "distinct",
+     "reason": "Statistical drift detection on embeddings using KS/PSI/MMD tests is unrelated to HMAC-SHA256 hash chain construction over sensor readings."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "Characterizing a black-box binary normalizer and fixing SQL rollup pipelines is a different problem from implementing an HMAC-SHA256 Merkle-style hash accumulator."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Though both involve HMAC-SHA256, the WAL record audit service task focuses on TCP handling, binary serialization, and database lookups, not on windowed hash chain accumulation with XOR-folding and out-of-order sequence sorting."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/implement-lz77-file-compressor",
+     0.137
+    ],
+    [
+     "terminal-bench-pro/recover-encrypted-db-credentials",
+     0.121
+    ],
+    [
+     "terminal-bench/embedding-drift-monitor",
+     0.117
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.113
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.096
+    ]
+   ],
+   "cost_usd": 0.01533
+  },
+  "novel": true
+ },
+ "cost_usd": 0.052137
+}

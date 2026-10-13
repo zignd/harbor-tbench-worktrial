@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "metric-rollup-drift-repair",
+  "title": "Fix the On-Call Metric Rollup Service",
+  "scenario": "A Node.js microservice aggregates per-pod CPU/memory metrics from a log stream and exposes them over a simple line-protocol TCP socket. At 3 AM, PagerDuty fires: the rollup values downstream consumers are reading are silently wrong \u2014 dashboards show healthy numbers while pods are actually saturated. The repo is ~1,200 lines across a collector, a rollup engine, a ring-buffer store, and a TCP server. A separate pre-compiled 'fast-aggregator' binary (no source) is used for the hot path; its behavior must be reverse-engineered by probing.",
+  "instruction_draft": "```\n[PAGERDUTY] CRITICAL - metric-rollup-svc latency p99 > 30s, consumer lag 47k\n$ systemctl status metric-rollup\n\u25cf metric-rollup.service - Metric Rollup Service\n   Active: active (running)\n$ curl -s localhost:7070/health\n{\"status\":\"ok\",\"uptime\":14823}\n$ echo 'QUERY cpu 60' | nc localhost 7070\ncpu.p95=12.4 cpu.avg=9.1 window=60\n$ echo 'QUERY mem 60' | nc localhost 7070\nmem.p95=43.2 mem.avg=31.8 window=60\n```\n\nYou've been paged. The metric-rollup service at port 7070 claims healthy, but values it returns are wrong. Consumers comparing against raw log files see up to 40% deviation in p95 figures and the average sometimes exceeds p95.\n\nFix the service so that:\n1. For any QUERY <metric> <window_seconds> request over the TCP protocol, the returned `avg` is the true arithmetic mean of all samples within the window, and `p95` is the 95th percentile using nearest-rank method over those same samples.\n2. The `avg` value must never exceed `p95` for any query.\n3. The service must handle QUERY requests for window sizes of 30, 60, 120, and 300 seconds correctly across all metric names the collector emits.\n4. After your fix, restart the service and confirm it answers protocol requests correctly.\n5. The pre-compiled aggregator binary at `/opt/rollup/bin/fast-aggregator` is part of the hot path; understand its interface before deciding whether it is involved in the bug.\n\nThe raw log feed is at `/var/log/metric-collector/metrics.log` (append-only, live). Investigate the running system \u2014 logs, metrics output, and code \u2014 before patching anything.",
+  "requirements": [
+   "avg returned by QUERY is the true arithmetic mean of samples within the requested window",
+   "p95 returned by QUERY uses the nearest-rank method over the same sample set",
+   "avg never exceeds p95 for any query",
+   "QUERY works correctly for window sizes 30, 60, 120, and 300 seconds",
+   "QUERY works correctly for all metric names emitted by the collector (cpu, mem, disk, net)",
+   "Service remains live and answering TCP requests after the fix"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs nodejs 20, nc, socat; copies all app files",
+   "/opt/rollup/src/collector.js: reads a synthetic log generator and writes to a shared ring-buffer store (live, appends every 2s)",
+   "/opt/rollup/src/store.js: ring-buffer implementation with a subtle off-by-one that causes the oldest ~5 samples to be included even when outside the window boundary (bug 1)",
+   "/opt/rollup/src/rollup.js: calls the fast-aggregator binary for p95, then computes avg independently in JS \u2014 but passes samples to the binary via a temp file sorted in DESCENDING order; fast-aggregator expects ascending order and computes nearest-rank on whatever order it receives, so p95 is actually p5 (bug 2). The two bugs interact: fixing only the ring-buffer off-by-one changes which samples are stale but doesn't fix p95 inversion; fixing only the sort order reduces the p95 error but the stale samples still corrupt avg enough that avg can exceed the (now-correct) p95 on some windows.",
+   "/opt/rollup/src/server.js: TCP server parsing QUERY requests, calls rollup.js",
+   "/opt/rollup/bin/fast-aggregator: pre-compiled Node.js-compiled binary (pkg-bundled), no source; accepts a file path as argv[1] containing newline-separated float values in ascending order, prints 'p95=<value>' to stdout; probing reveals it expects ascending order via experimentation",
+   "/opt/rollup/logs/rollup.log: service log showing occasional 'stale window boundary warning' messages (clue to bug 1)",
+   "/var/log/metric-collector/metrics.log: live append-only log of raw samples, format: '<timestamp_unix_ms> <metric> <value>'",
+   "systemd unit file /etc/systemd/system/metric-rollup.service running the service",
+   "Synthetic log generator script /opt/rollup/bin/gen-metrics.js runs as a background process, writing realistic-looking but controlled CPU/mem/disk/net values",
+   "A reference checker script /opt/rollup/bin/check-ground-truth.js that computes correct avg and p95 from the raw log and can be diffed against service output (present but not obviously named; solver must find it)",
+   "Total codebase ~1,100 lines; unrelated files: /opt/rollup/src/auth.js (unused stub), /opt/rollup/src/exporter.js (prometheus exporter, not involved)"
+  ],
+  "internal_hint": "Two interacting bugs: (1) store.js ring-buffer window boundary is off-by-one (uses `>` instead of `>=` on the timestamp cutoff), including one extra expired bucket of ~5 samples \u2014 this inflates avg slightly and can push it above a correct p95. (2) rollup.js writes the temp file for fast-aggregator with samples in descending order (JS array.sort() default is lexicographic, making large floats like '9.8' sort before '12.1', then the array is not reversed before writing) \u2014 fast-aggregator interprets position-based nearest-rank on this reversed array, returning what is effectively p5 instead of p95. Fixing bug 1 alone: avg is now correct but p95 is still inverted, so avg > p95 persists on many windows. Fixing bug 2 alone: p95 is now correct but stale samples still corrupt avg enough to occasionally exceed p95. Both must be fixed together. The binary is found by reading rollup.js, its interface is discovered by running it manually with controlled input files. The off-by-one is only visible by comparing service output against ground truth on a running system \u2014 reading the code shows a plausible-looking condition that is wrong only when the oldest sample's timestamp exactly equals the boundary.",
+  "trap": "A solver that fixes only the sort-order bug (bug 2) will see p95 values become plausible and stop. The hidden tests include window=30 queries issued at moments when the ring-buffer boundary off-by-one includes a cluster of high-value stale samples, causing avg to exceed the now-correct p95. The solver must run the system long enough for stale samples to accumulate across a window boundary, then observe avg > p95 in service output versus ground truth \u2014 this only manifests after ~60s of runtime, not immediately after restart.",
+  "tests": [
+   "Verifier starts the service fresh, waits 90s for log accumulation, then issues QUERY cpu 30 / QUERY cpu 60 / QUERY cpu 120 / QUERY cpu 300 and for each checks: (a) avg matches ground-truth mean within 0.5%, (b) p95 matches ground-truth nearest-rank p95 within 0.5%, (c) avg <= p95",
+   "Verifier repeats the same checks for metric names: mem, disk, net \u2014 emitted by the collector at different rates",
+   "Verifier issues 20 rapid sequential QUERY cpu 60 requests and verifies all return consistent values (no race on the temp file)",
+   "Verifier injects a synthetic spike of 10 high-value samples at t-25s then queries window=30 at t-0 and window=60 at t-0; the spike must appear in window=30 results (avg and p95 both elevated) and also in window=60, verifying boundary correctness",
+   "Verifier checks that after the fix, avg never exceeds p95 across 50 queries over a 5-minute soak period with varied window sizes",
+   "Verifier probes the fast-aggregator binary directly with a known ascending sorted input and verifies it returns the correct p95 (confirming the binary itself is correct and the bug is in how rollup.js calls it)"
+  ],
+  "verifier_knob": {
+   "name": "number_of_metric_names_and_window_sizes",
+   "value": "4 metrics x 4 windows = 16 scenarios, plus spike injection test",
+   "effect": "Reducing to 1 metric x 2 windows makes the task easier (fewer interaction paths to test); increasing to 6 metrics or adding 600s window adds more edge cases around sparse metrics where nearest-rank p95 is especially sensitive to stale sample inclusion"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the sort-order bug (obvious from reading rollup.js) and misses the ring-buffer off-by-one because it only shows up when the system runs long enough for stale samples to cross a window boundary",
+   "Agent finds the off-by-one by reading store.js but doesn't probe the fast-aggregator binary, assumes p95 is correct, and submits without fixing sort order",
+   "Agent probes fast-aggregator with a small hand-crafted input but uses ascending order (correct), concludes binary is fine, doesn't notice rollup.js sorts descending before writing the temp file",
+   "Agent restarts the service immediately after patching and runs a quick spot-check that happens to pass (avg < p95) before stale samples accumulate, then stops investigating",
+   "Agent reads check-ground-truth.js but doesn't realize it requires the service to have been running for >60s to see the boundary failure, declares victory after a 10s test"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "metrics",
+   "binary-reverse-engineering",
+   "two-interacting-bugs",
+   "sre",
+   "logs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/rollup/src/store.js  # find off-by-one: > vs >= on timestamp cutoff",
+   "cat /opt/rollup/src/rollup.js  # find descending sort before writing temp file for fast-aggregator",
+   "cat /opt/rollup/src/server.js  # understand QUERY protocol",
+   "cat /opt/rollup/src/collector.js  # understand metric names and emission rates",
+   "printf '1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\\n13\\n14\\n15\\n16\\n17\\n18\\n19\\n20\\n' > /tmp/asc.txt && /opt/rollup/bin/fast-aggregator /tmp/asc.txt  # expect p95=19",
+   "printf '20\\n19\\n18\\n...\\n1\\n' > /tmp/desc.txt && /opt/rollup/bin/fast-aggregator /tmp/desc.txt  # expect p95=19 but get p95=2, confirming ascending requirement",
+   "echo 'QUERY cpu 60' | nc localhost 7070  # observe current wrong output",
+   "tail -200 /var/log/metric-collector/metrics.log  # see raw samples",
+   "grep -i stale /opt/rollup/logs/rollup.log | tail -5  # find stale window boundary warning",
+   "ls /opt/rollup/bin/  # discover check-ground-truth.js",
+   "node -I /opt/rollup/bin/check-ground-truth.js cpu 60  # compare ground truth vs service output",
+   "sed -i 's/timestamp > cutoff/timestamp >= cutoff/' /opt/rollup/src/store.js  # fix bug 1",
+   "# Edit rollup.js: change samples.sort() to samples.sort((a,b) => a-b) before writing temp file  # fix bug 2",
+   "nano /opt/rollup/src/rollup.js",
+   "systemctl restart metric-rollup",
+   "sleep 10 && echo 'QUERY cpu 60' | nc localhost 7070  # quick sanity",
+   "node -I /opt/rollup/bin/check-ground-truth.js cpu 60  # verify avg <= p95 and within 0.5%",
+   "for m in cpu mem disk net; do for w in 30 60 120 300; do echo \"QUERY $m $w\" | nc localhost 7070; done; done  # spot check all 16 scenarios"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Systemd inside Docker is notoriously fragile; 'systemctl restart metric-rollup' may fail in a container without a real init system, making the 'service must remain live' requirement unverifiable or causing spurious failures",
+   "The 90s accumulation wait in the verifier combined with the 60s minimum runtime for the stale-sample trap to manifest creates timing sensitivity; on a slow 1-CPU container, metric emission every 2s may not produce enough samples for the 0.5% tolerance checks to be meaningful",
+   "The exact off-by-one condition ('only when oldest sample timestamp exactly equals the boundary') as described in the internal hint is actually a very rare edge case on a continuous system; the verifier's spike injection test may not reliably trigger it, making the test non-deterministic",
+   "The 'check-ground-truth.js is present but not obviously named' mechanic is a discoverability puzzle, not a technical puzzle; if the verifier depends on the agent finding it, the task may fail agents who solve the problem correctly without using that script",
+   "Race condition on the temp file (20 rapid sequential queries test) could produce flaky results if the fix doesn't add proper locking; the blueprint doesn't specify whether rollup.js uses a unique temp file per request or a shared one, leaving the expected fix ambiguous",
+   "The nearest-rank p95 definition can produce different results depending on whether the implementation uses 0-indexed or 1-indexed arrays; the 0.5% tolerance may not cover disagreements between verifier and solver implementations on small sample sets"
+  ],
+  "verdict": "reject",
+  "reasons": "Both bugs are directly readable in source code, making the speedrun ~18 commands and placing genuine_difficulty at most 2 by the rubric's own stated calibration ('tasks whose bugs are visible by reading the source were solved 4/4 and 4/5 times by Opus in 9-25 commands, so that shape scores at most 2'). The 'trap' of fixing only one bug only catches agents who skip reading store.js, which systematic agents won't do. Additionally, the systemd-in-Docker requirement is a significant infrastructure fragility that could cause invalid failures unrelated to the solver's correctness.",
+  "fixes": [
+   "Make at least one bug NOT visible by static code reading: obfuscate the off-by-one by computing the cutoff through a helper function or config file that uses an indirect expression, so the error only manifests when traced through runtime behavior or log analysis \u2014 forcing the agent to use the ground-truth checker and observe runtime data rather than read source",
+   "Replace systemd with a direct process manager (e.g., PM2 or a simple shell script with PID file) to eliminate Docker/systemd fragility while keeping the 'restart the service' requirement",
+   "Make the fast-aggregator binary actually implement a wrong algorithm (not just order-sensitive) so that probing it with controlled inputs is required to understand its behavior, not just confirmatory \u2014 this makes the binary reverse-engineering a genuine required step rather than optional",
+   "Add a third subtle bug (e.g., in server.js protocol parsing for window sizes > 100) that only manifests on the 120 and 300 second window tests, so fixing the two obvious bugs isn't sufficient and the agent must run all 16 scenarios to discover it",
+   "Use a named unique temp file scheme in rollup.js that makes the race condition test meaningful and requires the agent to also fix a concurrency issue, adding a third required fix that code reading alone won't reveal"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about optimizing a PostgreSQL query for performance; the candidate is about debugging a Node.js TCP metrics service with a ring-buffer store and binary aggregator."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves repairing a Rust NetFlow v9 UDP/TCP aggregation service; the candidate involves a Node.js metric rollup service with a pre-compiled binary on a different protocol and bug class."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted sales aggregation in a compiled service writing to SQLite; the candidate is about fixing statistical computations (mean, p95) in a live Node.js TCP metrics service."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves a Python log-enrichment pipeline with a GeoIP binary and Flask API; the candidate involves a Node.js ring-buffer metric rollup service with a TCP line protocol and a hot-path binary aggregator."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about computing HMAC-SHA256 over WAL records with a binary serialization format over TCP; the candidate is about fixing statistical rollup correctness (mean, p95) in a metrics service."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.146
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.129
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.108
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.086
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.08
+    ]
+   ],
+   "cost_usd": 0.015918
+  },
+  "novel": true
+ },
+ "cost_usd": 0.068388
+}

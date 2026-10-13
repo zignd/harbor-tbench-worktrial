@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from analysis import budget
 from analysis.ledger import Event, Ledger, hash_dir
 from evaluator.harbor_runner import run_with_retries
@@ -111,7 +113,19 @@ def _rejection_feedback(decision: dict) -> str:
 
 
 def _draft(cand: Candidate, ledger: Ledger, index, concepts: str, feedback, attempt: int):
-    """One blueprint draft and its review. Returns (blueprint, decision)."""
+    """One blueprint draft and its review. Returns (blueprint, decision), or (None, None)
+    if the model's reply can't be parsed twice in a row (one bad draft must not sink
+    the candidate)."""
+    for tries in range(2):
+        try:
+            return _draft_once(cand, ledger, index, concepts, feedback, attempt)
+        except (ValueError, ValidationError) as e:
+            _record(ledger, cand, "error", {"stage": "blueprint", "attempt": attempt,
+                                            "try": tries + 1, "error": str(e)[:500]})  # fmt: skip
+    return None, None
+
+
+def _draft_once(cand: Candidate, ledger: Ledger, index, concepts: str, feedback, attempt: int):
     budget.check(0.3)
     t0 = time.monotonic()
     bp, cost = make_blueprint(cand.spec, concepts, feedback=feedback)
@@ -156,7 +170,10 @@ def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
     concepts = novelty.concept_list(index)
     cand.save("spec.json", cand.spec.model_dump())
     feedback = None
-    attempt = len(list(cand.dir.glob("blueprint_rejected_*.json")))  # keep earlier evidence
+    # Number after earlier drafts so their evidence is never overwritten.
+    attempt = len(
+        [*cand.dir.glob("blueprint_rejected_*.json"), *cand.dir.glob("blueprint_unused_*.json")]
+    )
     for _ in range(BLUEPRINT_ROUNDS):
         attempts = list(range(attempt + 1, attempt + BLUEPRINT_DRAFTS + 1))
         attempt = attempts[-1]
@@ -165,15 +182,23 @@ def stage_blueprint(cand: Candidate, ledger: Ledger) -> bool:
                 pool.submit(_draft, cand, ledger, index, concepts, feedback, a) for a in attempts
             ]
             drafts = [f.result() for f in futures]
-        reasons = []
+        reasons, accepted = [], None
         for a, (bp, decision) in zip(attempts, drafts, strict=True):
-            if decision["accepted"]:
-                cand.blueprint = bp
-                cand.save("blueprint.json", bp.model_dump())
-                cand.save("blueprint_gate.json", decision)
-                return True
-            cand.save(f"blueprint_rejected_{a}.json", {"blueprint": bp.model_dump(), **decision})
-            reasons.append(f"[{bp.slug}] {_rejection_feedback(decision)}")
+            if bp is None:
+                continue
+            if decision["accepted"] and accepted is None:
+                accepted = (bp, decision)
+                continue
+            # Every other draft is evidence, even in a round that found an accepted one.
+            kind = "unused" if decision["accepted"] else "rejected"
+            cand.save(f"blueprint_{kind}_{a}.json", {"blueprint": bp.model_dump(), **decision})
+            if not decision["accepted"]:
+                reasons.append(f"[{bp.slug}] {_rejection_feedback(decision)}")
+        if accepted:
+            cand.blueprint = accepted[0]
+            cand.save("blueprint.json", accepted[0].model_dump())
+            cand.save("blueprint_gate.json", accepted[1])
+            return True
         feedback = " || ".join(reasons)[:6000]
     cand.status = "rejected"
     return False

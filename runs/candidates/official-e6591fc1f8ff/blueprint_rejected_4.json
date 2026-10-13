@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "wheel-codec-pack-threshold",
+  "title": "Codec Pack Size Regression",
+  "scenario": "A release engineer discovers that the nightly wheel build for an internal data-codec library has regressed: the published `.whl` file is 40 % larger than the previous release and exceeds the 900 KB size gate that CI enforces. The repo contains Python source, a pre-compiled C extension `_fastpack.cpython-313-x86_64-linux-gnu.so` (no source), several auto-generated data tables under `data/`, and a `build_wheel.sh` that runs `python -m build` and copies the result to `dist/`. The previous engineer left a note saying they 'added compression to the tables' but the wheel still balloons.",
+  "instruction_draft": "Our nightly wheel build for the `datacodec` library is failing the size gate: `dist/datacodec-1.4.0-cp313-cp313-linux_x86_64.whl` must be at most 900 KB (921 600 bytes). Running `bash /app/build_wheel.sh` currently produces a wheel that exceeds this limit.\n\nThe library must continue to pass its own self-test: `python -m pytest /app/tests/ -q` must exit 0 after the wheel is installed. Investigate the build pipeline and the data files it packages, find the root cause of the size regression, and fix it so that `bash /app/build_wheel.sh` produces a wheel \u2264 900 KB that still passes all tests. Do not remove or alter `_fastpack.so`; do not change the public Python API; the installed codec must produce byte-for-byte identical output to the reference for every input the test suite exercises.",
+  "requirements": [
+   "bash /app/build_wheel.sh completes without error",
+   "The resulting .whl file in dist/ is at most 900 KB (921 600 bytes)",
+   "python -m pytest /app/tests/ -q exits 0 when run against the installed wheel",
+   "_fastpack.so is present and unmodified in the installed package",
+   "The public Python API (encode/decode functions) produces byte-for-byte identical output to the reference implementation for all test inputs"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install -y build-essential binutils file",
+   "pip install build pytest numpy",
+   "Directory /app/datacodec/ with __init__.py, codec.py (encode/decode API), _tables.py (imports from data/)",
+   "Pre-compiled binary /app/datacodec/_fastpack.cpython-313-x86_64-linux-gnu.so \u2014 the actual fast encode/decode logic; no C source provided",
+   "Directory /app/data/ containing three large table files: huffman_table.pkl (~400 KB, pickled dict), alphabet_map.pkl (~420 KB, pickled dict), and run_lengths.npy (~180 KB numpy array) \u2014 all three are the same data as the previous release but serialised in an expanded format (the 'compression' the previous engineer added was actually decompression: they unpickled and re-pickled with protocol=2 instead of protocol=5, expanding the huffman and alphabet tables significantly, and saved the numpy array in text mode accidentally with np.savetxt instead of np.save)",
+   "MANIFEST.in and pyproject.toml that include data/ glob \u2014 so all three bloated files are bundled into the wheel",
+   "build_wheel.sh: runs `python -m build --wheel --outdir dist/` from /app",
+   "/app/tests/test_codec.py: imports datacodec, calls encode() on ~30 fixed byte strings and asserts exact output matches hard-coded expected values; also calls decode(encode(x)) == x for randomised inputs (seeded)",
+   "codec.py loads the three table files at import time using pickle.load and np.load; it passes them to _fastpack functions",
+   "The _fastpack.so binary reads the tables through ctypes/cffi-style pointers handed from Python \u2014 it does NOT reload from disk; the Python wrapper in codec.py is the one loading files",
+   "A reference script /app/reference_outputs.py that regenerates the expected test vectors deterministically from the current tables (used internally by tests)",
+   "The tables are functionally equivalent regardless of pickle protocol or numpy save format; only the on-disk size differs"
+  ],
+  "internal_hint": "Root cause: the previous engineer accidentally bloated the three data files. huffman_table.pkl and alphabet_map.pkl were re-serialised with pickle protocol=2 (legacy, larger) instead of protocol=5 (Python 3.8+, smaller with out-of-band buffers); run_lengths.npy was saved with np.savetxt() producing a human-readable text file instead of np.save() producing a compact binary. Together these inflate the wheel from ~750 KB to ~1040 KB. The fix is to reload each table and re-serialise correctly: pickle.dump(..., protocol=5) for the two dicts, and np.save() for the array. The opaque component (_fastpack.so) must be characterised by experiment: the solver cannot read its source but must observe that (a) it accepts the Python objects loaded from the table files unchanged, (b) swapping pickle protocols does not change the loaded dict content, and (c) the test suite checks byte-level codec output \u2014 so the solver must verify the tables round-trip identically before committing. The shallow_check_trap: naively just re-compressing the wheel with a zip trick or stripping debug symbols from .so makes the size gate pass on sample inputs but the hidden tests regenerate tables from scratch and check that encode() output matches the reference exactly, catching any solver who accidentally altered table content.",
+  "trap": "A solver who simply re-zips the wheel with higher compression, or who strips _fastpack.so, or who zeros out one of the table files to save space, will pass the naive size check but fail the hidden-input codec correctness tests. Likewise, a solver who re-saves the numpy array with np.save but forgets to re-run the pickle protocol fix (or vice versa) will still exceed 900 KB because both fixes together are needed to cross the threshold.",
+  "tests": [
+   "Size gate: stat the .whl in dist/ and assert its byte size <= 921600",
+   "Correctness gate (provided sample): install the wheel into a fresh venv, run pytest /app/tests/ and assert exit 0",
+   "Correctness gate (hidden inputs): at verify time, generate 200 random byte-strings (seeded numpy RNG), call installed datacodec.encode() on each, then datacodec.decode() on the result, assert all round-trips are identical; also assert each encode() output matches a reference computed by running the same _fastpack.so against the correctly-serialised tables loaded by a reference codec.py",
+   "Integrity gate: assert _fastpack.so has the same SHA-256 as the original (no modification)",
+   "API gate: assert datacodec.encode and datacodec.decode are callable and their signatures are unchanged"
+  ],
+  "verifier_knob": {
+   "name": "size_limit_bytes",
+   "value": "921600",
+   "effect": "Raising the threshold to 1000000 makes the task easy (stripping .so alone passes); lowering to 850000 requires the solver to also strip debug info from the bloated tables or find an additional optimisation; at 921600 exactly both table re-serialisation fixes are required simultaneously"
+  },
+  "expected_failure_modes": [
+   "Solver re-zips the wheel with higher compression levels and passes size gate but test vectors diverge because table content was corrupted",
+   "Solver fixes only the numpy save format but not the pickle protocol, leaving the wheel still ~970 KB and failing the size gate",
+   "Solver fixes only the pickle protocol but forgets run_lengths.npy is stored as text, still ~930 KB",
+   "Solver strips or patches _fastpack.so to save space, causing the integrity check to fail",
+   "Solver deletes data files from MANIFEST.in so they are not bundled, making the wheel small but causing ImportError at runtime",
+   "Solver re-serialises tables but introduces a subtle dict ordering or dtype change that makes encode() output differ from reference on hidden inputs"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "deployment",
+   "packaging",
+   "opaque-component",
+   "data-files",
+   "python",
+   "size-threshold"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls -la /app/data/  # check file sizes, immediately suspicious",
+   "cat /app/datacodec/codec.py  # understand table loading",
+   "cat /app/pyproject.toml && cat /app/MANIFEST.in  # understand build",
+   "python3 -c \"f=open('/app/data/huffman_table.pkl','rb'); print(f.read(2))\"  # check pickle protocol byte: \\x80\\x02 = protocol 2",
+   "file /app/data/run_lengths.npy  # immediately shows 'ASCII text' not binary",
+   "# write /tmp/fix.py: reload all three files, re-dump with pickle protocol=5 and np.save",
+   "python3 /tmp/fix.py  # re-serialize tables",
+   "ls -la /app/data/  # confirm sizes dropped",
+   "bash /app/build_wheel.sh  # rebuild wheel",
+   "ls -la /app/dist/  # check wheel size <= 921600",
+   "pip install /app/dist/datacodec-*.whl --force-reinstall",
+   "python -m pytest /app/tests/ -q  # verify correctness"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The pickle protocol is detectable in 1 command (read first 2 bytes), making the diagnosis trivially mechanical rather than requiring real investigation.",
+   "The numpy text-vs-binary distinction is immediately revealed by `file` command, leaving nothing to 'characterize by experiment'.",
+   "_fastpack.so never needs to be understood at all \u2014 the solver just re-serializes Python objects; the 'opaque component' lever contributes zero actual difficulty.",
+   "If the environment is x86_64 Linux but the reviewer container is arm64 (macOS host), the pre-compiled .so will fail to load, causing pytest to fail even on a correct solution \u2014 this is a flaky environment risk on non-matching architectures.",
+   "The 'both fixes together needed' threshold math (each alone leaves ~930-970 KB, both together ~750 KB) is a good trap but only works if the exact file sizes are carefully calibrated during environment build; if sizes drift, the threshold could be crossable with only one fix.",
+   "numpy's np.load may refuse to load a text file saved with np.savetxt under the .npy extension without allow_pickle or special flags, potentially causing an unhelpful error that misleads the solver about the root cause."
+  ],
+  "verdict": "reject",
+  "reasons": "The root cause is too directly observable: pickle protocol 2 vs 5 is a single `read(2)` call, and numpy text format is a single `file` command, putting the solution within ~12 commands for any skilled agent \u2014 well below the 20-command threshold for genuine_difficulty \u2265 4. The 'opaque component' lever does not contribute real difficulty since _fastpack.so never needs to be characterized; its behavior is irrelevant to the fix. The shallow_check_trap is well-constructed but the task overall is closer to a medium grep-and-fix than a hard investigative challenge.",
+  "fixes": [
+   "Remove the direct observability of pickle protocol: instead of protocol=2 vs protocol=5, use a custom serialization format or encrypt/obfuscate the table files so the solver must actually run experiments through the codec to understand what the tables contain and whether re-serialization preserves correctness.",
+   "Make _fastpack.so actually sensitive to table format or layout (e.g., it expects a specific memory layout or dtype), so the solver cannot just re-serialize and trust it will work \u2014 they must empirically verify through the opaque binary that the output is correct, adding genuine 'characterize by experiment' work.",
+   "Add a second regression: e.g., a spurious large file was accidentally included in MANIFEST.in (a debug log or test fixture), requiring the solver to audit the build manifest rather than just the data files \u2014 making the diagnosis non-obvious and the fix multi-step in a less mechanical way.",
+   "Tighten the size threshold so that only the correct serialization format passes (not any compression trick), and make the tables' content verification require understanding the codec's output format, preventing hollow solutions from passing even partially."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust codec service for correctness and latency; this task is about reducing Python wheel file size by fixing a build pipeline issue with data table compression."
+    },
+    {
+     "ref_id": "terminal-bench-pro/repair-broken-shell-data-pipeline",
+     "verdict": "distinct",
+     "reason": "That task is about fixing shell script permissions, line endings, and shebangs in a data pipeline; this task is about diagnosing and fixing a wheel size regression caused by uncompressed data tables."
+    },
+    {
+     "ref_id": "terminal-bench/bun-sourcemap-leak",
+     "verdict": "distinct",
+     "reason": "That task is about fixing source map privacy leaks in a Bun/TypeScript release pipeline; this task is about reducing Python wheel size while preserving codec correctness."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a binary normalizer and fixing SQL rollup correctness; this task is about diagnosing a wheel size regression from improperly compressed data tables."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NetFlow byte attribution logic in a Python aggregator; this task is about fixing a Python wheel build pipeline to reduce file size via proper data table compression."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ae2e414b859f",
+     0.141
+    ],
+    [
+     "terminal-bench-pro/repair-broken-shell-data-pipeline",
+     0.121
+    ],
+    [
+     "terminal-bench/bun-sourcemap-leak",
+     0.116
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.086
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.076
+    ]
+   ],
+   "cost_usd": 0.013944
+  },
+  "novel": true
+ },
+ "cost_usd": 0.050472
+}

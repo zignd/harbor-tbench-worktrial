@@ -1,0 +1,68 @@
+{
+ "slug": "aes-ctr-sqlite-record-cipher",
+ "title": "AES-CTR SQLite Record Cipher Repair",
+ "scenario": "A research scientist is trying to reproduce a published result that uses a C library (`librecenc`) to encrypt individual SQLite table rows with AES-128-CTR, deriving a per-record nonce from the record's primary key and a domain separator. The library was recently 'large-scale refactored' from a 1,400-line proof-of-concept into a modular ~1,800-line production system split across six source files. The refactor passes the 12 provided regression tests but produces silently wrong plaintexts for records outside the test corpus. The scientist can see decryption 'succeeds' (no error code) but the reproduced experimental data doesn't match the paper.",
+ "instruction_draft": "```\n$ ./repro_check --db /data/experiment.db --key-file /data/master.key\nRecord integrity: PASS (12/12 known records)\nReproduction check: FAIL\n  paper_hash:   a3f8c2...d901\n  computed_hash: 7b21e4...cc43\n  first mismatch: record_id=1847\n```\n\nI'm trying to reproduce Table 3 from the paper. The `librecenc` library was refactored last month and the 12 regression tests still pass, but when I run the full dataset of ~4,000 records from `/data/experiment.db`, the decrypted values don't match. The library source is in `/app/librecenc/`. The reference binary from before the refactor is at `/app/artifacts/librecenc_ref.so` (x86-64). The master key is in `/data/master.key`.\n\nFix `librecenc` so that:\n1. Encrypting any record with the library and decrypting it with the same library returns the original plaintext exactly.\n2. Encrypting a record with the library and decrypting it with the reference binary (or vice versa) returns the original plaintext exactly\u2014the wire format and nonce construction must be identical to the reference.\n3. The fixed library must correctly process all records including those with empty fields, fields whose serialized length is a multiple of 16 bytes, records with `record_id` values that are powers of two up to 2^32, and multi-field records where the total serialized length crosses a 256-byte boundary.\n4. Build the fixed library as `/app/librecenc/librecenc.so` and the CLI tool as `/app/bin/recenc`.",
+ "requirements": [
+  "Encrypting then decrypting any record returns the original plaintext exactly (round-trip correctness)",
+  "The library is wire-compatible with /app/artifacts/librecenc_ref.so: either can decrypt what the other encrypts",
+  "Empty string fields round-trip correctly",
+  "Fields whose serialized byte length is exactly a multiple of 16 round-trip correctly",
+  "Records with record_id that is a power of two (including 2^31 and 2^32-1) produce the correct nonce and round-trip correctly",
+  "Records whose total serialized length crosses a 256-byte boundary round-trip correctly",
+  "The CLI tool /app/bin/recenc encrypt and decrypt subcommands work against /data/experiment.db"
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm with gcc, libsqlite3-dev, libssl-dev installed via apt",
+  "/app/librecenc/ contains six C source files (~1,800 lines total): nonce.c, counter.c, serialize.c, encrypt.c, mac.c, db.c, plus a Makefile",
+  "nonce.c: constructs the 16-byte nonce as domain_sep[4] || record_id[8] || field_index[2] || reserved[2]. Bug: field_index is stored as big-endian but the reference used little-endian; this only matters for records with more than one field (field_index > 0)",
+  "counter.c: implements AES-CTR block counter. Bug: the counter increment after processing a full 16-byte block uses `counter[15]++` with no carry propagation; on inputs whose length is an exact multiple of 16, the final block is re-encrypted with a repeated counter value (data-dependent, invisible on the 12 regression tests which all have lengths 1-15 mod 16)",
+  "serialize.c: serializes record fields to bytes. Bug: empty string fields are serialized as a 2-byte length prefix of 0x0000, but the reference serialized them as a single 0x00 byte (no length prefix for zero-length fields). This changes total length and shifts all subsequent field nonces",
+  "mac.c: computes HMAC-SHA256 over the ciphertext for integrity. This component is CORRECT but its verification failure is the visible symptom the solver sees first (misleading_symptom: HMAC fails because the ciphertext is wrong due to the counter/nonce bugs, not because MAC logic is wrong)",
+  "db.c: SQLite integration, correct",
+  "encrypt.c: orchestration, correct",
+  "/app/artifacts/librecenc_ref.so: precompiled x86-64 shared library (the working pre-refactor version), no source",
+  "/data/experiment.db: SQLite database with ~4,000 records encrypted with the reference library; records include varied field counts, empty fields, and record_ids including powers of two",
+  "/data/master.key: 16-byte AES key",
+  "/app/repro_check: binary that decrypts all records and compares against paper hash",
+  "The 12 regression tests all use single-field records with lengths 1-15 mod 16 and no empty fields and record_ids that are not powers of two\u2014so all three bugs are invisible in the test suite",
+  "/app/tests/: test harness that compiles librecenc and runs fuzz_equivalence tests comparing librecenc output against librecenc_ref.so on fresh randomly generated records"
+ ],
+ "internal_hint": "Difficulty from runtime behavior: all three bugs are data-dependent. (1) The nonce endianness bug only triggers for record field_index > 0 (multi-field records). (2) The counter carry bug only triggers when plaintext length mod 16 == 0. (3) The empty-field serialization bug only triggers when a field value is empty. None of these conditions appear in the 12 regression test records. The misleading symptom is HMAC verification failure, which points the solver at mac.c (correct). The solver must instrument the encrypt/decrypt path with real data, isolate which record types fail, and trace back to the three independent bugs in nonce.c, counter.c, and serialize.c. The reference binary can be used as an oracle: encrypt with fixed lib, decrypt with ref, compare.",
+ "trap": "A solver who fixes only the HMAC (which is fine) or only the most obvious bug (counter carry OR nonce endianness but not both) will pass some generated inputs but fail others. Records with empty fields AND length-multiple-of-16 AND multi-field structure all need to align simultaneously for some test inputs. The verifier generates inputs at verify time covering each bug independently and in combination, so a partial fix that passes, e.g., single-field records and non-empty fields will still fail on multi-field records with empty fields whose total length is a multiple of 16.",
+ "tests": [
+  "Compile librecenc.so from /app/librecenc/ and load it alongside librecenc_ref.so",
+  "Generate 50 single-field records with random lengths 1-500 bytes (non-empty): encrypt with fixed lib, decrypt with ref, assert plaintext matches",
+  "Generate 20 single-field records whose payload length is exactly N*16 bytes for N in 1..20: encrypt with fixed lib, decrypt with ref, assert plaintext matches (tests counter carry fix)",
+  "Generate 30 multi-field records (2-5 fields) with no empty fields: encrypt with fixed lib, decrypt with ref, assert plaintext matches (tests nonce endianness fix)",
+  "Generate 20 records with at least one empty string field: encrypt with fixed lib, decrypt with ref, assert plaintext matches (tests empty-field serialization fix)",
+  "Generate 10 records with record_id equal to powers of two: 1,2,4,...,2^31,2^32-1: encrypt with fixed lib, decrypt with ref",
+  "Generate 15 multi-field records where at least one field is empty AND total serialized length is a multiple of 16: encrypt with fixed lib, decrypt with ref (tests bugs 2 and 3 together)",
+  "Generate 10 records where field_index > 0 AND payload length mod 16 == 0 AND at least one empty field (all three bugs interact): encrypt with fixed lib, decrypt with ref",
+  "Round-trip test: for all generated records above, encrypt then decrypt with fixed lib alone, assert plaintext matches",
+  "Run /app/repro_check with fixed lib against /data/experiment.db and assert reproduction check PASS"
+ ],
+ "verifier_knob": {
+  "name": "num_fuzz_records",
+  "value": "150 total across all categories",
+  "effect": "Increasing adds more records per category and adds adversarial combinations (e.g., record_id=2^24, 5 fields, 2 empty, total length 48); decreasing to 30 makes it easier to pass with a partial fix that handles most common cases"
+ },
+ "expected_failure_modes": [
+  "Solver reads mac.c first (misled by HMAC error), spends time verifying MAC logic is correct, then declares it fixed without touching nonce.c or counter.c",
+  "Solver finds and fixes the counter carry bug (most obvious when probing length-16 records) but misses the nonce endianness bug because they only test single-field records",
+  "Solver fixes nonce endianness and counter carry but misses the empty-field serialization difference because empty fields don't appear in casual testing",
+  "Solver fixes all three bugs but introduces a new bug in carry propagation (e.g., propagating carry across all 16 bytes but forgetting the big-endian byte order of the counter)",
+  "Solver uses the reference binary as an oracle only for decryption but never encrypts with the ref to compare intermediate ciphertext bytes, missing the nonce endianness direction"
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "aes-ctr",
+  "sqlite",
+  "c",
+  "fuzz-equivalence",
+  "system-administration",
+  "refactoring"
+ ]
+}

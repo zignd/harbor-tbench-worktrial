@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "spectral-rollup-regression-recovery",
+  "title": "Spectral Rollup Regression Recovery",
+  "scenario": "You maintain `specrollup`, a small in-house Python toolkit (~1,400 lines across six modules) that ingests raw spectrometer readings, bins them into frequency-band rollups, applies per-instrument calibration corrections, then serialises the aggregated dataset to a deployment-ready HDF5 archive consumed by downstream ML pipelines. Since last week's feature iteration that added multi-resolution rollup support, nightly CI started emitting a silent success exit code while the HDF5 archive contains corrupted calibration data for a specific band-combination edge case. The deployed binary plugin `libcalibcore.so` (precompiled, no source) handles the per-band gain interpolation; everything else is Python source.",
+  "instruction_draft": "The nightly rollup pipeline at `/app/specrollup/` exits 0 but the produced HDF5 archive at `/app/output/rollup.h5` contains incorrect calibrated values for multi-resolution band combinations. Repair the pipeline so that `python -m specrollup.run --config /app/config/production.yaml` produces a `rollup.h5` where every band group's `calibrated_flux` dataset matches the expected values to within 1e-4 relative error, the `resolution_tag` attribute on each group is set correctly, and the `checksum` scalar dataset in the root group equals the SHA-256 (hex) of the concatenated sorted group names and their `calibrated_flux` arrays.",
+  "requirements": [
+   "Running `python -m specrollup.run --config /app/config/production.yaml` exits with code 0",
+   "The output HDF5 at `/app/output/rollup.h5` exists",
+   "Every band group's `calibrated_flux` dataset matches reference values to within 1e-4 relative error across all instrument/band combinations including multi-resolution edge cases",
+   "Each HDF5 group has a `resolution_tag` string attribute set to the correct resolution tier string (e.g. 'coarse', 'fine', 'hybrid')",
+   "The root-level `checksum` scalar dataset equals the SHA-256 hex digest of the concatenated sorted group names and their `calibrated_flux` arrays (serialised as little-endian float64)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install libhdf5-dev; pip install h5py numpy scipy pyyaml",
+   "`/app/specrollup/` module tree: `__main__.py`, `run.py`, `binner.py`, `calibration.py`, `serialiser.py`, `checksum.py`, `utils.py` (~200 lines each)",
+   "`/app/specrollup/run.py` orchestrates the pipeline: load config -> read raw CSVs -> bin -> calibrate -> serialise -> write checksum. The multi-resolution feature added a `resolution_tier` dispatcher but introduced two interacting bugs: (1) `binner.py` passes band indices in the wrong order to `libcalibcore.so` when `resolution_tier != 'coarse'` (positional arg swap), and (2) `serialiser.py` writes `resolution_tag` using the *previous* tier's value due to a loop variable closure bug (classic Python late-binding closure over `tier`)",
+   "`/app/lib/libcalibcore.so` is a precompiled shared library (C, no source) exposing `calibrate_band(double *flux, int n_samples, int band_lo, int band_hi, double *gain_table, int n_gains, double *out)`. The argument order matters: `band_lo` must be strictly less than `band_hi`; if swapped, the function still returns 0 (success) but silently fills `out` with the reversed-gain interpolation, producing plausible-but-wrong values",
+   "`/app/lib/calibcore.pyi` stub is present documenting the correct signature",
+   "`/app/config/production.yaml` specifies three instruments (alpha, beta, gamma), each with coarse/fine/hybrid resolution tiers and 8 band ranges",
+   "`/app/data/raw/` contains 24 CSV files (instrument \u00d7 tier \u00d7 run) with ~5,000 rows each",
+   "`/app/data/reference/` contains `expected_calibrated.npz` with the ground-truth `calibrated_flux` arrays keyed by group name, used only by the verifier",
+   "`/app/specrollup/checksum.py` has the correct SHA-256 logic but is never called \u2014 `run.py` calls a stub `_placeholder_checksum()` that writes `'0' * 64` instead (third bug, introduced when the feature branch forgot to wire the real function)",
+   "All three bugs must be fixed in the correct order or the checksum will be wrong even if calibration is fixed"
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the cause of wrong calibrated values is NOT visible by reading \u2014 `libcalibcore.so` silently accepts swapped band indices and returns success with wrong output, so the solver must instrument the call site, compare outputs against reference data, and infer the argument swap by experiment; (2) an ordered procedure: fixing only the binner arg-swap without also fixing the serialiser closure bug produces wrong resolution_tags, which changes the sorted-group-name order, which corrupts the SHA-256 checksum even if calibrated values are right. The three fixes must all land: (a) swap `band_lo`/`band_hi` back to correct order in `binner.py`'s call to `libcalibcore.calibrate_band` for non-coarse tiers, (b) fix the closure bug in `serialiser.py` (capture `tier` with a default-argument `lambda tier=tier:` or restructure loop), (c) wire `checksum.py`'s real `compute_checksum()` into `run.py`. The silent wrong-output from the .so is the key non-visible-by-reading challenge.",
+  "trap": "A solver that fixes the obvious Python closure bug and sees plausible-looking HDF5 output will pass the sample data sanity check (values in reasonable physical range) but fail hidden-input tests because the calibrated_flux values are wrong for fine/hybrid tiers. A solver that fixes calibration but not the closure writes correct flux values under incorrect resolution_tags, making the sorted group order wrong and therefore the checksum wrong. A solver that fixes both but leaves the placeholder checksum fails the checksum test. All three fixes must be applied in a valid order.",
+  "tests": [
+   "Verifier runs `python -m specrollup.run --config /app/config/production.yaml` and asserts exit code 0",
+   "Verifier opens `/app/output/rollup.h5` and for each of the 24 groups (instrument \u00d7 tier \u00d7 8 bands collapsed to one group per instrument\u00d7tier) checks that `calibrated_flux` matches `expected_calibrated.npz[group_name]` within 1e-4 relative tolerance",
+   "Verifier checks every group's `resolution_tag` attribute equals the correct tier string for that group",
+   "Verifier independently recomputes the SHA-256 over sorted group names + little-endian float64 dumps of their calibrated_flux arrays and compares to the `checksum` dataset in the HDF5 root",
+   "Verifier runs the pipeline a second time with a fresh hidden config that adds a fourth instrument 'delta' with only hybrid-tier bands, confirming the fix generalises beyond the three sample instruments"
+  ],
+  "verifier_knob": {
+   "name": "number_of_hidden_instruments",
+   "value": "1 (delta instrument with hybrid-only tiers, injected at verify time)",
+   "effect": "Increasing to 3 hidden instruments with different band-count combinations raises difficulty because a partial fix that happens to work for the sample instrument layout fails on novel layouts"
+  },
+  "expected_failure_modes": [
+   "Agent reads Python source, finds the closure bug, fixes it, reruns, sees plausible HDF5 values, and stops \u2014 missing the silent wrong-calibration from swapped .so arguments",
+   "Agent finds the arg-swap in binner.py by reading the pyi stub but assumes the closure bug is independent and tests them separately, getting confused when fixing one breaks the checksum in a different way",
+   "Agent fixes all three Python-visible issues but hardcodes the checksum logic incorrectly (wrong serialisation order or encoding) and fails the checksum check",
+   "Agent notices the placeholder checksum immediately and fixes it, then fixes the closure bug, but never instruments the .so call and misses the calibration error, shipping wrong flux values with a valid-looking checksum"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "hdf5",
+   "shared-library",
+   "calibration",
+   "regression",
+   "ordered-repair",
+   "python"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/specrollup/run.py",
+   "cat /app/specrollup/binner.py",
+   "cat /app/specrollup/serialiser.py",
+   "cat /app/specrollup/checksum.py",
+   "cat /app/lib/calibcore.pyi",
+   "python -m specrollup.run --config /app/config/production.yaml",
+   "# Reading binner.py + calibcore.pyi reveals swapped band_lo/band_hi for non-coarse tiers",
+   "# Reading serialiser.py reveals classic closure bug (tier late-binding)",
+   "# Reading run.py reveals _placeholder_checksum() stub never wired to real checksum.py",
+   "sed -i 's/calibrate_band(flux, n, band_hi, band_lo/calibrate_band(flux, n, band_lo, band_hi/' /app/specrollup/binner.py",
+   "# Fix serialiser.py closure: change lambda to capture tier with default arg",
+   "python -c \"open('/app/specrollup/serialiser.py').read()\" && vi/sed fix closure",
+   "# Fix run.py: import compute_checksum from checksum.py and call it instead of _placeholder_checksum()",
+   "python -c \"open('/app/specrollup/run.py').read()\" && sed fix to wire real checksum",
+   "python -m specrollup.run --config /app/config/production.yaml",
+   "python -c \"import h5py; f=h5py.File('/app/output/rollup.h5','r'); print(f['checksum'][()]); [print(k,f[k].attrs['resolution_tag']) for k in f if k!='checksum']\""
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The core difficulty claim \u2014 that the arg-swap bug is 'NOT visible by reading' \u2014 is undermined by the presence of calibcore.pyi stub which documents the correct signature; a code reader finds the bug in the same pass as the closure bug, making the task much easier than intended",
+   "The 'ordered procedure' difficulty lever is weak: the three fixes are largely independent (calibration correctness, resolution_tag correctness, checksum wiring); fixing them in any order still produces a correct result, undermining the 'ordered repair' framing",
+   "Hidden instrument 'delta' injected at verify time with only hybrid-tier bands could cause flakiness if the pipeline requires pre-existing data files in /app/data/raw/ that don't exist for delta \u2014 the blueprint doesn't clarify whether the verifier also injects the required CSV data or just the config",
+   "The checksum serialisation spec ('concatenated sorted group names and their calibrated_flux arrays serialised as little-endian float64') is slightly ambiguous: does 'concatenated' mean name bytes + array bytes interleaved, or all names then all arrays? This could cause valid checksum implementations to fail",
+   "The 1e-4 relative error tolerance is stated but 'relative error' formula (|a-b|/|b| vs max(|a|,|b|)) is not specified, risking borderline cases near zero flux values"
+  ],
+  "verdict": "reject",
+  "reasons": "The task's claimed core difficulty \u2014 that the libcalibcore.so argument swap is invisible by source inspection \u2014 is directly negated by providing calibcore.pyi, which documents the correct signature and makes all three bugs findable by a single reading pass of ~5 files in ~16 commands. This collapses genuine_difficulty to 2, well below the required 4. Additionally, the 'ordered procedure' framing is misleading since the three fixes are largely independent and can be applied in any order. The hidden-instrument injection at verify time introduces a potential flakiness risk if the required CSV data files are not also injected alongside the config.",
+  "fixes": [
+   "Remove calibcore.pyi entirely OR make it document a misleading/incomplete signature so the arg-swap cannot be confirmed by source reading alone \u2014 the solver must then instrument the .so call and compare against reference data experimentally",
+   "Make the hidden delta instrument injection self-contained: explicitly state that the verifier injects both the config AND the corresponding raw CSV files, or better, make the pipeline generate synthetic data from config parameters so no external CSVs are needed for new instruments",
+   "Clarify the checksum serialisation precisely: 'for each group name in sorted order, append UTF-8 bytes of the group name followed by the little-endian float64 bytes of the calibrated_flux array' \u2014 remove all ambiguity about interleaving",
+   "To restore genuine difficulty to 4+, replace the .pyi stub with a misleading comment or wrong stub, and add a decoy bug (e.g., an obvious-looking but harmless off-by-one in coarse-tier processing) that wastes agent time while the real silent calibration error goes undetected until reference comparison"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/convert-jags-hierarchical-model-to-pymc",
+     "verdict": "distinct",
+     "reason": "That task is about converting a Bayesian hierarchical model between probabilistic programming frameworks, unrelated to HDF5 pipeline debugging or spectral data processing."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a compiled binary normalizer and fixing SQL rollup tables, whereas the candidate task is about debugging Python spectral calibration logic and HDF5 serialization with a precompiled calibration plugin."
+    },
+    {
+     "ref_id": "terminal-bench/batched-eval-parity",
+     "verdict": "distinct",
+     "reason": "That task is about fixing batched vs. single-example evaluation parity in an LLM evaluation framework, which is entirely unrelated to spectral data pipelines or HDF5 archives."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task is about fixing ETL aggregate totals in SQLite for revenue data, whereas the candidate task involves HDF5 spectral calibration data corruption and checksum validation."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a WAF classifier and its rule deployment/state synchronization, unrelated to spectral rollup pipelines or HDF5 calibration data."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/convert-jags-hierarchical-model-to-pymc",
+     0.146
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.112
+    ],
+    [
+     "terminal-bench/batched-eval-parity",
+     0.111
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.062
+    ],
+    [
+     "ours/official-10912a593843",
+     0.062
+    ]
+   ],
+   "cost_usd": 0.014532
+  },
+  "novel": true
+ },
+ "cost_usd": 0.051801
+}

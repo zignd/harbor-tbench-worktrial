@@ -4,10 +4,12 @@ The pipeline is run by /app/run_pipeline.sh, which reads /app/data/raw_samples.c
 
 The binary reads lines of reading_id,raw_value from stdin and writes reading_id,normalized_value to stdout. Raw values are ADC counts in the range 0-1023.
 
-Two correctness requirements must hold when /app/run_pipeline.sh is run on new input data placed at /app/data/raw_samples.csv:
+Three correctness requirements must hold when /app/run_pipeline.sh is run on new input data placed at /app/data/raw_samples.csv:
 
 1. Every row in hourly_stats must have p90_normalized within 0.5 of the true 90th percentile of normalized values for that (zone, hour) bucket.
 
 2. Every row in zone_energy must have total_energy within 1.0 of the true sum of raw_energy_wh for all rows in that zone.
 
-Repair whatever in the pipeline is needed so both thresholds are met on hidden inputs generated at verify time. The pipeline must complete successfully when /app/run_pipeline.sh is executed.
+3. The readings table must contain exactly as many rows as the input CSV — no rows may be dropped during the join or load steps.
+
+Repair whatever in the pipeline is needed so all three requirements are met on hidden inputs generated at verify time. The pipeline must complete successfully when /app/run_pipeline.sh is executed.

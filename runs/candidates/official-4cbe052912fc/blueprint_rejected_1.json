@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "crypto-migration-hash-refactor",
+  "title": "Cryptographic Hash Pipeline Migration",
+  "scenario": "A platform team is migrating a scientific data integrity service from MD5/SHA1 to a modern cryptographic suite (SHA-256, BLAKE2b, HMAC-SHA256). The service is a Go binary compiled into the Docker image \u2014 source is NOT present. It reads a custom binary record format from stdin or file paths, computes per-record checksums, and writes a signed manifest. The binary is in production; the team has log files, sample inputs, and a partially written replacement service at /app/svc/ (~900 lines across 6 files) that must match the legacy binary's manifest format exactly but use the new hash suite.",
+  "instruction_draft": "Hey \u2014 we're finally cutting over from the old integrity-checker binary to our new Go service. The old binary lives at /app/bin/legacy-checker and still works; the new service source is at /app/svc/. The problem is the new service's manifest output doesn't match what downstream consumers expect. The manifests need to pass validation by /app/bin/legacy-checker --verify on every record, and the new service must also emit HMAC-SHA256 authentication tags (using the key in /app/config/signing.key) that the legacy tool doesn't produce but our new validator at /app/bin/new-validator requires. Run /app/bin/legacy-checker --help and poke at both binaries to figure out the exact wire format \u2014 there's no other spec. Fix the new service so that /app/bin/new-validator passes on the full corpus in /app/data/corpus/ and the legacy checker's --verify mode also passes on those same manifests. The service should compile clean with 'go build ./...' from /app/svc/.",
+  "requirements": [
+   "The new Go service at /app/svc/ must compile with 'go build ./...' without errors.",
+   "Running the new service against any record file in /app/data/corpus/ must produce a manifest that passes /app/bin/legacy-checker --verify.",
+   "The same manifest must also pass /app/bin/new-validator, which checks HMAC-SHA256 authentication tags computed from /app/config/signing.key.",
+   "BLAKE2b-256 must be used for per-record content hashes (not SHA-256 or MD5).",
+   "SHA-256 must be used for the manifest root hash (chained over all record hashes in order).",
+   "The HMAC-SHA256 tag must cover the canonical manifest bytes in the exact order the legacy binary emits them.",
+   "Edge cases: empty records, records with zero-length payloads, and records where the declared length field exceeds the actual payload must be handled without panicking.",
+   "The service must process all corpus files, including ones with multiple records and mixed-size payloads."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base, with Go 1.22 installed via apt or manual install for building the new service.",
+   "/app/bin/legacy-checker: a compiled Go binary (no source) implementing the old integrity checker. Accepts --verify flag and reads/writes a custom binary manifest format. Internally uses MD5 for record hashes and a custom XOR-folded root hash \u2014 but the manifest wire format (field layout, length encoding, magic bytes) is what must be reverse-engineered.",
+   "/app/bin/new-validator: a compiled Go binary (no source) that accepts a manifest file and /app/config/signing.key and verifies HMAC-SHA256 tags appended to the manifest. Strict about byte order and canonical form.",
+   "/app/config/signing.key: a 32-byte hex-encoded HMAC key file.",
+   "/app/data/corpus/: 40-60 binary record files of varying sizes, including edge cases (empty, single-byte, multi-record, max-size, zero-length payload records). A subset visible at task start; the rest generated at verify time.",
+   "/app/svc/: ~900 lines of Go across 6 files (main.go, record.go, manifest.go, hash.go, hmac.go, config.go). The code has several bugs: (1) hash.go uses SHA-256 where BLAKE2b-256 is required for record hashes; (2) manifest.go emits record hashes in reverse order before computing the root, breaking the chain; (3) hmac.go computes HMAC over the raw payload bytes instead of the canonical manifest bytes; (4) record.go panics on zero-length payload records instead of emitting a well-defined empty hash.",
+   "The legacy binary's --help output describes the manifest format in terse terms; running it on sample inputs and doing hex analysis is the only way to confirm field layout.",
+   "Sample log files at /app/logs/ showing legacy binary output on known inputs, useful for cross-referencing.",
+   "A /app/scripts/smoke_test.sh that runs the new service against /app/data/corpus/sample_01.bin and pipes output through both validators \u2014 useful as a quick sanity check but does NOT cover edge cases."
+  ],
+  "internal_hint": "Difficulty comes from two levers: (1) observe_not_read \u2014 the legacy binary is opaque; the solver must run it with --help, feed it sample inputs, and hex-dump outputs to reverse-engineer the manifest wire format (magic bytes 0xCA 0xFE, little-endian u32 record count, then per-record: u32 payload_len, 32-byte record_hash, u64 offset; then 32-byte root_hash; new-validator appends a 32-byte HMAC tag after root_hash). (2) edge_case_inputs \u2014 zero-length payload records must emit a BLAKE2b-256 hash of the empty byte slice, not panic; the naive fix of guarding with len>0 causes a different hash value that still fails. The four bugs interact: fixing only the hash algorithm (SHA-256\u2192BLAKE2b) leaves the ordering bug active, so manifests verify on the sample but fail on multi-record corpus files. Fixing ordering but not HMAC input causes new-validator failures that look like a key problem. A solver who only tests against sample_01.bin (single record, non-empty) can appear to pass all four bugs without actually fixing them.",
+  "trap": "The smoke test uses a single-record, non-empty file. A solver who fixes only the hash algorithm passes the smoke test. Multi-record files expose the ordering bug; zero-length payload files expose the panic; the HMAC input bug only surfaces when new-validator runs on a valid-looking manifest. Shallow verification against sample_01.bin gives false confidence on all four bugs simultaneously.",
+  "tests": [
+   "Compile test: 'cd /app/svc && go build ./...' exits 0 and produces a binary.",
+   "For each of 20 corpus files (10 visible, 10 generated at verify time with varied record counts 1-50), run new service \u2192 pipe manifest through legacy-checker --verify \u2192 must exit 0.",
+   "For same 20 corpus files, run new service \u2192 pipe manifest through new-validator with signing.key \u2192 must exit 0.",
+   "Specifically test corpus files containing zero-length payload records: new service must not panic and must produce a valid manifest.",
+   "Specifically test a corpus file with 30 records of mixed sizes: manifest root hash must equal SHA-256 of the concatenation of all 30 BLAKE2b-256 record hashes in forward order.",
+   "Verify BLAKE2b-256 is used for record hashes: extract a record hash from a single-record manifest, independently compute BLAKE2b-256 of the payload, assert equality.",
+   "Verify HMAC is computed over canonical manifest bytes (everything before the HMAC tag): tamper with one byte of the manifest body and confirm new-validator rejects it.",
+   "Generate 5 adversarial corpus files at verify time: records with max u32 payload (truncated to 64KB for performance), records with all-zero payloads, records with payloads that are valid UTF-8 vs. arbitrary binary."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "40 files, 10 generated at verify time",
+   "effect": "Raising corpus_size increases the number of edge-case files (more zero-length, more large-record, more multi-record variants) and makes it harder for a partial fix to pass all cases; lowering it makes the task easier by reducing edge case coverage"
+  },
+  "expected_failure_modes": [
+   "Solver reverse-engineers the manifest format from --help text alone without hex-dumping binary output, misses the little-endian u32 encoding of record count, produces big-endian manifests that fail legacy-checker --verify on multi-record files.",
+   "Solver fixes hash algorithm and ordering bug but misidentifies the HMAC input as the full manifest including the tag itself (circular dependency); new-validator fails on all files.",
+   "Solver patches zero-length guard with 'if len(payload) > 0' and skips emitting a hash for empty records, causing root hash mismatch on any corpus file containing a zero-length record.",
+   "Solver tests only against sample_01.bin, confirms smoke test passes, submits without running against multi-record or edge-case files.",
+   "Solver identifies three of four bugs by reading the source, misses the HMAC input bug because hmac.go looks plausible ('compute HMAC over payload' seems reasonable), and only discovers it when new-validator unexpectedly rejects a syntactically valid manifest."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "binary-format",
+   "reverse-engineering",
+   "scientific-computing",
+   "refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/svc/hash.go  # sees SHA-256, knows to switch to BLAKE2b-256",
+   "cat /app/svc/manifest.go  # sees reverse-order bug in root hash chain",
+   "cat /app/svc/hmac.go  # sees HMAC computed over raw payload, not canonical manifest bytes",
+   "cat /app/svc/record.go  # sees panic on zero-length payload",
+   "cat /app/svc/main.go && cat /app/svc/config.go  # understand wiring",
+   "/app/bin/legacy-checker --help  # confirm manifest wire format fields",
+   "sed -i 's/sha256/blake2b/' /app/svc/hash.go  # + edit to use golang.org/x/crypto/blake2b",
+   "edit /app/svc/manifest.go to fix forward ordering of record hashes",
+   "edit /app/svc/hmac.go to compute HMAC over canonical manifest bytes (everything before HMAC tag)",
+   "edit /app/svc/record.go to emit blake2b hash of empty slice instead of panicking",
+   "cd /app/svc && go get golang.org/x/crypto/blake2b  # or check if already in go.mod",
+   "go build ./...  # verify compilation",
+   "bash /app/scripts/smoke_test.sh  # quick sanity",
+   "for f in /app/data/corpus/*.bin; do ./svc $f | /app/bin/legacy-checker --verify && ./svc $f | /app/bin/new-validator /app/config/signing.key; done"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The golang.org/x/crypto package may not be pre-vendored or available offline; if the container has no internet and go.mod doesn't already include it, adding BLAKE2b becomes an environment failure rather than a solver failure.",
+   "The legacy-checker --verify interface is not fully specified \u2014 if it reads from a file path vs stdin ambiguity exists, the test harness piping behavior could differ from how a solver runs it.",
+   "The blueprint says 'FROM python:3.13-slim-bookworm base, with Go 1.22 installed via apt or manual install' \u2014 apt Go packages on Debian bookworm are typically Go 1.19, not 1.22; pinning is needed or this causes a build environment failure unrelated to solver skill.",
+   "The 10 files 'generated at verify time' are not described with enough determinism \u2014 if generation logic is buggy or produces formats the new service can't handle for unspecified reasons, false failures occur.",
+   "New-validator binary behavior on manifest+HMAC is described but the exact invocation syntax (file path argument, stdin, key file path format) is not specified in the instruction, leaving the solver to guess CLI interface."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because all four bugs are explicitly visible in the source code (~900 lines across 6 files the solver can read), making the 'observe_not_read' difficulty lever illusory \u2014 a diligent agent reading the source finds all bugs in under 15 commands without needing to reverse-engineer anything from the binary. The task blueprint's own description of the difficulty mechanism is self-contradicting: it claims the challenge is reverse-engineering the opaque binary, but then provides a buggy source implementation that directly exposes all four defects. Additionally, the environment has a critical solvability risk around Go 1.22 availability and the BLAKE2b dependency requiring network access.",
+  "fixes": [
+   "Remove the new service source entirely or provide only a stub (e.g., main.go with no implementation) so the solver must reverse-engineer the manifest format from the binary and logs to write the implementation from scratch \u2014 this actually activates the observe_not_read lever.",
+   "Pin Go 1.22 via a specific tarball URL baked into the Dockerfile (not apt) and pre-vendor golang.org/x/crypto in the module cache to eliminate network dependency and environment ambiguity.",
+   "Fully specify the CLI interface for both legacy-checker and new-validator in the instruction (stdin vs file path, exit codes, flag syntax) or make --help output comprehensive enough that no ambiguity exists about invocation.",
+   "If source must be provided to make the task tractable, introduce bugs that are NOT visible as obvious wrong values (e.g., an off-by-one in length encoding, a subtle endianness issue in a single field, a missing byte in the HMAC input) so reading source is necessary but not sufficient \u2014 the solver must also run and observe to confirm which fields are wrong."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Both involve HMAC-SHA256 and binary wire formats, but the reference is a TCP network service doing WAL record processing with refund resolution, while the candidate is a Go source code migration task involving manifest format matching and multiple hash algorithms (BLAKE2b, SHA-256, HMAC)."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference is about fixing incorrect weighted aggregation logic in a sales service, while the candidate is about cryptographic hash algorithm migration and binary manifest format reverse-engineering."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is about NDJSON schema validation correctness and performance, while the candidate is about cryptographic hash pipeline migration with binary format compatibility."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "The reference is about fixing a binary frame encode/decode service with a specific wire format, while the candidate involves migrating cryptographic hash algorithms in a Go service and matching legacy binary manifest output."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference is about fixing a log enrichment pipeline's GeoIP data and adding an API endpoint, while the candidate is about cryptographic hash algorithm migration with binary format reverse-engineering."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.273
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.206
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.201
+    ],
+    [
+     "ours/official-aac910462208",
+     0.12
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.119
+    ]
+   ],
+   "cost_usd": 0.014637
+  },
+  "novel": true
+ },
+ "cost_usd": 0.047919
+}

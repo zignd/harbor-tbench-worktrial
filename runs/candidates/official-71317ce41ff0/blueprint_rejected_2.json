@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "sqlite-hmac-chain-refactor",
+  "title": "Cryptographic Audit Chain Refactor",
+  "scenario": "A research scientist is reproducing a published result that relies on a C-based cryptographic audit daemon. The daemon reads sensor records from a SQLite database, chains HMAC-SHA256 digests across rows in insertion order, and writes the chain-head digest back to a `chain_state` table after each batch. A major refactor six months ago split the monolithic `audit.c` into four modules, but the reproduced chain hashes never match the paper's reference values. The scientist has the old binary (no source) and the new source tree (~1,400 lines across six C files plus a SQLite schema), plus a small reference database with known chain outputs.",
+  "instruction_draft": "```\n$ ./audit_new --db reference.db --batch-size 50\nChain head after batch 1: 3a9f2c11e847b60d4f8a1c2e9d3b7f05a2e6c4d8f1b3e5a7c9d2f4b6e8a0c1\n\n$ python3 verify.py reference.db\nBATCH 1: MISMATCH\n  expected: 7c4e1a8b2f6d3c9e5a7b1d4f8c2e6a3b9d5f1c7e3a9b2d6f4c8e1a5b3d7f9c\n  got:      3a9f2c11e847b60d4f8a1c2e9d3b7f05a2e6c4d8f1b3e5a7c9d2f4b6e8a0c1\n```\n\nThe new audit daemon produces wrong chain hashes for every batch. The old binary `/usr/local/bin/audit_old` (no source available) produces the correct hashes that match `verify.py`.\n\nThe system is described in `/app/docs/PROTOCOL.md`. Your goal: make `./audit_new --db <db_file> --batch-size <n>` produce chain hashes that match the reference binary for all inputs, including batches that cross row-ID boundaries that were not exercised in `reference.db`.\n\nRequirements:\n1. For every SQLite database the verifier generates, `./audit_new --db <db> --batch-size <n>` must produce the same chain-head digest in the `chain_state` table as `audit_old` produces.\n2. The binary must handle batch sizes from 1 to 10000 and databases with 0 to 100000 rows.\n3. The chain must be recomputed correctly when the `chain_state` table is empty (fresh start) and when it is non-empty (resume from prior chain head).\n4. Row ordering for HMAC input construction must match the protocol exactly, including edge cases for NULL sensor values and the encoding of the previous-chain-head field when no prior state exists.\n5. After a successful run, `chain_state` must contain exactly one row with the correct `batch_seq`, `row_count`, and `digest` values.\n",
+  "requirements": [
+   "audit_new produces the same chain-head digest as audit_old for every generated database and batch size",
+   "Handles batch sizes 1 to 10000",
+   "Handles databases with 0 to 100000 rows",
+   "Correctly resumes from a non-empty chain_state table (incremental chaining)",
+   "Correctly handles fresh start when chain_state is empty (prior-head encoding edge case)",
+   "Correctly handles NULL sensor values in HMAC input construction",
+   "chain_state contains exactly one row with correct batch_seq, row_count, and digest after each run"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with apt packages: gcc, libsqlite3-dev, sqlite3, make, xxd, libssl-dev",
+   "pip packages: none beyond stdlib",
+   "/app/src/ \u2014 six C source files totaling ~1400 lines: main.c, chain.c, record.c, db.c, hmac_util.c, batch.c; plus Makefile building audit_new",
+   "/app/docs/PROTOCOL.md \u2014 precise protocol spec including field order, NULL encoding ('\\x00' byte for NULL sensor_value), and prior-head genesis encoding (32 zero bytes for no prior state, NOT an empty string)",
+   "/usr/local/bin/audit_old \u2014 compiled reference binary (x86-64, stripped, no source) that implements the correct protocol",
+   "/app/reference.db \u2014 SQLite database with 150 rows, known chain outputs for batch-size 50 in chain_state; verify.py reads expected values from a companion JSON",
+   "Planted bugs in the refactored source: (1) chain.c encodes NULL sensor values as the string 'NULL' instead of a single 0x00 byte; (2) hmac_util.c feeds the prior chain head as a lowercase hex string instead of raw 32-byte binary when resuming; (3) record.c sorts rows by sensor_id then row_id instead of purely by row_id, causing wrong order when multiple sensors share a batch \u2014 this third bug is the hardest because reference.db never has two sensors with rows interleaved in the same batch",
+   "The misleading symptom: the first batch always mismatches because of bug (1), so naive fixers patch NULL encoding and see batch 1 pass but miss that resume (bug 2) and ordering (bug 3) are also broken",
+   "Schema: CREATE TABLE records (row_id INTEGER PRIMARY KEY, sensor_id TEXT, ts INTEGER, sensor_value REAL); CREATE TABLE chain_state (batch_seq INTEGER, row_count INTEGER, digest TEXT);",
+   "verify.py: given a db, runs audit_old and audit_new on a fresh copy, compares chain_state digests",
+   "tests/fuzz_verify.py: generates random databases (varying row counts, NULL fractions, sensor_id collisions, partial prior chain states) and compares audit_old vs audit_new outputs"
+  ],
+  "internal_hint": "Difficulty comes from three interacting bugs that are not visible by reading any single file \u2014 they only manifest when the system runs on specific data configurations. Bug 1 (NULL encoding) is the red herring: it causes every batch to fail including batch 1, so the solver finds and fixes it early via the reference.db symptom. Bug 2 (hex-vs-binary prior head) only triggers on the SECOND and subsequent batches, i.e., when chain_state is non-empty; the reference.db has only one batch so it never exercises resume, and a solver who tests only reference.db will miss it. Bug 3 (sort order) only triggers when multiple distinct sensor_ids have rows that interleave in row_id order within one batch \u2014 reference.db's sensors have non-overlapping row_id ranges so batch ordering is accidentally correct. The verifier generates databases with intentional sensor_id interleaving and multi-batch runs, catching both bugs 2 and 3. The solver must black-box-probe audit_old with crafted databases (e.g., INSERT two sensors alternating row_ids, then run audit_old and compare) to discover the correct ordering and resume encoding, since the PROTOCOL.md describes intent but the implementation details of field encoding require empirical confirmation against the binary.",
+  "trap": "A naive solver patches NULL encoding (fixing the obvious symptom), confirms reference.db now passes, and submits. The fuzz tests generate: (a) multi-batch databases that exercise resume, catching the hex-vs-binary prior-head bug; (b) databases where two sensors have interleaved row_ids in the same batch, catching the sort-order bug. Both hidden bugs produce wrong digests silently \u2014 audit_new exits 0 but writes a wrong hash.",
+  "tests": [
+   "test_null_encoding: generates databases with 10%, 50%, and 100% NULL sensor_value rows, batch-size 1 and batch-size 37; compares audit_new chain_state digest to audit_old",
+   "test_resume_chaining: generates a 200-row database, runs audit_new with batch-size 50 four times (appending to chain_state), verifies final digest matches four sequential audit_old runs on same db",
+   "test_fresh_start: generates databases where chain_state is pre-populated with a wrong digest row, then cleared; verifies audit_new handles both states correctly",
+   "test_sensor_interleave: generates databases where sensor_ids 'A' and 'B' have alternating row_ids (A:1,3,5 B:2,4,6) in one batch; verifies ordering matches audit_old",
+   "test_zero_rows: runs audit_new on empty records table; verifies chain_state has one row with digest matching audit_old (genesis encoding)",
+   "test_batch_size_one: 100-row database with batch-size 1, all 100 sequential chain steps must match audit_old",
+   "test_large_database: 50000-row database with batch-size 1000, 50 sequential batches, final digest must match audit_old",
+   "test_mixed_null_interleave_resume: combines all three bug triggers simultaneously \u2014 NULL values, interleaved sensors, and multi-batch resume"
+  ],
+  "verifier_knob": {
+   "name": "num_fuzz_databases",
+   "value": "24",
+   "effect": "Increasing from 8 to 48 adds more sensor-interleave patterns, higher NULL fractions, and longer multi-batch chains, making it harder to accidentally pass with a partial fix; decreasing to 4 uses only simple cases that a NULL-only fix could pass"
+  },
+  "expected_failure_modes": [
+   "Solver patches NULL encoding only, tests reference.db, sees it pass, misses resume and ordering bugs",
+   "Solver finds and fixes NULL and resume bugs but misses that sort order is wrong because they test with single-sensor databases",
+   "Solver reads PROTOCOL.md description of 'sort by insertion order' and interprets this as the current (wrong) sort, not discovering that sensor_id as secondary sort key is the actual defect",
+   "Solver attempts to rewrite chain.c from scratch based on PROTOCOL.md but mis-implements the genesis encoding (empty vs 32-zero-bytes), failing the fresh-start tests",
+   "Solver probes audit_old but only with non-interleaved sensor data, never discovering the ordering difference"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "cryptography",
+   "sqlite",
+   "c",
+   "black-box-reverse-engineering",
+   "constraint-satisfaction",
+   "adversarial-reasoning"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/PROTOCOL.md",
+   "cat /app/src/chain.c  # spot NULL string literal",
+   "cat /app/src/hmac_util.c  # spot hex encoding of prior head",
+   "cat /app/src/record.c  # spot ORDER BY sensor_id, row_id",
+   "cat /app/src/batch.c && cat /app/src/db.c && cat /app/src/main.c",
+   "make -C /app",
+   "python3 verify.py reference.db  # confirm MISMATCH",
+   "edit chain.c: replace 'NULL' string with single 0x00 byte for NULL sensor_value",
+   "edit hmac_util.c: decode stored hex digest to raw 32-byte binary before HMAC input",
+   "edit record.c: change ORDER BY sensor_id, row_id to ORDER BY row_id only",
+   "make -C /app",
+   "python3 verify.py reference.db  # verify batch 1 passes",
+   "sqlite3 /tmp/test_resume.db 'CREATE TABLE records...; INSERT 200 rows; CREATE TABLE chain_state...'",
+   "audit_old --db /tmp/test_resume.db --batch-size 50 (4 times) vs audit_new (4 times)",
+   "sqlite3 /tmp/test_interleave.db 'INSERT sensor A: rows 1,3,5 and sensor B: rows 2,4,6'",
+   "audit_old vs audit_new on interleave db",
+   "python3 tests/fuzz_verify.py",
+   "verify all 8 test categories pass"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "audit_old is x86-64 binary \u2014 if grading environment is ARM (Apple Silicon, AWS Graviton), the reference binary cannot run, breaking all comparison tests",
+   "audit_old CLI flags not pinned in the blueprint \u2014 if flag syntax differs from audit_new, solver's probing scripts may fail with unhelpful errors",
+   "fuzz_verify.py uses no pinned random seed \u2014 while intentional interleaving is described, without a seed there's theoretical (low) risk that generated databases don't trigger bug 3 on every run",
+   "chain_state table state between sequential test runs must be carefully reset; if tests share database state the digest comparisons could be non-deterministic",
+   "All three bugs are readable directly from source code (~1400 lines), so a frontier agent reading all files upfront will likely spot all three bugs in the first 5 commands, reducing genuine difficulty significantly",
+   "verify.py implementation details not specified \u2014 if it doesn't properly isolate audit_old and audit_new runs (e.g., shared chain_state), results could be wrong or flaky"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold (score: 3) because all three planted bugs are directly visible in the source code \u2014 a frontier agent reading the six C files in the first few commands will spot the 'NULL' string literal, hex encoding call, and compound ORDER BY without needing empirical probing of audit_old. The 'misleading symptom' trap works on human engineers who test incrementally, but agents that read all source upfront bypass it entirely. Additionally, the x86-64-only reference binary creates a critical invalid failure risk if the grading environment is ARM-based.",
+  "fixes": [
+   "Obfuscate the bugs so they are not directly readable from source: e.g., use a computed string for NULL encoding (char *null_enc = get_null_encoding() where the wrong value comes from a config file or subtle macro), make the hex-vs-binary issue appear in a helper that looks plausibly correct (e.g., it calls a function named 'raw_digest' that actually returns hex), and make the sort order wrong via a query built from a string constant in db.c that looks like a format template",
+   "Precompile the source into object files and provide only chain.o and hmac_util.o as binaries, requiring the solver to black-box probe audit_old to discover the correct encoding \u2014 this forces empirical exploration and raises genuine difficulty to 4-5",
+   "Address the ARM/x86-64 risk by either providing a multi-arch binary (via QEMU emulation in the container) or by building audit_old from a hidden source at container build time for the host architecture",
+   "Pin the fuzz_verify.py random seed or use deterministic database generation to eliminate flakiness risk while still covering all three bug triggers"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Both involve HMAC-SHA256 in an audit context, but the reference task is about a TCP service computing HMACs over WAL records with refund resolution, while the candidate is about fixing a C daemon that chains HMACs across SQLite rows in batch sequences."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The reference task is about fixing a CSV pipeline with chunking/deduplication bugs, while the candidate is about reproducing a cryptographic HMAC chain in a C-based audit daemon."
+    },
+    {
+     "ref_id": "terminal-bench-pro/find-invalid-blockchain-transactions",
+     "verdict": "distinct",
+     "reason": "The reference task is about finding invalid transactions in a blockchain via HTTP API calls with a limited budget, while the candidate is about fixing a C cryptographic chaining algorithm to match a reference binary."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference task is about reverse-engineering a sensor normalization binary and fixing a SQL pipeline, while the candidate is about debugging a cryptographic HMAC chain implementation in C source code."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference task is about fixing a log enrichment pipeline with GeoIP enrichment and a Flask API, while the candidate is about matching cryptographic HMAC chain outputs between old and new C implementations."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.123
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.111
+    ],
+    [
+     "terminal-bench-pro/find-invalid-blockchain-transactions",
+     0.106
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.103
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.083
+    ]
+   ],
+   "cost_usd": 0.015717
+  },
+  "novel": true
+ },
+ "cost_usd": 0.063648
+}

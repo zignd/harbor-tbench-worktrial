@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "hmac-sqlite-audit-refactor",
+  "title": "Cryptographic Audit Trail Refactor",
+  "scenario": "A research scientist is reproducing a published result that relies on a C-based audit logging service. The service records experiment events into a SQLite database and signs each batch of records with HMAC-SHA256 so that tampering can be detected. A recent 'performance refactor' touched ~1400 lines across four C source files and the SQLite schema; the service still compiles and runs, but audit verification now fails on about 30% of batches \u2014 and the symptom points at the hash-comparison routine, not at the actual defect.",
+  "instruction_draft": "```\n$ ./audit_verify /var/audit/experiments.db\nBatch 001: OK\nBatch 002: OK\nBatch 003: FAIL  (hmac mismatch)\nBatch 004: OK\nBatch 005: FAIL  (hmac mismatch)\n...\nVerification: 14 of 50 batches FAILED\n```\n\nYou are reproducing a published experiment whose audit trail must verify cleanly. The audit service lives in `/opt/audit-svc/` (C sources + Makefile). It appends signed event batches to a SQLite database at `/var/audit/experiments.db`. A separate verifier binary at `/opt/audit-svc/audit_verify` reads the database and checks every stored HMAC-SHA256 tag.\n\nAfter the recent refactor, verification is failing. Fix the service so that:\n\n1. Every batch written by the service produces an HMAC-SHA256 tag that `audit_verify` accepts.\n2. The canonical byte sequence that is MACed is: the UTF-8 concatenation of each row's `event_id || '|' || timestamp_utc || '|' || payload`, rows ordered by `event_id` ascending, rows joined with `'\\n'`, no trailing newline, then `'\\n' || batch_seq` appended (where `batch_seq` is the batch's sequence number as a decimal string).\n3. The HMAC key is the 32-byte value stored in `/etc/audit-svc/hmac.key` (raw binary, not hex).\n4. The refactored service must continue to compile with `make` in `/opt/audit-svc/` and pass `make test` (unit tests for encoding helpers).\n5. All 50 pre-existing batches in the database must verify correctly after you replay or patch the stored tags, and all newly written batches must also verify.\n\nDo not alter `audit_verify.c` or the database schema.",
+  "requirements": [
+   "Every batch written by the fixed service has an HMAC-SHA256 tag accepted by audit_verify.",
+   "The MACed byte sequence follows the exact canonical form: rows ordered by event_id ascending, each row formatted as event_id|timestamp_utc|payload, rows joined with newline, then newline+batch_seq appended, no trailing newline after batch_seq.",
+   "The HMAC key is read as raw binary from /etc/audit-svc/hmac.key.",
+   "The project compiles with make and passes make test.",
+   "All 50 pre-existing batches in the database verify correctly (tags patched/replayed if needed).",
+   "Newly written batches also verify correctly against audit_verify."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with apt packages: gcc, make, libsqlite3-dev, libssl-dev, sqlite3, python3.",
+   "/opt/audit-svc/ contains: audit_svc.c (main loop, ~400 lines), batch.c (~350 lines, batch assembly), crypto.c (~300 lines, HMAC wrappers), db.c (~350 lines, SQLite helpers), audit_verify.c (verifier, correct and unmodifiable), Makefile, test/ directory with unit tests.",
+   "The planted defects (introduced by the 'refactor'):",
+   "  Defect 1 (misleading symptom source): In crypto.c, the hmac_verify() function does a byte-by-byte comparison in a loop that returns early on the first mismatch \u2014 this looks like a timing-side-channel fix gone wrong and draws attention, but it is functionally correct.",
+   "  Defect 2 (real bug, not visible by reading crypto.c): In batch.c, the row-assembly loop sorts rows by rowid (SQLite insertion order) instead of by event_id. For most batches insertion order == event_id order, so ~70% of batches pass. For batches where any event arrived out-of-order (roughly 30%), the MAC is over a different row sequence than audit_verify expects. The defect is only triggered by the actual row data in the database.",
+   "  Defect 3 (edge case): The canonical form appends '\\n' || batch_seq. After the refactor, batch.c uses snprintf to append '\\nbatch_%d' instead of '\\n%d', so the batch_seq suffix is wrong. This affects 100% of batches but is masked because Defect 2 already fails those batches \u2014 the solver must fix both independently.",
+   "  Defect 4 (edge case on payloads containing '|'): The row formatter in batch.c does not escape '|' characters in payloads. audit_verify.c uses a fixed split-on-first-and-second-pipe logic, so it is robust to embedded pipes in payload. The service formatter was changed to percent-encode '|' as '%7C' in payloads during the refactor, but audit_verify does not decode this, causing mismatches on any batch whose events have '|' in the payload. The test suite only uses payloads without '|', so make test passes regardless.",
+   "/var/audit/experiments.db: SQLite database with schema: CREATE TABLE batches (batch_seq INTEGER PRIMARY KEY, hmac_tag BLOB, written_at TEXT); CREATE TABLE events (event_id TEXT, batch_seq INTEGER, timestamp_utc TEXT, payload TEXT); populated with 50 batches (600 total events), ~30% of batches have out-of-order event_id vs rowid, ~20% have payloads with '|'.",
+   "/etc/audit-svc/hmac.key: 32 bytes of fixed pseudorandom binary.",
+   "audit_verify binary is pre-compiled from audit_verify.c and placed at /opt/audit-svc/audit_verify; source is present but solver is told not to modify it.",
+   "A helper script /opt/audit-svc/replay_tags.sh (stub, solver must implement or use their own approach) to recompute and UPDATE stored hmac_tag values after fixing batch.c."
+  ],
+  "internal_hint": "Difficulty source: 'not visible by reading' \u2014 Defect 2 (wrong sort column) is only revealed by querying the database to find batches where rowid order differs from event_id order. Defect 3 (wrong batch_seq suffix format) is visible in batch.c but masked by Defect 2; a solver who only fixes Defect 2 will see improvement (70% pass) but not 100%. Defect 4 (percent-encoding of '|' in payloads) only triggers on the ~20% of batches with pipe characters in payloads, which the unit tests never exercise. The hmac_verify early-return (Defect 1) is the misleading symptom: it looks like the bug because it's in crypto.c and it's unusual code, but it's functionally correct.\n\nResolution path: (1) Run audit_verify, note 14/50 failures. (2) Inspect crypto.c \u2014 see unusual hmac_verify loop, test it, confirm it is correct. (3) Query the DB: SELECT event_id, rowid FROM events WHERE batch_seq=3 ORDER BY rowid \u2014 observe event_ids not monotone. Recognize the sort is wrong. (4) Fix batch.c: ORDER BY event_id ASC. (5) Re-run verify \u2014 now ~40/50 pass (fixed Defect 2, but Defect 3 still corrupts all). Actually the interaction is: fixing Defect 2 alone leaves all batches failing on the suffix format. The solver must read the canonical spec carefully, compare to the snprintf call in batch.c, and fix the suffix from 'batch_%d' to '%d'. (6) Re-run verify \u2014 now batches without '|' in payloads pass, but ~10 still fail. (7) Query events with '|' in payload \u2014 realize payload encoding is wrong. Remove the percent-encoding from batch.c. (8) Recompute stored hmac_tags for all 50 batches by running a repair script that reads each batch's events from the DB, computes the canonical MAC, and UPDATEs the hmac_tag column. (9) Verify all 50 pass.",
+  "trap": "A shallow solver fixes only Defect 2 (the sort order, which is the most data-visible bug) and patches stored tags. The fuzz verifier generates fresh batches with randomized payloads \u2014 some containing '|' \u2014 and also generates batches where events are inserted out-of-order. The test checks both the stored DB tags AND writes new events through the live service. The percent-encoding defect (Defect 4) causes freshly written batches with '|' in payloads to fail. The batch_seq suffix defect (Defect 3) causes all freshly written batches to fail. A solver who only runs audit_verify against the patched DB and stops will miss both.",
+  "tests": [
+   "test_existing_batches: Open the database, run audit_verify against it, assert all 50 batches report OK.",
+   "test_new_batch_no_pipe: Inject 5 new events with payloads that contain no '|', trigger a batch flush, run audit_verify on the new batch, assert OK.",
+   "test_new_batch_with_pipe: Inject 5 new events with payloads containing one or more '|' characters (generated fresh each verify run), trigger flush, assert audit_verify reports OK.",
+   "test_out_of_order_event_ids: Inject events with event_ids that are non-monotone with respect to insertion order (e.g. insert id='evt_003', then 'evt_001', then 'evt_002'), flush batch, assert audit_verify reports OK \u2014 verifying sort is by event_id not rowid.",
+   "test_batch_seq_suffix: Directly compute the expected MAC for a known event set using the canonical spec, compare to the tag stored by the service, assert byte-for-byte equality \u2014 catches wrong suffix format.",
+   "test_key_reading: Modify hmac.key to a known value, write a batch with known events, assert the stored HMAC matches an externally computed reference (Python hmac.new(key, msg, sha256).digest()).",
+   "test_make_compiles: Run 'make' in /opt/audit-svc/, assert exit code 0.",
+   "test_make_test_passes: Run 'make test' in /opt/audit-svc/, assert all unit tests pass."
+  ],
+  "verifier_knob": {
+   "name": "num_fuzz_batches",
+   "value": "20 batches per category (pipe/no-pipe/out-of-order), 5 events each",
+   "effect": "Increasing to 50+ batches per category and adding edge cases like empty payloads, all-pipe payloads, very long event_ids, and Unicode in payloads raises difficulty; decreasing to 5 per category makes it easier to pass by accident."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the sort order (Defect 2) \u2014 all stored batches now verify but freshly written batches with '|' in payloads still fail.",
+   "Agent fixes sort order and percent-encoding but misses the batch_seq suffix format \u2014 all new batches fail.",
+   "Agent fixes all three code defects but forgets to recompute the stored hmac_tags for the 50 pre-existing batches \u2014 existing-batch tests fail.",
+   "Agent correctly identifies hmac_verify as suspicious (the misleading symptom) and spends most of the session redesigning the comparison function rather than finding the data-dependent bugs.",
+   "Agent patches the stored tags by re-running the still-buggy service, so the tags are recomputed with the remaining defects still present."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "hmac",
+   "sqlite",
+   "c",
+   "refactoring",
+   "audit-trail",
+   "edge-cases"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/audit-svc/batch.c  # read all of batch.c: spot ORDER BY rowid, '\\nbatch_%d' suffix, percent-encoding of '|'",
+   "cat /opt/audit-svc/audit_verify.c  # understand canonical spec and split-on-pipe logic (no %7C decoding)",
+   "cat /opt/audit-svc/crypto.c  # inspect hmac_verify loop \u2014 recognize it is functionally correct (early-return == memcmp)",
+   "./opt/audit-svc/audit_verify /var/audit/experiments.db  # observe 14/50 failures",
+   "sqlite3 /var/audit/experiments.db \"SELECT event_id, rowid FROM events WHERE batch_seq=3 ORDER BY rowid\"  # confirm out-of-order event_ids",
+   "sqlite3 /var/audit/experiments.db \"SELECT payload FROM events WHERE payload LIKE '%|%' LIMIT 5\"  # confirm pipe payloads exist",
+   "# Edit batch.c: fix ORDER BY rowid -> ORDER BY event_id ASC in row-assembly query",
+   "# Edit batch.c: fix snprintf suffix from '\\nbatch_%d' to '\\n%d'",
+   "# Edit batch.c: remove percent-encoding of '|' -> '%7C' in payload formatter",
+   "make -C /opt/audit-svc/  # confirm compiles",
+   "make -C /opt/audit-svc/ test  # confirm unit tests pass",
+   "python3 -I /tmp/replay.py  # script: for each batch, SELECT events ORDER BY event_id, build canonical string, compute HMAC, UPDATE hmac_tag",
+   "/opt/audit-svc/audit_verify /var/audit/experiments.db  # confirm all 50 OK",
+   "# Start/invoke service to write new events including '|' payloads and out-of-order event_ids",
+   "/opt/audit-svc/audit_verify /var/audit/experiments.db  # confirm new batches OK"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Triggering a 'batch flush' in tests (test_new_batch_no_pipe, test_new_batch_with_pipe) depends on the live service's flush mechanism being reliably invokable from the test harness \u2014 if the flush interface is unclear or timing-dependent, this could be flaky.",
+   "The 'replay_tags.sh stub' placeholder implies the solver must write their own repair script; if the test environment doesn't have the service running in a state where new events can be injected cleanly, the new-batch tests may fail for environmental reasons unrelated to the fix.",
+   "Defect 3 (suffix format) symptomatically masks as all batches failing even after fixing Defect 2, which could mislead the solver into thinking their fix was wrong and cause them to revert it \u2014 the instruction gives no hint about interaction between defects.",
+   "The percent-encoding defect (Defect 4) only manifests on ~20% of batches with '|' in payloads; if the fuzz verifier's random payload generation happens to produce no '|' characters in a run (unlikely given the design but possible), that defect goes undetected.",
+   "The test_key_reading test modifies /etc/audit-svc/hmac.key \u2014 if tests run in parallel or share state, this could corrupt other tests that depend on the original key."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 3 because all four defects are directly visible by reading batch.c once the solver knows to look there, and the canonical spec in requirement #2 makes Defects 3 and 4 trivially checkable against the source; a frontier agent would likely identify all bugs in a single careful source read in ~15 commands. The misleading symptom (Defect 1) adds distraction but a strong agent recognizes functionally-equivalent code quickly. To reach genuine_difficulty \u2265 4, the bugs need to be less directly discoverable by source inspection alone.",
+  "fixes": [
+   "Move Defect 2 (sort order) out of batch.c and into a SQL view or a compiled helper so it cannot be found by grepping for 'ORDER BY' \u2014 instead make it a runtime-computed ordering key that looks plausible (e.g. ORDER BY CAST(substr(event_id,5) AS INTEGER) which sorts correctly for most event_ids but fails on ones with alpha suffixes).",
+   "Replace the visible snprintf('\\nbatch_%d') with a call to a helper function format_batch_suffix() whose implementation is in a separate file with a plausible-looking but wrong format string \u2014 this separates the symptom (verifier fails) from the cause (wrong function in a different file) more strongly.",
+   "Add a fifth defect that is data-dependent and invisible in source: a subtle integer overflow in the batch sequence number encoding that only triggers for batch_seq > 127, so early batches pass but later ones fail \u2014 requiring the solver to notice a batch-number-correlated failure pattern.",
+   "Remove or minimize the explicit canonical-form spec from the instruction (or make it a reference to an external doc that must be inferred from audit_verify.c) so the solver must reverse-engineer the correct format from the verifier source rather than just comparing code to spec."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a broken HMAC-SHA256 audit/signing service over structured records with a specific canonical byte sequence, but differ in transport (TCP hex vs SQLite), language details, and the specific bug context."
+    },
+    {
+     "ref_id": "terminal-bench/nextjs-performance",
+     "verdict": "distinct",
+     "reason": "Completely different problem domain \u2014 web app performance optimization vs cryptographic audit trail repair."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Fixing incorrect weighted aggregation summaries in a sales service, not a cryptographic signing/verification problem."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "Fixing a binary frame encode/decode service with a specific wire format, unrelated to HMAC or audit trail signing."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "Fixing a log ingestion pipeline for schema validation and performance, unrelated to cryptographic signing or audit verification."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.292
+    ],
+    [
+     "terminal-bench/nextjs-performance",
+     0.133
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.125
+    ],
+    [
+     "ours/official-aac910462208",
+     0.104
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.081
+    ]
+   ],
+   "cost_usd": 0.013371000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.063291
+}

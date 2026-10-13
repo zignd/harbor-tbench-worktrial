@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "metric-rollup-query-service",
+  "title": "Build a Log Metric Rollup Query Service",
+  "scenario": "You're inheriting a data pipeline at a small infra team. There's a directory of gzipped JSONL log files (one per hour, covering several days) from a fleet of services, plus a partially-built Python query service that's supposed to answer time-range metric rollup questions over HTTP. The query service skeleton exists but the aggregation engine is missing, and there's a hidden normalization rule baked into how the logs encode certain metric values that you'll need to discover by exploring the data before you can get rollups right.",
+  "instruction_draft": "Hey, so I've got this log query service sitting in /app that's supposed to answer HTTP requests like 'give me the p95 latency and error rate for service X between time A and time B, bucketed by hour'. The server starts fine but all queries return wrong numbers. The logs are in /app/logs/ (gzipped JSONL, one file per hour). You need to wire up the missing aggregation backend so the service correctly handles the protocol described in /app/README.md. The verifier will hit it with a bunch of queries against those same log files, so the numbers have to actually match what's in the data. There's also a SQL cache layer that's supposed to persist computed rollups into /app/cache/rollups.db so repeated queries don't re-scan the logs \u2014 that needs to work too.",
+  "requirements": [
+   "The HTTP service at port 8765 must respond to POST /query with a JSON body specifying service_name, start_ts, end_ts, metric (one of: p50, p95, p99, error_rate, request_count), and bucket_seconds",
+   "Responses must return a JSON array of {bucket_start, bucket_end, value} objects covering the requested range, using only complete buckets that fall within [start_ts, end_ts]",
+   "Computed rollups must be persisted to /app/cache/rollups.db (SQLite) so a second identical query does not re-scan the gzipped log files",
+   "p50/p95/p99 latency values must be computed as true percentiles (not averages) across all requests in the bucket",
+   "error_rate is errors divided by total requests in the bucket, expressed as a float 0.0-1.0",
+   "The service must handle queries spanning multiple days and arbitrary bucket sizes (e.g. 300, 3600, 86400 seconds)",
+   "Log entries whose latency_ms field is encoded in the non-default unit (discoverable from the log data) must be normalized to milliseconds before aggregation"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get: sqlite3",
+   "pip: flask, numpy (pinned versions)",
+   "Directory /app/logs/ contains ~96 gzipped JSONL files named YYYYMMDD_HH.jsonl.gz covering 4 days",
+   "Each log line is a JSON object with fields: ts (unix epoch float), service (string), latency_ms (float, but ~15% of records from one specific service encode this in microseconds with a field latency_unit: 'us' \u2014 this is the hidden invariant), status_code (int), request_id (string)",
+   "Approximately 8 services appear in the logs with realistic traffic patterns; one service 'gateway-us' has the microsecond encoding anomaly",
+   "Log generator script (not shipped to solver) seeds random but deterministically so verifier can reproduce expected values",
+   "File /app/server.py: Flask app skeleton that starts, registers a /query route stub returning {'error': 'not implemented'}, and imports but does not call a missing module /app/aggregator.py",
+   "File /app/README.md: describes the HTTP protocol, JSON schema for requests and responses, the SQLite schema expected for the cache table (columns: service, metric, bucket_seconds, bucket_start, value), and states that all latency values in responses must be in milliseconds",
+   "File /app/cache/ directory exists and is writable",
+   "No aggregator.py file exists \u2014 solver must create it",
+   "The log files are realistically sized (~500-2000 entries per hour per service, compressed)",
+   "A small sample query script /app/sample_query.sh exists showing one example POST to the service and its expected output shape (but NOT the expected numeric values, so shallow testing won't catch normalization errors)"
+  ],
+  "internal_hint": "Two independent difficulty sources interact: (1) The solver must BUILD the aggregation engine (aggregator.py) which is non-trivial \u2014 it must scan gzipped JSONL logs, compute true percentiles with numpy, cache results in SQLite, and serve them via Flask. (2) The hidden_invariant is the microsecond encoding: roughly 15% of records for service 'gateway-us' have latency_unit='us', meaning their latency_ms values are actually microseconds and must be divided by 1000. This is NOT mentioned in README.md or server.py \u2014 it can only be discovered by inspecting the log data (e.g. noticing latency values of 50000+ for gateway-us that make no sense as milliseconds, or noticing the latency_unit field). A solver that builds a correct aggregator but misses the normalization will produce wrong p95/p99/p50 values for gateway-us queries, failing those test cases. The SQLite cache requirement also interacts: if the solver caches before normalizing, cached values will be wrong even after they fix normalization. The verifier generates fresh query parameters at verify time (different time ranges, different bucket sizes, different services including gateway-us) so pre-computing answers is not possible.",
+  "trap": "A naive solution builds the aggregator correctly for most services and passes sample queries, but fails all gateway-us latency queries because it never notices the latency_unit field. Additionally, a solver who discovers the normalization bug late may fix it in the scan path but forget to invalidate the SQLite cache, so the second run (which the verifier uses for cache-hit testing) still returns stale wrong values. The verifier explicitly tests gateway-us p95 latency in at least 3 of the query scenarios.",
+  "tests": [
+   "Test 1: POST /query for a non-gateway service (e.g. 'api-orders') p95 latency over a 6-hour window with 3600s buckets \u2014 verify each bucket value matches pre-computed ground truth within 1ms tolerance",
+   "Test 2: POST /query for 'gateway-us' p95 latency over a 4-hour window \u2014 verify values are in the milliseconds range (100-2000ms), not the microseconds range (50000-200000); a service that skips normalization fails this",
+   "Test 3: POST /query for error_rate for any service over a 24-hour window with 3600s buckets \u2014 verify sum of (value * request_count) across buckets approximately equals total errors in raw logs",
+   "Test 4: POST /query for request_count for 'gateway-us' over a 2-hour window \u2014 verify count matches direct grep of log files",
+   "Test 5: Issue an identical query twice; verify the second response is served from SQLite cache by checking /app/cache/rollups.db contains the expected rows AND response matches the first",
+   "Test 6: POST /query with bucket_seconds=300 (5-minute buckets) spanning 3 hours \u2014 verify number of returned buckets is correct (36) and no partial-coverage boundary buckets are included",
+   "Test 7 (generated at verify time): random service, random 12-hour window, p50 metric, 1800s buckets \u2014 computed against ground truth from log generator with fixed seed"
+  ],
+  "verifier_knob": {
+   "name": "number of query scenarios",
+   "value": "7",
+   "effect": "Reducing to 3 scenarios (no gateway-us latency test, no cache test) makes the task easier since the hidden invariant and cache interaction are not exercised; increasing to 10+ scenarios with more services and edge cases (empty buckets, single-record buckets, cross-midnight windows) makes it harder"
+  },
+  "expected_failure_modes": [
+   "Solver builds aggregator correctly but never inspects log data for latency_unit field, so gateway-us latency queries return values 1000x too large",
+   "Solver discovers normalization bug but fixes it after already writing bad values to SQLite cache; verifier's cache-hit test returns stale wrong values",
+   "Solver implements averaging instead of true percentiles for p50/p95/p99 (fails on skewed distributions that appear in the hidden test cases)",
+   "Solver handles boundary conditions incorrectly \u2014 includes partial buckets at the edges of the requested range, causing off-by-one in bucket count and slightly wrong values",
+   "Solver only tests against the sample query (which uses a non-gateway service) and declares success without checking gateway-us"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "logs",
+   "hidden-invariant",
+   "build-component",
+   "service-protocol",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/server.py",
+   "ls /app/logs/ | head -5",
+   "zcat /app/logs/<first_file>.jsonl.gz | head -30  # inspect log structure, notice latency_unit field on gateway-us records",
+   "zcat /app/logs/<first_file>.jsonl.gz | python3 -c \"import sys,json; [print(json.loads(l)) for l in sys.stdin if json.loads(l).get('service')=='gateway-us']\" | head -5  # confirm latency_unit='us' anomaly",
+   "cat /app/sample_query.sh",
+   "# Write /app/aggregator.py: scan gzipped JSONL, normalize latency_unit='us' by /1000, compute numpy percentiles, cache to SQLite, expose scan+query function",
+   "python3 /app/server.py &",
+   "bash /app/sample_query.sh  # verify basic shape",
+   "curl -s -X POST http://localhost:8765/query -H 'Content-Type: application/json' -d '{\"service_name\":\"gateway-us\",\"start_ts\":<ts>,\"end_ts\":<ts+14400>,\"metric\":\"p95\",\"bucket_seconds\":3600}'  # verify ms range not us range",
+   "sqlite3 /app/cache/rollups.db 'SELECT COUNT(*) FROM rollups;'  # verify cache populated",
+   "# Re-run same curl command to test cache hit",
+   "curl -s -X POST http://localhost:8765/query -H 'Content-Type: application/json' -d '{\"service_name\":\"api-orders\",\"start_ts\":<ts>,\"end_ts\":<ts+10800>,\"metric\":\"p95\",\"bucket_seconds\":300}'  # verify 36 buckets returned",
+   "# Verify bucket count is exactly 36, no partial boundary buckets",
+   "# Check error_rate computation with a manual count from logs",
+   "kill %1 && python3 /app/server.py &  # restart, verify cache still works"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The hidden invariant (latency_unit field) is directly visible in log JSON on first inspection \u2014 any agent that reads log samples will see it, making it not truly 'hidden'. The invariant is described as discoverable only by 'exploring data' but a single `zcat | head` command reveals it.",
+   "The cache invalidation trap only triggers if the agent writes bad values before discovering the normalization bug \u2014 a systematic agent who explores data first (the natural approach) avoids this entirely, so the 'trap' may not catch frontier agents.",
+   "Tolerance spec for Test 1 is '1ms tolerance' for p95 \u2014 this could be flaky if the verifier uses floating-point numpy percentile interpolation differently than the solver, especially at bucket boundaries with small sample counts.",
+   "Test 3's verification (sum of value * request_count \u2248 total errors) requires the verifier to know request_count per bucket, which means two separate queries or pre-computed data \u2014 if the verifier doesn't handle this correctly, it could produce false failures.",
+   "The verifier generates 'fresh query parameters at verify time' but the log data is fixed-seed deterministic \u2014 if there's any timing or ordering non-determinism in how the verifier selects time windows relative to log file boundaries, bucket alignment could differ.",
+   "No mention of what happens with empty buckets (time ranges with zero requests) \u2014 if the verifier expects them omitted vs. returned as null/zero, a mismatch could cause failures that aren't the solver's fault.",
+   "The instruction says 'complete buckets that fall within [start_ts, end_ts]' but doesn't clarify whether bucket_start >= start_ts AND bucket_end <= end_ts, or other interpretations \u2014 this ambiguity could cause Test 6's bucket count check to be contentious."
+  ],
+  "verdict": "reject",
+  "reasons": "The task scores below the required threshold on genuine_difficulty (2/5): the hidden invariant is immediately visible in log JSON on first `zcat | head` inspection, the aggregator.py is well-specified and straightforward for a skilled agent, and the speedrun reaches a likely-successful solution in ~16 commands. A frontier agent would succeed on this task most of the time, not 'fail often for real reasons.' Additionally, there are several invalid failure risks around tolerance specs, empty bucket handling, and cache behavior that could produce unfair failures.",
+  "fixes": [
+   "Make the hidden invariant harder to discover: instead of a visible JSON field `latency_unit`, encode the anomaly structurally (e.g., some log files use a different field name like `duration` instead of `latency_ms`, or the unit is documented only in a comment in a non-obvious config file the solver must find)",
+   "Add a second hidden invariant that interacts with the first \u2014 e.g., gateway-us also uses a different timestamp encoding (milliseconds instead of seconds for ts field) so the solver must discover two normalization rules and both must be correct for any gateway-us query to pass",
+   "Increase the build complexity: require the aggregator to support streaming/incremental updates (new log files arrive during the query window), or require a more complex SQL schema with per-service config table that must be joined",
+   "Remove or heavily restrict the sample_query.sh so it only tests a non-gateway service, and make the README deliberately not mention the latency_unit field anywhere, forcing log exploration rather than just reading docs",
+   "Clarify empty bucket handling in the protocol spec (return zero-value buckets, or omit them, or return null) to eliminate that invalid failure risk",
+   "Specify exact percentile interpolation method (e.g., 'numpy default linear interpolation') in README to prevent tolerance-based flakiness in Test 1"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a weighted sales aggregation bug in a compiled service with a config file mismatch, not building an HTTP log query service with percentile rollups and SQLite caching."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a log enrichment pipeline with GeoIP enrichment and a Flask API for per-country stats, not building a time-range metric rollup query service with percentile computation."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a NetFlow v9 UDP/TCP aggregation service in Rust, not building an HTTP log query service that computes percentile latency rollups from gzipped JSONL files."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a black-box normalizer binary and fixing SQL rollup queries, not building an HTTP query service with percentile computation over gzipped JSONL logs."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NDJSON schema validation and throughput in a Node.js ingestion pipeline, not building a time-range HTTP rollup query service with SQLite caching and hidden unit normalization."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.17
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.157
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.147
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.141
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.126
+    ]
+   ],
+   "cost_usd": 0.014799
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057927
+}

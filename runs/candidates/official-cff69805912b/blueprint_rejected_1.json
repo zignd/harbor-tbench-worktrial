@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "hmac-audit-log-service",
+  "title": "HMAC Audit Log Verification Service",
+  "scenario": "You maintain a firmware build pipeline for a resource-constrained IoT product line. The pipeline appends signed audit entries to a rolling log, and a small Python service reads those logs to answer cryptographic verification queries from the CI system. The repository has accumulated two years of commits; the signing scheme was quietly changed in a patch six months ago, but the verifier service was only partially updated and now silently produces wrong answers on pre-change entries.",
+  "instruction_draft": "You work on the embedded build toolchain at a bootstrapped hardware startup. The audit log verifier at `/app/verifier/` is supposed to answer protocol queries over a Unix socket: for any log entry id the caller supplies, the service must return whether the entry's HMAC is valid, the canonical hex digest it computed, and the algorithm name it used. The CI harness is reporting that verification passes for entries it should reject, and rejects entries that were signed correctly before last November's scheme change.\n\nThe log files live in `/app/logs/` and the git history of `/app` records every schema and key change. Your job is to make `/app/verifier/server.py` (keep the existing socket path `/tmp/audit.sock`) answer correctly for every entry in any log the harness sends, including entries written under both the old and the new signing scheme. The service must stay running as a daemon; the harness connects fresh for each batch of queries. Each query is a newline-terminated JSON object `{\"id\": \"<entry-id>\"}` and expects a newline-terminated JSON response `{\"valid\": <bool>, \"digest\": \"<hex>\", \"algorithm\": \"<name>\"}`.",
+  "requirements": [
+   "The verifier service runs as a daemon listening on the Unix socket /tmp/audit.sock.",
+   "For each query {\"id\": \"<entry-id>\"}, the service returns {\"valid\": <bool>, \"digest\": \"<hex>\", \"algorithm\": \"<name>\"} as a newline-terminated JSON object.",
+   "The service correctly verifies entries signed under the old scheme (pre-change) and the new scheme (post-change), distinguishing them by the entry's metadata embedded in the log.",
+   "The 'digest' field contains the HMAC hex digest the service computed (using the correct key and algorithm for that entry's epoch), regardless of whether it matches the stored digest.",
+   "The 'algorithm' field names the HMAC algorithm actually used for that entry (e.g. 'hmac-sha256' or 'hmac-sha1').",
+   "The 'valid' field is true if and only if the computed digest matches the digest stored in the log entry.",
+   "The service handles entries from log files covering both signing epochs without crashing or returning incorrect results."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with pip packages: none beyond stdlib (hmac, hashlib, json, socket are all stdlib).",
+   "Git repository at /app initialized with ~30 commits spanning 18 months of fake history.",
+   "Early commits establish a log schema v1: entries are JSONL records with fields {id, timestamp, payload, epoch, digest}, where digest = HMAC-SHA1(key_v1, id + ':' + payload) as hex.",
+   "A commit labelled 'security: upgrade HMAC to SHA-256 and rotate key' (6 months ago in fake history) changes the scheme: digest = HMAC-SHA256(key_v2, id + '|' + timestamp + '|' + payload) as hex. The epoch field changes from 'v1' to 'v2'.",
+   "/app/logs/ contains two log files: audit-old.jsonl (v1 entries, ~200 lines) and audit-new.jsonl (v2 entries, ~200 lines), plus a mixed audit-mixed.jsonl that interleaves both.",
+   "/app/verifier/server.py exists and starts a Unix socket server. It currently uses only the v2 scheme for all entries, so v1 entries all fail verification and return wrong digests.",
+   "/app/verifier/config.py holds both keys (key_v1, key_v2) as constants, but server.py only imports key_v2.",
+   "The git log shows the key rotation commit clearly; the v1 key is visible in the older version of config.py reachable via git show.",
+   "MISLEADING SYMPTOM: a comment in server.py says 'TODO: handle legacy epoch field' near a block that checks entry['epoch'] \u2014 but the block is actually correct for routing; the real bug is that the HMAC construction string (the message fed to HMAC) is wrong for v1 entries (uses v2's concatenation format with '|' and timestamp, not v1's ':' without timestamp), AND uses key_v2 for v1 entries.",
+   "A /app/tools/log_generator.py script (for reference) shows the exact construction used per epoch, but it is only discoverable by exploring the repo.",
+   "The verifier must stay running; it should loop accepting connections, handle one query per connection, and not exit.",
+   "At verify time, the harness generates 50 fresh log entries for each epoch by computing correct HMACs with the known keys and correct formats, inserts 10 deliberately corrupted entries per epoch, and queries all of them."
+  ],
+  "internal_hint": "Difficulty comes from two interacting bugs that are not visible by reading server.py alone: (1) the HMAC key used for v1 entries is key_v2 instead of key_v1 \u2014 this is a data-dependent path error that only manifests on v1 entries, (2) the message string fed to HMAC for v1 entries uses the v2 format (id + '|' + timestamp + '|' + payload) instead of the v1 format (id + ':' + payload, no timestamp). The misleading symptom is a 'TODO: handle legacy epoch field' comment near routing logic that actually works correctly \u2014 the solver who reads the file and sees the comment will waste time there. The real fixes require: (a) git-log or git-show to find the original key and message format from before the rotation commit, (b) running the service against sample v1 entries to observe that digests are wrong even when epoch routing looks right, (c) cross-referencing log_generator.py (in git history or working tree) to get exact construction strings. The solver must instrument or run the service against known-good entries to discover the message format mismatch, since both bugs live in a single HMAC-computation expression that looks plausible at a glance.",
+  "trap": "A solver who reads server.py, notices the epoch field is already checked, decides the routing is fine, and only fixes the key (adding key_v1 for v1 entries) will pass most v1 entries but fail all of them because the message construction string is also wrong. Since the harness generates fresh entries at verify time with the correct v1 format, a partial fix that corrects only the key or only the message format fails ~50% of all queries. A solver who tests only against the provided log files may get lucky on a subset but the hidden entries expose both dimensions of the bug.",
+  "tests": [
+   "Verifier correctly returns valid=true and matching digest for 50 freshly generated v1 entries (HMAC-SHA1, key_v1, message = id + ':' + payload).",
+   "Verifier correctly returns valid=false and the computed (wrong) digest for 10 deliberately corrupted v1 entries.",
+   "Verifier correctly returns valid=true and matching digest for 50 freshly generated v2 entries (HMAC-SHA256, key_v2, message = id + '|' + timestamp + '|' + payload).",
+   "Verifier correctly returns valid=false and the computed digest for 10 deliberately corrupted v2 entries.",
+   "The 'algorithm' field is 'hmac-sha1' for v1 entries and 'hmac-sha256' for v2 entries in all responses.",
+   "The service remains running and accepts a second batch of queries after the first batch completes (daemon behavior).",
+   "The 'digest' field for an invalid entry matches what the service computed (not the stored digest), confirming the computation path is correct even on mismatches.",
+   "Querying a non-existent entry id returns a JSON error response without crashing the daemon."
+  ],
+  "verifier_knob": {
+   "name": "num_fresh_entries_per_epoch",
+   "value": "50",
+   "effect": "Raising to 200 exposes any remaining edge cases in message construction (e.g. payloads containing ':' or '|'); lowering to 10 makes it easier to get lucky with a partial fix."
+  },
+  "expected_failure_modes": [
+   "Solver reads server.py, sees epoch routing logic near the TODO comment, concludes routing is correct, and only fixes the key assignment \u2014 leaving the message format bug intact, causing all v1 digests to be wrong.",
+   "Solver fixes both key and message format for v1, but computes the digest for the 'digest' response field using the stored value instead of the computed value, failing the 'digest on invalid entry' tests.",
+   "Solver identifies the message format from the log files by parsing stored entries (which show correct digests) and reverse-engineers the format empirically but gets the exact separator wrong (e.g. uses ' ' instead of ':'), causing subtle failures on fresh entries.",
+   "Solver makes the service handle one query and exit rather than looping, passing single-connection tests but failing the daemon persistence test.",
+   "Solver finds log_generator.py in the working tree but not the git history version, and if the working tree copy was also updated to v2 format, reconstructs the wrong v1 format."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "hmac",
+   "git-history",
+   "devops",
+   "python",
+   "log-processing",
+   "service-protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/verifier/server.py",
+   "cat /app/verifier/config.py",
+   "git -C /app log --oneline",
+   "cat /app/logs/audit-old.jsonl | head -5",
+   "cat /app/tools/log_generator.py",
+   "# Identify: v1 uses key_v1+SHA1+id+':'+payload; v2 uses key_v2+SHA256+id+'|'+ts+'|'+payload",
+   "# Edit server.py: branch on entry['epoch']; use correct key+algo+message per epoch; loop accepting connections",
+   "python /app/verifier/server.py &",
+   "echo '{\"id\": \"<some-v1-id>\"}' | nc -U /tmp/audit.sock",
+   "echo '{\"id\": \"<some-v2-id>\"}' | nc -U /tmp/audit.sock",
+   "# Verify valid=true, correct algorithm field, correct digest field",
+   "# Confirm daemon still running after two connections"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'digest' field requirement (return computed digest even for invalid entries) is stated in the requirements but easy to miss \u2014 however this is a legitimate test of comprehension, not ambiguity.",
+   "If log_generator.py in the working tree already shows v2 format (as the blueprint's own trap scenario mentions), and if the git-history version also shows v2, the solver cannot reconstruct v1 format from that file \u2014 this creates an environment consistency risk depending on how the environment is built.",
+   "The blueprint says 'only discoverable by exploring the repo' about log_generator.py but it's at a predictable path /app/tools/ in the working tree, making it trivially findable with ls or find, undermining the intended discovery friction.",
+   "The non-existent entry id test is mentioned in test list but the expected response format is not specified in the instruction (JSON error response \u2014 what fields?), creating ambiguity that could cause valid solutions to fail.",
+   "The harness generates 50 fresh entries at verify time using 'known keys and correct formats' \u2014 but the keys are embedded in config.py visible to the solver; the difficulty of format discovery collapses once log_generator.py is read, making the two bugs effectively a one-step fix."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because a skilled agent can solve this in ~12 commands: read server.py, read config.py (both keys present), read /app/tools/log_generator.py (in working tree, trivially findable), understand both bugs from that single file, write one corrected branch expression. The two-bug 'trap' collapses into a single edit once log_generator.py is found, and the misleading TODO comment is not a real obstacle for an agent that tests empirically. The non-existent entry id response format is also unspecified, creating an invalid failure risk.",
+  "fixes": [
+   "Remove log_generator.py from the working tree entirely \u2014 place it only in git history before the rotation commit, forcing the agent to use git-show or git-log to find it, adding 3-5 non-trivial commands.",
+   "Introduce a third signing epoch or a subtle key-derivation step (e.g., key_v1 is PBKDF2-derived from a passphrase in an old config file) so that finding the key requires more than reading config.py.",
+   "Specify the exact JSON schema for non-existent entry id responses (e.g., {\"error\": \"not found\"}) to eliminate the ambiguity failure risk.",
+   "Make the epoch field in log entries ambiguous or absent for some entries (requiring the agent to infer epoch from timestamp range by consulting git history), increasing the number of exploration steps required.",
+   "Add a third bug: the service closes the socket after one query (already partially listed as a trap), but make the fix non-obvious by requiring SO_REUSEADDR or proper socket lifecycle management, ensuring daemon persistence requires a real implementation change beyond just adding a loop."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Both involve HMAC over log records via a socket service, but the reference task focuses on binary WAL record canonicalization and a single fixed scheme, while the candidate requires handling two different signing epochs from git history with a Unix socket daemon."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference task is about NDJSON schema validation and throughput performance, not HMAC cryptographic verification."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference task involves a log enrichment pipeline with GeoIP and a Flask API, not HMAC audit log cryptographic verification."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The reference task involves NetFlow v9 UDP/TCP aggregation in Rust, not HMAC audit log verification with multiple signing epochs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference task involves fixing weighted sales aggregation in a compiled service, not HMAC cryptographic verification across multiple signing scheme epochs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.249
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.137
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.136
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.132
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.129
+    ]
+   ],
+   "cost_usd": 0.014162999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.047997
+}

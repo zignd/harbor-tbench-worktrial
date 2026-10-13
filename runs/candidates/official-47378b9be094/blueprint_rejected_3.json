@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "spectral-pipeline-regression-recovery",
+  "title": "Spectral Analysis Pipeline Regression Recovery",
+  "scenario": "A small open-source Python package, `spectraflow`, performs multi-step spectral preprocessing and peak-finding for mass spectrometry data. After a recent 'feature iteration' refactor that added configurable baseline correction and a new outlier-clipping stage, the deployed pipeline silently produces wrong peak tables for certain instrument batches \u2014 the maintainer sees a regression report but the unit tests still pass. The codebase (~1,200 lines across six modules) includes a compiled C extension (`spectraflow/_fast_baseline.so`) whose source is not shipped, a TOML config system, and a small SQLite results database that accumulates runs. The container ships a reference dataset and a `verify_run.py` harness the maintainer uses to check output integrity.",
+  "instruction_draft": "The `spectraflow` pipeline at `/app` is producing incorrect peak tables for some instrument batches since the last release. Restore the pipeline so that `python -m spectraflow.run --config /app/config/default.toml --input /app/data/batch_*.mzML --db /app/results.db` writes correct peak rows to the database for all batches, and `python /app/verify_run.py` exits 0.",
+  "requirements": [
+   "Running `python -m spectraflow.run` with the default config and all batch input files completes without error.",
+   "The SQLite database `/app/results.db` contains one row per (batch_id, peak_id) with correct mz, intensity, and fwhm values within documented tolerances for every batch file.",
+   "The `baseline_method` config key and the `outlier_clip_sigma` config key are both honoured correctly for all batches, including edge cases where sigma is large (no clipping) or baseline_method is 'none'.",
+   "`python /app/verify_run.py` exits 0, which checks checksums of computed peak tables against reference values stored in `/app/data/reference_peaks.json`.",
+   "The per-batch `status` column in the database is `'ok'` for all rows (not `'skipped'` or `'error'`)."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install libsqlite3-dev; pip install numpy==1.26.4 scipy==1.13.1 tomllib-backport pyopenms==3.1.0 (pinned).",
+   "Directory /app/spectraflow/ with six Python modules: __main__.py, run.py, pipeline.py, baseline.py, peaks.py, db.py (~200 lines each).",
+   "A compiled C extension /app/spectraflow/_fast_baseline.so (no source) that exports fast_arpls(y, lam, p) \u2014 an Asymmetric Reweighted Penalized Least Squares baseline estimator. It takes a 1-D float64 array and two floats and returns a same-shape baseline array.",
+   "Bug 1 (data-dependent, not visible by reading): In baseline.py the call to _fast_baseline.fast_arpls passes arguments as (lam, y, p) instead of (y, lam, p) \u2014 positional swap. This only manifests as wrong output (not a crash) when the lam value is numerically close to a valid array length, which happens only for the 'high_res' batch files. The 'low_res' batch files pass their checks coincidentally.",
+   "Bug 2 (ordered procedure / config interaction): In run.py, after the refactor, the outlier_clip_sigma value is read from config BEFORE the config file is parsed (the parse call was accidentally moved below the read). For the default config this silently gives sigma=inf (Python default for missing key lookup on an empty dict), which means no clipping happens and results look plausible \u2014 but the schema check in db.py flags rows where sigma was not applied to high-amplitude spikes, setting status='skipped'. This is only detectable by querying the DB or running verify_run.py.",
+   "Bug 3 (ordered procedure): The DB schema migration added a `fwhm` column but the INSERT in db.py still uses the old positional tuple (omitting fwhm), so fwhm is NULL for all rows. verify_run.py checks fwhm is non-null and within 10% of reference.",
+   "Five batch files: /app/data/batch_low_res_1.mzML, batch_low_res_2.mzML, batch_high_res_1.mzML, batch_high_res_2.mzML, batch_high_res_3.mzML \u2014 synthesized with pyopenms at Dockerfile build time using a seeded random generator so they are deterministic.",
+   "/app/data/reference_peaks.json \u2014 generated at build time by running a known-good version of the pipeline (before the regression), stored as {batch_id: [{peak_id, mz, intensity, fwhm}, ...]}.",
+   "/app/config/default.toml with keys: baseline_method='arpls', lam=1e5, p=0.01, outlier_clip_sigma=3.5.",
+   "/app/verify_run.py: opens results.db, checks row count, status='ok' for all rows, fwhm non-null, and that mz/intensity/fwhm match reference_peaks.json within 1% tolerance.",
+   "/app/results.db: pre-created empty SQLite DB with the new schema (including fwhm column).",
+   "A /app/CHANGELOG.md describing the feature additions vaguely: 'Added configurable baseline correction and outlier clipping; refactored config loading for extensibility.'"
+  ],
+  "internal_hint": "Three interacting bugs introduced during the feature-iteration refactor. Bug 1 is NOT visible by reading baseline.py in isolation \u2014 the argument swap (lam, y, p) vs (y, lam, p) only produces wrong numerical output (not a crash) and only corrupts results when lam\u2248len(y), which only occurs for the high_res batches (length 100000, lam=1e5). The solver must run the pipeline, see that high_res peaks are wrong, instrument the C extension call, and discover the swap by checking argument types/shapes. Bug 2 requires understanding Python execution order: the config dict is read before tomllib.loads() is called, so outlier_clip_sigma is missing from the dict and defaults to inf; this must be found by adding print statements or a debugger to run.py. Bug 3 is in db.py: the INSERT statement uses `(batch_id, peak_id, mz, intensity, status)` but the schema has `(batch_id, peak_id, mz, intensity, fwhm, status)` \u2014 fwhm is silently NULL. The ordered-procedure difficulty: fixing only bug 1 makes high_res peaks numerically correct but DB rows still have status='skipped' (bug 2) and fwhm=NULL (bug 3), so verify_run.py still fails. Fixing bug 2 alone lets clipping work but baseline is still wrong for high_res. Fixing bug 3 alone gives fwhm but wrong values. All three must be fixed in any order, but each is independently invisible until the pipeline actually runs on real data.",
+  "trap": "A naive agent reads baseline.py, sees the arpls call, and doesn't notice the argument order is wrong (the variable names look plausible). It then runs verify_run.py, sees it fails on fwhm (bug 3, most visible from the error message), fixes the INSERT, runs again, sees status='skipped' failures (bug 2), fixes the config read order, runs again \u2014 but high_res peaks are still wrong (bug 1 never found because no crash occurred). The agent declares success after fixing 2 of 3 bugs because the low_res batches pass and the error messages are gone for those. Hidden verify-time inputs include a fresh batch_high_res_4.mzML generated with a different seed at verify time, ensuring the baseline argument-swap bug cannot be masked by coincidental numeric agreement.",
+  "tests": [
+   "Verify results.db has exactly N rows (5 batches \u00d7 expected peaks per batch, checked against reference_peaks.json count) with status='ok' for all.",
+   "Verify fwhm is non-NULL and within 10% of reference for every row.",
+   "Verify mz and intensity values match reference within 1% for all low_res and high_res rows.",
+   "Run pipeline on a fresh batch_high_res_4.mzML (generated at verify time with a different seed but same lam/length so the argument-swap bug triggers) and check that output peaks match a pre-computed oracle within 1%.",
+   "Run pipeline with config outlier_clip_sigma=2.0 on a synthetic batch that has planted spike outliers; verify the spikes are clipped (intensity reduced) in the DB output.",
+   "Run pipeline with config baseline_method='none'; verify no baseline subtraction occurs (peak intensities match raw data, not baseline-corrected data).",
+   "Check that status='ok' for all rows across all batches in results.db (not 'skipped' or 'error')."
+  ],
+  "verifier_knob": {
+   "name": "number of independent state properties checked",
+   "value": "7",
+   "effect": "Raising to 9 adds checks on per-batch run timestamps in DB and a cryptographic checksum of the peak table; lowering to 4 drops the fresh-batch and config-variation tests, making it easier."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the visible fwhm NULL bug (bug 3) and the config-read-order bug (bug 2) but never finds the C extension argument swap (bug 1) because it produces wrong numbers not a crash.",
+   "Agent notices high_res batches give wrong peaks, tries to rewrite the baseline in pure Python to avoid the extension, but their pure Python ARPLS has a subtle numerical difference from the reference oracle, so verify_run.py still fails on tolerance.",
+   "Agent fixes all three bugs but resets results.db incorrectly (e.g. forgets to re-run against all five batches), so the DB has only partial rows.",
+   "Agent fixes bug 1 (argument swap) by guessing but swaps in the wrong direction, making low_res batches now fail too.",
+   "Agent finds the config ordering bug, 'fixes' it by hardcoding sigma=3.5 rather than reading from config, so the config-variation test (sigma=2.0) fails."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "regression",
+   "compiled-extension",
+   "config-bug",
+   "sqlite",
+   "ordered-procedure",
+   "reverse-engineering"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/spectraflow/run.py",
+   "cat /app/spectraflow/db.py",
+   "cat /app/spectraflow/baseline.py",
+   "python -m spectraflow.run --config /app/config/default.toml --input /app/data/batch_*.mzML --db /app/results.db",
+   "python /app/verify_run.py  # observe: fwhm NULL, status=skipped, high_res mz wrong",
+   "edit db.py: fix INSERT tuple to include fwhm column",
+   "edit run.py: move tomllib.loads() call above outlier_clip_sigma read",
+   "python -m spectraflow.run ... (re-run)",
+   "python /app/verify_run.py  # still fails on high_res intensity/mz",
+   "examine baseline.py fast_arpls call arguments carefully",
+   "edit baseline.py: swap (lam, y, p) to (y, lam, p)",
+   "python -m spectraflow.run ... (re-run all batches)",
+   "python /app/verify_run.py  # exits 0"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 3
+  },
+  "invalid_failure_risks": [
+   "Bug 1's core premise is physically implausible: passing a Python float (lam=1e5) where a C extension expects a 1-D numpy float64 array would almost certainly raise TypeError or segfault, not silently produce wrong numerical output. The 'silent wrong output' behavior requires very specific C extension implementation that is unspecified in the blueprint.",
+   "pyopenms==3.1.0 is ~500MB+ and has complex native dependencies; building it in a 1 CPU / 2 GB container from python:3.13-slim-bookworm may fail or time out, making the task unbuildable as described.",
+   "The compiled _fast_baseline.so must be built for python:3.13-slim-bookworm's exact ABI (CPython 3.13, glibc version, etc.); shipping a pre-compiled .so without source creates fragile ABI coupling that may silently fail to import or crash rather than misbehave.",
+   "numpy==1.26.4 may not have wheels for Python 3.13; numpy 1.26.x officially supports up to Python 3.12, so pip install may fail or require compilation, breaking the build.",
+   "The 'hidden batch_high_res_4.mzML generated at verify time' requires the verifier to run pyopenms at verify time, adding environmental fragility to the verification step.",
+   "tomllib is built into Python 3.11+ stdlib, so 'tomllib-backport' on Python 3.13 may conflict or be a no-op, and the import path in run.py must match whichever is used.",
+   "A strong agent reading baseline.py will likely notice the argument swap in 13 commands total (speedrun), making genuine_difficulty insufficient for a 'hard' task."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical physical implausibility at its core: Bug 1 claims a C extension receives a float where it expects a numpy array and produces wrong-but-not-crashing output, which is nearly impossible without very specific (unspecified) C implementation. Additionally, numpy==1.26.4 does not support Python 3.13, making the environment as described unbuildable. The speedrun reaches a solution in ~13 commands, which is too shallow for a 'hard' task scoring genuine_difficulty\u22654.",
+  "fixes": [
+   "Fix Bug 1's mechanism: instead of argument order swap (which would crash), use a subtle numerical bug that's source-visible but behaviorally hidden \u2014 e.g., lam is divided by 1000 in baseline.py (off-by-1000 scale), which gives wrong baseline only for high_res due to different signal amplitude range, and produces plausible-looking but shifted peaks.",
+   "Replace numpy==1.26.4 with numpy>=2.0 or use python:3.12-slim-bookworm to match numpy 1.26.x's supported Python versions; verify pyopenms has wheels for the chosen combination before finalizing the blueprint.",
+   "Replace or augment the compiled C extension requirement: either ship the .so pre-built for the exact target ABI with a documented build process, or make Bug 1 a pure-Python subtle logic error that doesn't depend on C extension argument passing, eliminating the ABI fragility.",
+   "To increase genuine_difficulty beyond 3, add a fourth bug that requires understanding the spectral domain (e.g., a window-size off-by-one in peak detection that only matters for closely-spaced peaks), ensuring the speedrun exceeds 20 commands and requires domain reasoning rather than just code-reading."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/dual-bash-python-config-parser",
+     "verdict": "distinct",
+     "reason": "Config parsing is a minor element here; the core problem is debugging a silent regression in a scientific data processing pipeline with a compiled extension and database output."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fluorescence-peak-fitting-pipeline",
+     "verdict": "distinct",
+     "reason": "That task asks you to implement a peak-fitting pipeline from scratch; this task asks you to debug a regression in an existing pipeline, a fundamentally different problem type."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "variant",
+     "reason": "Both tasks involve diagnosing a silent regression in a multi-step processing pipeline that produces wrong output without raising errors, then restoring correctness verified by a harness \u2014 the core debugging challenge is essentially the same even though the domain (CSV chunking vs. spectral analysis) and specific bugs differ."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task centers on reverse-engineering a black-box binary normalizer to characterize its transformation function, whereas this task is about finding and fixing Python-level logic bugs in an existing codebase."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task is a straightforward ETL aggregation correctness fix with clear SQL semantics; this task involves a domain-specific spectral analysis pipeline with a compiled C extension, TOML config, and checksum-based verification, making the debugging challenge substantially different."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/dual-bash-python-config-parser",
+     0.157
+    ],
+    [
+     "terminal-bench-pro/fluorescence-peak-fitting-pipeline",
+     0.15
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.147
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.141
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.117
+    ]
+   ],
+   "cost_usd": 0.015168000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056157
+}

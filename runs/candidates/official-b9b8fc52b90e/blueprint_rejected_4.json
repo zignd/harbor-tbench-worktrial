@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-c-service-repair",
+  "title": "Fix the Analyst's Broken Ledger Rollup Service",
+  "scenario": "An analyst noticed their daily summary numbers stopped matching raw transaction totals three weeks ago. The in-house C service `ledgerd` reads transaction records over a Unix socket, accumulates per-account running balances, and answers balance and rollup queries. The codebase is ~1,400 lines across a daemon, a shared accumulator library, and a shell-based migration/startup script that seeds historical data. The analyst has filed a ticket: 'rollups are off by amounts I cannot predict, and sometimes accounts that should show a credit show a debit.'",
+  "instruction_draft": "The ledger rollup service at /app is producing incorrect per-account balances and rollup totals. Fix it so that every balance query returns the correct running total for that account, every debit/credit sign is preserved correctly, and the rollup endpoint returns the sum of all account balances that matches the sum of all individual transactions. The service must stay running on its socket and answer the protocol correctly after your fix.",
+  "requirements": [
+   "Each balance query response for an account equals the algebraic sum of all transactions posted to that account (debits negative, credits positive).",
+   "The rollup endpoint returns a value equal to the sum of all individual account balances, which itself equals the sum of all raw transactions.",
+   "Debit transactions are recorded as negative amounts; credit transactions as positive amounts.",
+   "The service remains running on its Unix socket /tmp/ledgerd.sock and responds to the wire protocol after the fix.",
+   "The startup migration script must complete without error before the service accepts connections, and any historical seed data must be correctly incorporated into balances."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y gcc make socat netcat-openbsd; no internet after build.",
+   "Directory /app/src/ with ~1,400 lines of C across: ledgerd.c (daemon, socket server, ~500 lines), accumulator.c/.h (per-account hash table and running sum logic, ~350 lines), protocol.c/.h (wire frame parser/emitter, ~250 lines), and util.c/.h (misc helpers, ~150 lines).",
+   "Makefile at /app that builds the daemon to /app/bin/ledgerd.",
+   "Shell script /app/scripts/start.sh: compiles the service, runs /app/scripts/migrate.sh to seed historical CSV data, then starts the daemon. The migration script reads /app/data/seed_transactions.csv and POSTs each record over the socket using socat \u2014 but it does so BEFORE the daemon binds the socket (ordering bug: it calls migrate before the daemon is ready, causing silent drop of all seed data).",
+   "Bug 1 (data-dependent, not visible by reading): accumulator.c uses a fixed-width int32_t for the running sum. With the seed data missing (due to ordering bug), values fit in int32_t and look fine. When seed data IS correctly loaded, large account totals silently overflow int32_t, producing wrong and sign-flipped results. The overflow only manifests when both bugs are fixed together.",
+   "Bug 2 (ordering bug in start.sh): migrate.sh runs before the daemon's socket exists. socat fails silently (exit 0 with a warning to stderr that is redirected to /dev/null). All historical seed transactions are dropped. Fixing only the ordering reveals bug 1.",
+   "/app/data/seed_transactions.csv: ~800 rows, account IDs and amounts, some accounts with totals exceeding INT32_MAX when summed.",
+   "/app/data/sample_query.sh: a sample shell script showing how to send a BALANCE or ROLLUP protocol message over the socket and read the response \u2014 this is the reference for the wire protocol.",
+   "Protocol: newline-delimited text. POST <acct> <CREDIT|DEBIT> <amount_cents>\\n; BALANCE <acct>\\n \u2192 +<balance>\\n or -<balance>\\n; ROLLUP\\n \u2192 <total>\\n. Amounts are integers (cents).",
+   "The rollup total in accumulator.c is also int32_t (same overflow bug, second instance).",
+   "/app/scripts/migrate.sh has `2>/dev/null` hiding socat connection-refused errors, and exits 0 regardless.",
+   "Planted red herring: protocol.c has a commented-out alternative frame delimiter that looks suspicious but is not the cause of any bug."
+  ],
+  "internal_hint": "Two interacting bugs, each hiding the other. Bug A (ordered procedure): start.sh calls migrate.sh before the daemon socket exists; socat errors are silenced so seed data is silently dropped. With no seed data, account totals are small and fit in int32_t, so the numbers look plausible. Bug B (not visible by reading alone; only manifests at runtime with real data): accumulator.c and the rollup accumulator use int32_t for running balances; with large seed amounts, these overflow and produce wrong/sign-flipped results. Fix order matters: (1) fix start.sh to wait for the socket before migrating (use a loop checking for socket existence), (2) change int32_t to int64_t in accumulator.c for both per-account and rollup accumulators, (3) recompile, (4) restart. Doing only step 1 reveals step 2; doing only step 2 appears to fix it on small test inputs but fails on real data. The solver must observe the service running with actual seed data to see the overflow, which requires instrumenting or querying after fixing the ordering.",
+  "trap": "A naive agent fixes the ordering bug in start.sh (clearly visible once they read the script), restarts, queries the sample account shown in sample_query.sh (which has a small balance and fits in int32_t), sees a correct answer, and stops. The hidden tests send fresh large-amount transaction sequences and seed data that overflow int32_t, producing wrong balances. The agent has not changed the accumulator type, so large accounts fail. Alternatively, an agent that only changes int32_t to int64_t but does not fix the migration ordering will get incorrect balances because seed data is still silently dropped, and rollup will be wrong.",
+  "tests": [
+   "Verifier starts the service fresh via /app/scripts/start.sh (must succeed without error).",
+   "Verifier POSTs a sequence of 50 CREDIT and DEBIT transactions to 10 distinct accounts with amounts chosen at verify time (some accounts get totals exceeding 2^31 cents), then queries BALANCE for each account and checks it equals the algebraic sum of posted transactions.",
+   "Verifier queries ROLLUP and checks it equals the sum of all individual account balances (including seed data accounts).",
+   "Verifier checks that seed_transactions.csv accounts appear in BALANCE responses with non-zero values (confirming migration ran correctly).",
+   "Verifier posts interleaved DEBIT/CREDIT to a single account reaching a total that would overflow int32_t and checks the returned balance has the correct sign and magnitude.",
+   "Verifier sends a ROLLUP query and confirms the returned value equals the arithmetic sum of all BALANCE responses for all known accounts.",
+   "Verifier kills and restarts the service, re-runs migration, and repeats balance checks (confirms the fix is stable across restarts)."
+  ],
+  "verifier_knob": {
+   "name": "number_of_request_scenarios",
+   "value": "7 scenarios across 10 accounts with overflow-triggering amounts",
+   "effect": "Reducing to 2-3 scenarios with small amounts (all fitting in int32_t) would let a partial fix (ordering only) pass; increasing to 15+ scenarios with more accounts and larger amounts catches more edge cases in the overflow arithmetic and rollup consistency."
+  },
+  "expected_failure_modes": [
+   "Agent fixes the ordering bug in start.sh, tests with sample_query.sh (small amounts), sees correct output, and declares done \u2014 int32_t overflow bug survives and fails hidden tests with large amounts.",
+   "Agent spots the int32_t type in accumulator.c by reading the file, changes it to int64_t, recompiles, and tests without fixing the migration ordering \u2014 seed data is still dropped, rollup is wrong, but the agent believes it is fixed because sample queries with freshly-posted small transactions look correct.",
+   "Agent fixes both bugs but forgets to change the rollup accumulator variable (a separate int32_t in a different function), causing rollup to overflow even when per-account balances are correct.",
+   "Agent fixes both bugs but does not recompile after changing accumulator.c (edits source but runs the old binary), so the fix is not reflected at runtime.",
+   "Agent fixes start.sh wait loop incorrectly (e.g., waits for a fixed sleep instead of polling for socket existence), causing a race where migrate.sh sometimes runs before the socket is ready on slower machines."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "shell-scripting",
+   "c",
+   "integer-overflow",
+   "ordered-procedure",
+   "two-interacting-bugs",
+   "service-protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/scripts/start.sh  # spot: migrate.sh called before daemon starts",
+   "cat /app/scripts/migrate.sh  # confirm: socat errors silenced, exits 0",
+   "cat /app/src/accumulator.c  # spot: int32_t for running_sum and rollup accumulator",
+   "cat /app/src/accumulator.h",
+   "cat /app/data/sample_query.sh  # understand wire protocol",
+   "# Edit start.sh: add poll loop 'until [ -S /tmp/ledgerd.sock ]; do sleep 0.1; done' between daemon start and migrate call",
+   "# Edit accumulator.c: change int32_t to int64_t for per-account running_sum field",
+   "# Edit accumulator.c: change int32_t to int64_t for rollup accumulator variable",
+   "make -C /app  # recompile",
+   "pkill ledgerd 2>/dev/null; rm -f /tmp/ledgerd.sock",
+   "/app/scripts/start.sh &",
+   "sleep 1  # let socket appear and migration run",
+   "echo 'ROLLUP' | socat - UNIX-CONNECT:/tmp/ledgerd.sock  # verify non-zero rollup (seed data loaded)",
+   "echo 'POST acct_test CREDIT 3000000000' | socat - UNIX-CONNECT:/tmp/ledgerd.sock",
+   "echo 'BALANCE acct_test' | socat - UNIX-CONNECT:/tmp/ledgerd.sock  # verify 3000000000 not overflowed"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The int32_t overflow bug is plainly visible by reading accumulator.c; the blueprint claims it is 'not visible by reading alone' but a competent agent will always be suspicious of int32_t in a financial accumulator and fix it proactively, collapsing the 'interacting bugs hide each other' mechanic.",
+   "The migrate.sh ordering bug in start.sh is immediately obvious on a single read; both bugs are detectable by static reading in ~4 file reads, making the 'two-interacting-bugs' difficulty lever largely non-functional for a frontier agent.",
+   "Race condition risk in the verifier itself: if the verifier restarts the service and re-runs migration, there could be double-counting of seed data unless the service clears state on restart \u2014 the blueprint does not specify whether the daemon persists state across restarts or resets, which could make the restart-stability test flaky.",
+   "The protocol spec says BALANCE returns '+<balance>' or '-<balance>' but does not clarify what happens for zero balance or accounts that do not exist \u2014 edge cases that could cause verifier test failures if the implementation handles them differently.",
+   "The 'fixed sleep' vs 'poll loop' distinction in the failure modes suggests the verifier may be sensitive to timing; on a slow container under load, even a correct poll loop might have marginal timing, though this is low risk.",
+   "The blueprint does not specify whether POSTing to a non-existent account creates it or returns an error \u2014 ambiguity that could cause test failures if the verifier queries accounts before posting to them."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: both bugs are fully visible by static reading of the source files (int32_t in accumulator.c and migrate-before-daemon in start.sh), meaning a frontier agent can identify and fix both in ~15 commands without needing runtime observation. The 'interacting bugs hide each other' mechanic \u2014 the core difficulty lever \u2014 is neutralized because a careful agent reads all source files before acting and will flag int32_t as dangerous in a financial context regardless of whether overflow has manifested. The task is well-constructed in every other dimension (clear protocol, strong verifier, realistic scenario) but fails the minimum genuine_difficulty threshold of 4.",
+  "fixes": [
+   "Make the int32_t overflow bug NOT visible by reading: replace the explicit int32_t type with a typedef (e.g., 'typedef int32_t balance_t') defined in a platform header or config.h, so the type appears as 'balance_t' in accumulator.c \u2014 a skilled agent sees a plausible-looking custom type, not an obviously wrong fixed-width integer. The bug then only reveals itself at runtime with large data.",
+   "Add a third, subtler bug that requires runtime probing to detect: e.g., accumulator.c correctly uses int64_t but has an off-by-one in the hash table collision resolution that drops ~1-2% of transactions for accounts with more than N entries \u2014 invisible to static reading, only detectable by comparing posted vs. returned totals with sufficient transaction volume.",
+   "Make the ordering bug harder to spot: instead of migrate.sh being called before daemon start in a straightforward sequential script, embed the ordering in a systemd-unit-style dependency chain or a Makefile target ordering, requiring the agent to understand the build/start system's dependency graph rather than just reading a linear shell script.",
+   "Ensure the verifier explicitly tests the restart-stability scenario with a documented state-reset protocol (daemon clears in-memory state on restart, migration re-seeds), removing the double-counting ambiguity and making that test deterministic.",
+   "Add a protocol edge case (e.g., BALANCE for unknown account returns a specific sentinel vs. error code) that the agent must discover from the source or sample, creating an additional layer of required exploration."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "The reference task involves fixing a Python CSV import tool with idempotency and refund-matching logic in SQLite, while the candidate involves debugging a C daemon accumulating balances over a Unix socket with sign/rollup bugs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference task involves fixing weighted aggregation in a compiled C service writing to SQLite with config-driven weights, while the candidate involves fixing sign preservation and running-total accumulation bugs in a C ledger daemon communicating over a Unix socket protocol."
+    },
+    {
+     "ref_id": "terminal-bench-pro/find-invalid-blockchain-transactions",
+     "verdict": "distinct",
+     "reason": "The reference task is an exploration/search problem finding invalid transactions via constrained HTTP API calls, completely different from debugging a C accumulator daemon's balance and sign logic."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The reference task involves fixing UDP NetFlow parsing and aggregation in a Rust service, while the candidate involves fixing arithmetic sign and rollup summation bugs in a C ledger daemon over a Unix socket."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference task involves reverse-engineering a black-box binary normalizer and fixing SQL rollup queries, while the candidate involves debugging C source code for incorrect balance accumulation and sign handling in a socket-based daemon."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.163
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.133
+    ],
+    [
+     "terminal-bench-pro/find-invalid-blockchain-transactions",
+     0.132
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.093
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.087
+    ]
+   ],
+   "cost_usd": 0.013449000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.053124000000000005
+}

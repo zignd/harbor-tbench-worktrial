@@ -1,0 +1,58 @@
+{
+ "slug": "entropy-audit-spectral-pipeline",
+ "title": "Spectral Entropy Audit Pipeline",
+ "scenario": "A security engineer is auditing a cryptographic entropy-quality monitoring service that ingests raw byte samples from hardware RNGs and computes per-source spectral entropy statistics. The service lives in a git repository with ~1,200 lines across a data ingestion layer, a DSP pipeline, and a reporting module. Recent commits added a 'fast path' for large batches that silently diverges from the reference implementation on certain input patterns \u2014 the CI suite still passes because it only tests small synthetic samples. The engineer needs to find the regression, understand the mathematical error, and ship a corrected pipeline that meets a stated accuracy threshold.",
+ "instruction_draft": "```\n$ python audit_runner.py --source rng_feed_03 --report\nERROR: spectral_entropy values out of expected range for source rng_feed_03\nEntropy estimates: [7.9821, 0.0023, 7.9944, 0.0018, 7.9901]\nExpected: all values in [7.80, 8.00] for a healthy HWRNG source\nPipeline flagged 2 of 5 windows as 'degenerate' \u2014 escalating\n```\n\nYou are auditing the entropy-quality pipeline at `/app/entropy_service/`. The pipeline ingests streams of raw bytes from hardware RNG sources, segments them into overlapping windows, computes a Short-Time Fourier Transform (STFT) over each window, and derives a per-window spectral entropy estimate. Healthy HWRNG sources should produce spectral entropy values uniformly near 8.0 bits (log\u2082 of 256 frequency bins); a degenerate or biased source produces measurably lower values.\n\nThe error above is a false alarm: `rng_feed_03` is a confirmed healthy source. Something in the pipeline is producing near-zero entropy for a subset of windows even on healthy input.\n\nYour task:\n1. Investigate the git history and running code to identify what changed and why certain windows produce garbage estimates.\n2. Fix the pipeline so that `audit_runner.py` correctly reports spectral entropy for all window types.\n3. Extend the pipeline with a new `--calibrate` mode that, given a reference file of known-good entropy bytes, emits a per-source calibration offset (float, 4 decimal places) to `calibration/<source_id>.cal`. The calibration offset is defined as: `offset = mean(reference_spectral_entropies) - 8.0`, stored with sign.\n4. Ensure the fixed pipeline passes the acceptance criterion: on any 1 MB block of uniform-random bytes, every window's spectral entropy estimate must be within \u00b10.15 bits of 8.0 after applying the calibration offset.\n\nThe verifier will supply its own reference files and source streams not present in the repository.",
+ "requirements": [
+  "The root cause of near-zero entropy on certain windows must be identified and fixed in the pipeline code",
+  "audit_runner.py --report produces spectral entropy estimates in [7.85, 8.15] for all windows of a healthy HWRNG source after fix",
+  "A new --calibrate mode is implemented that reads a reference file and writes offset to calibration/<source_id>.cal",
+  "The calibration offset is defined as mean(reference_spectral_entropies) - 8.0, stored as a float with 4 decimal places",
+  "After applying calibration offset, every window's spectral entropy estimate on a 1 MB uniform-random block is within \u00b10.15 bits of 8.0",
+  "The fix must not break the existing --report output format or the passing CI tests"
+ ],
+ "environment": [
+  "Git repository at /app/entropy_service/ with ~1,200 lines across: ingestion.py (byte stream reader, window segmenter), dsp.py (STFT, spectral entropy computation), reporter.py (formatting, thresholding), audit_runner.py (CLI entrypoint), tests/ (small synthetic tests that still pass)",
+  "Git history of ~18 commits; a commit 6 commits ago titled 'perf: vectorize STFT window batch for large inputs' introduced a dtype coercion bug: the fast path casts the windowed signal to float32 before FFT but then applies the Hann window (stored as float64) in a way that numpy broadcasting silently downcasts the product to float32 with catastrophic cancellation for windows whose mean is near zero, producing near-zero magnitude spectra and thus near-zero entropy",
+  "The bug is data-dependent: windows where the byte stream has mean close to 128 (common in healthy RNGs) survive; windows where the DC component after mean-subtraction is very small happen to trigger the cancellation path \u2014 this only manifests on long real-data runs, not on the small synthetic test vectors",
+  "rng_feed_03/ directory contains 5 MB of real HWRNG sample data split into .bin files",
+  "A calibration/ directory exists but is empty; audit_runner.py has a stub --calibrate flag that raises NotImplementedError",
+  "requirements.txt pins numpy==1.26.4, scipy==1.13.0; python:3.13-slim-bookworm base image",
+  "The spectral entropy formula used is: H = -sum(p * log2(p)) where p = |FFT|^2 / sum(|FFT|^2) over the 256 positive-frequency bins of a 512-point FFT with Hann window; this must remain unchanged",
+  "A confounding red herring: reporter.py has an off-by-one on the threshold display (shows wrong count of flagged windows) but this does not affect the entropy values themselves \u2014 it looks like a bug but fixing it alone changes nothing material"
+ ],
+ "internal_hint": "Difficulty comes from two sources: (1) the bug is NOT visible by reading a single file \u2014 it only manifests with data-dependent paths (windows near zero mean after centering) that don't appear in the short test vectors; the solver must run the pipeline on real data and instrument/observe the failure. (2) the calibration feature requires correct mathematical derivation: the offset definition is subtle (it is computed on reference data, not on the test stream, and must be applied correctly when --report runs subsequently). The ordered procedure trap: if the solver fixes the dtype bug incorrectly (e.g., by casting everything to float64 but applying the window before centering), the calibration offsets will be wrong in a correlated way, and the threshold test on hidden inputs will still fail. The solver must: (a) use git log/diff to find the perf commit, (b) understand why float32 Hann-window application causes cancellation specifically for near-zero-mean windows, (c) fix by ensuring the Hann window multiply happens in float64 on centered data, (d) implement --calibrate correctly, (e) verify on a fresh 1 MB block. The trap is that the provided rng_feed_03 data has few near-zero-mean windows by chance, so a shallow fix that patches only the obvious dtype cast without fixing the centering order will pass the visible test but fail on verifier-generated data that has more such windows.",
+ "trap": "A solver who fixes only the obvious dtype cast (float32 \u2192 float64) without also ensuring the DC-removal (mean subtraction) happens before the Hann window multiplication will produce correct results on rng_feed_03 (which happens not to stress this ordering) but will still emit out-of-range entropy on verifier-supplied blocks where the window mean is non-negligible. Additionally, a solver who implements --calibrate but uses the wrong sign convention or computes the mean over the wrong set of windows will produce calibration files that, when applied, push estimates further out of range rather than correcting them.",
+ "tests": [
+  "Run audit_runner.py --report on rng_feed_03: all 5 window entropy values must be in [7.80, 8.15]",
+  "Verifier generates a fresh 1 MB block of os.urandom bytes, saves as /tmp/verify_rng.bin, runs audit_runner.py --calibrate --source verify_rng --input /tmp/verify_rng.bin, checks that calibration/verify_rng.cal exists and contains a float with 4 decimal places in [-0.5, 0.5]",
+  "Verifier then runs audit_runner.py --report --source verify_rng --input /tmp/verify_rng.bin --apply-cal and checks that ALL window entropy values are within \u00b10.15 of 8.0",
+  "Verifier generates a second 1 MB block with a different seed, repeats the above \u2014 offset must be recomputed from this new block and threshold must still hold",
+  "Verifier constructs a synthetic near-zero-mean block (each byte drawn from {127, 128} with equal probability) and runs --report; all window entropies must remain in [7.50, 8.15] (this block has lower spectral entropy by construction but must not produce near-zero garbage values)",
+  "Verifier checks that calibration/<source_id>.cal offset value equals mean(per-window spectral entropies on reference file) - 8.0 to within 0.0005 absolute error",
+  "Existing CI tests (tests/ directory) must still pass after the fix"
+ ],
+ "verifier_knob": {
+  "name": "entropy_tolerance",
+  "value": "\u00b10.15 bits",
+  "effect": "Tightening to \u00b10.08 makes it much harder \u2014 the solver must ensure float64 precision throughout and use the correct centering order; loosening to \u00b10.30 makes it possible to pass with a cruder fix that handles most but not all window types"
+ },
+ "expected_failure_modes": [
+  "Solver finds the dtype bug by reading the diff but fixes it incorrectly (casts output rather than input of Hann multiply), passes visible tests but fails on verifier's near-zero-mean windows",
+  "Solver implements --calibrate with wrong sign (computes 8.0 - mean instead of mean - 8.0), calibration files have wrong sign and push estimates further from 8.0",
+  "Solver correctly fixes the STFT bug but applies calibration offset at the wrong stage (before log2 rather than after entropy summation), failing hidden threshold tests",
+  "Solver notices the reporter.py off-by-one red herring and spends time fixing it, losing track of the real data-dependent bug",
+  "Solver verifies only on rng_feed_03 (which has no near-zero-mean windows by construction) and ships without testing on adversarial near-zero-mean data"
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "scientific-computing",
+ "tags": [
+  "dsp",
+  "spectral-analysis",
+  "git-history",
+  "data-dependent-bug",
+  "calibration",
+  "entropy"
+ ]
+}

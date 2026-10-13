@@ -4,6 +4,13 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 22:24 -03:00 · Malformed model JSON no longer sinks a candidate
+- **7 candidates of the 12-wide batch crashed** with `JSONDecodeError` within minutes. Under parallel load, Sonnet's blueprint and review replies sometimes held two JSON objects ("Extra data") or trailing commas. The parser took one greedy `{...}` span and parsed it strictly, so one bad draft out of four parallel ones crashed the whole candidate (~$0.6-0.8 of drafts each).
+- **`extract_json`** now scans for the first `{` that starts a decodable object (prose before it or a second object after it don't matter) and retries each position with trailing commas removed. This applies to every judge and reviewer, since they all share the parser. Tested on prose + trailing commas, two fenced blocks, and a non-JSON brace before the real object.
+- **A draft whose reply still can't be parsed twice** becomes a skipped draft (logged as an `error` event), not a crashed candidate.
+- **Evidence fix:** every draft in a round is saved, including those after the accepted one: `blueprint_rejected_<n>.json`, or `blueprint_unused_<n>.json` for a second accepted draft. Before, drafts after the accepted one were dropped.
+- The 7 crashed candidates were reset and re-run. 123 tests pass.
+
 ### 22:09 -03:00 · More parallelism: parallel blueprint drafts, gate slots, eager calibration, automatic tuning
 1. **Parallel blueprint drafts.** The difficulty review rejects most drafts (7 of 8 in the first validation batch), and up to 4 sequential tries took ~8 min per candidate. `stage_blueprint` now drafts and reviews `BLUEPRINT_DRAFTS` (4) at once and keeps the first accepted. If none passes, the next round gets every rejection reason (`BLUEPRINT_ROUNDS` 2, so up to 8 drafts). Every rejected draft is still saved as `blueprint_rejected_<n>.json`.
 2. **Wider batches with a machine-wide gate cap.** A 12-candidate batch runs with 10 workers. Authoring is API-bound (containers idle at ~0% CPU), but the image build + leak scan + oracle ×3 + nop are CPU-heavy, and a CPU-starved oracle looks flaky. That block now holds one of `GATE_CONCURRENCY` (3) machine-wide slots. The flock slot lock is shared with Opus trials (`evaluator/slots.py`).

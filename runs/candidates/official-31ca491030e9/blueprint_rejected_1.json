@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "sql-window-aggregate-regression",
+  "title": "SQL Aggregate Window Function Regression",
+  "scenario": "An open-source time-series analytics library ships a compiled query-rewriting binary (`/app/bin/qrewrite`) that transforms user SQL before execution against a SQLite database. A regression was reported after the last release: running the standard test suite shows some queries return correct results, but production maintainers have noticed subtly wrong numbers in financial roll-up reports. The repository contains ~1,400 lines across the query engine adapter, schema migrations, and a Python harness that pipes queries through the binary and returns results as JSON.",
+  "instruction_draft": "The query rewriter at `/app/bin/qrewrite` produces wrong aggregate results for some inputs. Fix the system so that for every SQL query the harness runs, the output matches the reference SQLite result computed without the rewriter.",
+  "requirements": [
+   "For every input query executed through `/app/run.py <sql>`, the JSON rows returned must exactly match (same values, same row order) the result of running the same SQL directly against the database with no rewriting.",
+   "The fix must persist: the verifier re-runs the harness against a fresh corpus of 60 generated queries after any changes."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3, gcc, python3-pip; builds /app/bin/qrewrite from a C source that is compiled but whose source is DELETED after build (only the binary remains), so the agent cannot read the rewriter logic.",
+   "The C source for qrewrite implements two bugs: (1) it rewrites `SUM(x)` inside a window-partitioned subquery by accidentally emitting `AVG(x)` when the partition column name contains an underscore; (2) it incorrectly strips the `ROWS BETWEEN` frame clause from window functions when an ORDER BY column alias matches a reserved word list (e.g. 'value', 'total', 'amount'), turning a bounded frame into an unbounded one.",
+   "/app/db.sqlite: a SQLite database with tables `ledger(id, account_id, amount, posted_at)` and `daily_summary(account_id, day, total_amount)` seeded with ~800 rows of synthetic financial data.",
+   "/app/run.py: reads SQL from argv, pipes it through qrewrite, executes the rewritten SQL on db.sqlite, returns JSON rows to stdout.",
+   "/app/reference.py: runs SQL directly on db.sqlite without rewriting, returns JSON rows to stdout (the ground truth).",
+   "/app/tests/sample_queries.sql: five sample queries that happen NOT to trigger either bug (safe column names, no reserved-word aliases) \u2014 provided as examples; they all pass.",
+   "/app/adapter.py: ~300-line wrapper around run.py that adds logging, retry logic, and a result-cache layer (plausible code, not involved in the bugs).",
+   "/app/migrations/: three SQL migration files, ~200 lines total (plausible, not involved).",
+   "The binary qrewrite accepts SQL on stdin and writes rewritten SQL to stdout; it exits 0 on success.",
+   "A wrapper script /app/intercept.sh that the agent can insert between run.py and qrewrite to observe or override rewriting \u2014 run.py checks for QREWRITE_BIN env var and uses it instead of /app/bin/qrewrite if set."
+  ],
+  "internal_hint": "Root cause 1 (data-dependent, not visible by reading): qrewrite silently emits AVG instead of SUM when a partition column name contains an underscore. This only manifests when the agent tests with account_id (which has an underscore) as a PARTITION BY column. The sample queries avoid this. Root cause 2 (also data-dependent): qrewrite drops the ROWS BETWEEN frame clause when the ORDER BY alias matches a reserved word list embedded in the binary. The sample queries use aliases like 'amt' and 'cnt', never 'total' or 'amount'. Fixing one bug without the other still fails many hidden corpus queries. The interaction: a query with both an underscore partition column AND a reserved-word ORDER BY alias triggers both bugs simultaneously, causing a doubly-wrong result. The agent must (a) compare qrewrite output SQL to what they expect for various inputs, (b) discover the two transformation rules by experimentation (diffing qrewrite stdin\u2192stdout), and (c) write a replacement QREWRITE_BIN wrapper that correctly passes through SQL without the two broken transformations, OR correctly rewrites without the bugs. The cleanest fix is a Python wrapper that either passes SQL unchanged (if the rewriting is optional) or replaces only the broken rewrite patterns.",
+  "trap": "The five sample queries all pass because they use safe column names (no underscores in PARTITION BY) and safe aliases (no reserved words in ORDER BY). A naive fix that simply passes SQL through unchanged works for the samples and for most ad-hoc tests. However, the hidden corpus includes queries that DO require the rewriting for correctness (e.g., qrewrite also applies a valid transformation expanding date-truncation shorthands like `DAY(posted_at)` to `date(posted_at,'start of day')` that SQLite requires). A pass-through wrapper breaks all queries that use the shorthand. The agent must identify which transformations are correct and preserve them while blocking only the two broken ones. Alternatively, the agent can mathematically verify that the shorthand expansion is safe and implement it correctly in the wrapper.",
+  "tests": [
+   "Verifier generates 60 SQL queries at verify time using a seeded RNG: 15 with underscore partition columns and SUM, 15 with reserved-word ORDER BY aliases and ROWS BETWEEN, 15 with both conditions, 15 with neither (baseline). For each, it runs `/app/run.py '<sql>'` and `/app/reference.py '<sql>'` and compares JSON output exactly.",
+   "At least 58/60 queries must match (allowing for 2 floating-point identical-value ties that might differ in row order when order is not fully specified).",
+   "Verifier also checks that the DAY() shorthand queries return correct results (not SQLite errors), ensuring the agent did not simply strip all rewriting.",
+   "Verifier checks that /app/run.py still invokes something (not just calls reference.py directly) by diffing process invocations via strace or by checking QREWRITE_BIN points to a real executable."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "60 queries (15 per category)",
+   "effect": "Raising to 120 increases coverage of edge cases (mixed underscore+reserved, nested subqueries with window functions, CTEs); lowering to 20 makes shallow fixes viable since fewer tricky cases appear."
+  },
+  "expected_failure_modes": [
+   "Agent writes a pass-through wrapper, passes sample tests, but fails corpus queries that use the DAY() shorthand (which qrewrite correctly handles).",
+   "Agent finds bug 1 (SUM\u2192AVG) by diffing qrewrite output, fixes it with a sed/awk wrapper, but misses bug 2 (frame clause dropping) because it only tests with non-reserved aliases.",
+   "Agent fixes bug 2 by recognizing the reserved-word list from binary strings, patches around it, but misses bug 1 because underscore columns don't appear in sample queries.",
+   "Agent correctly identifies both bugs independently but the combined-condition case (both bugs in one query) produces a result that doesn't match either partial fix due to interaction.",
+   "Agent replaces qrewrite with a Python reimplementation that handles the two bugs but incorrectly implements the DAY() shorthand expansion, breaking those 15 corpus queries."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "binary-analysis",
+   "window-functions",
+   "black-box-debugging",
+   "two-interacting-bugs",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/run.py  # find QREWRITE_BIN env var hook",
+   "cat /app/reference.py  # understand ground truth path",
+   "cat /app/tests/sample_queries.sql  # see safe baseline queries",
+   "strings /app/bin/qrewrite | grep -E 'value|total|amount|AVG|SUM|DAY|ROWS|underscore'  # enumerate binary constants",
+   "echo \"SELECT SUM(amount) OVER (PARTITION BY account_id FROM ledger LIMIT 1\" | /app/bin/qrewrite  # probe underscore partition",
+   "echo \"SELECT SUM(amount) OVER (PARTITION BY accountid) FROM ledger LIMIT 1\" | /app/bin/qrewrite  # compare no-underscore",
+   "echo \"SELECT SUM(amount) OVER (ORDER BY total ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM ledger LIMIT 1\" | /app/bin/qrewrite  # probe reserved alias",
+   "echo \"SELECT SUM(amount) OVER (ORDER BY amt ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM ledger LIMIT 1\" | /app/bin/qrewrite  # compare safe alias",
+   "echo \"SELECT DAY(posted_at) FROM ledger LIMIT 1\" | /app/bin/qrewrite  # discover valid DAY() expansion",
+   "# Confirm DAY() expands to date(col,'start of day') -- the valid transformation to preserve",
+   "cat > /app/qrewrite_fixed.py << 'EOF'\n#!/usr/bin/env python3\nimport sys, re\nsql = sys.stdin.read()\nsql = re.sub(r'\\bDAY\\((\\w+)\\)', r\"date(\\1,'start of day')\", sql)\nprint(sql, end='')\nEOF",
+   "chmod +x /app/qrewrite_fixed.py",
+   "QREWRITE_BIN=/app/qrewrite_fixed.py python /app/run.py \"SELECT SUM(amount) OVER (PARTITION BY account_id) FROM ledger LIMIT 3\"",
+   "python /app/reference.py \"SELECT SUM(amount) OVER (PARTITION BY account_id) FROM ledger LIMIT 3\"  # compare",
+   "QREWRITE_BIN=/app/qrewrite_fixed.py python /app/run.py \"SELECT SUM(amount) OVER (ORDER BY total ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM ledger LIMIT 3\"",
+   "python /app/reference.py \"SELECT SUM(amount) OVER (ORDER BY total ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM ledger LIMIT 3\"  # compare",
+   "QREWRITE_BIN=/app/qrewrite_fixed.py python /app/run.py \"SELECT DAY(posted_at) FROM ledger LIMIT 3\"  # verify DAY() still works",
+   "# Set QREWRITE_BIN permanently in environment or patch run.py default",
+   "echo 'export QREWRITE_BIN=/app/qrewrite_fixed.py' >> /app/.env  # or patch run.py"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The DAY() regex pattern in the wrapper may not handle all valid SQLite identifier characters (e.g., DAY(posted_at) vs DAY(t.posted_at) with table prefix), causing 'valid fix' to still fail DAY() corpus queries \u2014 agent fails for environment reasons not skill.",
+   "The QREWRITE_BIN mechanism requires run.py to check the env var at runtime; if run.py caches the binary path at import time, setting the env var after import won't work \u2014 flaky depending on Python import order.",
+   "Row ordering: the '2 floating-point tie' allowance may be insufficient if SQLite's sort is non-deterministic across runs for tied rows, causing intermittent failures unrelated to the fix.",
+   "The strace check for 'run.py still invokes something' may not work on all Linux kernel configurations in Docker (strace requires ptrace capability), making the hollow-solution check potentially unreliable.",
+   "The internal hint mentions 'date(posted_at, start of day)' but the actual SQLite syntax is date(col, 'start of day') \u2014 if the blueprint's regex has a bug in the DAY() expansion spec, the correct wrapper implementation could still fail.",
+   "If the compiled qrewrite binary has architecture-specific behavior (e.g., built for x86_64 but run on ARM), the binary may not execute, making the entire task environment broken."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 3 falls below the required minimum of 4. The speedrun completes in ~19 commands through systematic black-box probing (strings + stdin/stdout diffing), which is well within reach of a frontier agent in under 30 minutes. Both bugs are independently discoverable with 2-3 probe commands each, and the DAY() trap is caught by probing before patching. Additionally, several invalid failure risks exist around the QREWRITE_BIN mechanism, strace capability in Docker, and DAY() regex edge cases that could cause agent failures unrelated to task-solving skill.",
+  "fixes": [
+   "Increase genuine difficulty by making the DAY() transformation more complex (e.g., qrewrite correctly handles multiple date shorthands: DAY(), WEEK(), MONTH() with different SQLite expansions) so a simple regex is insufficient and the agent must reverse-engineer more of the binary's behavior.",
+   "Remove or complicate the QREWRITE_BIN escape hatch \u2014 instead require the agent to patch the binary wrapper invocation in run.py directly, or provide a plugin interface that is harder to discover, raising command count significantly.",
+   "Add a third interacting bug that only manifests when the first two are both fixed (e.g., a subtle numeric rounding in aggregate computation that only surfaces when SUM is correctly emitted and the frame clause is correct), making partial fixes produce false confidence.",
+   "Replace the strace-based hollow-solution check with a hash-based check that verifies the wrapper executable differs from reference.py, to avoid Docker ptrace capability issues.",
+   "Make the corpus queries require correct handling of table-qualified column references in DAY() (e.g., DAY(l.posted_at)) to prevent naive single-word regex fixes from passing all DAY() corpus queries."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task asks for SQL query optimization for performance while preserving output; the candidate asks for debugging a compiled binary query rewriter that produces wrong results and fixing correctness bugs."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is pure SQL optimization for performance equivalence; the candidate involves reverse-engineering/fixing a compiled binary rewriter to restore correctness."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve a compiled binary transformation stage corrupting downstream results, requiring the agent to characterize or fix the binary so pipeline outputs match a reference computation on fresh inputs."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about a NetFlow UDP/TCP aggregation service with networking and protocol parsing bugs; the candidate is about a SQL query-rewriting binary producing wrong aggregate values."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves a log enrichment pipeline with a GeoIP binary and Flask API correctness issues; the candidate is specifically about a SQL query rewriter producing wrong aggregate results."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.365
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.358
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.181
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.129
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.121
+    ]
+   ],
+   "cost_usd": 0.013224
+  },
+  "novel": false
+ },
+ "cost_usd": 0.067485
+}

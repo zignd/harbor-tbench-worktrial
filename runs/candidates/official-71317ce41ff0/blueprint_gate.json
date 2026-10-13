@@ -1,0 +1,114 @@
+{
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/librecenc/nonce.c /app/librecenc/counter.c /app/librecenc/serialize.c /app/librecenc/encrypt.c /app/librecenc/mac.c /app/librecenc/db.c",
+   "cat /app/librecenc/Makefile && make -C /app/librecenc/ 2>&1",
+   "/app/repro_check --db /data/experiment.db --key-file /data/master.key",
+   "# Symptom: HMAC fail \u2192 check mac.c first (mislead). Realize mac.c is correct.",
+   "# Write a small C harness: encrypt record_id=1847 with fixed lib, decrypt with ref.so, compare",
+   "gcc -I/app/librecenc test_single.c -L/app/librecenc -lrecenc -o test_single && ./test_single",
+   "# Observe mismatch. Try single-field record with length%16==0 to isolate counter bug",
+   "# Write test_counter.c: craft 16-byte payload, encrypt with lib, decrypt with ref",
+   "gcc test_counter.c -L/app/librecenc -lrecenc -ldl -o test_counter && ./test_counter",
+   "# Confirm counter carry bug. Read counter.c, fix: replace counter[15]++ with proper 16-byte carry loop",
+   "sed -i 's/counter\\[15\\]++;/carry propagation loop/' /app/librecenc/counter.c  # (manual edit)",
+   "make -C /app/librecenc/ && # retest length%16==0 records \u2192 pass",
+   "# Test multi-field record: field_index=1, encrypt lib vs ref \u2192 still mismatch",
+   "# Read nonce.c carefully, spot big-endian vs little-endian field_index write",
+   "# Fix nonce.c: change htons/big-endian write to little-endian for field_index bytes",
+   "make -C /app/librecenc/ && # retest multi-field \u2192 pass",
+   "# Test empty-field record \u2192 still mismatch",
+   "# Read serialize.c, compare: lib writes 0x0000+data, ref writes single 0x00",
+   "# Fix serialize.c: for empty strings, write single 0x00 byte not 2-byte prefix",
+   "make -C /app/librecenc/ && # retest empty-field records \u2192 pass",
+   "# Build CLI: check Makefile target for /app/bin/recenc",
+   "make -C /app/librecenc/ all && cp /app/librecenc/recenc /app/bin/recenc",
+   "/app/repro_check --db /data/experiment.db --key-file /data/master.key  # expect PASS",
+   "# Run /app/tests/ fuzz equivalence suite to confirm all 150 generated records pass"
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The reference binary /app/artifacts/librecenc_ref.so is x86-64 only; if the container runs on ARM (e.g., Apple Silicon Docker without Rosetta), dlopen of the ref binary fails silently or with a confusing error, making the oracle unusable and the fuzz_equivalence tests structurally broken.",
+   "The 12 regression tests are described as passing before the fix\u2014if the fix accidentally breaks them (e.g., wrong carry loop implementation), the verifier may not re-run them explicitly, or it might, depending on implementation. The blueprint doesn't explicitly list re-running regression tests as a verify step, so a fix that breaks the 12 known records might still pass if verifier only runs the newly generated fuzz inputs.",
+   "The empty-field serialization fix (single 0x00 vs 2-byte prefix) changes behavior for all zero-length fields, but the experiment.db was encrypted with the reference. If the verifier re-encrypts records from experiment.db using the fixed lib (rather than decrypting existing ciphertext), the test semantics change. The blueprint says decrypt experiment.db records, which were encrypted with ref\u2014so the fixed lib must decrypt correctly, not re-encrypt. This is fine but must be implemented carefully in the repro_check integration.",
+   "Carry propagation in counter.c: a solver who propagates carry in the wrong byte order (treating counter as little-endian when it's big-endian or vice versa) will pass some tests but fail others. The correct byte order of the AES-CTR counter block is not stated in the instruction, requiring the solver to infer it from the reference binary\u2014this is fair but could cause confusion if the fuzz tests don't cover counter overflow (counter value > 255, requiring multi-byte carry).",
+   "The instruction says record_ids include '2^32-1' but also '2^32' in the environment spec (these differ). The nonce field for record_id is 8 bytes so both fit, but the test list says 'powers of two up to 2^32' while also saying '2^32-1'. Minor inconsistency that shouldn't affect solvability but could cause confusion.",
+   "If /data/experiment.db records were all encrypted with the buggy lib (post-refactor), the repro_check would compare against paper hash computed from ref lib output\u2014so fixing the lib should allow correct decryption of ref-encrypted data. But if any records in experiment.db were encrypted post-refactor with the buggy lib, re-decrypting them with fixed lib would also fail. Blueprint says db was encrypted with reference, so this should be consistent."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has genuine difficulty: three independent data-dependent bugs hidden across separate files, a misleading HMAC symptom, and a test suite that covers all three bugs independently and in combination, making partial fixes fail. The ~22-command speedrun requires non-trivial instrumentation and oracle-comparison work to locate each bug without source-level hints in the instruction. Realism is high (regression-invisible refactor bugs are a real engineering failure mode). The main risk is the x86-64-only reference binary failing on non-x86 container environments, which must be mitigated by the build environment guaranteeing x86-64 execution.",
+  "fixes": [
+   "Explicitly pin the Docker build to --platform linux/amd64 or add a runtime check that aborts with a clear error if the ref binary cannot be dlopen'd, so ARM-based CI doesn't produce cryptic failures that look like solver errors.",
+   "Add re-running the original 12 regression tests as an explicit verifier step, so a fix that breaks existing behavior is caught (currently the verifier description omits this).",
+   "Clarify the record_id range in the test list: '2^32-1' appears in Requirements but '2^32' appears in the test bullet\u2014pick one consistently, noting that record_id is stored as 8 bytes so 2^32 is fine, but the inconsistency is confusing.",
+   "State the byte order of the AES-CTR counter block explicitly in a comment in counter.c (e.g., 'counter[0] is MSB') so the carry propagation fix has an unambiguous target and the task doesn't accidentally hinge on reverse-engineering counter endianness from the binary."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about HMAC-SHA256 tagging of WAL records over TCP with refund resolution; this task is about AES-128-CTR encryption of SQLite rows with nonce derivation and cross-binary wire compatibility."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/feal-linear-cryptanalysis",
+     "verdict": "distinct",
+     "reason": "That task is a cryptanalysis/known-plaintext attack on a FEAL cipher; this task is about debugging a refactored AES-CTR encryption library to restore wire compatibility."
+    },
+    {
+     "ref_id": "terminal-bench-pro/recover-encrypted-db-credentials",
+     "verdict": "distinct",
+     "reason": "That task involves filesystem block reassembly and XOR decryption to recover credentials; this task is about fixing a refactored AES-CTR library to match a reference binary's wire format."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js NDJSON log ingestion pipeline for schema validation and performance; this task is about repairing a C AES-CTR encryption library's correctness and wire compatibility."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust NetFlow v9 aggregation service's UDP/TCP data processing; this task is about fixing a C AES-CTR SQLite record encryption library's nonce construction and cross-binary compatibility."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.188
+    ],
+    [
+     "terminal-bench-2-1/feal-linear-cryptanalysis",
+     0.158
+    ],
+    [
+     "terminal-bench-pro/recover-encrypted-db-credentials",
+     0.147
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.129
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.125
+    ]
+   ],
+   "cost_usd": 0.015411000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.061824000000000004
+}

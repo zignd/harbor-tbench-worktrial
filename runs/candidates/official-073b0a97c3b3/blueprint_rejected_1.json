@@ -1,0 +1,155 @@
+{
+ "blueprint": {
+  "slug": "log-drain-metrics-rollup-repair",
+  "title": "3am: Metrics Rollup Service Is Silently Corrupting Dashboards",
+  "scenario": "A Node.js log-drain service ingests structured JSON logs from multiple upstream microservices, aggregates per-minute rollup metrics (request counts, error rates, p95 latency), and exposes them over a simple HTTP protocol consumed by a Grafana-like dashboard agent. You are on call and were paged because dashboards show flatlined error rates and p95 latencies that look suspiciously round. The service is running and responding, but something in the rollup pipeline is wrong. The codebase is ~1,200 lines across several files: an ingestion buffer, a rollup aggregator, a percentile calculator, and the HTTP protocol handler. There are real log fixtures on disk and a stream of live synthetic logs being fed in by a background generator process.",
+  "instruction_draft": "You're paged at 3am with this alert paste:\n\n```\n[ALERT] metrics-rollup-service anomaly detected\nDashboard: error_rate for service=checkout stuck at 0.000 for 14min\nDashboard: p95_latency for service=checkout reporting 100ms flat (implausible)\nLast good values: error_rate=0.031, p95_latency=247ms @ 02:41 UTC\nService PID 1847 is alive, /health returns 200\nLog drain ingesting: YES (counter incrementing)\n```\n\nThe rollup service is at `/app/rollup-service/`. A background log generator is already running, feeding synthetic traffic in. Investigate, fix the service, and restart it so that:\n\n1. Each GET `/metrics?service=<name>&window=<seconds>` request returns a JSON object with fields `service`, `window_seconds`, `request_count`, `error_rate` (float, 0\u20131), and `p95_latency_ms` (float).\n2. `error_rate` must equal the fraction of log entries in the window whose `status` field is >= 500, computed correctly across all entries in the window.\n3. `p95_latency_ms` must be the true 95th percentile of `duration_ms` values in the window, not an approximation with error greater than 1ms for up to 10,000 samples.\n4. Results must reflect log entries ingested within the last `window` seconds only, with no entries from outside the window included or excluded incorrectly.\n5. The protocol must handle any `service` name present in the log stream and any integer `window` between 1 and 3600.\n6. After your fix, the service must stay running and continue returning correct values as new logs arrive.",
+  "requirements": [
+   "GET /metrics?service=<name>&window=<seconds> returns JSON with fields: service, window_seconds, request_count, error_rate, p95_latency_ms",
+   "error_rate equals fraction of entries in window with status >= 500 (not > 500, not using a wrong threshold)",
+   "p95_latency_ms is the true 95th percentile of duration_ms values, error <= 1ms for up to 10,000 samples",
+   "Window filtering uses only entries within the last window_seconds, no fence-post errors",
+   "Any service name in the log stream is supported",
+   "Any integer window from 1 to 3600 is supported",
+   "Service stays running and reflects newly ingested logs in subsequent requests"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20, npm packages (express, dayjs), and Python for the verifier/generator",
+   "Directory /app/rollup-service/ with ~1,200 lines across: server.js (HTTP handler, ~150 lines), ingester.js (log buffer and intake, ~200 lines), aggregator.js (rollup logic with two bugs, ~300 lines), percentile.js (p95 calculator, ~200 lines), utils.js (timestamp helpers, ~150 lines), config.js (~50 lines), and package.json",
+   "Bug 1 (interacting, data-dependent): aggregator.js counts errors with `entry.status > 500` instead of `>= 500`, meaning HTTP 500 responses are silently excluded from error_rate. This only manifests when the actual error mix includes 500s (which the generator does produce), making error_rate appear low but not zero\u2014easy to miss if you only spot-check with 503s.",
+   "Bug 2 (interacting, non-visible without running): percentile.js implements a 'fast path' using a pre-sorted ring buffer that is only activated when sample count > 200. The ring buffer has an off-by-one in its insertion index that causes it to overwrite the oldest valid sample with a stale value from the previous flush cycle. This makes p95 look suspiciously stable/round on real data because stale high-latency samples dilute the distribution. The bug only appears after the buffer has been through at least one full rotation (~200 entries per service), which takes ~30-60 seconds of live traffic. Fixing bug 1 alone makes error_rate correct but p95 stays wrong. Fixing bug 2 alone makes p95 bounce correctly but error_rate is still wrong for 500s.",
+   "Bug interaction: error_rate being wrong masks that p95 is also wrong because the dashboard alert was triggered by BOTH metrics being off simultaneously; fixing one makes the service 'look better' but fail the verifier's independent checks on both metrics.",
+   "A background Python process /app/generator/gen.py runs continuously, injecting JSON log lines into the service's POST /ingest endpoint at ~20 lines/second, with a realistic mix of services (checkout, inventory, auth), status codes including 500, 502, 503, and duration_ms drawn from a log-normal distribution seeded with a fixed seed per service but varying over time.",
+   "Existing log fixtures at /app/rollup-service/fixtures/ with sample JSON log lines the solver can inspect",
+   "The service is pre-started (node server.js &) and already in the broken state when the solver arrives",
+   "/app/rollup-service/logs/ contains recent ingestion logs showing the counter is incrementing",
+   "A /health endpoint returns 200 even when rollup logic is broken (health check only pings the HTTP layer)"
+  ],
+  "internal_hint": "Two interacting runtime bugs, neither visible by reading code alone without knowing the data contract:\n\n1. STATUS THRESHOLD BUG (data-dependent): aggregator.js line ~87 uses `entry.status > 500` but the spec requires `>= 500`. This only causes wrong results when the traffic includes HTTP 500 responses, which the live generator does produce. The solver must run the service on real data, query error_rate, and compare it to manual counting of the fixture/live logs to notice the discrepancy. Simply reading the code shows `> 500` which looks plausible (one might think 5xx starts at 501).\n\n2. RING BUFFER OFF-BY-ONE (state-dependent, not visible until buffer rotates): percentile.js maintains a sorted ring buffer for the fast path (activated at N>200 samples). The insertion uses `this.buf[this.head++ % this.size] = value` but `this.size` is set to `this.maxSize - 1` instead of `this.maxSize`, meaning after exactly maxSize-1 insertions the head wraps to index 0 and overwrites the slot that was supposed to be the oldest-but-still-valid entry. This inserts a stale value from the previous window cycle into every subsequent p95 calculation, anchoring the percentile. The solver must wait for the buffer to rotate (30-60 seconds of live traffic) to observe the p95 stabilizing unnaturally, then instrument or add logging to the percentile calculator to trace the stale value back to the ring buffer logic.\n\nFix 1: Change `> 500` to `>= 500` in the error count predicate.\nFix 2: Change `this.size = this.maxSize - 1` to `this.size = this.maxSize` in percentile.js constructor.\n\nThe interaction: fixing only bug 1 makes error_rate pass but p95 still fails hidden tests with fresh high-volume inputs. Fixing only bug 2 makes p95 pass on small inputs but fail on high-volume because the ring buffer now works but error_rate is still wrong. A solver who spot-checks after fixing one bug may declare victory.",
+  "trap": "A solver who fixes only the `> 500` vs `>= 500` threshold will get correct error_rates and may manually verify p95 on a small sample (< 200 entries, where the ring buffer fast path is not activated). The verifier injects 500+ entries per service before querying p95, activating the broken fast path. The solver who fixes only the percentile bug will have correct p95 on small test queries but wrong error_rate when the verifier includes HTTP 500 status codes in its test traffic. Both bugs must be fixed for all verifier scenarios to pass.",
+  "tests": [
+   "Verifier starts fresh, waits 90 seconds for the generator to build up >200 entries per service (activating the ring buffer fast path), then queries /metrics?service=checkout&window=60 and independently counts entries in the last 60 seconds from the generator's own log to verify error_rate matches fraction with status>=500 (not >500), tolerance 0.005",
+   "Verifier injects a controlled burst of exactly 300 log entries for service 'verifier-svc' with known status codes (exactly 30 HTTP 500s, 20 HTTP 503s, 250 HTTP 200s) and known duration_ms values (a specific non-round distribution), waits 2 seconds, queries /metrics?service=verifier-svc&window=30, checks error_rate == 50/300 == 0.1667 (\u00b10.005) and p95_latency_ms matches independently computed true p95 of the injected durations (\u00b11ms)",
+   "Verifier queries /metrics?service=checkout&window=3600 and /metrics?service=checkout&window=5 and checks that the 5-second window has fewer entries than the 3600-second window (window boundary correctness)",
+   "Verifier injects entries for a service named 'xtest-alpha-7' (not in original fixtures), queries /metrics?service=xtest-alpha-7&window=60, checks response has all required JSON fields and error_rate is a valid float in [0,1]",
+   "Verifier sends 10 sequential requests over 20 seconds and checks that request_count in a short window increases over time (service is live and updating)",
+   "Verifier injects exactly 1000 entries with duration_ms = [1,2,...,1000] for a test service, queries p95, checks result is within 1ms of 950.0 (the true p95 of integers 1-1000)"
+  ],
+  "verifier_knob": {
+   "name": "injection_volume",
+   "value": "500 entries before p95 query",
+   "effect": "Lowering to <200 entries means the ring buffer fast path never activates, making bug 2 invisible and the task easier (only bug 1 matters). Raising to 2000+ entries increases the stale-value contamination effect and makes bug 2 more obvious from symptoms but also takes longer."
+  },
+  "expected_failure_modes": [
+   "Solver reads aggregator.js, spots the `> 500` bug, fixes it, manually queries the service and sees error_rate now looks reasonable, declares done without waiting for the ring buffer to rotate\u2014p95 tests fail",
+   "Solver notices p95 looks suspiciously round, investigates percentile.js, finds and fixes the ring buffer off-by-one, then queries and sees p95 varying correctly\u2014but never audits the error threshold and error_rate tests fail",
+   "Solver rewrites the percentile calculator from scratch using Array.sort() (correct), which fixes p95, but doesn't investigate error_rate at all and misses the `> 500` bug",
+   "Solver sees both fixes are needed but uses `entry.status >= 400` instead of `>= 500` (overcorrects or misreads the spec), causing error_rate to be wrong in a different direction",
+   "Solver fixes both bugs but restarts the service incorrectly (e.g., doesn't kill the old process), leaving two instances running on the same port\u2014one old, one new\u2014with load-balancing producing intermittently wrong results"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "nodejs",
+   "metrics",
+   "rollup",
+   "debugging",
+   "runtime-bug",
+   "percentile"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/rollup-service/aggregator.js",
+   "cat /app/rollup-service/percentile.js",
+   "sed -i 's/entry.status > 500/entry.status >= 500/' /app/rollup-service/aggregator.js",
+   "sed -i 's/this.size = this.maxSize - 1/this.size = this.maxSize/' /app/rollup-service/percentile.js",
+   "pkill -f 'node server.js' && cd /app/rollup-service && node server.js &",
+   "curl 'http://localhost:3000/metrics?service=checkout&window=60'",
+   "verify JSON shape and numeric fields look reasonable"
+  ],
+  "speedrun_commands": 7,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 90-second warmup window creates timing sensitivity: if the generator runs slower than ~20 entries/second (e.g., under CPU contention on 1-core container), the ring buffer may not rotate before the verifier queries, making p95 test pass vacuously without the fix.",
+   "Two node instances on the same port is listed as a failure mode but the verifier has no explicit check for this \u2014 a partially-fixed service could produce intermittently correct responses that pass some verifier retries by chance.",
+   "The core difficulty claim ('bugs not visible by reading code alone') is factually wrong: both `entry.status > 500` and `this.size = this.maxSize - 1` are immediately recognizable as bugs by static code inspection, collapsing the intended multi-phase investigation into a single read-and-fix pass.",
+   "The \u00b10.005 tolerance on error_rate assumes the live generator's traffic mix is stable during the verification window; if the generator's random seed causes a burst of 500s or a lull, the tolerance check could fail or pass incorrectly.",
+   "The 'fast path activated at N>200' threshold interacts with the verifier's 90-second wait: if window=60 is used but entries older than 60s are excluded, the effective sample count in the window might be under 200, bypassing the broken fast path even without a fix."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score fails the 4-minimum threshold because both bugs are directly and immediately visible via static code reading \u2014 `entry.status > 500` and `this.size = this.maxSize - 1` are recognizable in under a minute by any competent engineer or agent, reducing the solution to ~7 commands. The blueprint's central design premise ('bugs not visible by reading code alone') is factually incorrect, which invalidates the intended two-phase investigation and the trap mechanism. Additionally, the verifier's timing assumptions (90-second warmup, ring buffer rotation) create environmental flakiness that could cause invalid failures unrelated to solver correctness.",
+  "fixes": [
+   "Make the bugs truly non-visible in source by obfuscating them: e.g., extract the comparison into a named helper function `isError(entry)` that looks correct but uses a lookup table with a subtle off-by-one index, or hide the threshold in a config file loaded at runtime from an environment variable that defaults to the wrong value \u2014 forcing dynamic investigation.",
+   "Replace the ring buffer off-by-one with a bug that only manifests under a specific data distribution (e.g., the percentile is correct for uniform distributions but wrong for log-normal due to a bucket boundary assumption), requiring the solver to actually run and analyze real data rather than spot the bug in code.",
+   "Add a third interacting component: make the window filtering use `Date.now()` in one place and `process.hrtime()` in another with a clock skew accumulation bug, so even after fixing both known bugs, the window boundaries drift over time \u2014 requiring the solver to run the service for several minutes and observe the drift before identifying the root cause."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation in a sales database service, not about time-windowed metrics rollup and percentile computation in a log-drain service."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about schema validation and throughput of an NDJSON log ingestion pipeline, not about debugging a metrics rollup service with incorrect error rates and percentile calculations."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "That task is about C++ debug vs. release build memory corruption, unrelated to Node.js metrics aggregation or percentile computation bugs."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a log enrichment pipeline with GeoIP enrichment and API endpoints for country stats, not about time-windowed rollup metrics and percentile correctness."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a NetFlow v9 UDP/TCP aggregation service in Rust, not about Node.js log-drain metrics rollup with error rate and p95 latency bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.198
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.171
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.164
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.149
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.113
+    ]
+   ],
+   "cost_usd": 0.014075999999999998
+  },
+  "novel": true
+ },
+ "cost_usd": 0.054312
+}

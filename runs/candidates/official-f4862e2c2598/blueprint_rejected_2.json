@@ -1,0 +1,169 @@
+{
+ "blueprint": {
+  "slug": "metric-rollup-query-daemon",
+  "title": "Metric Rollup Query Service",
+  "scenario": "A data engineering team runs a pipeline that ingests per-minute service metrics into SQLite, rolls them up into hourly and daily aggregates via a scheduler, and exposes a small HTTP query daemon so downstream dashboards can pull aggregated stats. You've inherited this pipeline after the previous engineer left. The repo has ~1400 lines across an ingestor, a rollup scheduler, a query daemon, and a migration tool. Dashboards have been returning wrong numbers for weeks and nobody knows why.",
+  "instruction_draft": "Hey, I inherited the metrics pipeline in /app and the dashboards are totally wrong \u2014 hourly and daily rollups don't match what the raw per-minute data says. The query daemon at port 7700 needs to respond correctly to these requests: GET /metrics?name=<metric>&window=1h&ts=<unix_epoch> returns the sum, min, max, and p95 of all per-minute samples whose minute-boundary timestamp falls inside the 1-hour window ending at ts (exclusive), and GET /metrics?name=<metric>&window=24h&ts=<unix_epoch> does the same for the 24-hour window. The daemon must compute these correctly from the raw per-minute rows in the SQLite DB \u2014 don't trust the pre-rolled-up tables, those are what's broken. Make sure the daemon stays running and handles at least the sample metric names and timestamps in /app/sample_queries.txt. The DB is at /app/data/metrics.db.",
+  "requirements": [
+   "GET /metrics?name=<metric>&window=1h&ts=<unix_epoch> returns JSON with sum, min, max, p95 computed from raw per-minute rows whose timestamp satisfies: window_start <= ts_minute < ts, where window_start = ts - 3600",
+   "GET /metrics?name=<metric>&window=24h&ts=<unix_epoch> returns JSON with sum, min, max, p95 computed from raw per-minute rows whose timestamp satisfies: window_start <= ts_minute < ts, where window_start = ts - 86400",
+   "p95 is computed as the 95th percentile of the per-minute sample values (not of pre-aggregated rows)",
+   "The daemon listens on port 7700 and remains running",
+   "Responses use Content-Type application/json",
+   "If no rows exist for the window, return sum=0, min=null, max=null, p95=null",
+   "The daemon handles concurrent requests without crashing"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3, flask, gunicorn, numpy; exposes port 7700",
+   "/app/ingestor.py: ~300 lines, reads from /app/data/feed/*.jsonl and inserts per-minute rows into metrics_raw(metric_name, ts, value); correctly written",
+   "/app/rollup.py: ~250 lines, reads metrics_raw and writes into metrics_hourly(metric_name, hour_ts, sum, min, max, p95) and metrics_daily(metric_name, day_ts, sum, min, max, p95); contains TWO bugs: (1) the p95 computation uses numpy.percentile with the pre-aggregated min values instead of collecting all raw values, producing wrong p95; (2) the hourly rollup uses ROUND(ts/3600)*3600 instead of (ts/3600)*3600 (integer division flooring), causing some rows to be bucketed into the wrong hour",
+   "/app/query_daemon.py: ~200 lines, Flask app that serves /metrics by querying metrics_hourly or metrics_daily and returning their stored values \u2014 it does NOT query metrics_raw at all; so it faithfully returns the wrong pre-aggregated data",
+   "/app/migrate.py: ~150 lines, sets up the DB schema; run at container start",
+   "/app/scheduler.py: ~120 lines, runs rollup.py on a cron-like loop; correctly written",
+   "/app/data/metrics.db: pre-populated SQLite database with 30 days of per-minute data for 8 metric names (cpu_util, mem_used, req_count, err_count, latency_p99, disk_read, disk_write, net_bytes); metrics_raw has ~345,600 rows; metrics_hourly and metrics_daily are populated but contain wrong values due to the rollup bugs",
+   "/app/sample_queries.txt: 10 sample (metric, window, ts) combinations with expected outputs computed from raw data (used for sanity checking by the solver)",
+   "/app/start.sh: starts the daemon with gunicorn",
+   "The hidden invariant: the query daemon was never wired to metrics_raw \u2014 it only reads pre-aggregated tables. And the pre-aggregated tables are wrong due to the bucketing and p95 bugs in rollup.py. The solver must discover this by running queries and comparing to raw data, then fix the daemon to compute directly from metrics_raw.",
+   "A second hidden invariant: the p95 must be computed per-window from individual raw values, not from averaging stored p95 values across sub-windows \u2014 the verifier generates fresh time windows that cross rollup bucket boundaries to catch this."
+  ],
+  "internal_hint": "Root cause has two interacting parts: (1) query_daemon.py reads only pre-aggregated tables, never metrics_raw \u2014 this is not mentioned anywhere in the instruction and must be discovered by running a query and comparing the result to a direct SQL query on metrics_raw; (2) even if the daemon were fixed to call rollup.py on-demand, the rollup p95 is wrong because it aggregates stored min values instead of raw values. The correct fix is to rewrite the /metrics endpoint to query metrics_raw directly with a window filter, collect all matching values, and compute sum/min/max/p95 in Python using numpy. The solver must: (a) run sample queries against the daemon and observe wrong answers, (b) query metrics_raw directly to see correct answers, (c) read query_daemon.py to discover it uses pre-aggregated tables, (d) optionally read rollup.py to understand the p95 bug, (e) rewrite the daemon endpoint to hit metrics_raw. The key difficulty is that (c) and (d) are separate bugs that interact \u2014 fixing only the bucketing but keeping the pre-agg path still gives wrong p95 on cross-boundary windows.",
+  "trap": "A naive agent reads rollup.py, fixes the two bugs there, re-runs the rollup to repopulate metrics_hourly/daily, and verifies against sample_queries.txt \u2014 the samples all fall within clean hourly boundaries, so they pass. But the verifier generates windows with ts values that land mid-hour, causing the window to span parts of two hourly buckets. The pre-aggregated path cannot correctly compute p95 across two partial buckets (you cannot combine two p95 values into a combined p95 without the raw data). Only a daemon that queries metrics_raw with the exact window bounds passes these cross-boundary cases.",
+  "tests": [
+   "For each of 8 metric names, query /metrics with window=1h and a ts that falls exactly on an hour boundary \u2014 verify sum, min, max, and p95 match direct SQL aggregation on metrics_raw",
+   "For each of 8 metric names, query /metrics with window=1h and a ts that falls 23 minutes past an hour boundary (cross-bucket window) \u2014 verify all four statistics match direct SQL on metrics_raw; pre-agg solutions fail p95 here",
+   "For each of 8 metric names, query /metrics with window=24h and a ts that falls mid-day \u2014 verify statistics match direct SQL on metrics_raw",
+   "Query a metric and window where metrics_raw has zero rows (metric name exists but the time range is before ingest started) \u2014 verify sum=0, min=null, max=null, p95=null",
+   "Send 10 concurrent requests and verify all return correct 200 responses (no crashes)",
+   "Verify Content-Type: application/json on all responses",
+   "Verify the daemon process is still running after the test suite completes"
+  ],
+  "verifier_knob": {
+   "name": "cross_boundary_scenarios",
+   "value": "8 metric names x 3 window positions (aligned, +23min, +41min) = 24 cross-boundary test cases",
+   "effect": "Increasing the number of off-boundary ts values makes it harder to accidentally pass by re-running a fixed rollup; decreasing to only aligned windows would let a rollup-fix-only solution pass"
+  },
+  "expected_failure_modes": [
+   "Agent fixes rollup.py bugs and re-runs rollup but leaves query_daemon.py reading pre-aggregated tables \u2014 passes aligned samples but fails cross-boundary p95 tests",
+   "Agent rewrites the daemon to query metrics_raw but computes p95 incorrectly (e.g., uses percentile on a list of one value per minute rather than the actual value column, or uses linear interpolation vs nearest-rank method that differs on boundary cases)",
+   "Agent discovers the daemon reads pre-agg tables, patches it to call rollup on-demand for the window, but the on-demand rollup still uses the buggy p95 logic from rollup.py",
+   "Agent fixes the daemon endpoint but uses integer division truncation for window_start that's off by one second, causing boundary rows to be excluded or included incorrectly",
+   "Agent verifies only against sample_queries.txt (which uses aligned windows) and ships \u2014 hidden cross-boundary cases fail"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-engineering",
+  "tags": [
+   "sql",
+   "sqlite",
+   "metrics",
+   "http-service",
+   "hidden-invariant",
+   "percentile"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/sample_queries.txt",
+   "curl 'http://localhost:7700/metrics?name=cpu_util&window=1h&ts=<ts_from_sample>'",
+   "sqlite3 /app/data/metrics.db \"SELECT SUM(value),MIN(value),MAX(value) FROM metrics_raw WHERE metric_name='cpu_util' AND ts>=<ts-3600> AND ts<<ts>\"",
+   "# Observe mismatch \u2192 daemon returns wrong numbers",
+   "cat /app/query_daemon.py",
+   "# Instantly see: /metrics endpoint queries metrics_hourly/metrics_daily, never metrics_raw",
+   "# Plan: replace endpoint body with direct metrics_raw query + numpy p95",
+   "cat /app/rollup.py  # optional, confirms p95 bug but not needed for fix",
+   "# Edit query_daemon.py: new endpoint fetches values from metrics_raw WHERE metric_name=? AND ts>=window_start AND ts<ts, computes sum/min/max/p95 with numpy",
+   "pkill gunicorn && cd /app && gunicorn -w 4 query_daemon:app -b 0.0.0.0:7700 &",
+   "curl 'http://localhost:7700/metrics?name=cpu_util&window=1h&ts=<ts>'",
+   "# Compare to direct sqlite3 query \u2014 match",
+   "curl 'http://localhost:7700/metrics?name=cpu_util&window=1h&ts=<ts+23min>'",
+   "# Cross-boundary test \u2014 match (because we query raw directly)",
+   "curl 'http://localhost:7700/metrics?name=nonexistent&window=1h&ts=<ts>'",
+   "# Verify null response for empty window",
+   "# Run all 8 metrics x sample windows \u2014 all pass"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "p95 interpolation method (nearest-rank vs linear interpolation) is unspecified \u2014 numpy.percentile uses linear by default; if verifier uses a different method, valid solutions could fail on boundary values",
+   "Concurrent request test with gunicorn workers uses SQLite \u2014 WAL mode not guaranteed enabled, potential SQLITE_BUSY under concurrency causing flaky failures",
+   "Window boundary semantics: 'window_start <= ts_minute < ts' uses the phrase 'ts_minute' ambiguously \u2014 if per-minute rows are stored as Unix epochs that may not be exactly on minute boundaries, the filter could behave differently than expected",
+   "Restarting gunicorn inside the container may fail if start.sh uses a process supervisor that auto-restarts \u2014 agent could get stuck in a restart loop",
+   "The null-row test depends on knowing a time range before ingest started, which requires the agent to discover the ingest start time \u2014 sample_queries.txt may or may not include this case"
+  ],
+  "verdict": "reject",
+  "reasons": "The core 'hidden invariant' (query_daemon.py reads pre-aggregated tables instead of metrics_raw) is discovered by a single `cat` command after observing wrong output \u2014 a methodical agent reaches a complete solution in ~16 commands, placing genuine_difficulty firmly at 2 per the rubric's stated calibration. The task is otherwise well-constructed with excellent realism and clean verifiability, but fails the minimum genuine_difficulty threshold of 4. The trap (fixing rollup.py instead of the daemon) is only effective against agents that skip reading source files, which frontier agents reliably do not.",
+  "fixes": [
+   "Add a second hidden layer: make query_daemon.py appear to query metrics_raw but actually use a subtle SQL bug (e.g., wrong timezone conversion or off-by-one in window boundary using BETWEEN instead of >= AND <), so reading the source code alone doesn't reveal the bug \u2014 the agent must test with cross-boundary inputs and trace through the SQL logic carefully",
+   "Remove query_daemon.py from the repo entirely and make it a compiled binary (or obfuscated bytecode), forcing the agent to infer the bug from behavioral testing alone \u2014 this transforms the task from 'read source, find bug' to 'black-box debugging via systematic query comparison'",
+   "Specify the p95 interpolation method explicitly (e.g., 'use numpy.percentile with linear interpolation, method=linear') to eliminate ambiguous failure modes in the verifier",
+   "Enable SQLite WAL mode in migrate.py and document it, or replace the concurrency test with a sequential-but-many-requests test to avoid SQLite locking flakiness",
+   "Add a distractor: make metrics_raw itself have a subtle schema issue (e.g., ts stored as TEXT instead of INTEGER for one metric) that only affects cross-boundary queries for that metric, requiring the agent to inspect schema and handle type coercion"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Both involve a pipeline with a query daemon returning wrong aggregated stats, but the reference focuses on GeoIP enrichment bugs and adding a missing endpoint, while the candidate focuses on SQL window computation correctness (sum/min/max/p95) from raw vs pre-aggregated tables."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "Both involve a metrics pipeline with rollup tables and percentile computation, but the reference centers on reverse-engineering a black-box binary normalizer, while the candidate centers on fixing an HTTP query daemon to bypass broken rollup tables and compute stats directly from raw rows."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "Both involve SQL aggregation queries with percentile computation, but the reference is a query optimization task on PostgreSQL with no correctness bug, while the candidate is a debugging task fixing wrong rollup aggregations in a running HTTP service over SQLite."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "Both involve pipeline debugging producing wrong output, but the reference focuses on CSV chunking, deduplication, and validation logic, while the candidate focuses on HTTP daemon query correctness and bypassing broken pre-aggregated tables."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Both involve a query service returning incorrect aggregated data over a network protocol, but the reference involves NetFlow UDP/TCP parsing and flow aggregation in Rust, while the candidate involves SQLite-backed metric rollups and a Python/other HTTP daemon computing percentiles."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.105
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.104
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.1
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.083
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.082
+    ]
+   ],
+   "cost_usd": 0.016152
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058371
+}

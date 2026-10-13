@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "metric-rollup-query-service",
+  "title": "Metrics Rollup Query Service",
+  "scenario": "You've just inherited a data pipeline that ingests raw application logs, rolls them up into per-minute and per-hour metric aggregates stored in SQLite, and exposes a small HTTP query service so dashboards can ask questions like 'what was the p99 latency in the last hour?'. The previous engineer left it half-finished: the ingestion and rollup scripts run, the HTTP service starts, but queries return wrong numbers or crash on certain request shapes. The codebase is ~1,200 lines across an ingester, a rollup daemon, a query service, and some utility modules.",
+  "instruction_draft": "Hey, I inherited the metrics pipeline in /app and it's broken in production. The HTTP service on port 7700 is supposed to answer rollup queries correctly for any valid time window and metric name. Right now dashboards are getting garbage back. The service needs to handle at least these kinds of requests correctly: single-minute windows, multi-hour windows, windows that cross rollup boundaries (raw vs aggregated data), percentile queries (p50, p95, p99), and queries for metrics that had zero events in some sub-windows. Check the logs and data to figure out what's wrong, then fix it so the service answers correctly. The verifier will throw a range of request scenarios at port 7700 and check the responses against independently computed ground truth.",
+  "requirements": [
+   "The HTTP service listens on port 7700 and stays running after fixes are applied",
+   "GET /query?metric=<name>&start=<unix_ts>&end=<unix_ts>&stat=<count|sum|avg|p50|p95|p99> returns JSON {metric, start, end, stat, value}",
+   "Responses for windows entirely within raw-data retention (last 2 hours) are computed from raw rows",
+   "Responses for windows spanning both raw and rolled-up data correctly stitch the two sources together",
+   "Responses for windows entirely in rolled-up data use the hourly aggregates",
+   "Percentile stats (p50, p95, p99) are computed correctly even when sub-windows have zero events",
+   "A metric with zero events in the requested window returns value 0 (not an error or null)",
+   "count, sum, avg stats are numerically correct to within 0.01 relative error",
+   "p50/p95/p99 are within the nearest rank (no more than 1 rank off from true percentile)",
+   "The service handles at least 20 distinct metric names and windows ranging from 1 minute to 24 hours"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs sqlite3, flask, and a few stdlib-only helpers; no internet needed",
+   "/app/ingest.py: reads raw JSONL log lines from /app/data/raw/*.jsonl and inserts into SQLite raw_events table (metric_name, ts, value); ~150 lines, works correctly",
+   "/app/rollup.py: reads raw_events and writes to hourly_rollups table (metric_name, hour_ts, count, sum, min, max, p50, p95, p99); ~200 lines; BUG 1: percentile computation uses Python sorted() on aggregated min/max pairs instead of actual values \u2014 it reconstructs a fake distribution from stored min/max and count that is systematically wrong for skewed distributions; this is invisible until you run queries against real data",
+   "/app/query_service.py: Flask app on port 7700 with /query endpoint; ~250 lines; BUG 2: the stitching logic for cross-boundary windows (part raw, part rolled-up) double-counts the boundary hour \u2014 it includes the last rolled-up hour AND all raw events from that same hour; BUG 3: for percentile queries on cross-boundary or raw-only windows, it fetches values from raw_events but sorts as strings not floats (a schema mistake propagated from ingest.py which stores value as TEXT not REAL)",
+   "/app/utils/db.py: connection helpers, ~80 lines, correct",
+   "/app/utils/stats.py: percentile helper function that is correct but is NOT used by query_service.py (query_service.py has its own inline percentile that has the string-sort bug)",
+   "/app/data/raw/: 24 JSONL files (one per hour) with realistic synthetic log events for 25 metric names; generated deterministically with seed 42; values include latency (log-normal), error counts (Poisson), sizes (uniform); some metrics have zero-event windows",
+   "/app/logs/rollup.log and /app/logs/query.log: realistic logs showing the pipeline has been running; rollup log shows warnings about 'unusual distribution' that hint at the percentile reconstruction issue",
+   "/app/schema.sql: DDL for raw_events (metric_name TEXT, ts INTEGER, value TEXT) and hourly_rollups (metric_name TEXT, hour_ts INTEGER, count INTEGER, sum REAL, min REAL, max REAL, p50 REAL, p95 REAL, p99 REAL)",
+   "A startup script /app/start.sh that runs ingest.py, rollup.py, then starts query_service.py; the verifier calls this before sending requests",
+   "The SQLite database /app/metrics.db is pre-populated with 48 hours of data (so queries crossing rollup boundary are possible from the start)",
+   "/app/README.md: 2 paragraphs describing the architecture; mentions the raw retention window is 2 hours and older data lives only in hourly_rollups"
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) the bugs only manifest on real data \u2014 the percentile reconstruction from stored min/max/count in rollup.py looks plausible in code but produces wrong values on skewed distributions; the string-sort bug in query_service.py only shows when values like '9.8' sort before '10.2'; these require running queries and observing wrong output, not reading the code. (2) The stitching double-count is a state-dependent correctness issue: it depends on exactly which hour is the boundary, so a fix must understand the retention logic. The solver must: (a) run the service and probe it to see wrong values, (b) correlate logs to identify which code path is involved, (c) find the value TEXT column in schema.sql causing the sort bug, (d) realize rollup.py's percentile reconstruction is fundamentally wrong (must re-derive from raw events or store actual value arrays), (e) fix the boundary double-count in the stitching logic. A partial fix (fixing just the sort bug) passes simple raw-window tests but fails all cross-boundary and rolled-up-window percentile tests.",
+  "trap": "An agent that fixes only the obvious string-sort bug (casting value to REAL in the percentile sort) will pass raw-window percentile queries but still fail: (1) all rolled-up-window percentile queries because the stored p50/p95/p99 in hourly_rollups were computed with the fake min/max reconstruction, and (2) cross-boundary queries because the double-count remains. The verifier generates fresh request scenarios at verify time including pure-rollup windows and cross-boundary windows, so shallow testing against the provided sample data will not reveal these failures.",
+  "tests": [
+   "Verifier starts /app/start.sh and waits for port 7700 to accept connections",
+   "For each of 8 distinct metric names, queries a 10-minute window entirely within the last 2 hours (raw data only) and checks count, sum, avg match ground truth computed by the verifier directly from the JSONL files",
+   "For each of 5 metric names, queries p50/p95/p99 in a 30-minute raw window and checks each percentile is within 1 rank of true value computed by verifier from raw JSONL",
+   "For each of 6 metric names, queries a 3-hour window that crosses the raw/rollup boundary (2 hours ago) and checks count and sum are correct (no double-count)",
+   "For each of 4 metric names, queries p99 in a 6-hour window (entirely in rollup data) and checks the returned value matches a ground-truth recomputed by verifier from the original JSONL files (not from the stored rollup columns, since those may have been recomputed after fix)",
+   "Queries 3 metrics known to have zero events in a specific 15-minute sub-window; verifies value=0 is returned (not null/error) for count stat",
+   "Queries a 24-hour avg window covering all data; verifies result is within 0.01 relative error of ground truth",
+   "Sends 10 concurrent requests to verify the service does not crash under light concurrency",
+   "Verifier generates 5 additional random (metric, window, stat) triples not in the sample data and checks correctness"
+  ],
+  "verifier_knob": {
+   "name": "number_of_request_scenarios",
+   "value": "8 scenario groups (40+ individual requests)",
+   "effect": "Reducing to 3-4 groups (pure raw only) makes it easier because the rollup and stitching bugs go untested; increasing to 12+ groups with more cross-boundary and multi-day windows makes it harder"
+  },
+  "expected_failure_modes": [
+   "Agent fixes the string-sort bug only, passes raw-window tests, but fails rollup and cross-boundary percentile tests because stored rollup percentiles were computed wrong and stitching double-counts",
+   "Agent fixes the stitching double-count and string-sort but misses that hourly_rollup percentile columns are already corrupted in the DB and doesn't re-run rollup.py after fixing it",
+   "Agent re-runs rollup.py after fixing it but rollup.py still uses the fake min/max reconstruction for percentiles (a different bug from the sort bug); all rollup-window percentile tests still fail",
+   "Agent fixes rollup.py's percentile logic but uses a statistically wrong approximation (e.g., linear interpolation between min and max) that looks right on the sample but fails on the verifier's fresh skewed-distribution metrics",
+   "Agent correctly identifies all three bugs but the fix to rollup.py introduces a new regression in the count or sum columns that causes avg and count tests to fail"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-engineering",
+  "tags": [
+   "sql",
+   "metrics",
+   "bash",
+   "logs",
+   "service-protocol",
+   "bug-hunt"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/schema.sql  \u2192 spot value TEXT column (bug 3 source)",
+   "cat /app/rollup.py \u2192 spot fake percentile reconstruction from min/max (bug 1)",
+   "cat /app/query_service.py \u2192 spot string sort in percentile, stitching double-count (bugs 2,3)",
+   "cat /app/utils/stats.py \u2192 confirm correct helper exists, unused",
+   "grep -n 'sort\\|value' /app/query_service.py \u2192 pinpoint string sort line",
+   "grep -n 'stitch\\|boundary\\|hour_ts' /app/query_service.py \u2192 pinpoint double-count",
+   "grep -n 'p50\\|p95\\|p99\\|min\\|max' /app/rollup.py \u2192 pinpoint fake reconstruction lines",
+   "Fix query_service.py: cast values to float before sort, import and use stats.py percentile helper",
+   "Fix query_service.py: fix stitching to exclude last rollup hour when raw data covers it",
+   "Fix rollup.py: replace min/max reconstruction with actual sorted values queried from raw_events",
+   "python /app/rollup.py \u2192 re-run rollup to repopulate hourly_rollups with correct percentiles",
+   "bash /app/start.sh \u2192 restart full pipeline",
+   "curl 'localhost:7700/query?metric=latency&start=RAW_START&end=RAW_END&stat=p99' \u2192 verify raw window",
+   "curl 'localhost:7700/query?metric=latency&start=CROSS_START&end=CROSS_END&stat=count' \u2192 verify no double-count",
+   "curl 'localhost:7700/query?metric=latency&start=OLD_START&end=OLD_END&stat=p99' \u2192 verify rollup-only window",
+   "curl 'localhost:7700/query?metric=zero_metric&start=...&end=...&stat=count' \u2192 verify returns 0",
+   "python -c 'import concurrent.futures, urllib.request; [urllib.request.urlopen(...) for _ in range(10)]' \u2192 concurrency test"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Verifier timeout: re-running rollup.py over 48h \u00d7 25 metrics after fix may take longer than the verifier's startup wait, causing premature test failures",
+   "Flask dev server threading: 10 concurrent requests to a single-threaded Flask dev server may crash or serialize in ways that make the concurrency test flaky depending on how it's configured",
+   "Percentile tolerance ambiguity: 'within 1 rank' is undefined when a sub-window has very few events (N=2 or N=3); a correct implementation could technically fail this test",
+   "rollup.py percentile fix strategy ambiguity: fixing rollup.py to compute correct percentiles requires either re-querying raw_events at rollup time (feasible) or storing raw value arrays (schema change needed); the blueprint doesn't specify which approach is valid, and a schema change may break query_service.py's stitching logic in unexpected ways",
+   "The instruction does not tell the solver what the raw retention window is (2 hours); this is only in README.md, so a solver who skips README may guess wrong boundary"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three bugs are directly readable from source files (TEXT column in schema.sql, obvious fake min/max reconstruction in rollup.py, visible string sort and stitch logic in query_service.py) and a capable agent would identify and fix all of them in ~17 commands without needing to observe runtime behavior. The partial-fix trap is real but insufficient to compensate when the full fix path is code-readable. The task fails the minimum genuine_difficulty threshold of 4 and the average threshold of 3.6 (actual average: 4.0 with difficulty at 2 drags it below when weighted against the acceptance bar).",
+  "fixes": [
+   "Make the bugs harder to find by code-reading alone: hide the string-sort bug behind a helper function that looks correct (e.g., a utils/sort_helper.py that wraps sorted() but fails to cast), so the bug only manifests when tracing execution flow through multiple indirections",
+   "Make the rollup percentile reconstruction look statistically plausible: instead of obviously wrong 'sorted(min/max pairs)', use a realistic-looking but subtly incorrect interpolation formula (e.g., off-by-one in index calculation, or wrong quantile formula) that requires actually running queries against skewed data to detect",
+   "Add a 4th bug that is data-dependent and invisible without querying: e.g., the stitching uses UTC midnight as the boundary instead of exactly 2 hours ago, which is correct for most test cases but wrong for the 6 test metrics whose rollup boundary falls mid-hour \u2014 discoverable only by comparing ground truth against returned values",
+   "Ensure start.sh does NOT auto-run rollup.py so the solver must discover they need to re-run it after fixing rollup.py; this adds a non-obvious step that many agents miss",
+   "Specify Flask threading mode explicitly (threaded=True) in start.sh to avoid flaky concurrency tests"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task fixes a log enrichment pipeline with GeoIP enrichment and missing API endpoints; the candidate is about fixing metric rollup query correctness across raw/aggregated data with percentile calculations."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task fixes weighted regional sales aggregations in a compiled service; the candidate is about fixing an HTTP query service that stitches raw and rolled-up time-series metrics with percentile support."
+    },
+    {
+     "ref_id": "terminal-bench/embedding-drift-monitor",
+     "verdict": "distinct",
+     "reason": "That task fixes statistical drift detection (KS, PSI, MMD tests) for embedding distributions; the candidate is about fixing a time-series metrics rollup query service with raw/aggregated data stitching."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task fixes a NetFlow v9 UDP/TCP aggregation service in Rust with flow record processing; the candidate is about fixing an HTTP metrics rollup query service in Python/SQLite with percentile calculations."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task reverse-engineers a black-box binary normalizer and fixes SQL rollup queries for sensor data; the candidate is about fixing an HTTP service that queries and stitches multi-tier metric aggregates with percentile support."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.158
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.143
+    ],
+    [
+     "terminal-bench/embedding-drift-monitor",
+     0.127
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.124
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.111
+    ]
+   ],
+   "cost_usd": 0.014655000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.062988
+}

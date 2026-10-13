@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "hmac-sqlite-audit-refactor",
+  "title": "Cryptographic Audit Log Integrity Engine",
+  "scenario": "A research scientist is reproducing a published result that depends on a C-based system administration audit daemon. The daemon watches a SQLite database of system events and computes HMAC-SHA256 chain signatures over batches of log rows so that any tampering is detectable. After a major refactor to support multiple hash algorithms and per-tenant key derivation, the chain verification is silently broken: records are accepted as valid even when they have been tampered with, and the verification rejects some legitimate records. The compiled daemon binary is provided without source; the C verification library and SQLite schema are present and must be repaired.",
+  "instruction_draft": "```\n$ ./audit-verify --db audit.db --tenant research\nVerifying chain from row 1 to 4096...\nOK: 4096/4096 rows verified\n$ ./audit-tamper --db audit.db --row 512 --field payload --value INJECTED\n$ ./audit-verify --db audit.db --tenant research\nOK: 4096/4096 rows verified   <-- should have FAILED at row 512\n$ ./audit-verify --db audit.db --tenant science --range 1,200\nFAIL: row 17 invalid (chain break)\n```\n\nThe audit daemon at `/opt/auditd/` writes HMAC-SHA256 chain signatures into `audit.db`. After the recent refactor of `libaudit_verify.c` and the key-derivation module `kdf.c`, the verifier accepts tampered records and rejects some legitimate ones.\n\nRepair the C source in `/opt/auditd/src/` so that:\n1. Every record in a valid, untampered chain is accepted by `audit-verify`.\n2. Tampering with any field of any row (payload, timestamp, severity, or tenant_id) causes `audit-verify` to report a failure at exactly that row and all subsequent rows.\n3. Key derivation for each tenant uses the tenant_id and the master key from `/etc/auditd/master.key` exactly as documented in `/opt/auditd/docs/kdf_spec.md`.\n4. The HMAC input for row N is the concatenation of: the HMAC output of row N-1 (or a fixed genesis constant for N=1), then the canonical encoding of all auditable fields of row N, in the column order defined in the schema.\n5. The first row of each tenant partition resets the chain using the genesis constant, not the last row of a different tenant's chain.\n6. All of the above must hold for tenants whose tenant_id contains UTF-8 multibyte characters, for rows where any text field is empty, and for payloads up to 1 MB.\n\nRebuild with `make -C /opt/auditd/src` and verify with `/opt/auditd/audit-verify`.",
+  "requirements": [
+   "Every row in a valid untampered chain is accepted by audit-verify",
+   "Tampering with any auditable field (payload, timestamp, severity, tenant_id) of any row causes audit-verify to report failure at exactly that row and all subsequent rows in the same tenant chain",
+   "Key derivation uses the tenant_id concatenated with the master key per kdf_spec.md, not a static or global key",
+   "The HMAC input for row N is: HMAC(row N-1) || canonical_encode(all auditable fields of row N in schema column order); for N=1 use the genesis constant",
+   "Each tenant's chain is independent: the first row for a tenant uses the genesis constant regardless of other tenants' chain state",
+   "Correctness holds for tenant_ids with UTF-8 multibyte characters",
+   "Correctness holds for rows with empty text fields",
+   "Correctness holds for payloads up to 1 MB"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install gcc, make, libsqlite3-dev, libssl-dev via apt",
+   "Install Python packages: pytest, pysqlite3 (for test harness)",
+   "/opt/auditd/src/libaudit_verify.c: the main verification library with THREE bugs: (1) the HMAC input omits the tenant_id field from the canonical encoding, so cross-tenant replay attacks pass; (2) the chain genesis constant is read from a global that was zero-initialized after the refactor instead of using the documented 32-byte hex constant in kdf_spec.md; (3) the KDF calls HMAC-SHA256(master_key, tenant_id) but the refactor reversed the arguments to HMAC-SHA256(tenant_id, master_key), which produces wrong subkeys",
+   "/opt/auditd/src/kdf.c: the key derivation module with the reversed-argument bug",
+   "/opt/auditd/src/chain.c: correct chain-linking logic (not buggy, but references the broken genesis constant from libaudit_verify.c via extern)",
+   "/opt/auditd/src/Makefile: builds libaudit_verify.so and audit-verify binary",
+   "/opt/auditd/docs/kdf_spec.md: documents HMAC-SHA256(key=master_key, data=tenant_id), the 32-byte genesis constant in hex, and the canonical field ordering",
+   "/opt/auditd/audit-verify: compiled binary (rebuilt by make; initially broken)",
+   "/opt/auditd/audit-tamper: a compiled helper binary (no source) that modifies a single field in a row without updating HMAC signatures, used to inject tampered data for testing",
+   "audit.db: pre-seeded SQLite database with 3 tenants (including one with a multibyte UTF-8 tenant_id), ~2000 rows each, all valid chains built by the reference implementation",
+   "/etc/auditd/master.key: 32-byte binary master key file",
+   "/opt/auditd/src/canonical.c: correct canonical encoder (not buggy)",
+   "/opt/auditd/src/sqlite_iter.c: correct SQLite row iteration (not buggy)",
+   "~1800 total lines across all C files; additional plausible but uninvolved files: logging.c, config.c, signal_handler.c",
+   "Python test harness at /tests/test_chain.py that generates fresh tampered and untampered databases at verify time and invokes audit-verify, comparing exit codes and stderr output"
+  ],
+  "internal_hint": "Difficulty comes from two sources that are NOT visible by reading one file: (1) the symptom (verifier accepts tampered rows) points at chain.c or canonical.c, but those are correct; the real bugs are in libaudit_verify.c (missing tenant_id from HMAC input, wrong genesis constant) and kdf.c (reversed HMAC arguments for key derivation). An agent reading chain.c first will not find any bug. (2) The edge cases (multibyte tenant_id, empty fields, genesis constant) are not present in the sample audit.db query results and only fail at verify time. The solver must: run the verifier on a tampered record and observe it passes; then instrument or read libaudit_verify.c to see the HMAC input construction; notice tenant_id is missing; then check the genesis constant against kdf_spec.md; then check kdf.c argument order against kdf_spec.md. Three independent bugs must all be fixed for the tests to pass.",
+  "trap": "A naive solver sees that audit-verify wrongly accepts tampered rows and suspects chain.c or the SQLite iteration. They read chain.c and canonical.c, find no bug, patch chain.c defensively, and rebuild. The verifier still accepts tampered records because the HMAC input omits tenant_id (so a row moved to another tenant's chain still validates) and the genesis constant is wrong (so the first-row check uses the zero bytes, passing trivially on the pre-seeded database). The tests generate fresh databases with multibyte tenant_ids and empty fields, then tamper with row 1 of each tenant independently\u2014these fail because the KDF key is wrong due to reversed arguments, so the reference computation uses a different subkey than the repaired library.",
+  "tests": [
+   "Generate a fresh 500-row single-tenant chain using the reference Python implementation (which uses the correct genesis, KDF, and canonical encoding), insert into a temp SQLite DB, run audit-verify, assert exit 0",
+   "Tamper with row 47 payload in the above chain, run audit-verify, assert exit nonzero and stderr mentions row 47",
+   "Tamper with row 47 timestamp, assert failure at row 47",
+   "Tamper with row 47 severity, assert failure at row 47",
+   "Tamper with row 47 tenant_id by changing it to a different tenant's id, assert failure at row 47 (tests that tenant_id is included in HMAC input)",
+   "Generate a 3-tenant chain where one tenant has a multibyte UTF-8 tenant_id (e.g., '\u7814\u7a76\u8005'), verify all chains pass",
+   "Take the multibyte tenant chain, tamper row 1 of that tenant only, assert failure at row 1 for that tenant without affecting other tenants (tests genesis constant and chain independence)",
+   "Generate a chain where some rows have empty payload and empty severity fields, verify passes",
+   "Generate a chain with a 1MB payload row, verify passes",
+   "Move a valid row from tenant A's chain position 50 to tenant B's chain at position 50 (cross-tenant replay), assert audit-verify rejects it",
+   "Verify that the genesis constant used by the rebuilt binary matches the hex value in kdf_spec.md by generating a single-row chain starting from that constant and checking it validates",
+   "Fuzz: generate N=200 random chains with random tenant names, random field lengths, random tamper positions; for each, assert verifier accepts untampered and rejects tampered (N is the verifier knob)"
+  ],
+  "verifier_knob": {
+   "name": "fuzz_chain_count",
+   "value": "200",
+   "effect": "Raising N increases the number of randomly generated tenant/chain/tamper combinations tested at verify time, covering more edge cases in field lengths, tenant_id byte sequences, and tamper positions. Lowering to 20 makes it easier to pass by luck; raising to 1000 makes partial fixes that work on most inputs reliably fail."
+  },
+  "expected_failure_modes": [
+   "Agent reads chain.c and canonical.c, finds no bug, concludes the problem is in the SQLite layer or the binary, and never fixes the actual bugs in libaudit_verify.c and kdf.c",
+   "Agent fixes the HMAC input (adds tenant_id) and the genesis constant, but misses the reversed KDF arguments in kdf.c\u2014passes the sample database but fails the fuzz tests with fresh tenants",
+   "Agent fixes the KDF and genesis constant but misses that tenant_id must be in the HMAC input\u2014cross-tenant replay tests fail",
+   "Agent fixes all three bugs but introduces an off-by-one in the canonical encoding of empty fields, which only surfaces on the edge-case inputs generated at verify time",
+   "Agent rebuilds successfully but the Makefile links the old .o files; the binary still uses the broken genesis constant until a clean rebuild"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "cryptography",
+   "system-administration",
+   "sqlite",
+   "c",
+   "hmac",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/auditd/docs/kdf_spec.md",
+   "./audit-verify --db audit.db --tenant research",
+   "./audit-tamper --db audit.db --row 512 --field payload --value INJECTED",
+   "./audit-verify --db audit.db --tenant research (confirms bug: tampered passes)",
+   "cat /opt/auditd/src/libaudit_verify.c (spot: tenant_id missing from HMAC input, genesis constant is zero not documented hex)",
+   "cat /opt/auditd/src/kdf.c (spot: reversed HMAC arguments)",
+   "cat /opt/auditd/src/chain.c (confirm: correct, no bugs)",
+   "cat /opt/auditd/src/canonical.c (confirm: correct)",
+   "Edit libaudit_verify.c: add tenant_id to canonical field list for HMAC input",
+   "Edit libaudit_verify.c: set genesis constant to the 32-byte hex value from kdf_spec.md",
+   "Edit kdf.c: swap HMAC arguments back to HMAC-SHA256(key=master_key, data=tenant_id)",
+   "make -C /opt/auditd/src clean && make -C /opt/auditd/src",
+   "./audit-verify --db audit.db --tenant research (expect: 2000/2000 OK)",
+   "Use audit-tamper on fresh copy of DB, run audit-verify, expect failure at tampered row",
+   "./audit-verify --db audit.db --tenant <multibyte-tenant>",
+   "pytest /tests/test_chain.py -v"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The preseeded audit.db uses the correct reference implementation, but after fixing the KDF (reversed args), the subkeys will change\u2014audit-verify on the original audit.db may now FAIL even for untampered chains, since the DB was seeded with the broken KDF. This would confuse agents and could make test #1 (verify original DB) ambiguous about what 'correct' means.",
+   "The test harness generates fresh chains using a 'reference Python implementation'\u2014if this reference is not perfectly documented or accessible to the solver, they cannot validate their fix against it without running tests, creating a chicken-and-egg problem.",
+   "Makefile linking of old .o files (noted as a failure mode) is a real flakiness risk: `make` without `clean` may not recompile all affected translation units if timestamps are stale, making an otherwise correct fix appear broken.",
+   "The audit-tamper binary has no source and modifies rows without updating HMAC\u2014if it also modifies the row_number or sequence field used in chain linking, behavior may be undefined and tests could be flaky depending on schema details not fully specified.",
+   "The blueprint says the compiled daemon binary is 'provided without source' but also says to repair C source files that ARE present\u2014this creates a slight narrative inconsistency about what is and isn't available.",
+   "If the preseeded audit.db was built with the BUGGY implementation (reversed KDF, wrong genesis, missing tenant_id), then fixing the code will cause all 6000 rows to fail verification\u2014this contradicts requirement #1 and would break the DB-based tests unless the DB was built with the reference implementation despite bugs being in the source."
+  ],
+  "verdict": "reject",
+  "reasons": "The three bugs are all directly visible by reading source files (libaudit_verify.c and kdf.c), and a disciplined agent reading spec-first then all C files would find them in roughly 16 commands\u2014below the genuine_difficulty threshold. More critically, there is a fundamental logical inconsistency: the preseeded audit.db is described as built by the 'reference implementation' with valid chains, but if the source code has three bugs (wrong genesis, wrong KDF args, missing tenant_id), rebuilding with fixed code will produce a binary that REJECTS the preseeded DB, breaking requirement #1 and creating an irresolvable conflict between 'verify passes on audit.db' and 'fix the bugs.' This invalid failure risk is severe enough to reject the task.",
+  "fixes": [
+   "Resolve the preseeded DB consistency issue explicitly: either (a) state that audit.db was seeded with the buggy implementation so tests must use the fresh-generation harness only, removing any test that runs audit-verify on the original audit.db, or (b) provide a 're-seed' script that regenerates audit.db after the fix and make that step part of the setup.",
+   "To raise genuine_difficulty above 3, add a fourth bug that is NOT visible by direct source reading\u2014for example, an off-by-one in the row iteration range (sqlite_iter.c passes row 0 instead of row 1 as genesis anchor) that only manifests on chains longer than the preseeded sample, requiring dynamic instrumentation or careful tracing rather than just reading the source.",
+   "Add a 'clean build' guard to the Makefile check in the tests (e.g., run `make -C /opt/auditd/src clean && make`) to eliminate the flaky old-.o-file failure mode from being an invalid failure reason.",
+   "Clarify in the instructions whether audit.db can be used for initial testing or if solvers should rely solely on the test harness for verification, removing the narrative inconsistency about the preseeded database."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "variant",
+     "reason": "Both involve HMAC-SHA256 over structured log records with a C library and SQLite, but the candidate adds chained signatures, per-tenant key derivation, and tamper detection rather than a TCP service computing tags per-record."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The reference is a CSV pipeline chunking/deduplication bug in Python; the candidate is a C cryptographic audit chain repair problem."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "The reference is a WAF misclassification and deployment pipeline problem; the candidate is a cryptographic HMAC chain integrity problem."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference involves reverse-engineering a normalizer binary and fixing SQL rollups; the candidate is about repairing HMAC chain verification in C."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference is a log enrichment pipeline with GeoIP and a Flask API; the candidate is a cryptographic audit chain integrity repair task."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.22
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.121
+    ],
+    [
+     "ours/official-10912a593843",
+     0.111
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.092
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.068
+    ]
+   ],
+   "cost_usd": 0.015459
+  },
+  "novel": false
+ },
+ "cost_usd": 0.057192
+}

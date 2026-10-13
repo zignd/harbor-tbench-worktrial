@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "sql-histogram-binary-regression",
+  "title": "Query Plan Histogram Regression",
+  "scenario": "An open-source analytics database ships a compiled query-execution engine (`/usr/local/bin/qengine`) that accepts SQLite-dialect queries over CSV files. A regression was filed: aggregate histogram queries that worked in v1.1 now return wrong bucket counts on certain inputs. The repo contains a thin Python shim (`/app/runner.py`) that normalises queries and feeds them to the binary, plus a sample dataset and a few passing smoke tests. The binary has no source available in the container.",
+  "instruction_draft": "The query engine at `/usr/local/bin/qengine` produces incorrect results for WIDTH_BUCKET histogram aggregations. Fix `/app/runner.py` so that every WIDTH_BUCKET query returns counts that match the mathematical definition: each value v is placed in bucket ceil((v - lo) / w) clamped to [1, n], where w = (hi - lo) / n, lo and hi are the declared bounds, and n is the bucket count; values equal to hi fall in bucket n, values outside [lo, hi] are excluded. The engine itself must not be replaced or patched.",
+  "requirements": [
+   "WIDTH_BUCKET(v, lo, hi, n) places v in bucket floor((v - lo) / w) + 1 where w = (hi - lo) / n, clamped to [1, n]",
+   "Values exactly equal to hi are placed in bucket n (not excluded)",
+   "Values strictly less than lo or strictly greater than hi are excluded from all buckets",
+   "Bucket counts must be exact integers; no rounding error propagation",
+   "The runner must invoke qengine for the actual SQL evaluation; it cannot reimplement the full SQL engine",
+   "Queries with non-uniform data distributions (skewed, repeated boundary values, floats near bucket edges) must return correct counts"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install sqlite3 gcc make",
+   "Compile a C binary /usr/local/bin/qengine that wraps SQLite's execution but rewires WIDTH_BUCKET with TWO deliberate bugs: (1) boundary bug \u2014 values == hi are excluded (treated as > hi) instead of placed in bucket n; (2) floating-point accumulation bug \u2014 bucket width w is computed as integer division (lo and hi cast to int before subtracting) so fractional ranges are truncated, misplacing values near bucket edges",
+   "The binary accepts: qengine '<SQL>' '<csv_path>' and prints tab-separated rows",
+   "SQL dialect: SELECT col, WIDTH_BUCKET(val_col, lo_lit, hi_lit, n_lit) AS bucket, COUNT(*) FROM t GROUP BY bucket ORDER BY bucket",
+   "The runner /app/runner.py currently passes the query verbatim to qengine \u2014 it is about 120 lines with CSV loading, query parsing, and output formatting",
+   "/app/data/sample.csv: 50 rows of (id, value) with values in [0.0, 100.0], smoke tests pass on this file",
+   "/app/tests/smoke.py: 3 tests using sample.csv that all pass with the buggy binary because the sample avoids hi-boundary values and uses integer-aligned ranges",
+   "/app/README.md: documents the WIDTH_BUCKET contract including the hi-inclusive rule and the floating-point formula",
+   "~1500 lines total across runner, a query parser module, a CSV schema inferencer, output formatters, and unrelated aggregation helpers (SUM, AVG, MEDIAN)"
+  ],
+  "internal_hint": "Two interacting bugs live in the compiled qengine binary: (1) boundary exclusion \u2014 v==hi is dropped instead of mapped to bucket n; (2) integer-truncation of w \u2014 the C code computes w as (int)(hi-lo)/(double)n instead of (double)(hi-lo)/n, so for non-integer ranges the bucket width is wrong. Bug 1 is easy to spot by probing the binary with boundary values. Bug 2 only manifests with fractional (lo,hi) spans and causes misclassification of values near bucket edges \u2014 fixing bug 1 alone passes the smoke tests and many hand-crafted checks. The solver must intercept WIDTH_BUCKET calls in runner.py, rewrite them to push the full computation into SQLite expressions that the binary evaluates correctly (using CAST and CASE expressions), effectively pre-computing bucket assignment in the rewritten SQL rather than relying on qengine's native WIDTH_BUCKET implementation. The correct rewrite is: CASE WHEN v < lo OR v > hi THEN NULL ELSE MIN(n, CAST(FLOOR((CAST(v AS REAL) - lo) / ((CAST(hi AS REAL) - CAST(lo AS REAL)) / n)) + 1 AS INTEGER)) END. The solver discovers this only by running experiments: probing with boundary values (finds bug 1), then probing with fractional ranges like WIDTH_BUCKET(x, 0.0, 3.0, 3) on values {0.5, 1.0, 1.5} (finds bug 2). The sample data uses integer boundaries [0,100] so bug 2 is invisible there.",
+  "trap": "A solver that only fixes the hi-boundary case (adds a CASE WHEN v = hi THEN n) passes all smoke tests and passes spot checks with integer ranges, but fails the hidden corpus which includes fractional (lo, hi) spans and values near non-integer bucket edges. The integer-truncation bug shifts entire buckets for any range where (hi-lo) is not an integer multiple of n, which is common in real data.",
+  "tests": [
+   "Smoke: existing /app/tests/smoke.py all pass (regression guard)",
+   "Boundary corpus: generate 200 queries at verify time with values exactly equal to hi; every such value must appear in bucket n",
+   "Fractional-range corpus: generate 300 queries with lo/hi as non-integer floats (e.g. lo=0.7, hi=5.3, n=4); compare bucket assignments against a reference Python implementation of the spec formula",
+   "Edge-cluster corpus: generate 150 queries with many values clustered within 1e-9 of bucket boundaries; counts must match reference within 0 tolerance (exact integer match)",
+   "Exclusion corpus: generate 100 queries with values outside [lo, hi]; verify those rows are absent from output",
+   "Mixed corpus: 50 queries mixing in-range, boundary-equal, and out-of-range values in the same dataset; full count vector must match reference",
+   "Adversarial: n=1 (single bucket), n=100 (fine), lo==hi-epsilon (very narrow range), negative lo; all must match spec"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "800 total queries across all sub-corpora",
+   "effect": "Halving corpus_size (400) makes it easier to get lucky with a partial fix; doubling (1600) with more fractional edge cases makes even careful fixes fail if the formula has off-by-epsilon issues"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the hi-boundary bug, passes smoke + boundary corpus, fails fractional-range corpus",
+   "Solver patches the binary with a hex editor or replaces it entirely rather than fixing runner.py as required",
+   "Solver reimplements WIDTH_BUCKET in Python in runner.py but with a wrong formula (e.g. uses round instead of floor, or mishandles the CAST order)",
+   "Solver constructs a SQL rewrite that passes integer-range tests but uses integer division internally, reproducing bug 2 in the rewrite",
+   "Solver does not discover bug 2 because they test only with the provided sample.csv which has integer bounds"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "floating-point",
+   "constraint-satisfaction",
+   "adversarial-corpus",
+   "two-interacting-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/runner.py",
+   "cat /app/tests/smoke.py",
+   "printf 'id,value\\n1,100.0\\n' > /tmp/hi_test.csv && qengine \"SELECT WIDTH_BUCKET(value,0,100,5) AS b FROM t\" /tmp/hi_test.csv",
+   "# Confirms bug 1: value==hi is excluded",
+   "printf 'id,value\\n1,0.5\\n1,1.0\\n1,1.5\\n' > /tmp/frac_test.csv && qengine \"SELECT WIDTH_BUCKET(value,0.0,3.0,3) AS b FROM t\" /tmp/frac_test.csv",
+   "# Confirms bug 2: integer truncation of w gives wrong buckets",
+   "# Read query parser module to find interception point",
+   "cat /app/query_parser.py",
+   "# Write SQL rewrite for WIDTH_BUCKET in runner.py using CASE/CAST/FLOOR",
+   "# Replace WIDTH_BUCKET(v,lo,hi,n) with: CASE WHEN v<lo OR v>hi THEN NULL ELSE MIN(n,CAST(FLOOR((CAST(v AS REAL)-lo)/((CAST(hi AS REAL)-CAST(lo AS REAL))/n))+1 AS INTEGER)) END",
+   "# Apply regex substitution in runner.py interceptor",
+   "python /app/tests/smoke.py",
+   "# Verify smoke passes",
+   "printf 'id,value\\n1,100.0\\n2,50.0\\n3,-1.0\\n' > /tmp/mixed.csv && python /app/runner.py \"SELECT WIDTH_BUCKET(value,0,100,5) AS b, COUNT(*) FROM t GROUP BY b ORDER BY b\" /tmp/mixed.csv",
+   "# Verify boundary=bucket5, in-range correct, out-of-range excluded"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "GCC may optimize away the intentional integer-truncation bug depending on version/flags, making bug 2 absent or inconsistent in the compiled binary",
+   "Formula inconsistency: instruction draft says 'ceil((v-lo)/w)' but requirements say 'floor((v-lo)/w)+1'; these differ when (v-lo)/w is exactly an integer (boundary cluster values), potentially making edge-cluster corpus tests ambiguous or wrong",
+   "Implementing a reliable SQLite extension binary that parses WIDTH_BUCKET as a custom SQL function is non-trivial C; subtle parsing or aggregation bugs in the build could cause flakiness unrelated to the intended bugs",
+   "The WIDTH_BUCKET regex interceptor in runner.py may fail on whitespace variants, quoted identifiers, or subexpressions, causing false failures unrelated to the solver's fix logic",
+   "Smoke tests passing 'because sample avoids hi-boundary values and uses integer-aligned ranges' is fragile \u2014 if sample.csv generation is not precisely controlled, smoke tests could accidentally trigger the bugs and fail before any fix"
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because a skilled agent can discover both bugs in ~5 probe commands and implement the correct SQL CASE/CAST rewrite directly from the spec formula in ~15 total commands \u2014 the README documents the exact formula, making the fix essentially transcription work. The formula inconsistency between 'ceil' and 'floor+1' in the instruction creates an ambiguous edge case at exact integer bucket boundaries that could invalidate some edge-cluster corpus tests. The intentional C integer-truncation bug is fragile to reproduce reliably across GCC versions without carefully pinned flags.",
+  "fixes": [
+   "Raise genuine difficulty: hide the formula from README (document only the English rule 'each value placed in a bucket proportional to its distance from lo'), forcing the solver to derive the correct formula by experimentation and cross-checking against a spec they must infer",
+   "Add a third interacting bug (e.g., off-by-one in GROUP BY bucket ordering or NULL handling in the aggregation) so that fixing the SQL rewrite still requires understanding the binary's output format peculiarities",
+   "Resolve the ceil/floor+1 inconsistency: pick one canonical form throughout instruction, requirements, and test reference implementation, and add an explicit note about behavior when (v-lo)/w is exactly an integer",
+   "Pin the GCC version and add explicit compilation flags (-O0 -fno-optimize-sibling-calls) and a build-time test that verifies both bugs are present in the compiled binary before the container is sealed",
+   "Make the smoke tests use fractional ranges so they cannot be passed by fixing only bug 1, eliminating the shallow-fix trap and forcing solvers to find both bugs before they even see the hidden corpus"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/python-prime-http-server",
+     "verdict": "distinct",
+     "reason": "Completely different domain: HTTP server with primality testing vs. fixing a Python shim to correctly implement WIDTH_BUCKET histogram semantics around a closed-source binary."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is about query performance optimization for correctness-preserving rewrites in PostgreSQL, not about patching a Python wrapper to fix bucket-boundary semantics for a closed-source binary."
+    },
+    {
+     "ref_id": "terminal-bench-pro/learn-gaussian-mrf-and-infer",
+     "verdict": "distinct",
+     "reason": "Entirely different domain: probabilistic graphical model learning and inference vs. fixing histogram bucket logic in a Python shim."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve characterizing and working around a closed-source binary by fixing a surrounding Python/shell pipeline to produce mathematically correct output, with no source patching of the binary allowed; the core challenge and approach are essentially the same."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a Rust NetFlow aggregation service with UDP/TCP networking bugs, which is a fundamentally different problem from patching a Python query shim for histogram bucket correctness."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/python-prime-http-server",
+     0.126
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.118
+    ],
+    [
+     "terminal-bench-pro/learn-gaussian-mrf-and-infer",
+     0.116
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.1
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.066
+    ]
+   ],
+   "cost_usd": 0.015378
+  },
+  "novel": false
+ },
+ "cost_usd": 0.062817
+}

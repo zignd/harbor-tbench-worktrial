@@ -1,0 +1,67 @@
+{
+ "slug": "audit-log-hmac-chain-service",
+ "title": "Audit Log HMAC Chain Verifier",
+ "scenario": "You are an embedded/systems developer maintaining a lean DevOps audit-log service for a constrained environment. The service reads append-only log files produced by application nodes, verifies that each log entry is correctly chained (each entry's HMAC covers the previous entry's HMAC plus the entry payload), and answers protocol queries from a compliance checker over stdin/stdout. The git repository has six months of history; the service shipped with a verifier module but a silent bug was introduced three commits ago, and the compliance checker now rejects logs that the service incorrectly marks as valid.",
+ "instruction_draft": "Your team runs a small audit-log service at `/app/audit_service/`. Application nodes write structured log files to `/app/logs/`, where each entry must carry a valid HMAC-SHA256 chaining signature: the HMAC key for entry N is derived from the HMAC tag of entry N-1 (the genesis entry uses a fixed seed stored in `/app/config/chain.cfg`). A compliance checker connects over a simple line-oriented protocol on stdin/stdout: it sends `VERIFY <logfile>` and expects `OK <entry_count>` if the chain is intact, or `FAIL <first_bad_entry_index>` if any entry is invalid; it also sends `QUERY <logfile> <entry_index>` and expects the raw payload of that entry, or `NOTFOUND` if the index is out of range. The service currently gives wrong answers on some log files. Fix `/app/audit_service/` so that it answers all protocol requests correctly. The service must handle log files with up to 10 000 entries, including entries whose payloads contain embedded newlines encoded as `\n` literals (not real newlines), and must correctly distinguish a tampered payload from a tampered HMAC tag. All log files the compliance checker may send are in `/app/logs/`; do not modify them.",
+ "requirements": [
+  "For VERIFY <logfile>: respond OK <entry_count> if every HMAC chain link is valid from genesis to the last entry",
+  "For VERIFY <logfile>: respond FAIL <first_bad_entry_index> (0-indexed) if any entry has an invalid HMAC",
+  "For QUERY <logfile> <entry_index>: respond with the exact raw payload string of that entry",
+  "For QUERY <logfile> <entry_index>: respond NOTFOUND if index is out of range or file does not exist",
+  "HMAC key for entry N is HMAC-SHA256(previous_entry_tag, b'key') where previous_entry_tag is the raw bytes of the hex-encoded tag of entry N-1",
+  "The genesis entry (index 0) uses the key from /app/config/chain.cfg (field 'seed', hex-encoded)",
+  "Payload entries may contain the literal two-character sequence \\n (backslash + n) which must be preserved exactly in QUERY responses",
+  "The service must process log files up to 10 000 entries without error",
+  "A tampered payload (HMAC tag unchanged) and a tampered HMAC tag (payload unchanged) must both be detected as FAIL"
+ ],
+ "environment": [
+  "Git repository at /app with at least 15 commits of history spanning ~6 months",
+  "/app/audit_service/__init__.py and /app/audit_service/verifier.py (the main service entry point is /app/audit_service/service.py)",
+  "/app/audit_service/chain.py: a compiled Cython .so module (no source) that implements the HMAC derivation step \u2014 it has a latent bug introduced three commits ago: it uses the hex tag of the *current* entry rather than the *previous* entry when deriving the next key, making it wrong for all entries after index 0",
+  "/app/audit_service/service.py: reads protocol lines and dispatches to verifier.py and a log parser",
+  "/app/audit_service/parser.py: log file parser (~120 lines) with correct logic but one off-by-one: it counts the header line as entry index 0, shifting all real entries by 1",
+  "/app/audit_service/verifier.py: calls chain.py for HMAC derivation \u2014 surface symptom is that VERIFY returns wrong first_bad_entry_index, pointing at the parser, not the chain module",
+  "/app/config/chain.cfg: INI-style file with seed = <32-byte hex string>",
+  "/app/logs/: 8 pre-generated log files (2 valid chains, 2 with tampered payloads, 2 with tampered tags, 1 with embedded \\n literals in payloads, 1 with 500 entries)",
+  "/app/tools/generate_logs.py: deterministic log generator (solver can study it to understand the format)",
+  "/app/tools/chain_spec.md: written spec of the chaining algorithm (authoritative)",
+  "Dockerfile installs python 3.13-slim, cython3, pip packages: cryptography, configparser; pre-compiles chain.so from a hidden source using a Dockerfile RUN step then deletes the .pyx source",
+  "~1400 lines total across all Python files plus a realistic README"
+ ],
+ "internal_hint": "Two interacting bugs, one in a compiled binary component (chain.so) and one in parser.py. (1) chain.so derives key_N as HMAC(current_tag_N, seed) instead of HMAC(prev_tag_{N-1}, seed) \u2014 this is invisible by reading source because the .pyx was deleted; it only manifests when running VERIFY against a multi-entry log, where entries 1+ all report bad HMAC. This is the true root cause. (2) parser.py has an off-by-one: it includes the header line in its entry list, so entry indices are shifted by 1. The misleading symptom is that VERIFY returns FAIL 1 for a valid log (because the parser shift makes entry 0 the header with no HMAC field, which throws an exception caught as 'invalid'), leading the solver to focus on parser.py and miss that chain.so is also broken. The solver must: discover parser.py bug by reading the log format spec and comparing with parser output; discover chain.so bug by writing a test that manually recomputes HMACs for a known log and comparing with chain.so output \u2014 this requires running the system on real data, not reading source. The fix is: correct parser.py off-by-one, and reimplement the chain derivation in pure Python in verifier.py, bypassing chain.so entirely (or monkey-patching it).",
+ "trap": "A solver that fixes only the parser off-by-one will pass the provided sample logs (because valid logs now verify as OK) but fail hidden test cases that contain entries after index 0, because chain.so still computes wrong keys for N>0. Similarly, a solver that patches chain.so calls but uses the wrong byte encoding (e.g., encoding the hex tag as UTF-8 vs. ASCII, or hashing the raw binary tag instead of the hex string) will fail on entries whose tags contain bytes above 0x7F in intermediate steps. Hidden tests include: 50-entry chains (exposing the chain.so bug), chains starting at entry index 2 (exposing encoding edge cases), and logs with \\n literals in payloads (exposing QUERY response fidelity).",
+ "tests": [
+  "VERIFY on a fresh 50-entry valid log generated at verify time: must return OK 50",
+  "VERIFY on a fresh log where entry 23 has a tampered payload: must return FAIL 23",
+  "VERIFY on a fresh log where entry 7 has a tampered HMAC tag: must return FAIL 7",
+  "QUERY on a fresh log for index 0, 1, last: must return exact payload strings",
+  "QUERY for an out-of-range index: must return NOTFOUND",
+  "VERIFY on a fresh log with embedded \\n literals in payloads (entries 3 and 17): must return OK <count>",
+  "QUERY entry 3 from that log: must return payload with literal backslash-n preserved",
+  "VERIFY on a fresh 1000-entry log: must return OK 1000 and complete within 5 seconds",
+  "End-to-end: send 20 interleaved VERIFY and QUERY requests in one session; all must be answered correctly in protocol order"
+ ],
+ "verifier_knob": {
+  "name": "number of request scenarios",
+  "value": "9 distinct test cases at current setting",
+  "effect": "Raising to 15+ adds more edge cases (chains with all-zero seed, payloads with special characters, very long payloads), making partial fixes more likely to fail; lowering to 4 makes it passable with only the parser fix"
+ },
+ "expected_failure_modes": [
+  "Solver fixes parser.py off-by-one, sees sample logs pass, ships without discovering chain.so is also broken \u2014 fails all multi-entry hidden tests",
+  "Solver discovers chain.so is wrong but reimplements key derivation using wrong byte encoding (binary tag bytes vs hex string bytes) \u2014 passes entry 0 but fails entries 1+ on hidden 50-entry chains",
+  "Solver replaces chain.so calls with pure Python but forgets to handle the \\n literal encoding in QUERY, returning a real newline instead of backslash-n \u2014 fails the embedded-newline tests",
+  "Solver patches chain.so at import time using ctypes but gets the key derivation direction right while getting the HMAC input format wrong \u2014 fails approximately half of hidden tests inconsistently",
+  "Solver never discovers the chain.so bug because they only read Python source files and never run the service against a fresh generated log to observe wrong HMAC values"
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "cryptography",
+  "devops",
+  "git-history",
+  "log-processing",
+  "compiled-binary",
+  "protocol"
+ ]
+}

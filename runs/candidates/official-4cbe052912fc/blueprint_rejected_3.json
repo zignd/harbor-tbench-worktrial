@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "cryptostream-migration-refactor",
+  "title": "Cryptographic Stream Authenticator Migration",
+  "scenario": "A platform engineering team is migrating a scientific data pipeline that transmits large encrypted measurement streams between lab instruments and a central analysis cluster. The pipeline uses a compiled Go binary (`/usr/local/bin/cryptostream`) that authenticates, encrypts, and frames data packets. The binary was built from source that has since been refactored and the new source (`/app/src/`) has diverged significantly \u2014 the refactored code compiles and runs but produces output that fails verification on real instrument data. The verifier service (`/usr/local/bin/verify-stream`) is also a compiled binary with no source available.",
+  "instruction_draft": "Hey, we've got a broken migration on our hands. The refactored Go source in `/app/src/` compiles fine and the basic smoke test passes, but when we push actual instrument data through it, the downstream verifier rejects the frames. The original reference binary is still at `/usr/local/bin/cryptostream-ref` so you can compare behavior. The new binary should be built from `/app/src/` as `/usr/local/bin/cryptostream`. It needs to produce frames that `/usr/local/bin/verify-stream` accepts for all valid inputs, and it must reject (exit nonzero, write nothing to stdout) any malformed or malicious input. Check the test harness at `/app/test/` for the sample inputs we have \u2014 but fair warning, the verifier checks a bunch of cases we don't have samples for.",
+  "requirements": [
+   "Build the Go source at `/app/src/` and install the resulting binary at `/usr/local/bin/cryptostream`",
+   "The binary must produce frames accepted by `/usr/local/bin/verify-stream` for all valid instrument data inputs",
+   "The binary must exit nonzero and produce no stdout output when given malformed or malicious input",
+   "Behavior must match the reference binary `/usr/local/bin/cryptostream-ref` on all valid inputs"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.22, builds two Go binaries from separate source trees",
+   "Reference binary `/usr/local/bin/cryptostream-ref`: built from the original correct implementation, source NOT present in container",
+   "Verifier binary `/usr/local/bin/verify-stream`: black-box binary that validates frames, source NOT present",
+   "Refactored source `/app/src/`: ~1200 lines across 6 files: main.go, frame.go, auth.go, cipher.go, stream.go, util.go",
+   "The refactored source has three interacting bugs that only manifest on real data: (1) HMAC key derivation uses SHA-256 where the protocol requires SHA-512/256 \u2014 both compile, smoke tests pass because sample inputs are short enough that truncation doesn't differ in the first 8 bytes checked; (2) the nonce for AES-GCM is constructed big-endian in the refactor but the protocol specifies little-endian, which only matters when the sequence counter exceeds 0x00FFFFFF (samples never reach this); (3) the frame length field includes the auth tag in the refactor but the protocol expects it to exclude the tag \u2014 this always differs but the verifier's sample-mode check only validates the payload bytes, not the length field",
+   "Test harness `/app/test/` with 4 sample input files and expected outputs \u2014 all pass with the broken refactor because samples are small and counter never wraps",
+   "The sample inputs are synthetic short streams; the verifier's hidden corpus includes: streams with sequence counter > 0x01000000, streams with large payloads where the length field matters, and streams crafted with mutated auth tags or truncated frames (malicious inputs)",
+   "A `Makefile` at `/app/src/Makefile` that builds the binary",
+   "A protocol spec document at `/app/docs/protocol.md` describing the wire format including nonce endianness, HMAC algorithm, and frame length semantics"
+  ],
+  "internal_hint": "The difficulty comes from observe_not_read and edge_case_inputs interacting: all three bugs are invisible on the sample corpus (samples are small, counters are low, verifier sample-mode skips length check). The solver must: (1) run the reference binary against inputs with high sequence counters to observe nonce divergence, (2) craft or find inputs where counter > 0x00FFFFFF and diff the output bytes to discover the endianness bug, (3) read the protocol spec carefully for the HMAC algorithm mismatch (SHA-256 vs SHA-512/256), (4) instrument the frame serializer to compare length field values against the reference. The HMAC bug is findable by reading protocol.md but easy to miss since both algorithms have the same name prefix. The nonce bug only shows at runtime with high counters. The length bug always exists but the sample verifier doesn't catch it \u2014 the hidden verifier does.",
+  "trap": "A naive agent runs the 4 sample tests, sees them all pass, and declares success. The hidden corpus then fails on: (a) any stream with sequence counter > 16M (nonce endianness), (b) any stream where the verifier strictly checks the frame length field (off by 16 bytes \u2014 the GCM tag size), (c) inputs that should be rejected but the broken HMAC accepts due to the wrong algorithm producing a collision on crafted data. An agent that only fixes the most obvious difference it can spot (say, only the length field) will still fail on the counter-wrapping inputs.",
+  "tests": [
+   "Build test: `/usr/local/bin/cryptostream` exists and is executable",
+   "Sample corpus: all 4 provided sample inputs produce output accepted by verify-stream",
+   "Counter stress test (generated at verify time): 50 streams where the sequence counter starts at 0x00FFFFF0 and the stream contains >20 frames, forcing counter rollover past 0x01000000 \u2014 output must be accepted by verify-stream",
+   "Length field test (generated at verify time): 20 streams with payloads of exactly 1, 16, 255, 256, 1024, 65535 bytes \u2014 frame length fields must match reference binary byte-for-byte",
+   "HMAC key derivation test (generated at verify time): 30 streams with session keys derived from various passphrases \u2014 auth tags must match reference binary output exactly",
+   "Malicious input rejection: 40 inputs with truncated frames, flipped auth tag bytes, wrong magic bytes, or oversized length fields \u2014 all must cause exit nonzero with empty stdout",
+   "Benign edge cases: empty payload frames, maximum-length payloads, streams with exactly one frame \u2014 must be accepted by verify-stream",
+   "End-to-end round-trip: verify-stream piped from cryptostream output must exit 0 for all valid inputs"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "120 inputs (40 malicious, 80 benign covering all three bug dimensions)",
+   "effect": "Raising corpus size adds more counter-rollover inputs and more HMAC key variants, making partial fixes (fixing only 1 or 2 of the 3 bugs) fail on more cases; lowering it to ~20 inputs lets an agent that fixes only the length field squeak by"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the frame length field (the most structurally obvious difference) and misses nonce endianness \u2014 passes sample tests, fails counter-rollover corpus",
+   "Agent finds nonce and length bugs but misses HMAC algorithm mismatch because SHA-256 and SHA-512/256 look similar in code and short inputs produce different-but-plausibly-correct-looking output",
+   "Agent runs sample tests, all pass, submits without investigating why the reference binary exists or probing high-counter behavior",
+   "Agent reads the code and patches what looks wrong without running the reference binary against crafted inputs to confirm the actual protocol behavior",
+   "Agent correctly identifies all bugs but introduces a new regression in the rejection path \u2014 malicious inputs now produce output or exit 0"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "binary-analysis",
+   "refactoring",
+   "scientific-computing",
+   "edge-cases"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/protocol.md  # read wire format spec: nonce endianness, HMAC algo, frame length semantics",
+   "cat /app/src/auth.go  # find HMAC key derivation \u2014 spot sha256 where spec says sha512/256",
+   "cat /app/src/cipher.go  # find nonce construction \u2014 spot binary.BigEndian where spec says little-endian",
+   "cat /app/src/frame.go  # find frame length field \u2014 spot that auth tag size is included",
+   "grep -n 'sha256\\|sha512' /app/src/auth.go  # confirm exact symbol to replace",
+   "grep -n 'BigEndian\\|LittleEndian\\|nonce' /app/src/cipher.go  # confirm exact line",
+   "grep -n 'length\\|Len\\|TagSize\\|tag' /app/src/frame.go  # confirm exact expression",
+   "sed -i 's/sha256.New()/sha512_256.New()/g' /app/src/auth.go  # fix HMAC algorithm",
+   "# edit cipher.go: change binary.BigEndian.PutUint32 to binary.LittleEndian.PutUint32 for nonce",
+   "sed -i 's/binary.BigEndian/binary.LittleEndian/' /app/src/cipher.go",
+   "# edit frame.go: remove gcm.Overhead() (or aes.BlockSize) from length field computation",
+   "sed -i 's/len(payload) + gcm.Overhead()/len(payload)/' /app/src/frame.go",
+   "make -C /app/src/ && install -m755 cryptostream /usr/local/bin/cryptostream",
+   "for f in /app/test/*.bin; do /usr/local/bin/cryptostream < $f | /usr/local/bin/verify-stream && echo OK; done",
+   "# optionally diff outputs against reference binary on a sample to confirm"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "All three bugs are directly visible by reading the source files \u2014 the task description even states 'The HMAC bug is findable by reading protocol.md' and the nonce/length bugs are explicit code differences. A strong agent reading the source fixes all three in ~13 commands without needing the reference binary or crafted high-counter inputs.",
+   "The 'trap' of only running sample tests is only a trap for agents that skip reading the source; any agent that reads auth.go, cipher.go, and frame.go sequentially will find all three bugs via static analysis alone, bypassing the intended dynamic discovery path.",
+   "The difficulty levers (observe_not_read, edge_case_inputs) are undermined because the bugs are not hidden \u2014 they are structural differences between the refactored source and the protocol spec, findable by grep/cat in under 5 minutes.",
+   "The verifier's 'sample-mode check only validates payload bytes, not the length field' is noted as the reason the length bug isn't caught by samples \u2014 but a strong agent will not rely solely on sample tests after reading the instruction's explicit warning about hidden corpus cases.",
+   "If the Go standard library symbol for SHA-512/256 differs from what a simple sed fix assumes (e.g., 'crypto/sha512' with sha512.New512_256() vs a hypothetical 'sha512_256' package), the fix attempt could fail to compile, causing an invalid failure due to environment ambiguity.",
+   "The Makefile's exact build target and output path are not specified in the blueprint \u2014 if the binary lands in a non-obvious location, the install step may fail silently.",
+   "The frame length fix assumes 'gcm.Overhead()' is the exact expression used; if the refactored source uses a different variable name or constant (e.g., '16' hardcoded), the sed command would not apply and the task description provides insufficient detail to confirm the exact code shape."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are directly visible by reading the source files (auth.go, cipher.go, frame.go) and cross-referencing protocol.md \u2014 a strong agent resolves the task in ~13 commands via static analysis without needing to run the reference binary against crafted high-counter inputs. The task's intended difficulty mechanism (observe_not_read via runtime behavior on edge-case inputs) is bypassed because the bug locations are structurally obvious in code. Additionally, the blueprint contains potential invalid failure risks around exact Go symbol names and Makefile output paths that could cause environment-driven failures unrelated to solver skill.",
+  "fixes": [
+   "Make the bugs non-obvious in source: instead of a single BigEndian\u2192LittleEndian swap or a SHA-256\u2192SHA-512/256 rename, implement the bugs as subtle algorithmic choices \u2014 e.g., the nonce derivation uses a custom XOR-based mixing function that produces correct output for counters < 2^24 but diverges above it, requiring the solver to reverse-engineer the exact mixing function by diffing reference binary outputs.",
+   "Remove or obfuscate the protocol.md entry for the HMAC algorithm \u2014 instead of naming SHA-512/256 explicitly, describe it as 'the truncated variant of SHA-512 as defined in FIPS 180-4 \u00a75.3.6' so the solver must know or look up which Go crypto symbol corresponds to it, rather than doing a trivial grep match.",
+   "Ensure the sample tests are structured so they CANNOT pass with the buggy source by having at least one sample that triggers a visible failure \u2014 or clearly state that sample tests all pass with the broken refactor to prime the agent to look deeper; currently the instruction warns about this but a strong agent reading the source directly will still find the bugs before ever running samples.",
+   "Add a distractor bug in the source (e.g., an incorrect padding mode that's actually correct, or a suspicious-looking constant that is in fact right) to increase the cost of the static-analysis path and push solvers toward the intended dynamic-discovery approach.",
+   "Pin the exact Go import paths and function signatures in the blueprint to eliminate ambiguity about crypto symbol names (e.g., specify 'crypto/sha512.New512_256()' is required), so that environment-driven compilation failures are not possible."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/migrate-fortran-mcsim-to-gfortran",
+     "verdict": "distinct",
+     "reason": "That task is about migrating a build system from one compiler to another; this task is about reverse-engineering cryptographic framing behavior from a reference binary to fix a Go source divergence."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/build-pov-ray",
+     "verdict": "distinct",
+     "reason": "That task is a straightforward build-from-source and install; this task requires behavioral reverse-engineering of a closed-source verifier and reference binary."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/build-pmars",
+     "verdict": "distinct",
+     "reason": "That task is a straightforward build-from-source with no behavioral matching requirement; this task centers on matching cryptographic output of a reference binary."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "variant",
+     "reason": "Both tasks require implementing correct cryptographic serialization/authentication behavior to satisfy a closed-source binary verifier, with the same core challenge of reverse-engineering the expected protocol from a reference implementation."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about characterizing a transformation function by black-box experimentation and fixing a data pipeline; this task is about matching cryptographic framing behavior of a reference binary in Go source code."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/migrate-fortran-mcsim-to-gfortran",
+     0.245
+    ],
+    [
+     "terminal-bench-2-1/build-pov-ray",
+     0.169
+    ],
+    [
+     "terminal-bench-2-1/build-pmars",
+     0.164
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.139
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.12
+    ]
+   ],
+   "cost_usd": 0.013542
+  },
+  "novel": false
+ },
+ "cost_usd": 0.054909
+}

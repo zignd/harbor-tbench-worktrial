@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "entropy-audit-spectral-pipeline",
+  "title": "Cryptographic Entropy Audit: Spectral Pipeline",
+  "scenario": "A security engineer is auditing a key-derivation service that processes hardware RNG samples. The service lives in a git repository that has evolved over several commits; at some point the entropy estimation pipeline was refactored, and a numeric-precision bug was silently introduced into the spectral flatness computation that makes high-quality RNG streams fail their entropy floor check. The engineer must locate the regression via git bisect and data experiments, derive the correct formula, and add a new CLI subcommand `audit-batch` that processes a directory of binary sample files and writes a JSON report passing a stated accuracy threshold.",
+  "instruction_draft": "```\n$ python entropy_service/cli.py check samples/hw_rng_256k.bin\nEntropy check FAILED: spectral_flatness=0.3821 < threshold=0.85\nExpected high-quality RNG to pass.\n\n$ git log --oneline | head -6\na3f91c2 Add batch ingestion scaffold\n77e4d10 Refactor spectral estimator for performance\n3b2e881 Add reference test vectors\nd4c09f5 Initial entropy pipeline\n```\n\nThe entropy_service repository contains a command-line tool that audits binary files for cryptographic quality using a spectral flatness metric and three other estimators (chi-squared, serial correlation, compression ratio). Since a recent refactor the `check` command reports that known-good hardware-RNG samples fail the spectral flatness floor.\n\nYour task:\n\n1. Identify which commit introduced the regression and what the correct computation is. A genuine high-quality RNG sample must score spectral_flatness >= 0.85 and the other three estimators within their documented pass bands.\n\n2. Add a new subcommand `audit-batch <directory> <output.json>` to `entropy_service/cli.py` that:\n   - Discovers all `.bin` files in the directory (non-recursively).\n   - Runs all four estimators on each file.\n   - Writes a JSON report at `<output.json>` whose schema matches `docs/report_schema.json`.\n   - Sets `\"verdict\": \"PASS\"` only when all four estimators are within their documented pass bands.\n   - Returns exit code 0 if every file passes, exit code 1 if any file fails.\n\n3. The verifier will run `audit-batch` against a hidden directory of 40 binary files (20 CSPRNG-quality, 20 degraded/biased). The report must achieve:\n   - **Classification accuracy >= 0.90** (files correctly labelled PASS/FAIL vs. ground truth).\n   - All JSON output must validate against `docs/report_schema.json`.\n   - Wall-clock time <= 30 s for the full 40-file batch on 1 CPU.\n\nEverything the estimators need to know about correct pass bands is documented in `docs/estimator_spec.md`. The schema is in `docs/report_schema.json`. Do not change the public API of existing functions; add `audit-batch` as a new subcommand only.",
+  "requirements": [
+   "The `check` subcommand must report PASS for high-quality RNG samples (spectral_flatness >= 0.85, other estimators within documented bands).",
+   "A new `audit-batch <directory> <output.json>` subcommand exists in `entropy_service/cli.py`.",
+   "`audit-batch` discovers all `.bin` files in the given directory non-recursively.",
+   "`audit-batch` runs all four estimators (spectral_flatness, chi_squared, serial_correlation, compression_ratio) on each file.",
+   "Output JSON validates against `docs/report_schema.json`.",
+   "Each file entry carries a `\"verdict\": \"PASS\"` or `\"verdict\": \"FAIL\"` field set by the conjunction of all four estimators' pass bands.",
+   "Exit code is 0 if every file passes, 1 if any file fails.",
+   "Classification accuracy on the hidden 40-file test set is >= 0.90.",
+   "Wall-clock time for the full 40-file batch is <= 30 seconds on 1 CPU.",
+   "Existing public function signatures are not modified."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs numpy, scipy, jsonschema, click via pip (pinned versions).",
+   "Git repository at /app with 4 commits of real history (not a stub).",
+   "Commit d4c09f5: initial pipeline with correct spectral flatness formula: geometric_mean(|X_k|) / arithmetic_mean(|X_k|) computed over DFT magnitude bins, excluding DC.",
+   "Commit 3b2e881: adds reference test vectors in tests/vectors/ (known-good and known-bad binary files) and a pytest suite that passes on d4c09f5.",
+   "Commit 77e4d10 (the regression): 'Refactor spectral estimator for performance' replaces the magnitude array with the squared-magnitude array (power spectrum) before computing geometric and arithmetic means, changing the formula to geometric_mean(|X_k|^2)/arithmetic_mean(|X_k|^2). This makes the ratio equal to the square of the correct value, depressing it below 0.85 for all inputs including good RNG. The commit message says 'no semantic change'.",
+   "Commit a3f91c2: adds a stub function `audit_batch` in `entropy_service/batch.py` that raises NotImplementedError, and an empty `audit-batch` CLI subcommand that calls it. Other estimators (chi_squared, serial_correlation, compression_ratio) are correct across all commits.",
+   "entropy_service/estimators.py: ~250 lines, four estimator functions, the spectral one is the bugged one.",
+   "entropy_service/cli.py: ~120 lines, click-based CLI with `check` and stub `audit-batch`.",
+   "entropy_service/batch.py: ~60 lines, stub with NotImplementedError.",
+   "entropy_service/utils.py: ~80 lines, shared helpers (read_binary, chunk_file).",
+   "docs/estimator_spec.md: documents the correct formula for all four estimators and their pass bands. Spectral flatness is defined as geometric_mean(|X_k|) / arithmetic_mean(|X_k|) over non-DC DFT magnitude bins, pass band [0.85, 1.0]. Chi-squared: p-value >= 0.01. Serial correlation: |r| <= 0.05. Compression ratio (via zlib): ratio >= 0.95.",
+   "docs/report_schema.json: JSON Schema for the audit-batch output requiring top-level keys 'generated_at', 'files' (array), each file object having 'filename', 'size_bytes', 'estimators' (object with all four scores), 'verdict'.",
+   "samples/hw_rng_256k.bin: 256 KiB of actual os.urandom data generated at image-build time with a fixed seed (deterministic via /dev/urandom seeded from a fixed value using Python secrets module at build time \u2014 actually use numpy.random.default_rng(42).bytes(262144) to be deterministic).",
+   "tests/: pytest suite with 6 tests; 4 pass on all commits (chi-sq, serial, compression, CLI help), 2 fail after 77e4d10 (spectral pass-band tests).",
+   "A build script `/app/build_env.sh` seeds the sample files deterministically so tests are reproducible.",
+   "Total source: ~800 lines across 6 files (estimators, cli, batch, utils, two test files)."
+  ],
+  "internal_hint": "Difficulty source 1 (not visible by reading): The bug in commit 77e4d10 is subtle \u2014 squaring the magnitude array before computing the ratio looks like a benign performance refactor (one array pass instead of two). The solver must run the old and new versions on actual data, observe the score depression, and realize that squaring changes the formula. Reading the commit diff shows the array name changed from `magnitudes` to `power` but the ratio formula text looks syntactically identical (geometric/arithmetic), so a solver who reads the code without running it may miss that `power` is already squared. Difficulty source 2 (substantial construction + quantitative bar): The audit-batch subcommand must be fully built with correct formula, correct schema emission, correct verdict logic, and must score >=0.90 on 40 hidden files split between CSPRNG-quality and degraded (biased-byte, low-entropy, periodic) inputs. The four estimators interact: a file can pass spectral flatness but fail chi-squared. Naive implementations that only fix spectral flatness but emit wrong JSON schema, or that get serial correlation sign wrong, will fail the threshold. Resolution path: (1) git bisect or git log -p to find the power-spectrum substitution in 77e4d10, (2) read estimator_spec.md for the correct formula and pass bands, (3) fix estimators.py line that computes spectral flatness, (4) implement batch.py audit_batch function, (5) verify schema matches report_schema.json, (6) test on samples/.",
+  "trap": "A naive agent fixes the spectral flatness formula (the obvious visible bug) and wires up audit-batch to call the four estimators, but ships a verdict that uses OR instead of AND across estimators (any pass = PASS), or emits JSON with a subtly wrong schema (e.g., nesting estimator scores as a list instead of an object, or omitting 'size_bytes'). The hidden test set includes degraded files that pass spectral flatness but fail chi-squared, so an OR-logic verdict misclassifies them. Schema validation failures cause the verifier to reject the report entirely before checking accuracy. Additionally, agents who skip git history and re-derive the spectral formula from scratch may compute it correctly on the sample file in the repo but use log-domain computation that accumulates floating-point error causing 1-2 borderline files to flip verdict.",
+  "tests": [
+   "Run `python entropy_service/cli.py check samples/hw_rng_256k.bin` and assert exit code 0 and stdout contains 'PASS'.",
+   "Run existing pytest suite; all 6 tests must pass.",
+   "Run `python entropy_service/cli.py audit-batch /hidden/test_batch/ /tmp/report.json`; assert the JSON at /tmp/report.json validates against docs/report_schema.json using jsonschema.",
+   "Load /tmp/report.json; for each of the 40 files compare 'verdict' against ground-truth labels; assert accuracy >= 0.90.",
+   "Assert exit code from the audit-batch call is 1 (because the hidden batch contains FAIL files).",
+   "Assert wall-clock time of the audit-batch call is <= 30 seconds (measured with `time` in the verifier script).",
+   "Verify the 20 CSPRNG-quality files in the hidden batch all have spectral_flatness score >= 0.85 in the report (catches formula still wrong).",
+   "Verify the 20 degraded files include at least 16 FAIL verdicts (catches OR-logic bug).",
+   "Run `python -c 'from entropy_service.estimators import spectral_flatness; assert spectral_flatness.__code__.co_argcount == 1'` to confirm function signature unchanged.",
+   "Verify 'generated_at' key exists and is an ISO-8601 string in the report JSON."
+  ],
+  "verifier_knob": {
+   "name": "accuracy_threshold",
+   "value": "0.90",
+   "effect": "Raising to 0.95 requires the serial-correlation estimator to also be correctly calibrated (degraded files with high serial correlation but acceptable spectral flatness must be caught). Lowering to 0.80 makes it passable even with the OR-logic bug."
+  },
+  "expected_failure_modes": [
+   "Agent reads the code and spots that `power` differs from `magnitudes` but incorrectly concludes the formula is equivalent (e.g., believes geometric/arithmetic of squares equals geometric/arithmetic of values), fixes nothing, and fails spectral tests.",
+   "Agent fixes spectral flatness but implements audit-batch with OR-logic for verdicts, passing CSPRNG files correctly but mislabelling degraded files that pass spectral but fail chi-squared \u2014 accuracy falls to ~0.70.",
+   "Agent emits JSON where estimator scores are a flat list instead of a named-key object, causing schema validation to fail and the verifier to report 0 accuracy.",
+   "Agent re-derives spectral flatness in log-domain for numerical stability but introduces an off-by-one on the DC bin (includes bin 0), shifting the score for short files; borderline degraded files flip to PASS.",
+   "Agent correctly fixes the formula and builds audit-batch but does not make it fast enough \u2014 iterating over 40 \u00d7 256KB files with Python-level loops for DFT exceeds 30 s; needs numpy FFT.",
+   "Agent fixes the bug and tests on the provided sample file, which passes all four estimators, declares done, and does not test on any degraded file before submitting \u2014 fails hidden tests."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "security-scientific-computing",
+  "tags": [
+   "git-bisect",
+   "spectral-analysis",
+   "entropy-estimation",
+   "new-feature",
+   "metric-threshold",
+   "ordered-procedure"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat docs/estimator_spec.md",
+   "git log --oneline",
+   "git show 77e4d10 -- entropy_service/estimators.py | grep -A 30 spectral",
+   "git show d4c09f5 -- entropy_service/estimators.py | grep -A 30 spectral",
+   "cat entropy_service/estimators.py",
+   "Edit estimators.py: replace squared-magnitude array 'power' with 'magnitudes' (1-line fix)",
+   "python entropy_service/cli.py check samples/hw_rng_256k.bin",
+   "cat docs/report_schema.json",
+   "cat entropy_service/batch.py",
+   "cat entropy_service/cli.py",
+   "Edit batch.py: implement audit_batch \u2014 glob *.bin, run all 4 estimators, AND logic for verdict, emit schema-compliant JSON with generated_at ISO-8601, files array with filename/size_bytes/estimators object/verdict",
+   "python entropy_service/cli.py audit-batch samples/ /tmp/test_report.json",
+   "python -c \"import jsonschema, json; schema=json.load(open('docs/report_schema.json')); jsonschema.validate(json.load(open('/tmp/test_report.json')), schema)\"",
+   "cat /tmp/test_report.json",
+   "pytest tests/ -v",
+   "python -c \"from entropy_service.estimators import spectral_flatness; assert spectral_flatness.__code__.co_argcount == 1\""
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The compression_ratio estimator using zlib may produce borderline scores for 256KB files depending on numpy RNG output \u2014 if the deterministic sample is near the 0.95 threshold, small floating-point differences across Python/zlib versions could cause flaky pass/fail on hw_rng_256k.bin.",
+   "The 30-second wall-clock limit is measured on '1 CPU' but the container may not enforce CPU pinning; a loaded CI host could cause a correct numpy FFT implementation to exceed the limit spuriously.",
+   "The hidden test set ground-truth labels are not disclosed to the solver, so if the estimator spec's pass bands are calibrated to those 40 specific files rather than general RNG quality, a correct implementation of the spec might still score below 0.90 on unusual edge cases in the hidden set.",
+   "If the build script uses numpy.random.default_rng(42).bytes(262144) for the sample but the zlib compression ratio for this specific seed is < 0.95 (possible for pseudo-random data), the check subcommand test may fail with a correct implementation."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 is disqualifying: the bug is discoverable by reading 3 git commands (variable rename from 'magnitudes' to 'power' in a diff), the fix is a single line, and the implementation is fully spec-driven with no ambiguous design decisions. A frontier agent would complete this in ~16 commands with high reliability, making it a medium-difficulty task dressed in security framing rather than a hard one. The average score (4+4+5+2+5)/5 = 4.0 meets the average threshold but genuine_difficulty fails the minimum-4 requirement.",
+  "fixes": [
+   "Increase genuine difficulty by making the bug non-visible from a diff: instead of renaming a variable, have the refactor introduce a subtle mathematical equivalence that is only wrong for non-uniform distributions (e.g., replacing geometric_mean(|X_k|)/arithmetic_mean(|X_k|) with exp(mean(log(|X_k|)))/mean(|X_k|) where the log-domain version clips near-zero values differently), forcing the solver to run experiments and understand floating-point behavior rather than just reading code.",
+   "Remove the explicit internal hint that 'the array name changed from magnitudes to power' from the blueprint \u2014 even though it's marked internal, it reveals the exact shape of the bug and confirms a read-only approach suffices; restructure so the bug is only discoverable by running bisect and comparing outputs.",
+   "Add a second latent bug (e.g., an off-by-one in the serial correlation lag, or a wrong normalization in chi-squared for non-256-byte files) that only manifests on the hidden test set's file sizes, forcing the solver to validate against multiple file sizes and making partial fixes insufficient to reach 0.90 accuracy.",
+   "Make the batch implementation non-trivial by requiring chunked processing (files up to 4MB, not 256KB) so that naive in-memory FFT approaches hit the 30s limit and the solver must implement streaming or chunked spectral estimation \u2014 this creates genuine performance engineering tension."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/reactor-safety-control",
+     "verdict": "distinct",
+     "reason": "Reactor control optimization problem with no overlap in domain, tools, or techniques."
+    },
+    {
+     "ref_id": "terminal-bench-pro/merge-git-bundles-and-implement-transform",
+     "verdict": "distinct",
+     "reason": "Git bundle merging and data transformation problem with no cryptographic or entropy analysis components."
+    },
+    {
+     "ref_id": "terminal-bench/react-lead-form",
+     "verdict": "distinct",
+     "reason": "React/TypeScript form submission and CRM export problem, entirely different domain."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "CSV pipeline chunking and deduplication bug fix, unrelated to cryptographic entropy or spectral analysis."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "HMAC-SHA256 audit service over TCP with WAL records, different from entropy estimation and git bisect regression hunting."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/reactor-safety-control",
+     0.116
+    ],
+    [
+     "terminal-bench-pro/merge-git-bundles-and-implement-transform",
+     0.102
+    ],
+    [
+     "terminal-bench/react-lead-form",
+     0.101
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.085
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.084
+    ]
+   ],
+   "cost_usd": 0.014907
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05874
+}

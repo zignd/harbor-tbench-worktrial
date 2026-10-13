@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "metrics-rollup-deployment-repair",
+  "title": "On-Call: Fix the Broken Metrics Rollup Deployment",
+  "scenario": "An SRE is paged at 3am because the customer-facing dashboards are showing zeros for all hourly rollup metrics. The system consists of a Node.js metrics ingestion service that accepts raw event POSTs, a rollup worker that aggregates them into hourly buckets, and a query service that serves aggregated data over HTTP. The environment has ~1400 lines across five JS files, a SQLite database with historical data, a JSON-based inter-process message format, and systemd-style process logs. Two interacting bugs were introduced in the last deployment: one in the rollup worker's bucket flush logic and one in a missing but required aggregation component that the query service expects.",
+  "instruction_draft": "```\n[2026-10-12 03:14:22] ALERT: metrics.hourly_rollup.completions = 0 for 47 minutes\n[2026-10-12 03:14:22] ALERT: metrics.query.p99_latency = timeout (>30s)\n[2026-10-12 03:14:22] metrics-worker[2847]: WARN flush attempt: 0 buckets flushed\n[2026-10-12 03:14:22] metrics-query[2901]: ERROR Cannot read properties of undefined (reading 'percentile')\n[2026-10-12 03:14:22] metrics-query[2901]: at buildResponse (/app/query-service/aggregator.js:88:31)\n```\n\nYou are on-call. The metrics pipeline at `/app` must be restored. The pipeline consists of:\n- `ingest-service/` \u2013 accepts POST /event with JSON body, runs on port 4000\n- `rollup-worker/` \u2013 reads from the ingest queue, aggregates into hourly buckets, flushes to SQLite at `/app/data/metrics.db`\n- `query-service/` \u2013 serves GET /metrics?name=<name>&window=<hours> on port 4001\n\nAfter your fix, the full pipeline must satisfy all of the following:\n1. POST /event to port 4000 with `{name, value, timestamp}` payloads must be accepted and queued.\n2. The rollup worker must flush completed hourly buckets to the database within 60 seconds of the bucket closing.\n3. GET /metrics?name=<name>&window=<hours> on port 4001 must return a JSON object with fields: `name`, `window_hours`, `buckets` (array of hourly bucket objects each containing `hour_ts`, `count`, `sum`, `min`, `max`, `p50`, `p95`, `p99`).\n4. The percentile fields (p50, p95, p99) must be computed correctly from the raw sample reservoir stored per bucket \u2014 not approximated as zero or as the mean.\n5. The pipeline must handle metric names and values it has never seen before, not just the names present in the existing database.\n6. All three processes must be running and reachable after your fix.",
+  "requirements": [
+   "POST /event on port 4000 accepts {name, value, timestamp} and returns HTTP 200",
+   "Rollup worker flushes completed hourly buckets to SQLite within 60 seconds",
+   "GET /metrics?name=<name>&window=<hours> on port 4001 returns JSON with name, window_hours, buckets array",
+   "Each bucket object contains hour_ts, count, sum, min, max, p50, p95, p99",
+   "Percentile fields are computed correctly from stored sample reservoirs, not approximated",
+   "Pipeline handles metric names not present in the existing database",
+   "All three processes (ingest, rollup-worker, query-service) are running and reachable"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20, npm, sqlite3 CLI",
+   "npm packages: express, better-sqlite3, commander \u2014 all pre-installed at /app/node_modules",
+   "ingest-service/index.js (~180 lines): working HTTP server, writes events to an in-memory queue file /app/data/queue.ndjson, has a subtle bug: it writes timestamp as string not number, which the rollup worker silently ignores (events land in wrong bucket or are dropped when bucket boundary is computed numerically)",
+   "rollup-worker/worker.js (~300 lines): reads queue.ndjson, computes bucket boundaries using Date arithmetic \u2014 bug 1: the bucket flush condition uses `bucketEnd <= Date.now()` but the variable `bucketEnd` is computed from the raw string timestamp (not parsed), so it compares a string to a number, always evaluates false, meaning NO buckets are ever flushed",
+   "rollup-worker/reservoir.js (~120 lines): implements reservoir sampling for percentiles \u2014 this file DOES NOT EXIST in the deployment (was accidentally excluded from the last git push); worker.js requires('./reservoir') causing a silent crash on startup that the worker masks by catching the require error and falling back to an empty stub that returns 0 for all percentiles",
+   "query-service/index.js (~200 lines): HTTP server that queries SQLite and calls aggregator.js",
+   "query-service/aggregator.js (~160 lines): has bug 2 \u2014 it calls `reservoir.percentile(samples, 0.99)` but `reservoir` is undefined because the module path is wrong (`require('../shared/reservoir')` but the file should be at `/app/rollup-worker/reservoir.js`); this is the error shown in the pasted log",
+   "shared/ directory exists but is empty \u2014 the reservoir module was meant to live here but was never populated",
+   "data/metrics.db: pre-seeded SQLite database with 6 hours of historical data for metric names 'api.latency', 'db.query_time', 'cache.hit_rate' \u2014 gives solver something to query but masks that new metrics don't work",
+   "data/queue.ndjson: contains ~200 events written in the last hour (with string timestamps) that have never been flushed",
+   "logs/worker.log: shows the worker started, caught a require error for reservoir, logged 'using stub percentiles', then shows 47 consecutive 'flush attempt: 0 buckets flushed' lines",
+   "logs/query.log: shows the crash stack for the percentile call",
+   "start.sh: shell script that starts all three processes with node, used by the verifier to restart everything after the solver's changes",
+   "All processes are initially running but broken as described"
+  ],
+  "internal_hint": "Two interacting bugs: (1) ingest-service writes timestamp as JSON string; rollup-worker parses bucket boundaries by doing arithmetic on the raw value, so string-vs-number comparison means `bucketEnd <= Date.now()` is always false \u2014 no buckets ever flush. Fixing only this reveals nothing, because (2) reservoir.js does not exist anywhere in the repo. The rollup-worker silently falls back to stub percentiles (all zeros), and the query-service crashes trying to call a method on the undefined module at the wrong path. The solver must: discover the string-timestamp bug by reading queue.ndjson and worker.js and running the worker with some instrumentation; realize reservoir.js is completely absent by reading the require() paths in both worker.js and aggregator.js; BUILD the reservoir module (a reservoir sampling implementation with T=1000 samples and percentile interpolation) and place it in a location reachable by both consumers; fix the require paths in both files; fix the timestamp parsing in ingest-service; restart all processes. The difficulty comes from (a) the stub masking that reservoir is missing until you look at the actual p-values, (b) the string-vs-number comparison being a runtime data-dependent bug invisible without running the code, and (c) the reservoir module being a non-trivial component that must be built correctly \u2014 naive implementations that sort all samples or use wrong interpolation fail the hidden tests.",
+  "trap": "A solver that reads aggregator.js and fixes only the require path (pointing it at rollup-worker/reservoir.js) will find that file doesn't exist, create a minimal stub returning 0, and then verify against the historical data in metrics.db \u2014 the existing buckets have pre-computed p50/p95/p99 so the GET /metrics call succeeds. But the verifier posts fresh events with a new metric name, waits 90 seconds for a flush, and then checks percentiles on a newly created bucket \u2014 which exposes that (a) no flush ever happened due to the string comparison bug, and (b) even after fixing the flush, a stub returning 0 fails the percentile correctness checks on freshly computed buckets.",
+  "tests": [
+   "Verifier starts by posting 500 events for a fresh metric name 'test.verifier.latency' with float values drawn from a known distribution (uniform 1-1000ms) with timestamps spread over a 2-hour window ending 5 minutes ago",
+   "Verifier waits 90 seconds then GET /metrics?name=test.verifier.latency&window=3 and checks HTTP 200 and correct JSON shape",
+   "Verifier checks that buckets array contains at least 1 bucket for the hour that closed before the current time",
+   "Verifier checks that count in each bucket matches the number of posted events in that hour window",
+   "Verifier checks that p50 is within 5% of the true median of the posted values in that bucket (computed from the known distribution)",
+   "Verifier checks that p99 is within 10% of the true 99th percentile (must be > 900ms for uniform 1-1000 distribution)",
+   "Verifier checks that min and max are exactly correct (within float epsilon)",
+   "Verifier posts 50 more events for a second fresh metric 'test.verifier.errors' with integer values 0-10, waits 90 seconds, queries it, and checks that p50 is non-zero and within range",
+   "Verifier checks all three ports are open and responding: POST /event 200, GET /metrics 200, and that the worker process is running",
+   "Verifier checks that the historical metric 'api.latency' still returns correct data (regression check)"
+  ],
+  "verifier_knob": {
+   "name": "event_count_per_bucket",
+   "value": "500 events per hour bucket",
+   "effect": "Lowering to 50 makes reservoir sampling less important (sort-based naive implementations also pass); raising to 5000 stresses the reservoir capacity and makes wrong interpolation more detectable. At 500, a correctly implemented reservoir with T=1000 gives accurate percentiles; a naive full-sort implementation also works but a stub returning 0 or mean clearly fails."
+  },
+  "expected_failure_modes": [
+   "Solver fixes the require path in aggregator.js and creates a stub reservoir returning 0, verifies against pre-seeded historical data which has pre-computed percentile columns, declares success without checking newly flushed buckets",
+   "Solver finds and fixes the reservoir module but misses the string-vs-number timestamp comparison bug; buckets never flush; fresh events are never queryable; solver only tests with the historical metric names that are already in the DB",
+   "Solver builds the reservoir module but implements percentile as simple linear interpolation on a sorted full array \u2014 passes for small inputs but the reservoir logic is wrong on large inputs where eviction should be random; hidden tests with 5000 events expose this",
+   "Solver fixes flush logic and creates reservoir.js but puts it at the wrong shared path; one of the two consumers (worker or query-service) fails silently; shallow verification against one endpoint misses the other",
+   "Solver restarts only one or two processes instead of all three; the fix is correct but the old broken process is still running on the port"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "javascript",
+   "nodejs",
+   "metrics",
+   "debugging",
+   "missing-component",
+   "two-interacting-bugs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/logs/worker.log  # reveals 'caught require error for reservoir', 'using stub percentiles'",
+   "cat /app/logs/query.log  # reveals crash at aggregator.js:88 percentile call",
+   "cat /app/rollup-worker/worker.js  # find require('./reservoir'), bucketEnd<=Date.now() string comparison",
+   "cat /app/query-service/aggregator.js  # find require('../shared/reservoir') wrong path",
+   "cat /app/ingest-service/index.js  # find timestamp written as string",
+   "ls /app/shared/ && ls /app/rollup-worker/  # confirm reservoir.js absent everywhere",
+   "cat /app/data/queue.ndjson | head -3  # confirm string timestamps in queue",
+   "# Now all bugs are known: (1) string timestamp causes bucketEnd string-vs-number comparison fail, (2) reservoir.js missing entirely",
+   "# Write /app/shared/reservoir.js: ~80 lines, reservoir sampling Algorithm R, percentile with linear interpolation",
+   "# Edit worker.js line: fix require('./reservoir') -> require('../shared/reservoir')",
+   "# Edit worker.js line: fix bucketEnd comparison -> Number(bucketEnd) <= Date.now() or parse at ingestion",
+   "# Edit ingest-service/index.js: fix timestamp write -> Number(body.timestamp) not String",
+   "# Edit query-service/aggregator.js: fix require('../shared/reservoir') path (already correct or fix to '../shared/reservoir')",
+   "cat /app/start.sh  # understand restart procedure",
+   "pkill -f 'node.*ingest' && pkill -f 'node.*worker' && pkill -f 'node.*query'  # kill old processes",
+   "bash /app/start.sh  # restart all three",
+   "curl -s -X POST localhost:4000/event -H 'Content-Type: application/json' -d '{\"name\":\"smoke\",\"value\":42,\"timestamp\":...}'",
+   "sleep 65",
+   "curl -s 'localhost:4001/metrics?name=smoke&window=2'  # verify shape and percentiles"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The worker.log explicitly states 'caught require error for reservoir' and 'using stub percentiles' \u2014 this directly reveals the missing-component bug, collapsing the intended masking difficulty. A log-reading agent finds both root causes in 2 files.",
+   "The 90-second wait in tests combined with a 1 CPU environment could make timing flaky: if the rollup worker's flush interval is close to 60s and system is under load during test, the bucket may not flush within the 90s window deterministically.",
+   "The ingest-service timestamp-as-string bug and the rollup-worker string-vs-number comparison are both visible by reading 2 source files (no instrumentation needed), reducing the data-dependent runtime discovery claim.",
+   "The task description says the worker 'masks' the require error by catching it and falling back to a stub \u2014 but the log file then shows 'using stub percentiles', so the masking is immediately broken by reading the logs.",
+   "If the solver correctly fixes all bugs but start.sh has port-reuse issues (old process still holding port 4000/4001), the verification step checking 'all three ports responding' could fail non-deterministically.",
+   "The verifier posts 500 events with timestamps 'spread over a 2-hour window ending 5 minutes ago' \u2014 these are past timestamps. After the fix, the rollup worker must detect these as belonging to already-closed buckets. If the flush logic only flushes buckets that closed after startup, old events from queue.ndjson may never be processed, causing a valid-looking fix to fail the verifier's fresh-event test."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because the worker.log explicitly reveals both root causes ('caught require error for reservoir', 'using stub percentiles') making the intended masking moot \u2014 a frontier agent reading logs first finds both bugs in under 5 files with ~19 commands total. The task's primary difficulty lever (stub silently masking missing reservoir) is undermined by the logs being too informative. Additionally, the 90-second flush timing window on a 1-CPU container creates flakiness risk for the verifier, and past-timestamp event replay after fix may not trigger the flush logic correctly depending on implementation.",
+  "fixes": [
+   "Remove 'using stub percentiles' and 'caught require error for reservoir' from the log output \u2014 replace with a generic 'percentile computation initialized' success message so the agent cannot identify the missing-reservoir bug from logs alone and must discover it by reading source and observing zero p-values in query output.",
+   "Increase genuine difficulty by adding a third subtle bug or making the reservoir file exist but contain a subtly wrong percentile implementation (off-by-one in interpolation, wrong eviction probability) so the agent must both find and correctly debug the implementation rather than just create it from scratch.",
+   "Make the flush timing deterministic for the verifier: instead of relying on wall-clock 60-second intervals, have the verifier explicitly trigger a flush endpoint (POST /admin/flush) that the worker exposes, removing timing flakiness from the test suite.",
+   "Change the queue.ndjson pre-existing events to use correct numeric timestamps so the timestamp-string bug only manifests for new events posted during the test, forcing the agent to post events and observe them fail to appear rather than seeing it in static queue data.",
+   "Add a note in the instruction that the worker process logs are at /app/logs/ but redact the specific error messages, forcing the agent to run the worker manually with debug output to observe the failure mode."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/payments-pipeline-fix",
+     "verdict": "distinct",
+     "reason": "That task focuses on worker startup timing and notification correctness during respawns, while this task involves fixing two specific bugs in a metrics rollup pipeline (bucket flush logic and missing aggregation component)."
+    },
+    {
+     "ref_id": "terminal-bench-pro/setup-mlflow-sqlite-server",
+     "verdict": "distinct",
+     "reason": "That task is about setting up MLflow from scratch with SQLite backend, while this task is about diagnosing and fixing bugs in an existing multi-service metrics pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a binary normalizer and fixing SQL rollups for sensor data, while this task involves fixing Node.js service bugs in a metrics ingestion/rollup/query pipeline."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust NetFlow UDP aggregation service with specific query types, while this task involves fixing a Node.js metrics pipeline with SQLite storage and percentile computation."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task involves fixing incorrect weighted aggregation in a regional sales service, while this task involves fixing a multi-service metrics pipeline with bucket flush logic and missing percentile computation components."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/payments-pipeline-fix",
+     0.132
+    ],
+    [
+     "terminal-bench-pro/setup-mlflow-sqlite-server",
+     0.117
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.117
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.11
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.106
+    ]
+   ],
+   "cost_usd": 0.014934
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058484999999999995
+}

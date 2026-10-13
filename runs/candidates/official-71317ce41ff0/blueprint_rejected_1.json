@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "hmac-sqlite-audit-refactor",
+  "title": "HMAC Audit Log Integrity Service",
+  "scenario": "A research scientist is attempting to reproduce a published experiment that relied on a tamper-evident SQLite audit log service written in C. The service computes per-row HMAC-SHA256 chain signatures over a research event log, then stores the chained MACs in a companion SQLite database. After a 'minor refactoring' to support larger record batches, the service silently produces wrong chain values on most inputs\u2014but the symptom looks like a database schema mismatch, not a cryptographic bug.",
+  "instruction_draft": "```\n$ ./audit_verify --db /data/audit.db\nERROR: chain verification failed at row 47 (stored_mac != computed_mac)\nSchema version: 3  Expected: 3\n47 rows verified OK, 1 failed\n```\n\nI am trying to reproduce the audit log validation results from our lab's 2024 paper. The service at `/app/audit_svc/` reads experiment events from `/data/events.jsonl`, computes a running HMAC-SHA256 chain (each row's MAC covers the previous row's MAC concatenated with the current row's canonical field encoding), and writes both the events and the per-row MACs into `/data/audit.db`. The companion verifier `audit_verify` recomputes the chain and checks it against the stored values.\n\nAfter someone refactored the batch-processing path in `audit_svc`, verification fails. Fix the service so that:\n1. For any input `events.jsonl` (with 1 to 50,000 events), the chain MACs stored in the database exactly match what `audit_verify` computes independently from the same events.\n2. The canonical field encoding used for HMAC input must match the specification in `/app/audit_svc/SPEC.md` exactly\u2014including field ordering, length-prefixed binary encoding of strings, little-endian 64-bit integers for numeric fields, and the zero-byte sentinel between records.\n3. The HMAC key is derived per-session from a 32-byte master secret stored in `/data/secret.key` using HKDF-SHA256 with the session ID as info; the session ID is the SHA-256 of the first event's raw JSON line.\n4. Verification must pass for all batch sizes (the service accepts `--batch-size N` from 1 to 4096).\n5. The compiled binary must be the one at `/app/audit_svc/audit_svc` (rebuild is required after your fix).",
+  "requirements": [
+   "For any events.jsonl with 1\u201350,000 events, chained MACs in audit.db match audit_verify's independent recomputation",
+   "Canonical field encoding matches SPEC.md: field ordering, length-prefixed strings, little-endian int64, zero-byte sentinel between records",
+   "HMAC key is derived via HKDF-SHA256 from /data/secret.key with session ID (SHA-256 of first event's raw JSON line) as info",
+   "Verification passes for all --batch-size values from 1 to 4096",
+   "The fixed and rebuilt binary /app/audit_svc/audit_svc is used (not a Python reimplementation)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: gcc, make, libsqlite3-dev, libssl-dev (for OpenSSL HMAC/HKDF), python3 (for audit_verify reference and test harness)",
+   "/app/audit_svc/ contains: main.c (~300 lines), batch.c (~250 lines), crypto.c (~180 lines), encode.c (~220 lines), hkdf.c (~150 lines), Makefile, SPEC.md",
+   "The refactoring bug is in batch.c: when batch_size > 1, the canonical encoder resets a shared length-prefix accumulator between records but fails to reinitialize the field-order cursor, causing fields 3 and 4 (timestamp_ns and severity) to be swapped in the HMAC input for all records after the first in each batch. With batch_size=1 (the old default), each batch has one record so the cursor reset is harmless\u2014making the single-record path appear correct.",
+   "A second, subtler bug: in hkdf.c the HKDF-Expand step uses the session ID bytes as the 'salt' parameter instead of the 'info' parameter (salt and info are swapped in the OpenSSL HKDF_CTX_set1_info / HKDF_CTX_set1_salt calls). This means key derivation produces a different key than the spec requires. audit_verify correctly implements HKDF per the spec, so even with batch_size=1, keys differ\u2014but the sample database was generated with the buggy code, so the pre-existing /data/audit.db passes the buggy verifier but fails the correct one.",
+   "The misleading symptom: the error message prints 'Schema version: 3  Expected: 3' because the schema version check runs first and passes, making it look like a schema migration issue rather than a crypto bug.",
+   "/app/audit_svc/SPEC.md fully specifies canonical encoding: fields in order [event_id(u64,LE), session_id(32 bytes raw), timestamp_ns(u64,LE), severity(u8), message(u32 LE length + UTF-8 bytes)], zero-byte 0x00 appended after each record's encoding before the next record's data is concatenated into the HMAC update stream.",
+   "audit_verify is a Python script at /app/audit_verify that correctly implements the chain verification per SPEC.md; it is the reference implementation and is NOT buggy.",
+   "/data/events.jsonl contains 200 sample events with varied field values including edge cases: empty message string (length=0), maximum severity (255), timestamp_ns=0.",
+   "/data/secret.key is a fixed 32-byte binary file.",
+   "The test harness at /app/tests/run_tests.py generates fresh events.jsonl files at verify time with random field values, runs audit_svc with varied --batch-size values, then runs audit_verify and checks for chain agreement.",
+   "Plausible but uninvolved code: /app/audit_svc/journal.c (rotating log file writer, ~150 lines), /app/audit_svc/pool.c (memory pool allocator, ~120 lines), /app/audit_svc/schema.c (SQLite schema migration, ~100 lines) \u2014 these are correct and not involved in the bugs."
+  ],
+  "internal_hint": "Difficulty comes from two interacting bugs neither of which is visible by reading one file in isolation, and from a misleading symptom. Bug 1 (batch.c): the field-order cursor `enc_cursor` is a static int reset to 0 at record boundaries, but the batch loop reuses a shared `encode_ctx` struct without calling `encode_ctx_reset()` between records when batch_size>1; only `acc_len` is zeroed. This swaps fields 3 and 4 in the HMAC input for records 2..N in each batch. The solver must instrument the encoder with batch_size=2 vs batch_size=1 and observe divergence. Bug 2 (hkdf.c): `HKDF_CTX_set1_salt` and `HKDF_CTX_set1_info` are called with their arguments reversed\u2014session_id goes to salt, empty string goes to info, but the spec says salt=empty and info=session_id. The solver must read SPEC.md carefully and compare it to the OpenSSL call sequence. The misleading symptom (schema version message) sends solvers to schema.c first. A solver that fixes only Bug 1 will see batch_size=1 tests pass but batch_size>1 fail. A solver that fixes only Bug 2 will see all tests fail on key mismatch. Both must be fixed together.",
+  "trap": "A solver who fixes only the batch cursor reset (Bug 1) will see batch_size=1 sample pass and incorrectly conclude the fix is complete. The hidden tests generate inputs with batch_size=1,2,4,16,64,256,1024,4096 and also check HMAC key correctness by comparing stored MACs against an independent HKDF implementation; even batch_size=1 tests fail if HKDF salt/info are swapped. A solver who only reads the error and checks the schema migration code never finds either bug.",
+  "tests": [
+   "Generate 100 fresh events with random fields; run audit_svc --batch-size 1; run audit_verify; assert all 100 MACs match (catches HKDF bug alone)",
+   "Generate 100 fresh events; run audit_svc --batch-size 2; run audit_verify; assert all 100 MACs match (catches both bugs together)",
+   "Generate 100 fresh events; run audit_svc --batch-size 64; run audit_verify; assert all 100 MACs match",
+   "Generate 100 fresh events; run audit_svc --batch-size 4096; run audit_verify; assert all 100 MACs match",
+   "Edge case: single event with empty message (message length=0); batch_size=1 and batch_size=4; both must pass audit_verify",
+   "Edge case: event with timestamp_ns=0 and severity=255; must produce correct chain MAC",
+   "Edge case: exactly 4096 events (one full max batch); audit_verify must pass",
+   "Key derivation correctness: independently compute HKDF-SHA256(secret.key, salt=empty, info=session_id) in the test harness using Python's cryptography library; compare first stored MAC's key material against reference (via a test-only instrumented build flag that dumps the derived key)",
+   "Canonical encoding spot-check: for a known event, independently encode per SPEC.md in the test harness and compute HMAC; compare against what audit_svc stores for that event at batch_size=1 and batch_size=3"
+  ],
+  "verifier_knob": {
+   "name": "num_generated_inputs",
+   "value": "9 test cases spanning batch sizes 1,2,4,16,64,256,1024,4096 plus edge cases",
+   "effect": "Raising adds more random event counts, more batch sizes, and more edge-case field combinations (e.g., non-ASCII UTF-8 in message, maximum-length messages); lowering to just batch_size=1 makes the task much easier since Bug 1 is invisible at batch_size=1"
+  },
+  "expected_failure_modes": [
+   "Agent investigates schema.c and journal.c (the misleading symptom path) and never reaches batch.c or hkdf.c",
+   "Agent finds and fixes Bug 1 (batch cursor) but misses Bug 2 (HKDF salt/info swap) because batch_size=1 sample appears to pass after Bug 1 fix alone\u2014Bug 2 requires independent key derivation check",
+   "Agent reimplements the service in Python (violating the compiled binary requirement) or wraps audit_svc without recompiling",
+   "Agent fixes Bug 2 but not Bug 1, then tests only with batch_size=1 and declares success",
+   "Agent reads SPEC.md but misreads the zero-byte sentinel rule (appending it after the full record vs. after each field), producing an encoding that passes most tests but fails the spot-check test"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "hmac",
+   "sqlite",
+   "c",
+   "hkdf",
+   "audit-log",
+   "batch-processing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/audit_svc/SPEC.md",
+   "cat /app/audit_svc/hkdf.c",
+   "grep -n 'set1_salt\\|set1_info' /app/audit_svc/hkdf.c",
+   "cat /app/audit_svc/batch.c",
+   "grep -n 'enc_cursor\\|encode_ctx\\|acc_len\\|reset' /app/audit_svc/batch.c",
+   "cat /app/audit_svc/encode.c",
+   "edit hkdf.c: swap HKDF_CTX_set1_salt and HKDF_CTX_set1_info arguments",
+   "edit batch.c: add encode_ctx_reset() call between records in batch loop",
+   "make -C /app/audit_svc/",
+   "python3 /app/tests/run_tests.py"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'test-only instrumented build flag' for HKDF key dumping must be pre-wired in the Makefile; if not implemented correctly, the key derivation test cannot run and could spuriously fail or pass",
+   "The audit_verify Python reference script is assumed correct and not validated independently; a bug there invalidates all tests",
+   "Test harness uses random field values\u2014if not seeded or reproducibly generated, marginal races or platform-specific float/int serialization could cause intermittent failures",
+   "The 50,000-event / 4096-batch test may exceed the 2 GB memory limit or time out on 1 CPU given SQLite + HMAC over large inputs",
+   "The misleading symptom (schema version) is described so explicitly in the instruction that a careful agent is primed to ignore it, reducing the red-herring effect to near zero"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies the task: both bugs are locatable by direct sequential reading of small C files (hkdf.c ~150 lines, batch.c ~250 lines), and a strong agent can find and fix both in ~10 commands without sophisticated reasoning. The misleading symptom provides at most 2-3 wasted commands before a systematic agent moves to the crypto files. The task needs the bugs to be harder to isolate\u2014e.g., by hiding the field-swap in a macro expansion chain, making the HKDF swap non-obvious through wrapper indirection, or requiring the agent to diff against a known-good commit rather than read fresh source.",
+  "fixes": [
+   "Increase genuine difficulty by making Bug 1 less local: instead of a missing reset call, have the field-order cursor stored as a global with a subtle off-by-one that only manifests when batch_size is a power of two (forcing the agent to instrument and compare outputs rather than spot the call site)",
+   "Make Bug 2 harder to find by wrapping the OpenSSL HKDF calls in a thin abstraction layer (e.g., hkdf_derive() in hkdf.c calls a helper set_hkdf_params() in a separate params.c) so the swap isn't visible in a single file scan\u2014requiring the agent to trace call graphs",
+   "Remove the explicit bug descriptions from the blueprint's 'Environment to build' section (they belong only in the internal hint) to avoid inadvertently priming reviewers and agents reading the task description",
+   "Add a correctness requirement that the existing /data/audit.db (generated with buggy code) must be detected as invalid after the fix\u2014this forces the agent to verify the fix changed behavior rather than accidentally leaving the old binary in place",
+   "Seed the test harness RNG with a fixed value per test case index so results are reproducible; document the memory/time budget for the 50,000-event case"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "variant",
+     "reason": "Both involve fixing an HMAC computation service over structured records with a binary canonical form, but differ in transport (TCP vs SQLite), chaining mechanism, key derivation (HKDF vs static key), and the specific bug type."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Involves a log enrichment pipeline with GeoIP enrichment and a Flask API, not a cryptographic chaining or HMAC problem."
+    },
+    {
+     "ref_id": "terminal-bench/session-window-debug",
+     "verdict": "distinct",
+     "reason": "Involves session window processing and event grouping semantics, unrelated to HMAC or cryptographic audit log integrity."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Involves fixing a weighted aggregation service writing to a SQLite database, not cryptographic chaining or HMAC computation."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "Involves a Node.js log ingestion pipeline with schema validation and performance requirements, unrelated to HMAC or cryptographic integrity."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.247
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.199
+    ],
+    [
+     "terminal-bench/session-window-debug",
+     0.162
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.14
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.122
+    ]
+   ],
+   "cost_usd": 0.013977
+  },
+  "novel": false
+ },
+ "cost_usd": 0.055179000000000006
+}

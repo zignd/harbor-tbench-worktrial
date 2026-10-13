@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "crypto-migration-hash-authenticator",
+  "title": "Scientific Data Authenticator Migration",
+  "scenario": "A platform engineering team is migrating a scientific computing cluster's data-integrity service from SHA-1 to a modern multi-algorithm scheme. The service is a compiled Go binary (/app/authenticator) that accepts scientific dataset records over stdin and emits authenticated manifests. The source is gone \u2014 only the binary and a small set of example inputs/outputs survive. The team needs a new Go service at /app/newauth/main.go that accepts the same wire format and produces outputs that pass verification by the cluster's existing validator binary (/app/validator).",
+  "instruction_draft": "Hey, we're cutting over our data integrity service on the HPC cluster and the old authenticator binary at /app/authenticator is going away. I need you to write a replacement in Go at /app/newauth/main.go. It should accept the same input format the old one does and produce output that passes /app/validator (run it as: /app/validator < your_output). There's a handful of sample pairs in /app/samples/ to get you oriented. The new service needs to handle all the edge cases the old one did \u2014 blank fields, multi-line payloads, datasets with zero records, records with embedded delimiters, and Unicode in field values. Build it with go build -o /app/newauth/authenticator /app/newauth/main.go.",
+  "requirements": [
+   "A Go source file exists at /app/newauth/main.go and compiles with 'go build -o /app/newauth/authenticator /app/newauth/main.go'",
+   "Running /app/newauth/authenticator on any valid input and piping to /app/validator exits 0",
+   "The replacement handles empty record sets (zero records) identically to the old binary",
+   "The replacement handles records containing the field delimiter character as escaped data",
+   "The replacement handles multi-line field values (newlines embedded in quoted fields)",
+   "The replacement handles Unicode characters in field values including surrogate-adjacent codepoints",
+   "The replacement handles records where optional fields are absent (sparse records)",
+   "The output manifest includes a per-record HMAC-SHA256 tag computed with the dataset session key",
+   "The output manifest includes a dataset-level rolling hash chain linking all record tags",
+   "The final line of output is a root digest that the validator independently recomputes and checks"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with golang-1.21 installed via apt",
+   "A compiled Go binary /app/authenticator (built from hidden source during Docker build, source deleted) that reads a custom line-oriented format from stdin and writes an authenticated manifest to stdout",
+   "A compiled Go binary /app/validator that reads a manifest from stdin and exits 0 if valid, 1 if not, printing a terse error on failure",
+   "Directory /app/samples/ containing 6 .in/.out pairs covering normal cases: a 3-record dataset, a 10-record dataset, and a 1-record dataset",
+   "The wire format: first line is 'SESSION <hex-session-key>', subsequent lines are 'RECORD <field1>|<field2>|<field3>|<field4>' where fields may be empty, base64-encoded if containing pipe/newline, and the session key seeds the HMAC",
+   "The manifest format: one 'TAG <record_index> <hmac_hex>' line per record, then a 'CHAIN <rolling_sha256_hex>' line after each tag, then a final 'ROOT <sha256_of_all_chains_hex>' line",
+   "The HMAC key is derived as HKDF-SHA256(session_key_bytes, salt='authenticator-v2', info='record-hmac') \u2014 this is discoverable only by black-box probing",
+   "The rolling chain is SHA256(previous_chain_hex || current_tag_hex) with the initial chain being SHA256('INIT')",
+   "The ROOT is SHA256(concatenation of all CHAIN values in order, newline-separated)",
+   "A Go module scaffold at /app/newauth/go.mod with module name 'newauth' and Go 1.21 declared",
+   "Hidden corpus at verify time: 200 inputs including zero-record sessions, records with pipe chars encoded as base64, multi-line fields, Unicode including U+FFFD and U+10FFFF, sparse records with 1-3 empty trailing fields omitted, and a session key of all-zero bytes"
+  ],
+  "internal_hint": "Difficulty comes from two interacting observe_not_read levers. First, the HKDF derivation is not visible in any sample \u2014 the sample inputs all use session keys where HKDF(key) happens to look like a simple truncation, so a solver who reverse-engineers the HMAC by matching sample outputs will get the wrong key derivation for non-trivial session keys and fail on the hidden corpus. Second, the base64-encoding rule for fields containing pipes or newlines is only triggered by edge-case inputs not present in the samples. A solver must: (1) probe /app/authenticator with crafted inputs to discover the HKDF expansion (varying session keys and watching HMAC outputs change), (2) discover the base64 field encoding by feeding pipe-containing fields and reading the output manifest, (3) discover the zero-record ROOT value (which is SHA256('INIT') alone since there are no CHAIN lines), (4) implement the rolling chain correctly. The chain initial value 'INIT' and HKDF parameters are discoverable only by experimentation.",
+  "trap": "A naive solver reads the 6 sample pairs, matches the HMAC formula by assuming the session key bytes are used directly as the HMAC key (which works for the samples because HKDF with those specific keys produces output with the same leading bytes as the key itself by coincidence), then fails the hidden corpus on any session key where HKDF expansion meaningfully differs. A second trap: solvers that don't probe with pipe-containing fields will produce unescaped manifests that the validator rejects. A third trap: the zero-record ROOT is not empty-string hash but SHA256('INIT') \u2014 solvers who skip this emit a wrong ROOT and fail zero-record inputs.",
+  "tests": [
+   "Compile test: 'go build -o /app/newauth/authenticator /app/newauth/main.go' exits 0",
+   "Sample regression: for each .in/.out pair in /app/samples/, pipe .in through /app/newauth/authenticator and pipe result to /app/validator, expect exit 0",
+   "Zero-record test: send 'SESSION <random_hex>\\n' with no RECORD lines; pipe output to /app/validator",
+   "Pipe-in-field test: send a RECORD where field2 contains a literal '|' character; validator must accept output",
+   "Newline-in-field test: send a RECORD where field3 contains an embedded newline (base64-encoded); validator must accept",
+   "Unicode test: send a RECORD with U+10FFFF in field1; validator must accept",
+   "Sparse record test: send a RECORD line with only 2 fields (trailing fields absent); validator must accept",
+   "Non-trivial session key test: send a session key of 32 zero bytes followed by 5 normal RECORDs; validator checks HMAC derivation via HKDF",
+   "Large corpus test (100 randomly generated sessions with 0-50 records each, random Unicode, random embedded delimiters): all pass /app/validator",
+   "Chain ordering test: two sessions with the same records in different order must produce different ROOT values"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "200 inputs at hard setting",
+   "effect": "Lowering to 20 inputs (only basic normal cases) lets a solver pass with wrong HKDF if they got lucky on sample keys; raising to 500 adds more adversarial Unicode and delimiter combinations"
+  },
+  "expected_failure_modes": [
+   "Solver deduces HMAC key is the raw session key bytes from samples (works on samples, fails on hidden corpus with different keys where HKDF matters)",
+   "Solver correctly implements HMAC but misses base64 escaping for pipe/newline fields, fails all pipe-containing inputs",
+   "Solver handles pipe escaping but uses empty-string hash or skips ROOT for zero-record case",
+   "Solver gets HKDF right but uses wrong salt or info string (guesses 'v1' or empty), fails all non-trivial session keys",
+   "Solver verifies only against the 6 sample pairs, declares success, and submits without probing edge cases"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "go",
+   "cryptography",
+   "black-box-reverse-engineering",
+   "hmac",
+   "hkdf",
+   "scientific-computing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/samples/*.in \u2014 read all sample inputs",
+   "cat /app/samples/*.out \u2014 read all sample outputs",
+   "echo 'SESSION deadbeef\\nRECORD a|b|c|d' | /app/authenticator \u2014 baseline probe",
+   "echo 'SESSION 0000000000000000\\nRECORD a|b|c|d' | /app/authenticator \u2014 zero key probe",
+   "echo 'SESSION ffffffffffffffff\\nRECORD a|b|c|d' | /app/authenticator \u2014 vary key, observe HMAC shift",
+   "echo 'SESSION deadbeef\\n' | /app/authenticator \u2014 zero records, capture ROOT value",
+   "python3 -c \"import hashlib; print(hashlib.sha256(b'INIT').hexdigest())\" \u2014 verify ROOT=SHA256('INIT')",
+   "# Probe ~20 more varied session keys, collect (key, hmac) pairs",
+   "# Write Python script to test HKDF(key, salt=X, info=Y) for common X,Y strings against observed HMACs",
+   "python3 -I /tmp/probe.py \u2014 discover salt='authenticator-v2', info='record-hmac'",
+   "echo 'SESSION abc\\nRECORD pipe|fi|eld' with literal pipe in field value | /app/authenticator \u2014 discover base64 encoding rule",
+   "echo 'SESSION abc\\nRECORD only_two_fields|here' | /app/authenticator \u2014 test sparse records",
+   "# Write /app/newauth/main.go with: SESSION parse, HKDF-SHA256(key,salt,info), HMAC-SHA256 per record, rolling chain, ROOT",
+   "go build -o /app/newauth/authenticator /app/newauth/main.go",
+   "for f in /app/samples/*.in; do /app/newauth/authenticator < $f | /app/validator; done",
+   "echo 'SESSION abc\\n' | /app/newauth/authenticator | /app/validator \u2014 zero record",
+   "# Test pipe-in-field through new binary \u2192 validator",
+   "# Test Unicode U+10FFFF through new binary \u2192 validator",
+   "# Fix any failures, rebuild, retest",
+   "# Run large random corpus generator script \u2192 all pass validator"
+  ],
+  "speedrun_commands": 45,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "HKDF coincidence claim is fragile: the blueprint asserts sample session keys produce HKDF output with 'the same leading bytes as the key itself by coincidence' \u2014 this is mathematically unlikely for arbitrary keys and would need careful construction during Docker build; if the Docker build author miscalculates, some samples may already expose HKDF, making the trap ineffective or causing sample regression failures",
+   "Clarity gap: the instruction says 'base64-encoded if containing pipe/newline' but does NOT state this in the solver-visible instruction \u2014 only in the blueprint's internal description. The solver instruction mentions 'records with embedded delimiters' as an edge case but gives no encoding hint. A solver may not know whether to use base64, percent-encoding, or backslash-escape, making this ambiguous and potentially an unfair failure mode rather than a genuine difficulty",
+   "The instruction draft does not mention HMAC, HKDF, or any cryptographic specifics \u2014 the solver must discover the entire output format by black-box probing. This is fine for solvability but the 'requirements' section lists specific HMAC/HKDF details that the instruction text never mentions, creating a gap between what's stated vs. tested",
+   "Flaky coincidence dependency: if the HKDF coincidence property doesn't hold perfectly for all 6 sample keys, naive solvers who use raw session bytes as HMAC key will fail even the sample regression test, making the task harder than intended and potentially causing valid solution paths to break",
+   "Zero-record ROOT=SHA256('INIT') is a specific design choice not hinted anywhere in the instruction; if the validator uses a different sentinel value or the Docker build has a bug, legitimate solutions fail unfairly",
+   "The 'coincidence' that HKDF output matches raw key bytes is extremely improbable without deliberate key selection \u2014 the blueprint needs these keys to be specifically crafted, which adds Docker build complexity and a potential correctness risk"
+  ],
+  "verdict": "reject",
+  "reasons": "The clarity score is limited to 3 because the solver-visible instruction omits critical information (encoding rules, output format structure, cryptographic scheme) that the tests explicitly check, creating a gap between stated requirements and verified requirements. The solvability score is 3 because the HKDF parameter discovery requires extensive black-box probing with systematic key variation and hypothesis testing \u2014 plausible but tight for one hour. Most critically, the invalid failure risks are substantial: the core 'coincidence' trap requires artificially constructed session keys that make HKDF output look like raw keys, which is mathematically non-trivial to engineer reliably in a Docker build, and if it breaks, the entire trap mechanism fails making the task either trivially easy (HKDF exposed) or impossibly unfair (samples fail).",
+  "fixes": [
+   "Make the encoding scheme discoverable but unambiguous: in the instruction, mention that 'the old binary uses a field encoding scheme for special characters' so solvers know to probe for it, without revealing what scheme it is",
+   "Replace the fragile 'HKDF coincidence' trap with a cleaner observe_not_read lever: use session keys where naive HMAC(raw_key) fails obviously on samples too, but provide a sample that demonstrates the HMAC output format so solvers know they need HKDF; make discovery come from probing parameter variations rather than relying on an engineered mathematical coincidence",
+   "Add a brief format skeleton to the instruction (e.g., 'output has per-record authentication tags, a chain value after each, and a final root digest') so that the output format structure is stated \u2014 the hard part (deriving exact crypto parameters) remains undisclosed but the solver knows what categories of output to produce",
+   "Validate the Docker build by confirming the HKDF coincidence property computationally before publishing: write a test that confirms HKDF(sample_keys) has leading bytes matching raw keys, and include this as a build-time assertion"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/polyglot-yaml-config-validator",
+     "verdict": "distinct",
+     "reason": "That task is about creating a polyglot bash/Python validator script for YAML config files, while the candidate is about reverse-engineering a binary's wire format and implementing an HMAC-SHA256/hash-chain authentication service in Go."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "That task is about extracting XOR-obfuscated credentials from a Go binary to run it successfully, while the candidate is about reverse-engineering input/output formats to reimplement a cryptographic data-integrity service in Go."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "variant",
+     "reason": "Both tasks involve implementing a service that computes HMAC-SHA256 tags over structured records with specific serialization requirements, validated by an existing binary, though the candidate adds hash chaining, edge-case handling, and a Go reimplementation aspect rather than a TCP server."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a broken Node.js NDJSON log ingestion pipeline for correctness and performance, while the candidate is about reverse-engineering and reimplementing a cryptographic data-integrity service in Go."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about debugging incorrect region-level sales aggregation in an existing service, while the candidate is about reverse-engineering a binary's protocol and reimplementing it with HMAC-SHA256 and hash-chain authentication."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/polyglot-yaml-config-validator",
+     0.231
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.186
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.176
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.122
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.113
+    ]
+   ],
+   "cost_usd": 0.015069
+  },
+  "novel": false
+ },
+ "cost_usd": 0.058764000000000004
+}

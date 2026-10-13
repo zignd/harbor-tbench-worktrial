@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "aes-ctr-record-codec-refactor",
+  "title": "Authenticated Record Encryption Codec Repair",
+  "scenario": "A research scientist is reproducing a published result that stores environmental sensor readings in an SQLite database using a custom AES-128-CTR + HMAC-SHA256 authenticated encryption scheme. The original tool (v1) was refactored into a modular C library (v2) spanning ~1,800 lines across 12 source files to support batch operations and optional field encoding. The v2 binary decrypts ~90% of records correctly but silently produces wrong plaintext or fails MAC verification on a subset of records. The scientist needs the v2 library to be a bit-for-bit equivalent codec to v1 on all valid inputs so that reproduced results match the published data.",
+  "instruction_draft": "```\n$ ./cryptostore_v2 decrypt --db=measurements.db --out=recovered.csv\nDecrypted 9,847 records. MAC verification failed: 153 records skipped.\nExpected 10,000 records in recovered.csv.\n\n$ diff recovered.csv reference_partial.csv\n< row 1024,28.31,101325,0.612,...\n> row 1024,28.31,101325,0.612,...\n[binary-identical lines differ in whitespace?]\n```\n\nYou are reproducing a published environmental dataset. The v1 reference tool at `/opt/cryptostore_v1` (binary only, no source) produced the encrypted SQLite database at `/data/measurements.db`. The v2 library source is at `/app/libcryptostore/` (~1,800 lines of C across 12 files), built with `make -C /app` to produce `/app/cryptostore_v2`.\n\nThe v2 codec must satisfy:\n1. `cryptostore_v2 decrypt` recovers all 10,000 records from `measurements.db` with no MAC failures.\n2. Every decrypted record is byte-for-bit identical to what `cryptostore_v1 decrypt` produces for the same row.\n3. `cryptostore_v2 encrypt` followed by `cryptostore_v2 decrypt` round-trips correctly for all inputs, including records where any optional field is absent (empty string in CSV), records whose SQLite `rowid` has any value from 1 to 2^32-1, and records whose plaintext length falls in [0, 512] bytes.\n4. The encrypted blobs produced by `cryptostore_v2 encrypt` on fresh inputs must be decryptable by `cryptostore_v1 decrypt` and vice versa (wire-format compatibility).\n\nThe test suite generates fresh inputs at verify time and compares `cryptostore_v2` output against `cryptostore_v1` output byte-for-byte. Investigate the environment \u2014 logs, the database, and the v1 binary's behavior \u2014 before modifying source.",
+  "requirements": [
+   "cryptostore_v2 decrypt recovers all 10,000 rows from measurements.db with zero MAC failures",
+   "Decrypted bytes for every row are bit-for-bit identical to cryptostore_v1 decrypt output for the same row",
+   "cryptostore_v2 encrypt then decrypt round-trips correctly for records with any optional field absent",
+   "cryptostore_v2 encrypt then decrypt round-trips correctly for rowids from 1 to 2^32-1",
+   "cryptostore_v2 encrypt then decrypt round-trips correctly for plaintexts of length 0 through 512 bytes",
+   "Blobs encrypted by cryptostore_v2 are decryptable by cryptostore_v1 and vice versa (wire-format compatibility)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y gcc make libsqlite3-dev openssl libssl-dev xxd python3",
+   "/opt/cryptostore_v1: compiled x86-64 binary of the reference v1 implementation (stripped, no source); supports 'encrypt --db=<db> --in=<csv> --key=<hex>' and 'decrypt --db=<db> --out=<csv> --key=<hex>'",
+   "/app/libcryptostore/: 12 C source files (~1,800 lines total): aes.c, ctr.c, hmac.c, codec.c, field_enc.c, record.c, nonce.c, batch.c, db.c, cli.c, util.c, main.c; plus a Makefile",
+   "/data/measurements.db: SQLite database with 10,000 encrypted rows produced by cryptostore_v1; schema: CREATE TABLE measurements (id INTEGER PRIMARY KEY, blob BLOB NOT NULL, ts INTEGER NOT NULL)",
+   "/data/reference_partial.csv: plaintext for rows 1-500 (the 'easy' rows with small IDs and all fields present) produced by cryptostore_v1, for the scientist's spot-check",
+   "/data/key.hex: the 128-bit AES key and 256-bit HMAC key concatenated as hex (used by both v1 and v2)",
+   "Bug 1 (data-dependent, not source-visible): nonce.c computes the per-record CTR nonce as XOR of a base nonce with the rowid encoded as 3 bytes little-endian; v1 uses 4 bytes little-endian; records with rowid >= 256^3 = 16,777,216 get a truncated/wrong nonce \u2014 the database contains rows with IDs up to ~10,000 so this truncation bug only manifests when the high byte of the 4-byte rowid encoding is non-zero, which happens for IDs >= 16,777,216; BUT the more subtle manifestation is that 3 bytes vs 4 bytes shifts the HMAC input length for nonce derivation, corrupting MAC on all records where rowid > 0x00FFFFFF \u2014 in the planted DB some IDs are synthetically set above this threshold to trigger failures",
+   "Bug 2 (edge-case, not source-visible without running): field_enc.c encodes optional fields; when a field is absent, v1 writes a 2-byte length prefix of 0x0000 followed by nothing; v2 writes 0xFFFF as the absent-field sentinel; both decode their own format but are incompatible \u2014 this only matters for round-trip and wire-format-compatibility tests with absent fields, which don't appear in reference_partial.csv",
+   "Bug 3 (alignment/interaction, requires experimentation): codec.c pads plaintext to 16-byte AES block boundary before encrypting; v1 uses PKCS#7 padding; v2 uses zero-padding with a length trailer in the last byte (a common refactoring mistake); records whose plaintext is exactly a multiple of 16 bytes get double-padded in v1 (adds a full 16-byte block) but not in v2, so MAC fails on those records even with bugs 1 and 2 fixed",
+   "Misleading symptom: MAC failures surface first and the error message in batch.c points to the HMAC verification function; the HMAC code itself (hmac.c) is correct; the failures come from wrong ciphertext (bugs 1 and 3) producing wrong plaintext which fails MAC, not from a bug in hmac.c itself \u2014 an agent that immediately audits hmac.c wastes significant time",
+   "The failing rows in measurements.db include: ~50 rows with high IDs (>16M) that trigger Bug 1, ~60 rows with exactly-block-aligned plaintext that trigger Bug 3, ~43 rows that trigger both; reference_partial.csv contains none of these (rows 1-500 have small IDs and non-aligned plaintexts and all fields present)",
+   "Plant realistic 'noise' code: aes.c is a clean AES-128 implementation (~300 lines), hmac.c is a clean HMAC-SHA256 (~120 lines), ctr.c is a clean CTR mode driver (~80 lines) \u2014 none of these have bugs, so reading them is a dead end",
+   "The /app/logs/ directory contains a build log and a test run log showing '9847/10000 decrypted' with no further diagnostics \u2014 the logs are the entry point to noticing the ~1.5% failure rate"
+  ],
+  "internal_hint": "Difficulty comes from data-dependent failures (not source-visible). Root causes: (1) nonce.c encodes rowid as 3 bytes LE instead of 4 bytes LE \u2014 only triggers on rows with rowid bytes > 0x00FFFFFF in the DB, discoverable by comparing v1 vs v2 nonce derivation on a row with a high ID using gdb/printf instrumentation, not by reading nonce.c which looks plausible; (2) field_enc.c uses 0xFFFF as absent-field sentinel instead of 0x0000-prefix \u2014 only fails on round-trip with absent fields and wire-compat tests, not visible in the reference CSV; (3) codec.c uses zero-padding+trailer instead of PKCS#7 \u2014 only fails on block-aligned plaintexts, discoverable by crafting a 16-byte plaintext and comparing v1/v2 ciphertext. The misleading symptom (MAC errors in batch.c log) sends a naive agent to hmac.c which is correct. A skilled engineer must: instrument v2 to dump nonces and ciphertexts for failing rows, diff against v1 on the same rows, isolate which rows fail, probe the high-ID hypothesis, fix nonce.c, then notice remaining failures on block-aligned records, fix codec.c, then run wire-compat tests and discover the field_enc.c sentinel mismatch.",
+  "trap": "An agent that fixes only the most obvious MAC-path issue (e.g., adding a missing HMAC finalize call or reordering MAC inputs) will pass the reference_partial.csv spot-check (rows 1-500 all succeed even before any fix) and may believe the task is done. The fuzz_equivalence verifier generates fresh inputs including: rowids sampled from [1, 2^32-1] (catching Bug 1 at high IDs), plaintexts of exactly 16, 32, 48 bytes (catching Bug 3), and records with absent optional fields (catching Bug 2) \u2014 all of which fail unless all three bugs are fixed.",
+  "tests": [
+   "Test 1 \u2014 existing DB: run 'cryptostore_v2 decrypt --db=/data/measurements.db --out=/tmp/out.csv --key=$(cat /data/key.hex)' and assert exit 0 with exactly 10,000 rows and zero MAC-failure log lines",
+   "Test 2 \u2014 v1 equivalence on DB rows: for each of 10,000 rows, compare cryptostore_v2 decrypt output byte-for-byte against cryptostore_v1 decrypt output for the same row",
+   "Test 3 \u2014 round-trip, high rowids: generate 200 random CSV records, insert with rowids sampled uniformly from [1, 2^32-1] via cryptostore_v2 encrypt, then decrypt with cryptostore_v2 and assert byte-for-bit match",
+   "Test 4 \u2014 round-trip, block-aligned plaintexts: generate records with plaintext lengths exactly 16, 32, 48, 64, 80, 96, 112, 128, 160, 256, 384, 512 bytes; encrypt with v2, decrypt with v2, assert match",
+   "Test 5 \u2014 absent optional fields: generate records where each of the 4 optional measurement fields is absent in all 2^4=16 combinations; encrypt with v2, decrypt with v2, assert byte-exact match",
+   "Test 6 \u2014 wire-format compatibility v2->v1: encrypt 100 random records (including high rowids, block-aligned, absent fields) with cryptostore_v2, decrypt with cryptostore_v1, assert byte-exact match",
+   "Test 7 \u2014 wire-format compatibility v1->v2: encrypt 100 random records with cryptostore_v1, decrypt with cryptostore_v2, assert byte-exact match",
+   "Test 8 \u2014 zero-length plaintext: encrypt a record with an empty sensor payload (all optional fields absent, zero-length mandatory fields replaced with their zero values), round-trip through v2, compare to v1"
+  ],
+  "verifier_knob": {
+   "name": "num_fuzz_records_per_test",
+   "value": "200",
+   "effect": "Raising to 500-1000 increases coverage of rowid space and plaintext-length boundary conditions, making it harder to pass with a partial fix; lowering to 20 makes it possible to accidentally pass with an incorrect implementation that happens to avoid all three failure modes in the small sample"
+  },
+  "expected_failure_modes": [
+   "Agent reads hmac.c first (misled by MAC error symptom), finds it correct, concludes the MAC code is fine, then audits aes.c and ctr.c (also correct), wasting 15+ commands before instrumenting the actual failing rows",
+   "Agent fixes only Bug 1 (nonce truncation), reruns on the DB, gets 9,947 successes, declares victory \u2014 fails Test 3 (block-aligned round-trip) and Tests 5-7 (absent fields and wire-compat)",
+   "Agent fixes Bugs 1 and 3 but misses Bug 2 because reference_partial.csv has no absent-field records and the agent never tests that case explicitly, failing Tests 5, 6, 7",
+   "Agent correctly identifies all three bugs in nonce.c, codec.c, field_enc.c but makes an off-by-one error in the PKCS#7 implementation for exactly-block-aligned inputs (adds wrong number of padding bytes), failing Test 4",
+   "Agent uses gdb to trace a failing row with a moderately high ID (e.g., row 5000) that only triggers Bug 3, concludes the only bug is in padding, fixes codec.c, misses Bug 1 because the high-ID rows happen not to be in the agent's sample, failing Test 3"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "aes-ctr",
+   "authenticated-encryption",
+   "sqlite",
+   "c",
+   "large-scale-refactoring",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/logs/test_run.log  # confirm 9847/10000",
+   "sqlite3 /data/measurements.db 'SELECT id FROM measurements ORDER BY id DESC LIMIT 20'  # check for high IDs",
+   "cat /app/libcryptostore/nonce.c  # find 3-byte LE bug",
+   "sed -i 's/3-byte encoding/4-byte encoding/' /app/libcryptostore/nonce.c  # fix Bug 1",
+   "make -C /app",
+   "/app/cryptostore_v2 decrypt --db=/data/measurements.db --out=/tmp/out1.csv --key=$(cat /data/key.hex)  # still ~60 failures",
+   "cat /app/libcryptostore/codec.c  # find zero-pad+trailer vs PKCS#7",
+   "edit codec.c to implement PKCS#7 properly including block-aligned double-block case",
+   "make -C /app",
+   "/app/cryptostore_v2 decrypt --db=/data/measurements.db --out=/tmp/out2.csv --key=$(cat /data/key.hex)  # 0 failures",
+   "diff /tmp/out2.csv against v1 output for all 10000 rows  # verify Test 2",
+   "cat /app/libcryptostore/field_enc.c  # find 0xFFFF vs 0x0000 sentinel",
+   "fix field_enc.c absent-field encoding to use 0x0000 prefix",
+   "make -C /app",
+   "run round-trip test with absent optional fields  # verify Test 5",
+   "/opt/cryptostore_v1 decrypt on v2-encrypted blob with absent fields  # verify Test 6",
+   "/app/cryptostore_v2 decrypt on v1-encrypted blob with absent fields  # verify Test 7",
+   "run round-trip with rowids in [1, 2^32-1]  # verify Test 3",
+   "run round-trip with block-aligned plaintexts 16,32,...,512  # verify Test 4",
+   "run zero-length plaintext test  # verify Test 8"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The v1 binary is described as x86-64 only; if the container runs on ARM (e.g., Apple Silicon CI), v1 will not execute and all wire-format-compatibility tests (Tests 6, 7, 8) become impossible to pass, making failures invalid.",
+   "Bug 1 description is internally inconsistent: it says the truncation only matters for rowids >= 16,777,216 but also says 'HMAC input length for nonce derivation corrupts MAC on all records where rowid > 0x00FFFFFF' \u2014 the DB has IDs up to ~10,000, so the blueprint claims ~50 rows have IDs synthetically set above 16M, but the 'rowid up to ~10,000' description and the 'synthetically set above this threshold' are in tension; an agent reading the DB might not find any high-ID rows if the setup script is wrong.",
+   "The instruction says 'binary-identical lines differ in whitespace?' in the diff output, implying a possible whitespace normalization ambiguity in the CSV output format that could make byte-for-byte comparison flaky depending on locale or line-ending settings.",
+   "Building a ~1,800-line C library from scratch for this blueprint requires significant scaffolding work; if the Makefile or any of the 12 source files have compilation errors or missing dependencies, the task becomes unsolvable regardless of the agent's skill.",
+   "The speedrun reveals all three bugs are directly readable in source once the correct files are opened \u2014 the claimed 'not source-visible without running' property doesn't hold, making the difficulty mechanism weaker than stated and reducing genuine_difficulty.",
+   "Tests generate fresh random inputs at verify time; if the random seed or input generation is not deterministic or reproducible, flaky test outcomes could occur (e.g., a high-rowid sample by chance never hitting >16M values).",
+   "The internal hint says Bug 1 only triggers for IDs > 16M, but the fuzz test samples uniformly from [1, 2^32-1] \u2014 with 200 records the probability of missing the high-ID range is negligible, but with fewer samples there could be unlucky runs."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 is disqualifying: all three bugs are directly readable in their respective source files (nonce.c, codec.c, field_enc.c) once an agent looks at the right file, so a systematic agent can solve this in ~20 commands without instrumentation or binary analysis. The blueprint's claimed difficulty mechanism ('not source-visible without running') contradicts the actual setup where the bugs are syntactically obvious in source. Additionally, the x86-64-only v1 binary creates an environment validity risk on non-x86 CI, and the DB ID range description is internally inconsistent.",
+  "fixes": [
+   "Make the bugs genuinely not source-visible: obfuscate the incorrect logic (e.g., embed the 3-byte encoding inside a macro in a header, derive the sentinel via a compile-time constant computed from other constants, hide the padding choice behind a function pointer set at init time) so that reading source alone is insufficient and dynamic instrumentation is required.",
+   "Resolve the x86-64 portability problem: either use a QEMU-based container that emulates x86-64 so v1 runs on any host architecture, or provide the v1 source compiled for multiple architectures, to avoid invalid failures on ARM CI runners.",
+   "Fix the internal inconsistency in Bug 1: explicitly state in the environment spec that the measurements.db contains exactly N rows with synthetically elevated IDs (e.g., 'rows 9501-9550 have id values 16,777,220 to 16,777,270') so the builder knows exactly what the DB must contain and the agent can verify the ID distribution.",
+   "Raise difficulty by adding a fourth subtle bug that requires differential binary analysis (e.g., the nonce base is derived from a KDF whose input byte-order differs between v1 and v2, discoverable only by running both and comparing nonce bytes with a debugger), ensuring instrumentation is genuinely required and the speedrun exceeds 30 commands."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a lost encryption implementation from its decryption source; the candidate is about debugging a C library refactor to achieve bit-for-bit compatibility with a reference binary."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/feal-linear-cryptanalysis",
+     "verdict": "distinct",
+     "reason": "That task is a known-plaintext cryptanalysis attack to recover secret keys; the candidate is a codec compatibility/bug-fix task with no cryptanalysis involved."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/db-wal-recovery",
+     "verdict": "distinct",
+     "reason": "That task is about recovering data from a corrupted SQLite WAL file; the candidate is about fixing an AES-CTR+HMAC codec implementation to match a reference binary."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a TCP service that computes HMAC-SHA256 tags over canonically serialized WAL records; the candidate is about debugging a C library's AES-CTR+HMAC authenticated encryption to match a reference binary."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a CSV chunking pipeline with deduplication and validation logic; the candidate is about achieving bit-for-bit cryptographic codec compatibility between two versions of a C library."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.156
+    ],
+    [
+     "terminal-bench-2-1/feal-linear-cryptanalysis",
+     0.135
+    ],
+    [
+     "terminal-bench-2-1/db-wal-recovery",
+     0.132
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.13
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.112
+    ]
+   ],
+   "cost_usd": 0.015267
+  },
+  "novel": true
+ },
+ "cost_usd": 0.06314700000000001
+}

@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "wheel-codec-compression-threshold",
+  "title": "Compressed Wheel Codec Repair",
+  "scenario": "Your team ships a Python wheel that bundles a proprietary compiled encoder (`_fastpack.so`, no source) alongside a pure-Python fallback. The build pipeline produces `.fpk` archive files from large data directories and the release criterion is that the final wheel's codec must compress every test corpus to \u2264 55% of its raw size. A recent refactor of the Python packaging scripts broke the pipeline: `build_wheel.py` now silently falls back to an uncompressed code path for many input files, sailing through the sample smoke-test but failing the size gate on the hidden corpora.",
+  "instruction_draft": "You are the release engineer for the `fastpack` wheel. The project lives in `/app/fastpack/`. Running `python build_wheel.py` produces `dist/fastpack-1.4.0-py3-none-any.whl` and a batch encoder at `dist/encode_corpus.py`. That encoder, when invoked as `python encode_corpus.py <input_dir> <output_dir>`, must write one `.fpk` file per input file. The acceptance gate: the total size of all `.fpk` files written from any test corpus must be \u2264 55% of the total raw size of the input files. The provided smoke corpus at `/app/smoke_corpus/` passes today, but the hidden CI corpora do not. Investigate the packaging pipeline, characterise the compiled `_fastpack.so` component by experiment (its source is not available), and fix `build_wheel.py` and any related Python files so that the deployed encoder always uses the most-compressive code path for every file type and size. The wheel must install cleanly with `pip install` and `encode_corpus.py` must be importable from it.",
+  "requirements": [
+   "Running `python build_wheel.py` completes without error and produces `dist/fastpack-1.4.0-py3-none-any.whl`.",
+   "The wheel installs cleanly via `pip install dist/fastpack-1.4.0-py3-none-any.whl`.",
+   "After installation, `python encode_corpus.py <input_dir> <output_dir>` writes one `.fpk` file per input file in `<output_dir>`.",
+   "For any test corpus, total `.fpk` byte size \u00f7 total raw input byte size \u2264 0.55.",
+   "The encoder must handle files of varying sizes (1 KB \u2013 50 MB) and content types (text, binary, repetitive, random-ish) present in the hidden corpora.",
+   "No `.fpk` file may be larger than its corresponding input file (i.e. the codec must not inflate any single file)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm.",
+   "`/app/fastpack/` contains: `build_wheel.py`, `fastpack/__init__.py`, `fastpack/encoder.py`, `fastpack/codec.py`, `fastpack/_fastpack.so` (pre-compiled, no source), `fastpack/fallback.py`, `setup.cfg`, `MANIFEST.in`, `pyproject.toml`.",
+   "`_fastpack.so` exposes three C-extension entry points discoverable via `help()` or `dir()`: `compress_block(bytes, level: int) -> bytes`, `compress_stream(bytes, chunk_size: int, level: int) -> bytes`, and `get_supported_levels() -> list[int]`. It does NOT expose a plain 'compress' symbol.",
+   "`encoder.py` (the broken file) calls `_fastpack.compress(data)` \u2014 a symbol that does not exist \u2014 and catches the resulting AttributeError silently, then falls back to `fallback.py` which stores data uncompressed with just a 4-byte magic header.",
+   "`codec.py` contains correct dispatch logic that was written but never wired into `encoder.py` after the refactor; it selects `compress_stream` for files \u2265 64 KB and `compress_block` for smaller files, at the level returned by `get_supported_levels()[-1]` (highest).",
+   "`build_wheel.py` has a secondary bug: it copies `encoder.py` into the wheel but omits `codec.py` from the `package_data` / include list, so even a fixed `encoder.py` that imports `codec` would fail at install time unless `build_wheel.py` is also corrected.",
+   "`/app/smoke_corpus/` contains 6 small highly-repetitive text files (total ~120 KB) \u2014 these compress well even under the fallback (magic header + zlib level 1 accidentally applied to small files in fallback) so the smoke test passes.",
+   "Hidden CI corpora include: mixed text/binary files up to 20 MB each; moderately-compressible binary data; files sized exactly at the 64 KB boundary; and a corpus of near-random data where the codec must at least not inflate files.",
+   "`apt-get install -y python3-dev` and `pip install build wheel setuptools` are pre-installed.",
+   "A verifier script at `/verify/run_check.py` is present that generates fresh corpora, runs `encode_corpus.py`, and checks the \u2264 0.55 ratio; it is not readable by the solver (mode 0000) but is executed by the test harness."
+  ],
+  "internal_hint": "Two interacting bugs cause the failure. (1) `encoder.py` calls `_fastpack.compress(data)` which doesn't exist; the AttributeError is caught silently, routing all encoding through `fallback.py`. The solver must EXPERIMENT with `_fastpack.so` (no source available) to discover the actual API \u2014 `dir(_fastpack)` or `help(_fastpack)` reveals `compress_block`, `compress_stream`, `get_supported_levels`. (2) `build_wheel.py` omits `codec.py` from the packaged files, so importing it from the installed wheel raises ImportError. The solver must fix `encoder.py` to call `codec.compress(data)` (which already contains correct dispatch logic), AND fix `build_wheel.py` to include `codec.py`. A naive fix that only patches `encoder.py` to call the right symbol directly (without using `codec.py`'s dispatch) will pass small files but fail at the 64 KB boundary where `compress_stream` is needed. A fix that corrects `encoder.py` but not `build_wheel.py` works locally but fails after install. The opaque component forces experimentation; the shallow-check trap is that fixing the direct symbol call alone passes the smoke corpus but fails files near the chunk-size boundary.",
+  "trap": "A solver who probes `_fastpack.so`, discovers `compress_block`, and simply rewrites `encoder.py` to call `_fastpack.compress_block(data, level)` on all files will pass the smoke corpus (small files) but fail the hidden corpus containing files \u2265 64 KB: those need `compress_stream` with appropriate chunk sizes to achieve \u2264 55% ratio. The correct dispatch is already in `codec.py` \u2014 but the solver has to notice `codec.py` exists AND that `build_wheel.py` excludes it. A solver who fixes both `encoder.py` and the symbol issue but forgets to fix `build_wheel.py` will see local tests pass but the installed wheel will `ImportError` on `codec`.",
+  "tests": [
+   "Install the wheel via pip into a fresh venv and assert the import `from fastpack import encoder` succeeds and `fastpack.codec` is importable from the installed package.",
+   "Run `encode_corpus.py` on the provided smoke corpus; verify total `.fpk` size \u00f7 raw size \u2264 0.55 and no `.fpk` exceeds its input size.",
+   "Generate a hidden corpus of 20 files ranging from 10 KB to 20 MB of pseudo-random-but-compressible data (seeded LCG output XOR'd with repeating patterns); run the encoder; assert ratio \u2264 0.55.",
+   "Generate a hidden corpus with files exactly 63 KB, 64 KB, and 65 KB of compressible data; assert each `.fpk` \u2264 55% of its raw size (catches wrong dispatch at boundary).",
+   "Generate a hidden corpus of moderately-compressible binary data (PNG-like byte distributions); assert ratio \u2264 0.55.",
+   "Assert that no `.fpk` output file is larger than its corresponding input (no inflation allowed).",
+   "Rebuild the wheel from scratch in a clean environment and re-run all corpus checks to confirm `build_wheel.py` correctly packages all required modules."
+  ],
+  "verifier_knob": {
+   "name": "compression_ratio_threshold",
+   "value": "0.55",
+   "effect": "Lowering to 0.45 requires the solver to also find the optimal level parameter via experiment (not just call get_supported_levels()[-1] blindly); raising to 0.65 makes even a partially-fixed solution pass some corpora, reducing difficulty."
+  },
+  "expected_failure_modes": [
+   "Agent discovers compress_block but misses the stream/block dispatch boundary at 64 KB, so large-file corpora fail the ratio test.",
+   "Agent fixes encoder.py correctly but never notices build_wheel.py omits codec.py, so the installed wheel raises ImportError and all corpus tests fail.",
+   "Agent inlines the entire codec logic into encoder.py using compress_block everywhere (no stream dispatch), passes small corpora but fails large-file hidden tests.",
+   "Agent reads codec.py, sees it imports _fastpack.compress_stream, but assumes it's also broken and rewrites everything from scratch using only compress_block, missing the boundary condition.",
+   "Agent fixes the symbol name to compress_block but uses level=1 (guessed) instead of get_supported_levels()[-1], achieving only ~65% ratio on less-compressible corpora."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-packaging",
+  "tags": [
+   "python",
+   "wheels",
+   "opaque-binary",
+   "compression",
+   "deployment",
+   "systems-programming"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/fastpack/encoder.py",
+   "cat /app/fastpack/codec.py",
+   "cat /app/fastpack/build_wheel.py",
+   "cat /app/fastpack/setup.cfg",
+   "python3 -c \"import sys; sys.path.insert(0,'/app/fastpack'); from fastpack import _fastpack; print(dir(_fastpack))\"",
+   "# Confirms: compress_block, compress_stream, get_supported_levels",
+   "# Edit encoder.py: replace _fastpack.compress(data) with import codec; codec.compress(data)",
+   "sed -i 's/_fastpack.compress(data)/codec.compress(data)/' /app/fastpack/encoder.py",
+   "# Add 'from fastpack import codec' import to encoder.py",
+   "nano /app/fastpack/encoder.py  # add codec import, fix call site",
+   "# Fix build_wheel.py to include codec.py in package files",
+   "nano /app/fastpack/build_wheel.py  # add codec.py to package_data or file list",
+   "cd /app/fastpack && python build_wheel.py",
+   "pip install dist/fastpack-1.4.0-py3-none-any.whl --force-reinstall",
+   "python -c \"from fastpack import encoder, codec; print('imports OK')\"",
+   "mkdir /tmp/smoke_out && python dist/encode_corpus.py /app/smoke_corpus/ /tmp/smoke_out/",
+   "python3 -c \"import os; i=sum(os.path.getsize(os.path.join('/app/smoke_corpus',f)) for f in os.listdir('/app/smoke_corpus')); o=sum(os.path.getsize(os.path.join('/tmp/smoke_out',f)) for f in os.listdir('/tmp/smoke_out')); print(o/i)\"",
+   "# Verify ratio <= 0.55, done"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Near-random data in hidden corpora may not compress to \u226455% even with compress_stream at max level, making the task unsolvable for that corpus type regardless of correct implementation",
+   "The 'no inflation' requirement plus 4-byte magic header means tiny files (e.g., 1 KB of random data) could technically inflate, creating an impossible constraint for random content",
+   "The fallback.py description says 'magic header + zlib level 1 accidentally applied to small files' \u2014 this ambiguity means the smoke test pass mechanism is unclear and could cause unexpected behavior",
+   "If _fastpack.so is not compiled for python3.13-slim-bookworm ABI, the entire task fails at import time with no path to fix it (pre-compiled binary with no source)"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because both bugs are directly visible in readable source files and the solution path is ~18 commands of read-edit-build \u2014 well within the rubric's 'at most 2' threshold for source-visible bugs solved in 9-25 commands. The opaque .so exploration reduces to a single `dir()` call since codec.py already contains correct dispatch logic, eliminating the need for real experimentation. The task needs architectural changes to hide the bugs from direct source inspection (e.g., the bugs embedded in compiled/obfuscated code, or the dispatch logic absent from readable files) to achieve genuine difficulty \u2265 4.",
+  "fixes": [
+   "Remove codec.py entirely from the environment so the solver must derive correct dispatch logic by experimenting with _fastpack.so directly, testing different chunk sizes and levels empirically to find what achieves \u226455% on varying file sizes",
+   "Move the bug into a compiled component or obfuscate encoder.py (e.g., as a .pyc only) so the broken symbol call isn't immediately readable \u2014 force genuine black-box exploration",
+   "Add a third interacting bug that is not visible from source inspection, such as a race condition in the build pipeline or a corrupted wheel metadata entry that only manifests after pip install in a fresh venv",
+   "Make the 64 KB dispatch boundary non-obvious by not having codec.py available, requiring the solver to discover empirically that compress_block alone fails large files and stream chunking is needed"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "DNA storage codec involves error-correcting codes for biological storage channels, while this task is about diagnosing a Python packaging bug that causes fallback to an uncompressed code path."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task fixes CSV pipeline row count/deduplication bugs, while this task involves characterizing a black-box compiled .so library and fixing packaging to ensure the compressed code path is always used."
+    },
+    {
+     "ref_id": "terminal-bench-pro/restore-broken-pip-installation",
+     "verdict": "distinct",
+     "reason": "That task restores a broken pip installation from backups, while this task requires reverse-engineering a compiled encoder and fixing a Python wheel build pipeline."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "variant",
+     "reason": "Both tasks involve a broken codec pipeline with a black-box compiled component that must be characterized by experiment and fixed to meet performance/correctness thresholds, with the core challenge being diagnosing why one code path is used instead of another."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks require characterizing a black-box compiled binary by experiment (no source available) and fixing a surrounding pipeline so that the correct transformation is applied to all inputs to meet a quantitative threshold."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.139
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.107
+    ],
+    [
+     "terminal-bench-pro/restore-broken-pip-installation",
+     0.101
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.091
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.079
+    ]
+   ],
+   "cost_usd": 0.014624999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.059244
+}

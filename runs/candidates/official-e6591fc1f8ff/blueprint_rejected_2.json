@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "wheel-codec-deploy-threshold",
+  "title": "Binary Codec Deployment Size Gate",
+  "scenario": "Your team ships a Python data-processing service as a self-contained wheel. A compiled C extension (`_fastcodec.so`) handles the hot path: encoding and decoding variable-length integer frames from binary data files. The extension was recently updated by a contractor who left no source, and the wheel build pipeline\u2014which runs `python setup.py bdist_wheel` then copies the wheel to a deployment staging area\u2014has started producing wheels that exceed the 2 MB deployment gate enforced by the staging infrastructure. The workspace at `/app` contains the build pipeline, the black-box `.so`, approximately 1,200 lines of Python glue across several modules, and the corpus of binary data files used as test fixtures.",
+  "instruction_draft": "Our wheel build at `/app` is broken for deployment: `bash /app/build_pipeline.sh` currently produces a wheel that exceeds the 2 MB staging gate enforced at `/app/verify/gate.py`. The wheel must be at most 2,097,152 bytes (2 MiB) AND the codec must still round-trip every frame in `/app/data/` without error\u2014including frame types not present in that directory but described in `/app/docs/codec_spec.md`. Fix the build pipeline so the produced wheel passes the size gate while preserving correct encode/decode behaviour across all frame types (type IDs 0x00\u20130x1F). Do not alter the `.so` file or the codec specification.",
+  "requirements": [
+   "Running `bash /app/build_pipeline.sh` completes without error and produces a `.whl` file in `/app/dist/`.",
+   "The produced wheel file is at most 2,097,152 bytes (2 MiB).",
+   "Installing the wheel and running `python -m fastcodec roundtrip /app/data/` exits 0 with no decode errors reported.",
+   "Installing the wheel and running the verifier's hidden round-trip sweep over all frame type IDs 0x00\u20130x1F exits 0.",
+   "The codec spec at `/app/docs/codec_spec.md` is not modified.",
+   "The `.so` file `_fastcodec.so` is not modified or replaced."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install -y binutils file strip (for investigation tooling)",
+   "pip install wheel setuptools build",
+   "Directory /app/fastcodec/ \u2014 Python package: __init__.py, _codec.py (~300 lines), _registry.py (~150 lines), _io.py (~200 lines), cli.py (~180 lines), utils.py (~150 lines), compat.py (~80 lines).",
+   "File /app/fastcodec/_fastcodec.so \u2014 precompiled CPython 3.13 extension, stripped binary, ~1.3 MB; no source available. Exports encode_frame(), decode_frame(), supported_types().",
+   "File /app/data/ \u2014 12 binary fixture files totalling ~900 KB, covering frame types 0x00, 0x01, 0x04, 0x08, 0x10 only.",
+   "File /app/docs/codec_spec.md \u2014 specifies all 32 frame types (0x00\u20130x1F), their header layouts and payload rules.",
+   "File /app/setup.py \u2014 packages everything under fastcodec/ including a large /app/fastcodec/vendor/ subdirectory (~1.8 MB of bundled test fixtures and lookup tables copied in by a previous developer).",
+   "File /app/fastcodec/vendor/ \u2014 contains ~1.8 MB of data files (prebuilt lookup CSVs and copies of test fixtures) that are included in the wheel package but NOT required at runtime; they exist only because the previous developer forgot to exclude them.",
+   "File /app/build_pipeline.sh \u2014 runs `python setup.py bdist_wheel`, then validates the output exists.",
+   "File /app/verify/gate.py \u2014 the staging gate script; checks wheel size <= 2097152 bytes, installs wheel in a venv, runs round-trip on /app/data/, then on verifier-generated frames for all types 0x00\u20130x1F.",
+   "File /app/verify/frame_gen.py \u2014 deterministic generator (seeded) that produces synthetic frames for each of the 32 type IDs; used by gate.py at verify time.",
+   "The .so correctly handles all 32 frame types as long as Python glue passes header fields according to the spec; _registry.py currently has a copy-paste error that causes types 0x18\u20130x1F to be registered with wrong header_size, causing decode to fail for those types on the round-trip check.",
+   "MANIFEST.in is missing an exclude for the vendor/ directory, and setup.py uses find_packages() with no exclusions, so the wheel balloons to ~3.1 MB.",
+   "The shallow trap: removing vendor/ alone brings the wheel to ~1.3 MB and passes the size gate AND passes the provided /app/data/ fixtures (which only use types 0x00\u20130x10). The hidden verifier then tests types 0x18\u20130x1F and fails because _registry.py still has the wrong header_size for those types."
+  ],
+  "internal_hint": "Difficulty comes from two interacting problems: (1) the opaque_component (_fastcodec.so) must be probed by experiment to determine what it actually expects for each frame type \u2014 the solver must call supported_types() and probe encode_frame/decode_frame with different header_size values to characterize correct behavior for types 0x18\u20130x1F, then cross-check with codec_spec.md; (2) the shallow_check_trap: the obvious fix (exclude vendor/ from the wheel via MANIFEST.in or setup.py package_data exclusion) passes the size gate and all provided fixtures but silently fails hidden verifier cases for frame types 0x18\u20130x1F because _registry.py has wrong header_size constants for those types. The solver must: (a) profile the wheel to find vendor/ is the size culprit, (b) fix MANIFEST.in and/or setup.py to exclude vendor/, (c) experiment with the .so to discover the correct header_size for types 0x18\u20130x1F (the .so encodes a 6-byte header for those, not 4-byte as _registry.py claims), (d) fix _registry.py accordingly. Finding (c) requires running encode_frame() with different parameters and observing success/failure \u2014 it cannot be read from a source file.",
+  "trap": "Excluding vendor/ from the wheel satisfies the size constraint and makes all provided fixture round-trips pass, giving the solver false confidence. The hidden verifier generates frames for types 0x18\u20130x1F using frame_gen.py; _registry.py's wrong header_size causes decode_frame() to return corrupt payloads or raise, and the gate exits nonzero. The solver must probe the .so directly to discover the correct header layout for the upper type range.",
+  "tests": [
+   "T1 (size gate): assert os.path.getsize(wheel_path) <= 2097152",
+   "T2 (provided fixtures): install wheel in fresh venv; run `python -m fastcodec roundtrip /app/data/`; assert exit code 0 and no error lines in stdout/stderr",
+   "T3 (hidden frame sweep): for each type_id in range(0x00, 0x20): generate a deterministic frame using frame_gen.py(seed=42, type_id=type_id); encode then decode; assert decoded payload == original payload",
+   "T4 (so integrity): assert sha256(_fastcodec.so) == original_hash (file not modified)",
+   "T5 (spec integrity): assert sha256(codec_spec.md) == original_hash (spec not modified)"
+  ],
+  "verifier_knob": {
+   "name": "size_limit_bytes",
+   "value": "2097152",
+   "effect": "Raising the limit (e.g. to 3 MB) makes the task easier because vendor/ exclusion alone suffices for size \u2014 but T3 still fails without the registry fix, so difficulty stays unless both are raised. Lowering the limit forces additional optimizations (e.g. stripping .pyc, compressing assets) making it harder."
+  },
+  "expected_failure_modes": [
+   "Agent removes vendor/ directory, passes size gate, passes provided fixtures, declares done \u2014 fails T3 for types 0x18\u20130x1F.",
+   "Agent reads _registry.py, sees header_size constants, guesses they match codec_spec.md without running the .so \u2014 misses the mismatch for the upper type range.",
+   "Agent modifies the .so (e.g. re-strips it) to try to shrink it further \u2014 fails T4.",
+   "Agent constructs the correct header_size for some but not all types 0x18\u20130x1F (e.g. fixes 0x18\u20130x1B but not 0x1C\u20130x1F) because probing was incomplete.",
+   "Agent uses UPX or wheel compression tricks that corrupt the .so import, causing ImportError at install time."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "deployment",
+   "binary-extension",
+   "reverse-engineering",
+   "wheel",
+   "python",
+   "systems-programming"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/build_pipeline.sh",
+   "cat /app/setup.py",
+   "du -sh /app/fastcodec/vendor/ && ls /app/fastcodec/vendor/",
+   "bash /app/build_pipeline.sh 2>&1 | tail -5; ls -la /app/dist/",
+   "cat /app/docs/codec_spec.md",
+   "cat /app/fastcodec/_registry.py",
+   "# codec_spec.md documents 6-byte header for 0x18-0x1F; _registry.py has 4-byte \u2014 mismatch is now visible by reading, no probing needed",
+   "# Edit setup.py: add exclude_package_data={'fastcodec': ['vendor/*', 'vendor/**']} or use find_packages with exclude",
+   "# Edit MANIFEST.in: add 'prune fastcodec/vendor'",
+   "# Edit _registry.py: change header_size from 4 to 6 for type IDs 0x18-0x1F",
+   "bash /app/build_pipeline.sh",
+   "ls -la /app/dist/*.whl",
+   "python /app/verify/gate.py"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The codec_spec.md explicitly documents all 32 frame type header layouts, so the _registry.py bug is discoverable by reading the spec \u2014 not by probing the .so. This collapses the opaque_component difficulty lever and makes the task solvable in ~13 commands by a careful reader without any experimentation.",
+   "If the spec is deliberately vague or ambiguous about 0x18-0x1F header sizes, agents might fail due to spec ambiguity rather than genuine skill gap \u2014 an invalid failure mode.",
+   "The shallow_check_trap only works if an agent skips reading codec_spec.md, which a competent agent would not do given the instruction explicitly references it. Frontier agents almost always read all referenced documents.",
+   "setup.py/MANIFEST.in interaction with Python 3.13 and wheel/setuptools versions may produce non-deterministic package inclusion behavior depending on exact setuptools version, risking flaky environment issues.",
+   "The build pipeline uses `python setup.py bdist_wheel` which is deprecated in newer setuptools; behavior may vary by version and could cause unexpected failures unrelated to the actual task.",
+   "No explicit pinned version for setuptools/wheel/build pip packages, meaning environment reproducibility is uncertain."
+  ],
+  "verdict": "reject",
+  "reasons": "The opaque_component difficulty lever is self-defeating: the instruction explicitly directs agents to codec_spec.md which 'specifies all 32 frame types (0x00\u20130x1F), their header layouts,' making the _registry.py bug discoverable by reading rather than by probing the .so. This collapses the claimed hard difficulty to ~13 commands solvable by any careful agent. The shallow_check_trap only catches agents who skip reading a file the instruction explicitly calls out, which frontier agents reliably read. genuine_difficulty scores 2, failing the minimum threshold of 4 and the average threshold of 3.6.",
+  "fixes": [
+   "Remove any mention of header layout details from codec_spec.md for types 0x18-0x1F (or make the spec itself wrong/incomplete for that range), forcing the agent to experimentally probe the .so to discover the true header_size \u2014 this restores the opaque_component lever.",
+   "Alternatively, make the spec technically correct but ambiguous (e.g., describing the header format in a way that requires interpreting bit-field packing, where _registry.py's implementation could plausibly be right) so agents must probe to disambiguate.",
+   "Pin specific versions of setuptools, wheel, and build in the Dockerfile (e.g., pip install 'setuptools==69.5.1' 'wheel==0.43.0') to ensure reproducible behavior with the deprecated setup.py bdist_wheel invocation.",
+   "Add a second hidden corruption in _registry.py (e.g., wrong type_id remapping for one type in 0x18-0x1F that misroutes a specific frame subtype) discoverable only by running encode/decode experiments, ensuring at least one fix requires experimental probing even if the spec reveals the header_size.",
+   "Consider migrating build_pipeline.sh to use `python -m build` instead of deprecated `python setup.py bdist_wheel` for a more realistic and stable environment."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/compare-cmake-build-types-performance",
+     "verdict": "distinct",
+     "reason": "That task is about benchmarking CMake build types and recording results; the candidate is about reducing wheel size while preserving codec correctness."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a running HTTP service's decode/encode bug; the candidate is about reducing a Python wheel's deployment size without breaking a black-box C extension."
+    },
+    {
+     "ref_id": "terminal-bench-science/cell-lineage-reconstruction",
+     "verdict": "distinct",
+     "reason": "That task is about video analysis and cell tracking; the candidate is about build artifact size reduction for a binary codec wheel."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing panics and meeting latency benchmarks in a Rust codec; the candidate is about shrinking a Python wheel under a size gate while keeping a black-box C extension functional."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a binary normalizer and repairing a SQL pipeline; the candidate is about reducing wheel deployment size for a Python codec package."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/compare-cmake-build-types-performance",
+     0.12
+    ],
+    [
+     "ours/official-aac910462208",
+     0.116
+    ],
+    [
+     "terminal-bench-science/cell-lineage-reconstruction",
+     0.108
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.101
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.09
+    ]
+   ],
+   "cost_usd": 0.013782
+  },
+  "novel": true
+ },
+ "cost_usd": 0.054297000000000005
+}

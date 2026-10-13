@@ -97,10 +97,27 @@ def _create(messages: list[dict], model: str, max_tokens: int, temperature: floa
     raise last  # type: ignore[possibly-undefined]
 
 
+_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
+
+
 def extract_json(text: str) -> dict:
-    """Parse the first JSON object in a reply (bare, or inside a ```json fence)."""
-    fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    candidate = fenced.group(1) if fenced else text[text.find("{") : text.rfind("}") + 1]
-    if not candidate:
-        raise ValueError(f"no JSON object in reply: {text[:200]!r}")
-    return json.loads(candidate)
+    """Parse the first JSON object in a reply (bare, or inside a ```json fence).
+
+    Scans for the first `{` that starts a decodable object, so prose around it or a
+    second object after it doesn't matter, and retries with trailing commas removed
+    (both seen in Sonnet replies under load).
+    """
+    decoder = json.JSONDecoder()
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    for source in [*fenced, text]:
+        start = source.find("{")
+        while start != -1:
+            for attempt in (source[start:], _TRAILING_COMMA.sub(r"\1", source[start:])):
+                try:
+                    obj, _ = decoder.raw_decode(attempt)
+                    if isinstance(obj, dict):
+                        return obj
+                except json.JSONDecodeError:
+                    pass
+            start = source.find("{", start + 1)
+    raise ValueError(f"no JSON object in reply: {text[:200]!r}")

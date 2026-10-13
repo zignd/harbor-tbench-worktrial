@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "hmac-audit-log-verifier",
+  "title": "HMAC Audit Log Verification Service",
+  "scenario": "You maintain a lightweight audit-log integrity service for an embedded device fleet. The service reads a git repository of daily log bundles, verifies an HMAC chain across each bundle's entries, and answers protocol queries from a compliance checker. Three weeks ago a developer refactored the HMAC key-derivation step and the chain-signing loop; the compliance checker started reporting sporadic verification failures that nobody could reproduce in unit tests. The service itself lives in the repo under /app/audit_service/, built over ~1400 lines across five modules, and the git history contains the original working implementation plus the refactored one.",
+  "instruction_draft": "Your team ships an audit-log HMAC chain verification service at /app/audit_service/. A compliance checker connects on TCP port 7741 and sends newline-delimited JSON requests; the service must respond correctly to every request.\n\nEach daily log bundle in /app/bundles/ is a text file where every line is a JSON record with fields: seq (integer), ts (ISO-8601 timestamp), payload (string), and hmac (hex string). The hmac field on record N must equal HMAC-SHA256(key_N, prev_hmac_N-1 || seq_N || payload_N) where key_N is derived per-record as HMAC-SHA256(master_key, bundle_id || \":\" || str(seq_N)) and prev_hmac is the hex hmac of the previous record (or the bundle_id string for seq 0). The master_key is stored as the first line of /app/secrets/master.key.\n\nThe compliance checker sends three request types:\n- {\"op\": \"verify_bundle\", \"bundle_id\": \"<name>\"} \u2014 respond {\"ok\": true, \"count\": N} if all N records verify, or {\"ok\": false, \"bad_seq\": <first failing seq>} if any record fails.\n- {\"op\": \"verify_range\", \"bundle_id\": \"<name>\", \"from_seq\": M, \"to_seq\": N} \u2014 verify records M..N inclusive in that bundle; respond {\"ok\": true, \"count\": N-M+1} or {\"ok\": false, \"bad_seq\": <first failing seq>}.\n- {\"op\": \"recompute_hmac\", \"bundle_id\": \"<name>\", \"seq\": N} \u2014 recompute and return the correct hmac for record N; respond {\"hmac\": \"<hex>\"}.\n\nThe service must handle all three request types correctly across all bundles. The git history contains the prior working implementation; investigate the refactor to understand what changed.",
+  "requirements": [
+   "The service listens on TCP port 7741 and accepts newline-delimited JSON requests.",
+   "verify_bundle returns {\"ok\": true, \"count\": N} when all N records in the bundle pass HMAC verification, or {\"ok\": false, \"bad_seq\": S} where S is the first failing seq.",
+   "verify_range verifies only records from_seq through to_seq inclusive and returns the same schema as verify_bundle with count = to_seq - from_seq + 1 on success.",
+   "recompute_hmac recomputes the correct HMAC for the specified record and returns {\"hmac\": \"<lowercase hex>\"}.",
+   "Per-record key derivation is HMAC-SHA256(master_key, bundle_id + \":\" + str(seq)) using the master_key from /app/secrets/master.key.",
+   "The HMAC chain for record N covers: key_N = derived key, message = prev_hmac || str(seq) || payload, where prev_hmac is the bundle_id string for seq 0.",
+   "The service remains running and handles multiple sequential connections without crashing."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs no extra packages beyond stdlib.",
+   "/app/audit_service/ with ~1400 lines across five Python files: server.py (TCP listener and dispatcher), verifier.py (HMAC chain logic \u2014 the buggy refactored version), key_derive.py (key derivation \u2014 has a subtle second bug introduced in the same refactor), bundle_reader.py (parses log files), and utils.py (hex encode/decode helpers).",
+   "Git repository at /app with history: initial commit has a working verifier and key_derive; a 'refactor: streamline HMAC pipeline' commit introduces two bugs: (1) key_derive.py encodes the seq as a zero-padded 8-digit decimal string instead of plain str(seq), making all keys wrong for records with seq < 10000000; (2) verifier.py concatenates prev_hmac + payload + str(seq) instead of prev_hmac + str(seq) + payload, silently reordering the message \u2014 unit tests passed because the test bundles had single-character payloads where reordering didn't change values.",
+   "/app/bundles/ contains 5 pre-generated bundle files (names: 2024-01-15, 2024-01-16, 2024-01-17, 2024-01-18, 2024-01-19). Each has 50-200 records. The HMACs in these files were computed using the CORRECT algorithm (plain str(seq), correct concatenation order), so the current buggy code fails to verify them.",
+   "/app/secrets/master.key contains a 32-byte hex string (deterministically generated from a fixed seed).",
+   "A /app/compliance_checker.py test client that the solver can run manually to observe failures \u2014 it exercises all three request types against the running service.",
+   "The server.py starts the TCP service; the solver must ensure it runs. A /app/start.sh script that does 'python /app/audit_service/server.py &' is provided.",
+   "Verifier-time: the test harness starts the service, then sends fresh requests including bundles NOT present in /app/bundles/ (generated at verify time using the correct algorithm) by dropping them into /app/bundles/ before connecting."
+  ],
+  "internal_hint": "Difficulty comes from TWO sources: (1) the bugs are not visible by reading one file in isolation \u2014 both bugs interact: key_derive produces wrong keys AND verifier concatenates in wrong order, so a solver who fixes only one bug still gets all-wrong HMACs because the other bug remains; (2) the symptoms are misleading \u2014 verify_bundle returns bad_seq=0 for every bundle, suggesting the chain anchor is broken (pointing at bundle_id handling), but the actual bugs are in key derivation encoding and message field ordering. A solver who reads only verifier.py and fixes the concatenation order will find that seq=0 still fails because the derived key is wrong. They must diff the git history carefully and find both changed files. The resolution: revert key_derive.py to use str(seq) (no zero-padding) and revert verifier.py to concatenate prev_hmac + str(seq) + payload.",
+  "trap": "A solver who fixes only the concatenation order in verifier.py (the more obvious bug when reading that file) will see that verify_bundle still returns bad_seq=0 \u2014 they may conclude the bundle_id anchor logic is broken and start modifying that, never finding the key_derive zero-padding bug. A solver who runs the compliance checker against their partially fixed service, sees all failures, and concludes 'maybe I need to regenerate the bundle files' will destroy the ground truth. The hidden verify-time bundles expose both bugs simultaneously: if either bug remains, all HMACs are wrong.",
+  "tests": [
+   "verify_bundle on each of the 5 pre-existing bundles returns {\"ok\": true, \"count\": N} with correct N.",
+   "verify_bundle on 3 fresh bundles generated at verify-time with the correct algorithm returns {\"ok\": true, \"count\": N}.",
+   "verify_range on a sub-range of a fresh bundle (e.g., seq 10 to 25) returns {\"ok\": true, \"count\": 16}.",
+   "verify_range on a range containing a deliberately corrupted record returns {\"ok\": false, \"bad_seq\": S} with correct S.",
+   "recompute_hmac for seq=0 of a fresh bundle returns the exact correct 64-char lowercase hex string.",
+   "recompute_hmac for seq=7 of a fresh bundle (verifying both key derivation and chain) returns the exact correct hex string.",
+   "Service handles 10 sequential connections without crashing or hanging.",
+   "verify_bundle on a bundle where exactly one record (seq=3) has a tampered payload returns {\"ok\": false, \"bad_seq\": 3}."
+  ],
+  "verifier_knob": {
+   "name": "number of fresh bundles and request scenarios at verify time",
+   "value": "6 fresh bundles, 8 distinct request scenarios",
+   "effect": "Increasing adds more bundle sizes (including bundles with seq > 9999999 to expose zero-padding separately) and more verify_range edge cases (empty range, single record, last record); decreasing to 3 bundles and 4 scenarios makes it easier to pass with one bug fixed."
+  },
+  "expected_failure_modes": [
+   "Solver finds and fixes only the concatenation-order bug in verifier.py; all HMACs still wrong because key_derive zero-padding bug remains; solver spends remaining time chasing a red herring in the anchor logic.",
+   "Solver correctly identifies both bugs by diffing git history but re-implements recompute_hmac incorrectly (forgets to walk the chain to get prev_hmac for seq>0, instead using an empty string), failing all recompute_hmac tests on non-zero seqs.",
+   "Solver fixes both bugs but the service crashes on the second connection due to an existing socket-reuse bug in server.py that was always there (not introduced by the refactor), failing the multi-connection test.",
+   "Solver regenerates the bundle files using their (partially correct) implementation, making the pre-existing bundles match the broken code; verify-time fresh bundles generated with the correct algorithm then fail.",
+   "Solver reads only the most recent commit and never checks git log; finds one bug by code inspection but misses the second because it requires understanding the intended semantics vs the original implementation."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "hmac",
+   "git-history",
+   "service-protocol",
+   "log-processing",
+   "python",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "git log --oneline  # confirm 2 commits: initial working + refactor commit",
+   "git diff HEAD~1 HEAD -- app/audit_service/key_derive.py  # immediately reveals zero-padding: f'{seq:08d}' vs str(seq)",
+   "git diff HEAD~1 HEAD -- app/audit_service/verifier.py  # immediately reveals reordering: prev_hmac+payload+str(seq) vs prev_hmac+str(seq)+payload",
+   "sed -i 's/f\"{seq:08d}\"/str(seq)/' /app/audit_service/key_derive.py  # fix zero-padding bug",
+   "sed -i 's/prev_hmac + payload + str(seq)/prev_hmac + str(seq) + payload/' /app/audit_service/verifier.py  # fix concatenation order",
+   "bash /app/start.sh  # start service on port 7741",
+   "python /app/compliance_checker.py  # verify all 5 pre-existing bundles pass all ops",
+   "# confirm multi-connection: compliance checker likely makes multiple connections already"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'socket-reuse bug in server.py that was always there' is listed as a valid failure mode for the multi-connection test, but if it exists in the provided code and the test requires multi-connection handling, the task may be unsolvable without fixing an undisclosed bug \u2014 the instruction never tells solvers to also fix server.py.",
+   "Verify-time fresh bundle generation must be implemented correctly by the test harness; any bug in the harness's HMAC computation makes recompute_hmac exact-match tests produce invalid failures with no recourse for the solver.",
+   "The instruction says 'investigate the refactor' as the discovery method, but a solver who goes straight to git diff bypasses all intended difficulty in under 5 minutes \u2014 the difficulty design assumes exploratory symptom-chasing rather than direct diff inspection.",
+   "recompute_hmac for seq>0 requires chain-walking (computing all prior HMACs to get prev_hmac), which is implied but not explicitly stated; a solver might implement it correctly or incorrectly without clear guidance, making this a potential ambiguity in the spec."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because the entire task resolves in 8 commands once a competent agent runs git diff on the two changed files \u2014 the scenario explicitly mentions the git history, making this the obvious first move. The 'misleading symptom' trap only works on solvers who never check git history, which a strong agent will do immediately. The average score is 4.0 but genuine_difficulty fails the minimum threshold of 4. Additionally, the undisclosed always-present socket-reuse bug in server.py risks creating an invalid failure mode where the task is unsolvable as instructed.",
+  "fixes": [
+   "Remove git history entirely: instead of a refactor commit, deliver only the broken code and a specification document (or comments) describing the intended algorithm \u2014 force the solver to reason about the HMAC math from the spec, not diff two files. This eliminates the 8-command speedrun path.",
+   "Eliminate the socket-reuse bug in server.py or explicitly add 'ensure the service handles at least 10 sequential connections' to the instruction so solvers know server.py may also need fixing.",
+   "Add a third, non-obvious bug that requires actually running the service and analyzing failure patterns \u2014 e.g., an off-by-one in verify_range (uses > instead of >= for to_seq boundary), discoverable only by testing edge cases, not by code inspection or diffing.",
+   "Make the key derivation and HMAC chain formula more complex so that even after finding the diff, a solver must carefully validate their understanding by testing against known-correct outputs before they can be confident the fix is complete."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "variant",
+     "reason": "Both involve a TCP service computing HMAC tags over structured records, but the candidate adds an HMAC chain verification protocol with key derivation, multiple operation types, and a git-history debugging angle that differ substantially from the single-record tagging service."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "The framecodec task is about binary frame encoding/decoding over HTTP, with no HMAC or audit-log concepts involved."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about NDJSON schema validation and performance, not HMAC chain verification or cryptographic integrity."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about a sales aggregation weighted-sum bug in a compiled service, unrelated to HMAC or audit logs."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about NetFlow v9 UDP ingestion and TCP query aggregation in Rust, with no cryptographic or HMAC chain concepts."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.298
+    ],
+    [
+     "ours/official-aac910462208",
+     0.176
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.149
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.101
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.098
+    ]
+   ],
+   "cost_usd": 0.014691000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.054849
+}

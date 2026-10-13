@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "spectral-pipeline-version-migration",
+  "title": "Spectral Analysis Pipeline Regression Recovery",
+  "scenario": "An open-source maintainer maintains `spectralab`, a ~1,400-line Python codebase for processing mass spectrometry data. After merging a 'feature/v2-normalizer' branch, downstream CI began silently producing wrong peak integrals on some input files while passing on others. The environment contains the full source tree, a compiled C extension (`_fastpeaks.so`) with no accompanying source, a SQLite database of cached intermediate results from the old pipeline, and a small set of sample spectra. The maintainer's job is to find what broke, restore correctness, and ensure the new normalizer feature still ships.",
+  "instruction_draft": "The spectralab pipeline at /app/spectralab produces incorrect integrated peak areas for certain input spectra after the v2-normalizer merge. Restore correct peak integration across all input types while keeping the v2 normalizer active, and write the corrected results to /app/output/results.db.",
+  "requirements": [
+   "The pipeline must run end-to-end without error using `python -m spectralab.cli --all --output /app/output/results.db`",
+   "Each row in results.db table `peak_integrals` must have an `integral` value within 0.5% of the reference value for that spectrum_id and peak_id",
+   "The v2 normalizer must remain active (config flag `normalizer_version=2` must be present and respected in the output metadata table)",
+   "Peak detection must correctly handle both centroid-mode and profile-mode spectra (both types appear in the hidden test inputs)",
+   "The migration script /app/spectralab/migrations/migrate_cache.py must complete without error and produce a valid cache schema in results.db"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install: gcc, sqlite3, libsqlite3-dev",
+   "pip install: numpy==1.26.4, scipy==1.13.1, pandas==2.2.2",
+   "Directory /app/spectralab/ with ~1,400 lines across: cli.py, pipeline.py, normalizer.py, integrator.py, peak_detector.py, cache.py, config.py, utils.py, migrations/migrate_cache.py, tests/",
+   "Compiled binary /app/spectralab/_fastpeaks.so: a C extension that exports `find_peaks(arr, threshold, mode)` where mode=0 is centroid, mode=1 is profile; the mode argument was silently swapped in the v2 integration path (only detectable by running on real data, not by reading Python source)",
+   "The v2 normalizer was merged but the call site in integrator.py passes `mode=1` unconditionally instead of reading `spectrum.mode` from the metadata \u2014 so centroid spectra get profile processing and produce integrals ~30-60% too high, while profile spectra happen to be correct",
+   "A SQLite cache database /app/spectralab/cache.db with the old schema (missing a `normalizer_version` column added in v2); migrate_cache.py exists but has a bug: it runs ALTER TABLE without checking if the column already exists, causing it to crash on re-run and also fails to populate the new column with the correct default",
+   "Sample spectra in /app/data/: 4 .mzML files (2 centroid, 2 profile) with known reference integrals embedded as comments in a companion /app/data/reference.json",
+   "config.py hardcodes normalizer_version=1 despite the v2 branch intending to set it to 2; the config was not updated in the merge",
+   "The integrator.py contains a subtle ordering bug: it normalizes AFTER integration instead of before, introduced in the merge; this compounds the mode bug on centroid spectra",
+   "Hidden test inputs at verify time: 6 additional spectra (3 centroid, 3 profile) with reference integrals not present in the sample data"
+  ],
+  "internal_hint": "There are four interacting problems that must all be fixed, in order: (1) config.py must be updated to set normalizer_version=2. (2) migrate_cache.py must be fixed to use `IF NOT EXISTS` in the ALTER TABLE and must populate the default value for existing rows. (3) integrator.py must normalize BEFORE integrating (reorder two function calls). (4) The call to _fastpeaks.find_peaks in integrator.py must pass `mode=spectrum.mode` instead of hardcoded `mode=1`. Problem (4) is the hardest to find because _fastpeaks.so has no source; the solver must instrument the pipeline, observe that centroid spectra return wrong integrals while profile spectra are correct, infer that the mode argument is wrong, and probe the binary extension (e.g., via pydoc, introspection, or trial runs with synthetic data) to discover the argument semantics. The ordered procedure matters: fixing (3) without (4) still produces wrong centroid results; fixing (4) without (3) still produces wrong integrals for centroid spectra because normalization order affects the peak detection threshold scaling. The migration must complete cleanly before the main pipeline can write results.db.",
+  "trap": "A shallow agent fixes the obvious Python bugs (normalizer order, config flag) and verifies against the 2 sample centroid spectra \u2014 but misses that _fastpeaks.so is receiving mode=1 for centroid spectra. The hidden test inputs include 3 centroid spectra where the mode bug causes 35-55% integral inflation. The agent also likely skips fixing migrate_cache.py because the sample run doesn't re-run the migration; the verifier runs it fresh on a clean results.db and it crashes if the idempotency fix is absent.",
+  "tests": [
+   "Run `python -m spectralab.cli --all --output /tmp/verify_results.db` with 6 hidden spectra injected into /app/data/; check exit code is 0",
+   "For each of 6 hidden (spectrum_id, peak_id) pairs, assert abs(results.integral - reference.integral) / reference.integral < 0.005",
+   "Among the 6 hidden spectra, check that 3 centroid-mode spectra each have integral within tolerance (catches unfixed mode bug)",
+   "Query results.db metadata table: assert normalizer_version = 2 for every processed spectrum",
+   "Run `python /app/spectralab/migrations/migrate_cache.py` twice in succession on a fresh db; assert both runs exit 0 (idempotency check)",
+   "Assert migration produces a `normalizer_version` column in cache.db with default value 1 for legacy rows",
+   "Confirm _fastpeaks is called with correct mode by running a synthetic centroid spectrum with known analytical integral and asserting <1% error"
+  ],
+  "verifier_knob": {
+   "name": "hidden_spectrum_count",
+   "value": "6 (3 centroid, 3 profile)",
+   "effect": "Increasing to 10+ spectra with more varied baseline shapes makes the tolerance harder to meet and exposes any partial fix more reliably; decreasing to 2 makes it easier to pass by luck"
+  },
+  "expected_failure_modes": [
+   "Agent fixes Python-visible bugs (normalizer order, config) but never discovers the _fastpeaks mode argument error because it cannot read the C extension source; centroid spectra fail hidden tests",
+   "Agent discovers and fixes the mode bug but applies the fix after the normalizer reorder, not realizing both must be fixed together for centroid spectra to pass tolerance",
+   "Agent fixes migrate_cache.py syntax but does not make it idempotent; verifier's double-run crashes",
+   "Agent verifies only against the 4 sample spectra (all passing after partial fix) and submits without testing hidden centroid cases",
+   "Agent patches integrator.py normalize-before-integrate correctly but gets the threshold scaling wrong for centroid mode, causing ~2-4% integral error that barely fails the 0.5% tolerance"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "reverse-engineering",
+   "compiled-extension",
+   "ordered-procedure",
+   "regression-recovery",
+   "mass-spectrometry",
+   "migration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/spectralab/config.py  # spot normalizer_version=1",
+   "cat /app/spectralab/integrator.py  # spot normalize-after-integrate AND mode=1 hardcode",
+   "cat /app/spectralab/migrations/migrate_cache.py  # spot ALTER TABLE bug + missing default",
+   "cat /app/spectralab/normalizer.py  # understand v2 API",
+   "sed -i 's/normalizer_version=1/normalizer_version=2/' /app/spectralab/config.py",
+   "# Edit migrate_cache.py: ADD COLUMN IF NOT EXISTS + UPDATE SET normalizer_version=1 WHERE normalizer_version IS NULL",
+   "# Edit integrator.py line ordering: move normalize() call before integrate() call",
+   "# Edit integrator.py: change mode=1 to mode=spectrum.mode",
+   "python /app/spectralab/migrations/migrate_cache.py",
+   "python -m spectralab.cli --all --output /app/output/results.db",
+   "sqlite3 /app/output/results.db 'SELECT * FROM peak_integrals LIMIT 10'",
+   "sqlite3 /app/output/results.db 'SELECT DISTINCT normalizer_version FROM metadata'",
+   "python /app/spectralab/migrations/migrate_cache.py  # idempotency check",
+   "python3 -I -c \"import json; ...\"  # compare sample integrals to reference.json"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The supposed 'hardest' bug (mode=1 hardcode in integrator.py) is fully visible in Python source\u2014any agent that reads integrator.py finds it without binary introspection, collapsing difficulty",
+   "The C extension's mode argument semantics don't need reverse-engineering if the hardcode is visible; the agent just changes mode=1 to mode=spectrum.mode without understanding _fastpeaks internals",
+   "The ordering constraint (fix 3 before 4) may not actually matter if both edits are made to the same file in one editing session\u2014an agent can fix both simultaneously and never encounter the ordering dependency",
+   "SQLite's ALTER TABLE IF NOT EXISTS syntax support varies; Python's sqlite3 module on SQLite <3.37 doesn't support IF NOT EXISTS for ADD COLUMN, potentially causing the 'fix' to fail silently or differently than expected",
+   "The 0.5% tolerance is tight and may be flaky if floating-point arithmetic differs between the task-builder's reference computation and the solver's environment (e.g., numpy version differences in integration)",
+   "The 'trap' description says agents verify against 2 sample centroid spectra\u2014but if mode=1 is visible in source and fixed, the trap doesn't work, making the difficulty claim self-contradictory",
+   "Building a ~1,400-line coherent codebase with a compiled .so that has internally swapped mode semantics (mode=0 behaves as profile, mode=1 as centroid) requires very careful construction to avoid the swap being detectable from the Python-side call signature alone"
+  ],
+  "verdict": "reject",
+  "reasons": "The task's central difficulty claim\u2014that the mode bug requires binary introspection of _fastpeaks.so\u2014collapses because the bug manifests as a hardcoded `mode=1` literal in readable Python source (integrator.py), making it a straightforward code-reading exercise. All four bugs are detectable by reading 3-4 Python files in under 14 commands, putting genuine_difficulty at 2, well below the required threshold of 4. Additionally, the SQLite IF NOT EXISTS for ADD COLUMN has version compatibility risks that could produce invalid failures unrelated to the solver's correctness.",
+  "fixes": [
+   "To restore genuine difficulty: move the mode-selection logic entirely into the C extension (e.g., _fastpeaks auto-detects mode from the array shape, but uses wrong heuristics), so Python source shows no mode argument at all and the agent must probe the binary behavior empirically",
+   "Alternatively, make the Python call site look correct (mode=spectrum.mode) but have the .so silently swap mode=0 and mode=1 internally\u2014then the bug is truly invisible from Python source and requires black-box testing or binary analysis",
+   "Replace the migrate_cache.py IF NOT EXISTS approach with a try/except OperationalError pattern (which is the actual Python sqlite3 idiom), and document the SQLite version requirement to avoid flaky environment failures",
+   "Add a fifth bug that requires understanding the mzML parsing logic (e.g., centroid vs profile detection from file headers is wrong for a specific vendor format), so that even after fixing the four stated bugs, hidden test spectra from that vendor fail\u2014requiring genuine investigation rather than just reading stated bugs",
+   "Reduce the number of bugs from 4 to 2, but make them genuinely non-obvious (e.g., one requires binary instrumentation, one requires statistical analysis of residuals across multiple spectra to identify), so the difficulty is concentrated rather than spread across many shallow fixes"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task centers on reverse-engineering a black-box binary normalizer to characterize its transformation, whereas the candidate task is about debugging a Python regression after a branch merge with no binary reverse-engineering required."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunk-based CSV pipeline deduplication and row-count bugs, while the candidate task involves spectral data peak integration correctness, C extension interaction, SQLite cache migration, and a versioned normalizer feature."
+    },
+    {
+     "ref_id": "terminal-bench-pro/xrd-two-peak-fitting",
+     "verdict": "distinct",
+     "reason": "That task is a straightforward peak-fitting computation on given XRD data, whereas the candidate task is a multi-component pipeline debugging and regression recovery problem involving a broken merge, C extensions, cache migration, and multi-mode spectra."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about correcting a weighted aggregation bug in a sales service with a compiled binary, while the candidate task involves spectral peak integration regression recovery in a Python pipeline with a C extension and SQLite cache migration."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "That task is about fixing duplicate-aggregation and distinct-count bugs in a CSV-to-SQLite ETL pipeline, whereas the candidate task involves spectral analysis peak integration correctness, a versioned normalizer feature, C extensions, and cache schema migration."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.16
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.123
+    ],
+    [
+     "terminal-bench-pro/xrd-two-peak-fitting",
+     0.117
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.1
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.1
+    ]
+   ],
+   "cost_usd": 0.014862
+  },
+  "novel": true
+ },
+ "cost_usd": 0.054396
+}

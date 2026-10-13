@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "metric-rollup-canary-regression",
+  "title": "On-Call: Canary Metric Rollup Service Silent Failure",
+  "scenario": "A Node.js metrics aggregation service rolls up per-pod telemetry into time-bucketed summaries consumed by a downstream alerting system. At 3am, PagerDuty fires: the canary deployment is emitting rollups with wrong p99 latency values and duplicate bucket keys under high cardinality. The service has ~1,400 lines across six files. Logs show the service is 'healthy' by its own health check but downstream dashboards show corrupted aggregates. A compiled native addon (`metrics_native.node`) handles the hot-path histogram merge; its source is not present.",
+  "instruction_draft": "```\n[PAGERDUTY] CRITICAL: canary-rollup-svc p99_latency_ms reporting 0 for 23 of 40 pods\n[PAGERDUTY] CRITICAL: duplicate bucket keys detected in aggregation output stream\nService: rollup-svc (canary), port 7420\nDashboard: http://localhost:7420/metrics/summary?window=60\nLogs: /var/log/rollup-svc/current\nIncident started: 03:07 UTC\n```\n\nThe rollup service at `/app/rollup-svc` is in production on port 7420. It accepts POST requests to `/ingest` with pod telemetry batches, and exposes aggregated summaries on GET `/metrics/summary`. Downstream alerting calls `/metrics/summary?window=N` (N in seconds, 10 \u2264 N \u2264 300) and expects:\n\n1. Each response is a JSON array of bucket objects. Every bucket object must have a unique `bucket_key` (format: `<service>:<pod>:<window_start_epoch>`). No two objects in a single response may share a `bucket_key`.\n2. The `p99_latency_ms` field in each bucket must equal the 99th-percentile latency computed from the raw observations ingested for that pod in that window, rounded to the nearest integer. A zero value is never correct when observations exist.\n3. The service must handle at least 200 distinct `pod_id` values per ingestion batch without dropping or mismerging data.\n4. After fixing, restart the service so it is reachable on port 7420 and responds correctly to fresh ingestion followed by summary queries.\n\nAll requirements are checked by sending real protocol requests with generated pod telemetry. Do not modify the verifier or any test harness files.",
+  "requirements": [
+   "GET /metrics/summary?window=N returns a JSON array with no duplicate bucket_key values",
+   "p99_latency_ms in each bucket equals the true 99th-percentile of raw observations for that pod/window, non-zero when observations exist",
+   "Service handles batches of \u2265200 distinct pod_ids without data loss or merging errors",
+   "Service is live on port 7420 after fixes are applied",
+   "No modification of verifier or test harness files"
+  ],
+  "environment": [
+   "Node.js 20 installed, plus npm packages: express, pino, node-pre-gyp",
+   "Main service at /app/rollup-svc/ with files: server.js, aggregator.js, bucket-store.js, ingest-handler.js, summary-handler.js, health.js (~1400 lines total)",
+   "Precompiled native addon at /app/rollup-svc/build/Release/metrics_native.node (no source); exports merge_histograms(bufA, bufB) -> buf and quantile(buf, q) -> float",
+   "BUG 1 (data-dependent, not visible by reading): bucket-store.js uses a JavaScript Map keyed by template literal `${service}:${pod}` but the key generation in summary-handler.js uses a subtly different field name (pod_id vs podId) so lookups always miss for pods whose names contain underscores, returning 0 for p99. This only manifests at runtime with real pod names containing underscores\u2014test pod names without underscores pass.",
+   "BUG 2 (interacting): aggregator.js merges incoming histogram buffers by calling merge_histograms correctly for the first batch but on subsequent batches within the same window, it passes the arguments in reversed order (accumulated, incoming) instead of (incoming, accumulated)\u2014the native addon's merge is non-commutative for HDR histograms. Fixing BUG 1 alone causes tests to get non-zero p99 values, but they are wrong (too low) due to BUG 2. Fixing BUG 2 alone means lookups still miss for underscore pod names. Both must be fixed.",
+   "BUG 3 (construction): The duplicate bucket_key bug\u2014summary-handler.js iterates the store and emits one entry per (service, pod, window_start) but window_start is computed by flooring to window granularity using integer division that does not account for the query window N being passed as a string; `Math.floor(ts / N)` where N is '60' (string) causes NaN bucket_starts, so all entries get bucket_key ending in ':NaN' and collapse to one entry, but the de-duplication logic then emits only the last-seen entry. Fix requires parseInt(N, 10) and proper deduplication logic that keeps all unique pods.",
+   "Planted log file /var/log/rollup-svc/current showing recent 'healthy' health-check responses and a few 'merge complete' log lines with no error indication",
+   "A /app/rollup-svc/test-data/ directory with a sample_batch.json showing a 5-pod batch (no underscores in names) that appears to work in smoke tests",
+   "Verifier at /app/verify.js (read-only) that posts generated batches with 200 pods (many with underscores), then queries /metrics/summary?window=60 and checks all three requirements",
+   "Dockerfile installs node 20, copies /app, runs npm install in rollup-svc, starts service via node /app/rollup-svc/server.js"
+  ],
+  "internal_hint": "Three causes interact: (1) Field name mismatch (pod_id vs podId) in the bucket store key lookup causes p99=0 for underscore-named pods\u2014invisible without running against real pod names since the sample data avoids underscores. (2) Non-commutative histogram merge has arguments reversed on subsequent batches\u2014manifests only after multiple ingestion calls to the same window. (3) window N passed as string causes NaN in bucket key arithmetic, collapsing all buckets and triggering the dedup bug. Fixing (3) alone makes unique keys appear but p99 is still 0 (bug 1) or wrong (bug 2). Fixing (1) alone gives non-zero p99 but wrong values. A skilled engineer finds (3) quickly by looking at /metrics/summary output, then notices p99=0 by instrumenting with curl, then traces the field name mismatch via logging, then discovers the reversed merge by comparing single-batch vs multi-batch p99 values experimentally.",
+  "trap": "A naive agent runs the sample 5-pod batch (no underscores), sees non-zero p99 values, declares success. The verifier uses 200 pods with underscores in names and fires multiple ingestion batches per window\u2014both bug 1 and bug 2 then manifest. An agent that only fixes the NaN bucket key issue (bug 3) will pass deduplication checks but still fail p99 correctness tests. An agent that fixes bugs 1 and 3 gets non-zero p99 but wrong quantile values due to reversed merge arguments.",
+  "tests": [
+   "POST /ingest with a batch of 200 pods (100 with underscores in pod_id), then GET /metrics/summary?window=60 \u2014 verify zero duplicate bucket_keys in response",
+   "POST /ingest with a batch of 200 pods across 3 consecutive calls (simulating time passing within window), then GET /metrics/summary?window=60 \u2014 verify p99_latency_ms matches independently computed 99th percentile for each pod",
+   "POST /ingest with a single pod with known latency distribution [1,1,1,...,1,1000] (99 ones and one 1000), GET /metrics/summary?window=60 \u2014 verify p99_latency_ms is between 900 and 1000 (not 0, not 1)",
+   "POST /ingest two separate batches for the same pod within the same 60s window with different latency sets, verify the summary merges both sets correctly for p99",
+   "GET /metrics/summary?window=10 and ?window=300 both return valid non-duplicate arrays after ingestion",
+   "GET /health returns 200 (service liveness check)",
+   "POST /ingest with pod_id values containing underscores, hyphens, and dots \u2014 verify all appear in summary response with correct non-zero p99",
+   "Verify exactly 200 distinct bucket entries are returned when 200 distinct pods were ingested in a single window"
+  ],
+  "verifier_knob": {
+   "name": "pod_count",
+   "value": "200",
+   "effect": "Lowering to 20 with no-underscore pod names would allow a buggy solution with only bug 3 fixed to pass; raising to 500 with more varied names increases merge-path coverage and makes partial fixes more likely to expose wrong p99 values"
+  },
+  "expected_failure_modes": [
+   "Agent runs sample data (no underscores, single batch), sees p99 non-zero, restarts service, declares done \u2014 verifier fails on underscore pods and multi-batch windows",
+   "Agent fixes the NaN bucket_key bug (bug 3) and the field name mismatch (bug 1) but misses the reversed merge argument order (bug 2) \u2014 deduplication passes but p99 values are wrong on multi-batch windows",
+   "Agent reads aggregator.js and bucket-store.js but doesn't instrument live service with real data to discover the underscore-specific lookup failure \u2014 concludes code looks correct",
+   "Agent identifies bug 3 and bug 1 via code reading, fixes them, does not notice bug 2 because single-batch p99 looks correct, submits without testing multi-batch scenario",
+   "Agent discovers the native addon behavior is non-commutative only by generating test data, but without understanding HDR histogram semantics, attempts to 'fix' it by swapping arguments back and forth until one test passes, breaking another"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "javascript",
+   "metrics",
+   "debugging",
+   "native-addon",
+   "service-protocol",
+   "two-interacting-causes"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/rollup-svc/summary-handler.js",
+   "cat /app/rollup-svc/bucket-store.js",
+   "cat /app/rollup-svc/ingest-handler.js",
+   "cat /app/rollup-svc/aggregator.js",
+   "# Observe Bug 3: Math.floor(ts / N) where N is a string param \u2192 NaN bucket_start",
+   "# Observe Bug 1: summary-handler uses podId but bucket-store keys on pod_id (or vice versa)",
+   "# Observe Bug 2: aggregator.js calls merge_histograms(accumulated, incoming) instead of (incoming, accumulated)",
+   "# Fix summary-handler.js: parseInt(N, 10) to fix NaN; fix field name to match bucket-store key",
+   "# Fix aggregator.js: swap merge_histograms arguments to (incoming, accumulated)",
+   "curl -s http://localhost:7420/health",
+   "pkill -f 'node /app/rollup-svc/server.js' || true",
+   "node /app/rollup-svc/server.js &",
+   "sleep 1 && curl -s http://localhost:7420/health",
+   "curl -X POST http://localhost:7420/ingest -H 'Content-Type: application/json' -d @/app/rollup-svc/test-data/sample_batch.json",
+   "curl -s 'http://localhost:7420/metrics/summary?window=60' | node -e \"const d=JSON.parse(require('fs').readFileSync('/dev/stdin','utf8')); console.log(d.length, d[0])\"",
+   "node /app/verify.js"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Native addon behavior (non-commutative merge) is asserted as fact but not verifiable by solver \u2014 if the addon behaves differently than spec claims, Bug 2 fix could break things or be unfixable",
+   "The claim that merge_histograms is non-commutative for HDR histograms is a domain assumption baked into the task; if solver inspects and finds it is actually commutative, the 'fix' becomes a no-op and test results become confusing",
+   "Timing sensitivity: window_start computed from epoch timestamps means tests could span a 60s window boundary during verification, causing pods to appear in different windows and count check (exactly 200 entries) to fail flakily",
+   "The verifier file location and read-only constraint isn't enforced mechanically \u2014 a solver who modifies verify.js accidentally may get confusing results",
+   "If the service is already running in the container, pkill + restart sequence could hit a race condition on port 7420 availability"
+  ],
+  "verdict": "reject",
+  "reasons": "All three bugs are directly visible by static code reading across four files (~16-command speedrun), placing genuine_difficulty at 2 per the rubric's explicit calibration that source-readable bugs solved 4/4 by Opus score at most 2. The interacting-causes narrative is compelling but doesn't add runtime exploration difficulty since each bug's root cause is a single-line code smell (string coercion, field name typo, swapped arguments) findable in one pass through the source. The average score (~3.6) barely clears the threshold but genuine_difficulty fails the minimum-4 requirement.",
+  "fixes": [
+   "Make at least one bug runtime-only (not statically visible): e.g., the field name mismatch should be conditional on a config value loaded at startup from an environment variable or external file, so reading source alone is insufficient \u2014 the agent must trace the config loading path at runtime",
+   "Add a fourth interacting cause that requires runtime measurement to find: e.g., a race condition in the bucket-store's Map access under concurrent ingestion that only manifests with \u2265150 concurrent pods, requiring the agent to load-test and observe via logs",
+   "Remove the internal hint's explicit enumeration of all three bugs from the blueprint (it's fine internally, but signals the task was designed top-down rather than discovered bottom-up) and ensure at least one bug requires generating test traffic with specific pod name patterns to surface, not just reading code",
+   "Replace the field name mismatch (easily spotted by grep/diff) with a hash collision or off-by-one in a bucketing function that only triggers for pod names with specific byte lengths \u2014 still a code bug but requires a non-obvious test case to discover"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation in a compiled binary with a SQL database, not about p99 histogram merging, duplicate bucket keys, or high-cardinality pod telemetry in a Node.js service."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about NDJSON log validation and throughput performance, not about real-time metric rollups, histogram p99 computation, or duplicate bucket key deduplication."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about binary frame encode/decode protocol correctness in a different service domain, with no overlap in the histogram merging, bucket deduplication, or pod telemetry aggregation concepts."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a closed binary normalizer and fixing SQL rollup pipelines for sensor data, a completely different domain and debugging approach from the Node.js canary metric rollup service."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about NetFlow v9 UDP/TCP aggregation in Rust with flow record deduplication, a different protocol, language, and core problem from the Node.js p99 histogram rollup service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.15
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.126
+    ],
+    [
+     "ours/official-aac910462208",
+     0.12
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.11
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.104
+    ]
+   ],
+   "cost_usd": 0.014781
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056385000000000005
+}

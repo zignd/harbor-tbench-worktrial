@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "sql-aggregate-filter-regression",
+  "title": "SQL Window Aggregate Filter Regression",
+  "scenario": "You maintain an open-source analytics engine that compiles user-supplied SQL queries into a bytecode-evaluated query plan. A regression was reported after the last release: queries that combine window functions with HAVING filters and GROUP BY produce silently wrong numeric results on certain input distributions. The engine ships as a compiled binary `/app/qengine` with no source available. A SQLite reference database at `/app/reference.db` and a schema + seed script at `/app/seed.sql` are provided. The repository also contains a test harness `test_runner.py` that feeds SQL queries to the binary via stdin and compares output to SQLite.",
+  "instruction_draft": "The analytics binary `/app/qengine` produces wrong query results for some GROUP BY + HAVING + window-function queries. Fix the SQL query rewriter at `/app/rewriter.py` so that every query the test harness submits produces byte-identical output to the SQLite reference. The harness is `test_runner.py`; run it to see which queries currently fail.",
+  "requirements": [
+   "All SQL queries submitted by the test harness produce output byte-identical to SQLite for the same query on the same data.",
+   "The fix must be in `/app/rewriter.py`; the binary `/app/qengine` must not be replaced or patched.",
+   "The rewriter must correctly handle all combinations of GROUP BY, HAVING, and window functions (RANK, SUM OVER, ROW_NUMBER) that the harness generates, including edge cases with NULL groups, ties in window ordering, and HAVING clauses that reference window function aliases."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, gcc, and builds `/app/qengine` from a C source that is deleted after compilation \u2014 only the binary remains.",
+   "The binary `/app/qengine` reads a SQL query from stdin plus a path argument to a SQLite-format database file, executes the query via its own engine, and writes CSV rows to stdout.",
+   "The binary has two interacting bugs introduced at compile time: (1) it applies HAVING filter *before* computing window function partitions, discarding rows that would alter partition peers; (2) it miscounts NULL groups by treating NULL as equal to the empty string in GROUP BY, so a group of NULLs gets merged with a group of empty strings.",
+   "/app/rewriter.py is a ~200-line Python SQL rewriter that transforms incoming SQL before passing it to the binary. It currently rewrites simple queries correctly but does not compensate for either bug.",
+   "/app/seed.sql populates `/app/reference.db` with three tables: `events` (10 000 rows, nullable `category` TEXT, numeric `amount`, timestamp), `sessions` (3 000 rows), `items` (5 000 rows with empty-string and NULL categories).",
+   "/app/test_runner.py generates a deterministic corpus of 40 parameterized queries at runtime (seeded with a fixed integer), runs each through both SQLite and `/app/qengine` after rewriting, and diffs the CSV outputs.",
+   "A sample set of 8 'visible' queries is also present in `/app/samples/` so the solver can run quick spot-checks.",
+   "The overall project has ~1 200 lines across rewriter.py, test_runner.py, seed.sql, a schema validation helper, and a query template library \u2014 realistic sized but not trivially small.",
+   "Python packages: no third-party SQL parsers; only stdlib `re`, `sqlite3`, `subprocess`, `csv` are available, so the rewriter must do its own SQL manipulation."
+  ],
+  "internal_hint": "Bug 1 (HAVING-before-window): The binary evaluates HAVING before computing window functions over the full partition. Rewriter must lift window functions into a CTE/subquery wrapper so the binary sees a plain SELECT without HAVING on the outer query; HAVING is re-applied in an outer SELECT that filters the already-computed window column. Bug 2 (NULL-vs-empty-string group merge): The binary conflates NULL and '' in GROUP BY keys. Rewriter must add a COALESCE sentinel or CASE expression in every GROUP BY key column so NULLs and empty strings are distinguishable inside the binary, then strip or invert the sentinel in the output column names. The interaction: fixing only Bug 1 (wrapping in CTE) still leaves NULL/'' groups merged, and the merged groups feed window partition computation differently, so window ranks shift. The naive fix of adding COALESCE without the CTE wrap appears to fix the sample queries (which happen to have no HAVING filter) but fails the hidden corpus queries that combine both. The solver must discover both bugs by running experiments: run a query with no HAVING but with NULL categories, then run one with HAVING but no NULLs, then a combined one, and diff against SQLite to isolate each failure mode independently.",
+  "trap": "A naive fix that adds COALESCE to GROUP BY columns passes all 8 visible sample queries (none combine HAVING with NULL-category window queries) but fails ~15 of the 40 hidden corpus queries that combine HAVING filters with NULL groups in window partitions. Conversely, wrapping in a CTE subquery to defer HAVING passes the visible HAVING queries but leaves NULL group merge broken. Only the combined fix (CTE subquery wrapping + COALESCE sentinel in GROUP BY keys, with the sentinel stripped from output) passes the full corpus.",
+  "tests": [
+   "test_runner.py generates 40 queries at verify time using a fixed seed; each query's CSV output from the rewritten path must match SQLite's output character-for-character.",
+   "At least 8 queries combine GROUP BY + HAVING + at least one window function (RANK or SUM OVER PARTITION BY).",
+   "At least 6 queries have NULL or empty-string values in the GROUP BY key column; at least 4 of those also have a HAVING clause.",
+   "At least 4 queries use window functions with ties in the ORDER BY key to stress RANK vs ROW_NUMBER semantics.",
+   "A post-fix sanity check runs the 8 visible sample queries to ensure the rewriter did not regress them.",
+   "The binary `/app/qengine` must still be the executor (test_runner checks its mtime/size; it must not have been replaced)."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "40 queries",
+   "effect": "Raising to 80 adds more NULL+HAVING+window combos and multi-level CTEs; lowering to 15 makes it easier to hit 100% by luck or partial fix. At 40, only the fully correct combined fix passes."
+  },
+  "expected_failure_modes": [
+   "Agent reads rewriter.py, spots it doesn't handle HAVING, wraps queries in a subquery CTE, verifies against the 8 samples, and submits \u2014 failing the NULL-group hidden cases.",
+   "Agent adds COALESCE to GROUP BY keys, verifies samples (which have no HAVING+NULL combo), submits \u2014 failing hidden queries with both HAVING and NULL groups.",
+   "Agent attempts to patch the binary directly (strings, hex edit) and breaks it entirely.",
+   "Agent writes a full SQL parser from scratch but has subtle precedence bugs in the CTE rewriter that mis-parenthesize multi-window queries.",
+   "Agent fixes both bugs independently but the sentinel chosen for COALESCE collides with an actual value in the dataset ('__NULL__' appears as a real category value in 3 rows), causing a different merge error."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "window-functions",
+   "constraint-satisfaction",
+   "two-interacting-bugs",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/rewriter.py",
+   "cat /app/test_runner.py",
+   "python /app/test_runner.py  # see which queries fail",
+   "ls /app/samples/",
+   "cat /app/samples/*.sql",
+   "sqlite3 /app/reference.db \"SELECT category, SUM(amount) as s, RANK() OVER (ORDER BY SUM(amount)) as r FROM events GROUP BY category HAVING s > 100\"",
+   "echo 'SELECT category, SUM(amount) as s, RANK() OVER (ORDER BY SUM(amount)) as r FROM events GROUP BY category HAVING s > 100' | /app/qengine /app/reference.db",
+   "# Confirm HAVING-before-window bug",
+   "sqlite3 /app/reference.db \"SELECT category, COUNT(*) FROM events GROUP BY category ORDER BY category\"",
+   "echo 'SELECT category, COUNT(*) FROM events GROUP BY category ORDER BY category' | /app/qengine /app/reference.db",
+   "# Confirm NULL/empty-string merge bug",
+   "# Edit rewriter.py: add CTE subquery wrapping to defer HAVING evaluation",
+   "# Edit rewriter.py: add COALESCE sentinel in GROUP BY key columns",
+   "python /app/test_runner.py  # check progress",
+   "# Observe sentinel collision with '__NULL__' in real data",
+   "sqlite3 /app/reference.db \"SELECT COUNT(*) FROM events WHERE category = '__NULL__'\"",
+   "# Change sentinel to something collision-free e.g. chr(1) or '__QENGINE_NULL_SENTINEL__'",
+   "# Update rewriter.py with new sentinel",
+   "python /app/test_runner.py  # final check - all 40 should pass",
+   "ls -la /app/qengine  # confirm binary untouched"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The sentinel collision trap (__NULL__ appearing as real category data) could cause a valid fix attempt to fail without clear signal - the agent might not realize the sentinel itself is the problem, making this an environmental 'gotcha' rather than a skill test",
+   "The binary's mtime/size check is fragile - if the Docker build has any non-determinism in compilation timestamps or compiler flags, the baseline mtime/size may vary, making the check unreliable",
+   "The test harness generates 40 queries 'at verify time using a fixed seed' but the blueprint says it also generates them 'at runtime' for the agent - if the runtime seed differs from the verify seed for any reason (e.g., Python version differences, hash randomization), visible queries won't match hidden ones",
+   "Requiring byte-identical CSV output for floating-point arithmetic (SUM, RANK etc.) across SQLite and a custom C binary could produce platform-dependent floating-point formatting differences that are not the solver's fault",
+   "The 8 visible sample queries are designed to never combine HAVING + NULL groups, which is an artificial constraint - a real regression corpus would not be so neatly partitioned; this artificiality makes the trap feel constructed rather than organic"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores only 3/5 because a skilled agent reading rewriter.py will spot both missing transformations (HAVING deferral, NULL coalescing) from code inspection in under 20 commands, without requiring the deep experimental discovery the blueprint anticipates. The speedrun reaches a full solution in ~20 steps, which per the rubric caps genuine_difficulty at 2-3. Additionally, the sentinel collision trap risks invalid failures where a correct approach fails due to an environmental gotcha rather than a skill gap, and the mtime/size binary integrity check introduces fragility.",
+  "fixes": [
+   "Increase genuine difficulty by obfuscating the rewriter.py structure - e.g., make it a compiled .pyc only, or split the bug across two files where one is a shared utility with a subtle semantic error, forcing the agent to reason about behavior from test outputs rather than source inspection",
+   "Replace the sentinel collision gotcha with a more principled difficulty lever - e.g., make the NULL group bug manifest only when PARTITION BY and GROUP BY keys differ, requiring the agent to understand window partition semantics rather than just string escaping",
+   "Add a third interacting bug or make the CTE rewriting non-trivial by requiring correct handling of multi-window queries where two OVER clauses have different PARTITION BY keys, forcing the agent to write a proper SQL AST transformation rather than a regex-based one",
+   "Ensure the sentinel collision trap produces a clear, diagnosable failure signal (e.g., a specific query in the visible samples that uses '__NULL__' as a real value) so it tests problem-solving skill rather than luck",
+   "Replace the binary mtime/size integrity check with a behavioral check (e.g., run a known-broken query directly against the unmodified binary and verify it still produces the wrong output) to avoid fragility from compilation non-determinism"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task asks you to optimize a known-correct query for performance; this candidate asks you to fix a rewriter so a buggy analytics binary produces correct results \u2014 different core problem."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "That task is purely about SQL query optimization for efficiency; this candidate is about debugging a query rewriter to fix semantic correctness bugs in window-function handling."
+    },
+    {
+     "ref_id": "terminal-bench-pro/python-sql-injection-sanitizer",
+     "verdict": "distinct",
+     "reason": "That task is about building a regex-based SQL sanitizer for security; this candidate is about fixing a SQL rewriter to correctly transform window-function queries."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering a binary's transformation function and fixing a data pipeline; this candidate involves fixing a Python SQL rewriter for window-function query correctness."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a NetFlow aggregation network service; this candidate is about fixing a SQL query rewriter for analytics correctness."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.328
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.313
+    ],
+    [
+     "terminal-bench-pro/python-sql-injection-sanitizer",
+     0.165
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.128
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.113
+    ]
+   ],
+   "cost_usd": 0.013485
+  },
+  "novel": true
+ },
+ "cost_usd": 0.056469000000000005
+}

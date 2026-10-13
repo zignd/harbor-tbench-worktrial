@@ -1,0 +1,159 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-c-service",
+  "title": "Daily Ledger Rollup Service Repair",
+  "scenario": "An analyst running month-end reconciliation noticed that daily account balances reported by the in-house C aggregation service started diverging from raw transaction totals about six weeks ago. The service reads transaction records over a Unix socket, accumulates running balances per account, and responds to STATUS queries with per-account summaries. The codebase is ~1,400 lines across five C source files plus a shell-based harness that manages startup, log rotation, and nightly rollup snapshots. Two bugs interact: one corrupts the snapshot file in a way that is only visible when the rollup snapshot is actually loaded on restart, and the other only triggers on accounts whose ID modulo 16 equals zero (a hash-bucket boundary), so lightweight tests with a few accounts pass clean.",
+  "instruction_draft": "The ledger rollup service at /app/ledger must correctly accumulate transaction debits and credits, persist daily snapshots on SIGHUP, and restore those snapshots exactly on restart so that a STATUS query for any account returns its true running balance. Fix the service so it passes all protocol checks.",
+  "requirements": [
+   "STATUS <account_id> returns the exact sum of all posted credits minus debits for that account, across restarts.",
+   "SIGHUP causes the service to write a snapshot file and then continue serving without data loss.",
+   "Restarting the service with an existing snapshot file restores all balances before accepting new connections.",
+   "Accounts whose numeric ID is a multiple of 16 must report correct balances, the same as all other accounts.",
+   "The rollup shell harness must complete without error: it sends transactions, signals SIGHUP, kills and restarts the service, and verifies balances."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, socat, and Python 3 (for the verifier harness).",
+   "/app/ledger/src/ contains five C files: main.c (~300 lines, socket accept loop and signal handler), accounts.c (~280 lines, hash-table with 16 buckets, balance accumulation), snapshot.c (~220 lines, binary serialization/deserialization of the account table), proto.c (~180 lines, line-protocol parser for POST/STATUS/QUIT commands), log.c (~80 lines, timestamped logging). No source for any opaque component; all bugs are in data-dependent execution paths not visible by reading alone.",
+   "Bug 1 (snapshot corruption, data-dependent): snapshot.c writes each account's balance as a signed 32-bit integer using fwrite(&bal, 4, 1, f) but reads it back with fread(&bal, 4, 1, f) into a 64-bit long (the in-memory type). On little-endian x86-64, positive balances under 2^31 appear correct, but the upper 4 bytes of the long are never zeroed after fread into stack memory, so when those bytes happen to be non-zero (from a prior large-balance account sitting in the same stack frame), the restored balance is wrong. This only manifests reliably after a sequence of large-then-small balance accounts in snapshot order.",
+   "Bug 2 (hash-bucket boundary, data-dependent): accounts.c uses account_id % BUCKETS to find the bucket, where BUCKETS is defined as 16 and the comparison for 'bucket full, grow' uses a strict less-than that skips index 0 of the overflow chain for bucket 0 (i.e., accounts with id % 16 == 0). Their transactions are silently dropped after the first overflow entry is written, causing STATUS to return a stale partial balance. This is a logic error in a loop index, not visible unless you actually POST transactions to an account with id divisible by 16 AND the bucket has already seen one prior account.",
+   "The two bugs interact: fixing only the snapshot bug still causes wrong STATUS responses for mod-16 accounts, and fixing only the bucket bug still causes wrong balances after restart for certain account orderings. A partial fix looks correct on small same-session tests.",
+   "/app/ledger/harness.sh is the shell management script: it compiles the service, starts it, posts a batch of seeded transactions (sourced from /app/ledger/txns.dat), sends SIGHUP, waits, kills the process, restarts it, and runs STATUS checks. It currently exits nonzero and prints MISMATCH for some accounts.",
+   "/app/ledger/txns.dat contains ~200 POST lines including accounts 0, 16, 32, 48, 80, 112, 144, 160 (all multiples of 16) and a mix of large and small balances designed to trigger the stack-frame contamination on restore.",
+   "/app/ledger/Makefile compiles all five C files into a single binary /app/ledger/bin/ledgerd.",
+   "The service listens on a Unix domain socket /tmp/ledger.sock, protocol: line-oriented text, commands POST <acct> <amount> (integer, positive=credit, negative=debit), STATUS <acct>, QUIT."
+  ],
+  "internal_hint": "Difficulty comes from data-dependent execution paths: Bug 1 only fires when a prior large-balance account occupies the same stack frame as the fread target during snapshot restore (not visible by reading snapshot.c in isolation; requires running with the actual txns.dat sequence). Bug 2 only fires for account IDs divisible by 16 after the first overflow entry in that bucket is written (requires experimentation with specific account IDs). A skilled engineer must: (1) run harness.sh and observe which accounts mismatch, (2) bisect whether mismatches appear only after restart (Bug 1) or also in-session (Bug 2), (3) instrument with gdb or printf to trace fread return values and bucket assignment for mod-16 accounts, (4) fix snapshot.c to read into a properly typed variable (int32_t) and zero-extend explicitly, (5) fix the bucket overflow loop index in accounts.c. The ordered procedure matters: fixing snapshot.c first and re-running the harness still shows failures for mod-16 accounts, which might be attributed to the snapshot bug still being present if the solver doesn't re-examine carefully.",
+  "trap": "A solver that fixes only the snapshot type mismatch (the more obvious of the two after reading snapshot.c) will pass tests with the provided txns.dat if those tests happen not to include enough mod-16 accounts in overflow position. The verifier generates fresh transaction batches at verify time that include multiple mod-16 accounts each with at least two prior occupants of their hash bucket, guaranteeing bucket overflow and exposing Bug 2. A solver that fixes only the bucket bug will pass in-session STATUS checks but fail post-restart checks on the verifier's large-balance ordering.",
+  "tests": [
+   "Verifier compiles the service fresh from /app/ledger/src/ and /app/ledger/Makefile to confirm it builds cleanly.",
+   "Verifier generates 8 fresh account sets at verify time, each containing accounts with IDs that are multiples of 16 (at least 3 per bucket) alongside non-multiple accounts, with randomized credit/debit sequences summing to known values.",
+   "For each generated account set: POST all transactions, query STATUS for every account, verify exact balance matches expected sum.",
+   "For each generated account set: POST all transactions, send SIGHUP, kill the service, restart it, query STATUS for every account, verify restored balances match expected sums.",
+   "Specifically tests at least 5 accounts with id % 16 == 0, each receiving transactions after another account already occupies the same bucket's first overflow slot.",
+   "Specifically tests snapshot restore after a sequence where account 1000000 (large balance ~1.5 billion) is snapshotted before account 16 (small balance ~100) to trigger stack-frame contamination if the type bug remains.",
+   "Verifier runs harness.sh and checks it exits 0.",
+   "Verifier checks that the service does not crash or hang on SIGHUP (sends signal and verifies the socket is still accepting connections within 2 seconds)."
+  ],
+  "verifier_knob": {
+   "name": "number_of_account_sets",
+   "value": "8",
+   "effect": "Increasing the number of generated account sets increases the chance of hitting both bug conditions in varied orderings; decreasing to 2-3 makes it easier to get lucky with a partial fix."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the snapshot type mismatch (most readable bug), re-runs harness.sh, sees it pass with the bundled txns.dat, submits without noticing that mod-16 accounts with bucket overflow still fail on verifier-generated inputs.",
+   "Agent fixes only the bucket overflow logic, tests STATUS in-session and sees correct values, does not test post-restart balances, misses the snapshot corruption on verifier's large-balance ordering.",
+   "Agent correctly identifies both bugs conceptually but introduces an off-by-one in the bucket fix (e.g., wrong boundary condition for the overflow chain head), which passes small tests but fails when a bucket has 3+ accounts.",
+   "Agent replaces the snapshot format entirely with a text-based format but introduces an endianness or precision issue for negative balances (debits), causing incorrect restored balances for accounts net-negative.",
+   "Agent fixes both bugs but breaks the SIGHUP handler (e.g., calls exit instead of continuing to serve), causing the harness liveness check to fail."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "service-protocol",
+   "data-dependent-bugs",
+   "binary-serialization",
+   "hash-table"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/ledger/harness.sh",
+   "cat /app/ledger/src/snapshot.c",
+   "cat /app/ledger/src/accounts.c",
+   "cat /app/ledger/src/main.c",
+   "cat /app/ledger/src/proto.c",
+   "bash /app/ledger/harness.sh 2>&1 | tail -30",
+   "Identify Bug 1: fread(&bal, 4, 1, f) into 64-bit long \u2014 upper bytes uninitialized (visible in snapshot.c)",
+   "Identify Bug 2: bucket overflow loop index skips slot 0 for bucket 0 (visible in accounts.c)",
+   "Edit snapshot.c: use int32_t tmp; fread(&tmp,4,1,f); bal=(long)tmp; to fix type mismatch",
+   "Edit accounts.c: fix loop start index in overflow chain for bucket 0",
+   "make -C /app/ledger",
+   "bash /app/ledger/harness.sh"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Bug 1 relies on uninitialized stack memory behavior (undefined behavior in C); compiler flags, optimization levels, or ASAN in the container could zero the stack, making the bug non-reproducible or flaky across builds.",
+   "The blueprint claims bugs are 'not visible by reading alone' but describes both with sufficient precision (exact types, exact loop condition) that a skilled agent reading the source files can identify and fix them statically in ~5 read commands plus 2 edits \u2014 no dynamic analysis required.",
+   "Stack-frame contamination for Bug 1 depends on a specific calling sequence placing a large-balance account in the same frame as the fread target; gcc inlining or register allocation changes could prevent this from manifesting consistently.",
+   "The 'two interacting bugs hide each other' difficulty lever may not hold if the verifier always generates inputs exposing both bugs independently \u2014 an agent fixing one bug and re-running could still see failures pointing clearly to the second bug."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because both bugs are statically visible in the source: the fread-into-long type mismatch is a well-known C pitfall immediately apparent in snapshot.c, and the loop index error in accounts.c is described with enough precision to find by inspection in under 12 commands total. The blueprint's claim that bugs are 'not visible by reading alone' is contradicted by its own detailed descriptions. Additionally, Bug 1 relies on undefined behavior (uninitialized stack memory) that is fragile across compiler versions and optimization settings, creating invalid failure risk from environment flakiness rather than engineering difficulty.",
+  "fixes": [
+   "Make Bug 1 deterministic and non-UB: instead of relying on uninitialized stack bytes, use a deliberate serialization format error (e.g., write 8 bytes but read only 4, causing offset corruption in subsequent records) that is consistently wrong regardless of compiler behavior.",
+   "Obscure both bugs to require dynamic analysis: remove the precise type names from the blueprint description and instead describe symptoms only ('balances diverge after restart for certain account orderings'), forcing the agent to actually run the harness and instrument with printf/gdb to locate root causes.",
+   "Increase the hash-table complexity so Bug 2 is not findable by a simple loop-index scan: e.g., bury it in a multi-level indirection or a macro expansion that only evaluates incorrectly for bucket==0, requiring runtime tracing to pinpoint.",
+   "Add a third subtle bug (e.g., a race condition in the SIGHUP handler between snapshot write and continued serving) to raise the total command count and prevent quick convergence, pushing the speedrun above 20 commands."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "Both involve ledger reconciliation but the reference uses Python/SQLite/CSV imports while the candidate involves a C service with Unix sockets, SIGHUP snapshots, and a specific hash-bucket boundary bug."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Both involve fixing aggregation bugs in a compiled service, but the reference is a Rust/C++ regional sales aggregator with weight configuration issues, while the candidate is a C socket-based ledger service with snapshot persistence and hash-bucket boundary bugs."
+    },
+    {
+     "ref_id": "terminal-bench-pro/fix-release-build-memory-corruption",
+     "verdict": "distinct",
+     "reason": "The reference is about fixing a C++ service that behaves differently between debug/release builds with AddressSanitizer, while the candidate involves fixing specific logic bugs in a C ledger service related to snapshot corruption and modulo-16 hash-bucket boundary errors."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is a Node.js log ingestion pipeline with schema validation and performance issues, completely different domain and technology from the candidate's C socket-based ledger service."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The reference is a Rust NetFlow v9 UDP/TCP aggregation service with flow parsing and query bugs, while the candidate is a C Unix-socket ledger service with snapshot persistence and hash-bucket boundary bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.173
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.143
+    ],
+    [
+     "terminal-bench-pro/fix-release-build-memory-corruption",
+     0.12
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.101
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.097
+    ]
+   ],
+   "cost_usd": 0.012972000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.054959999999999995
+}

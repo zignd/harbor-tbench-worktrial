@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "budget-rollup-c-service-repair",
+  "title": "Budget Rollup Aggregation Service Repair",
+  "scenario": "An analyst at a small analytics firm noticed that monthly budget rollup totals stopped matching the sum of department line items after a 'minor refactor' two sprints ago. The in-house C service reads department records from a binary flat-file database, aggregates them by cost center, and serves rollup queries over a simple line-protocol TCP socket. The codebase is ~1,100 lines across five source files plus a shell-script build pipeline. Nobody left notes on what changed.",
+  "instruction_draft": "The budget rollup service at /app/rollupd is producing wrong aggregation totals. Fix it so that every rollup query returns the correct sum for each cost center across all department records in the data file.",
+  "requirements": [
+   "The service, when started with /app/start.sh, listens on TCP port 7474 and answers line-protocol queries.",
+   "A query of the form 'GET <cost_center_id>\\n' returns '<cost_center_id> <sum>\\n' where sum is the correct integer sum of all budget_amount fields for records belonging to that cost center.",
+   "A query of the form 'GET ALL\\n' returns one line per cost center in ascending cost_center_id order, each formatted as '<cost_center_id> <sum>\\n', followed by a line 'END\\n'.",
+   "The service correctly handles cost centers whose records span more than one page in the binary data file.",
+   "The service correctly handles cost centers with IDs that differ only in a trailing digit (e.g., CC10 vs CC1).",
+   "A 'RELOAD\\n' command causes the service to re-read the data file from disk and respond 'OK\\n'; subsequent queries reflect the reloaded data.",
+   "The build script /app/build.sh compiles the service without errors using gcc."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm with apt-get install: gcc make netcat-openbsd",
+   "/app/src/main.c: service entry point, sets up TCP socket on 7474, dispatches commands to aggregator",
+   "/app/src/aggregator.c: reads binary flat file, builds in-memory hash map of cost_center -> sum; BUG 1: page-boundary read loop uses '<' instead of '<=' when checking remaining bytes in a page, silently dropping the last record of every page that falls exactly on the page boundary",
+   "/app/src/aggregator.c: BUG 2 (interacting): the hash key comparison uses strncmp(a, b, strlen(a)) which matches 'CC1' as a prefix of 'CC10', merging their buckets; this bug partially compensates for BUG 1 in the sample data because the phantom missing records happen to land in buckets that get merged, making the sample totals look plausible",
+   "/app/src/parser.c: binary record parser - struct layout is: uint16_t rec_len, char cost_center[8], int64_t budget_amount; no bugs here",
+   "/app/src/proto.c: TCP line-protocol handler for GET, GET ALL, RELOAD commands; no bugs here",
+   "/app/src/hashmap.c: open-addressing hash map implementation; no bugs here",
+   "/app/include/: header files for all modules",
+   "/app/data/budget.bin: binary flat file with ~400 records across 8 pages (page size 512 bytes); constructed so that some records fall exactly at page boundaries AND cost centers CC1/CC10/CC100 exist with distinct intended totals",
+   "/app/build.sh: compiles all .c files and links to produce /app/rollupd; currently compiles successfully (bugs are logic bugs not compile errors)",
+   "/app/start.sh: launches /app/rollupd with /app/data/budget.bin as argument",
+   "/app/tests/sample_query.sh: provided sample that queries GET CC3 and shows the expected result for the one cost center that happens to be unaffected by both bugs",
+   "The data file is generated deterministically by /app/tools/gen_data.py (source included) so the verifier can regenerate fresh data files at verify time with different record layouts"
+  ],
+  "internal_hint": "BUG 1 is in aggregator.c's page-read loop: the condition `bytes_consumed < page_size` should be `bytes_consumed + sizeof_min_record <= page_size` or equivalently the loop reads until it cannot fit another record header, but the current off-by-one drops the last record when it lands exactly at a page boundary. BUG 2 is the strncmp key comparison: `strncmp(key, bucket->key, strlen(key))` matches any bucket whose key starts with `key`, so CC1 absorbs CC10 and CC100. These interact: with only BUG 1, the dropped-boundary records happen to mostly belong to CC10 and CC100; with only BUG 2, CC1's total is inflated but the sample query for CC3 passes; with both bugs simultaneously, the inflation from BUG 2 roughly compensates the loss from BUG 1 for certain cost centers making the provided sample pass. The correct fix is: (1) change the page-read loop termination to check remaining bytes against the minimum record size, and (2) change strncmp to use the bucket key length: `strcmp(key, bucket->key)`. The solver must discover both bugs by experimenting with the running service on non-sample cost centers, not by reading one obvious line.",
+  "trap": "A solver who only runs the provided sample query against CC3 (unaffected by both bugs) will see correct output and conclude the service is working. A solver who finds and fixes only BUG 2 (the strncmp) will see CC1/CC10/CC100 separate correctly but BUG 1 still drops boundary records, causing wrong totals on hidden inputs with records at page boundaries. A solver who finds and fixes only BUG 1 will see the boundary records included but now BUG 2's prefix matching is unmasked and CC1 absorbs CC10, still wrong. Both bugs must be fixed together for all hidden test inputs to pass.",
+  "tests": [
+   "Verifier generates a fresh budget.bin with known record layout where specific records fall exactly at page boundaries, starts the service, queries each cost center individually, and checks each sum matches the reference computed directly from the generator's record list.",
+   "Verifier checks GET ALL returns all cost centers in ascending ID order with correct sums, and that CC1, CC10, CC100 each have their own distinct correct totals.",
+   "Verifier inserts a new cost center 'X' whose records all fall at page boundaries, queries GET X, verifies the sum equals the expected value (tests BUG 1 in isolation).",
+   "Verifier queries cost center 'A' and 'AB' separately and verifies their totals are independent (tests BUG 2 in isolation after BUG 1 is fixed).",
+   "Verifier sends RELOAD after writing a modified data file, then re-queries and checks updated totals.",
+   "Verifier confirms build.sh succeeds with gcc and produces the /app/rollupd binary."
+  ],
+  "verifier_knob": {
+   "name": "number of request scenarios",
+   "value": "6 distinct cost-center query patterns with fresh data file",
+   "effect": "Raising to 10+ scenarios with more varied page-boundary placements and more cost-center prefix collisions makes partial fixes fail more visibly; lowering to 2 scenarios makes a single-bug fix plausibly pass."
+  },
+  "expected_failure_modes": [
+   "Agent reads source code, spots the strncmp call as suspicious, fixes only BUG 2, tests against the provided sample which now passes, and submits without discovering BUG 1.",
+   "Agent instruments the running service and notices wrong totals for a few cost centers, traces it to strncmp (BUG 2), fixes it, then reruns the sample query and sees it pass, misses that BUG 1 is still present because the sample cost center CC3 has no boundary records.",
+   "Agent fixes BUG 1 first, notices some totals improve, but the strncmp bug now causes new-looking failures that confuse the agent into thinking its BUG 1 fix was wrong, reverts, and chases a phantom.",
+   "Agent correctly identifies both bugs but makes an error in the page-boundary arithmetic (uses wrong struct size constant), leaving BUG 1 partially fixed\u2014boundary records on odd-sized cost centers still drop.",
+   "Agent modifies build.sh incorrectly or introduces a compile error while refactoring the hash map comparison, breaking the service entirely."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "c",
+   "shell-scripting",
+   "service-protocol",
+   "two-interacting-bugs",
+   "binary-format",
+   "aggregation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/aggregator.c",
+   "grep -n 'strncmp\\|strlen\\|bytes_consumed\\|page_size' /app/src/aggregator.c",
+   "# BUG 1 spotted: loop condition 'bytes_consumed < page_size' drops last boundary record",
+   "# BUG 2 spotted: strncmp(key, bucket->key, strlen(key)) matches prefixes",
+   "sed -i 's/bytes_consumed < page_size/bytes_consumed + MIN_REC_SIZE <= page_size/' /app/src/aggregator.c",
+   "sed -i 's/strncmp(key, bucket->key, strlen(key))/strcmp(key, bucket->key)/' /app/src/aggregator.c",
+   "/app/build.sh",
+   "/app/start.sh &",
+   "sleep 1 && printf 'GET CC1\\n' | nc localhost 7474",
+   "printf 'GET CC10\\n' | nc localhost 7474",
+   "printf 'GET CC100\\n' | nc localhost 7474",
+   "printf 'GET ALL\\n' | nc localhost 7474"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The MIN_REC_SIZE constant may not exist by that name; an agent fixing BUG 1 with the wrong struct size would cause a partial fix that still fails hidden tests \u2014 this is a valid failure mode per design, but if the constant name is ambiguous in the actual source, it could cause confusion.",
+   "The binary data file is generated by gen_data.py at verify time with 'different record layouts' \u2014 if the verifier regenerates data with a layout where CC3 also has boundary records, the sample_query.sh would fail even on a correct fix, potentially confusing the solver during development.",
+   "Race condition: start.sh launching rollupd as a background process with no readiness check could cause nc queries to fail if the service hasn't bound port 7474 yet \u2014 flaky if no sleep is added.",
+   "If the solver fixes strncmp to use strlen(bucket->key) instead of strcmp, it might pass most tests but fail edge cases with keys of equal length \u2014 a subtle partial fix the verifier should catch but the test description doesn't explicitly address.",
+   "The 'interacting bugs mask each other' property means that after fixing only one bug, NEW failures appear that weren't visible before \u2014 an agent might interpret this as their fix being wrong and revert, which is a valid failure mode but could also be triggered by test environment inconsistency."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty fails the minimum threshold (scores 2/5) because both bugs are co-located in aggregator.c and immediately visible to any agent that reads source code \u2014 the speedrun reaches a correct solution in ~12 commands without needing to run the service at all. The entire difficulty design relies on the agent NOT reading source and instead probing the running service, but no constraint prevents source reading. The interaction between the two bugs is clever but irrelevant when source inspection finds both in a single file read.",
+  "fixes": [
+   "Obfuscate the bug location: spread the bugs across different files (e.g., BUG 1 in hashmap.c's iterator, BUG 2 in proto.c's key parsing), so no single file read reveals both; force the agent to correlate behavior across files.",
+   "Add a compile-time macro that makes the strncmp bug non-obvious: e.g., define a KEYEQ(a,b) macro in a header that looks correct but has the prefix-match flaw, requiring the agent to trace macro expansion.",
+   "Make BUG 1 a subtle arithmetic error (e.g., wrong struct size constant in a #define shared across files) rather than a visually obvious '<' vs '<=' so it requires understanding the struct layout to spot.",
+   "Add source obfuscation or only provide the compiled binary for aggregator.c (provide source for other files), forcing the agent to debug via behavior rather than source inspection.",
+   "Introduce a third plausible-looking red herring bug in parser.c that doesn't affect correctness but draws agent attention away from the real bugs in aggregator.c."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "variant",
+     "reason": "Both involve fixing a broken aggregation service where rollup/summary totals don't match line-item sums, differing mainly in language (C vs unspecified), transport (TCP socket vs SQLite), and weighting vs simple sum."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task involves NetFlow v9 UDP packet parsing and JSON TCP query handling in Rust, not a C binary flat-file budget aggregation service."
+    },
+    {
+     "ref_id": "terminal-bench-pro/python-prime-http-server",
+     "verdict": "distinct",
+     "reason": "That task is building a prime number HTTP server from scratch in Python Flask, unrelated to aggregation repair."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves HMAC-SHA256 computation over WAL records with a refund resolver, not budget rollup aggregation."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a Node.js NDJSON log ingestion pipeline for schema validation and performance, not a C aggregation service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.195
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.19
+    ],
+    [
+     "terminal-bench-pro/python-prime-http-server",
+     0.17
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.152
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.115
+    ]
+   ],
+   "cost_usd": 0.013977
+  },
+  "novel": false
+ },
+ "cost_usd": 0.051276
+}

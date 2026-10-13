@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "pack-deploy-native-extension",
+  "title": "Binary Extension Deployment Calibration",
+  "scenario": "A Python data-processing service ships a pre-compiled C extension (`_fastpack.so`) that encodes records into a compact binary format used downstream. The release pipeline assembles a wheel, installs it into a staging virtualenv, runs a validation script against sample data files, and publishes an artifact manifest. Since last week's libc upgrade the pipeline `make deploy` completes without errors and the validation script reports OK on the three sample files, but production jobs silently produce corrupt output on real data.",
+  "instruction_draft": "You are the release engineer on call. The deployment pipeline lives in `/app/pipeline/`. Running `make deploy` succeeds and the built-in validation reports PASS, but the deployed extension produces incorrect encoded output on real workloads.\n\nYour job: investigate the `_fastpack.so` extension's encoding behaviour across its full input space, identify the conditions under which it produces wrong output, and deliver a drop-in replacement encoder at `/app/pipeline/encoder.py` that is imported instead of the native extension when present. The replacement must be a pure-Python module that exports the same public API (`encode_record(fields: list[str]) -> bytes`) and produces byte-for-byte identical output to the correct encoding contract for every valid input.\n\nThe correct contract is defined in `/app/pipeline/spec/encoding_spec.md`. Your encoder will be evaluated against a hidden set of at least 500 records drawn from the full valid input domain; it must produce output that matches the reference implementation on every record. The validation metric is exact-match rate across the hidden corpus; the threshold is 1.00 (every record correct).",
+  "requirements": [
+   "A file `/app/pipeline/encoder.py` exists and exports `encode_record(fields: list[str]) -> bytes`.",
+   "The module is importable without the native extension present.",
+   "On every record in the hidden evaluation corpus, `encoder.encode_record(fields)` returns bytes that exactly match the reference encoding defined in the spec.",
+   "The exact-match rate across the hidden corpus must be 1.00 (all records correct)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm.",
+   "apt-get: gcc, make, file, xxd, python3-dev.",
+   "pip: no third-party packages required for the encoder itself; numpy and pytest available for investigation.",
+   "Directory `/app/pipeline/` contains: `Makefile`, `deploy.sh`, `validate.py`, `__init__.py`, `_fastpack.so` (pre-compiled, no source), `spec/encoding_spec.md`.",
+   "Directory `/app/pipeline/data/samples/` contains three sample `.dat` files used by `validate.py`; these are chosen to avoid triggering the buggy code paths.",
+   "Directory `/app/pipeline/data/hidden/` is absent at task time; the verifier generates it at verify time from the full input domain.",
+   "`_fastpack.so` is a genuine compiled extension (compiled from a short C file that is NOT present). It implements `encode_record` but has a defect: it mis-encodes field values whose UTF-8 byte length exceeds 127 (uses a 1-byte length prefix with no high-bit continuation, truncating the length to 7 bits and corrupting subsequent fields).",
+   "`spec/encoding_spec.md` fully describes the wire format: a 4-byte little-endian field count, then for each field a 2-byte little-endian length prefix followed by the UTF-8 bytes. The spec is correct and complete.",
+   "`validate.py` imports `_fastpack` and checks the three sample files; samples contain only short strings (\u226440 bytes each) so the bug never triggers.",
+   "`Makefile` has a `deploy` target that copies the `.so` into the virtualenv site-packages and runs `validate.py`.",
+   "The verifier imports `/app/pipeline/encoder.py` directly (not `_fastpack`) and calls `encode_record` on 500+ records including many with fields longer than 127 UTF-8 bytes, multi-byte Unicode, and empty strings.",
+   "A reference implementation (hidden from solver, used only by verifier) encodes with 2-byte LE length prefix per spec."
+  ],
+  "internal_hint": "The root cause is the opaque binary component: `_fastpack.so` uses a 1-byte length prefix instead of the spec-mandated 2-byte little-endian prefix. This only manifests on field values \u2265128 bytes. The solver cannot read the C source; they must probe the `.so` experimentally (call it with increasingly long strings, hexdump the output, compare to spec). The shallow-check trap is that the three sample files all contain short strings, so `validate.py` always passes. The solver must read the spec carefully (2-byte LE length, not 1-byte), discover the `.so` deviation by experiment (e.g., `python3 -c \"import _fastpack; import sys; sys.stdout.buffer.write(_fastpack.encode_record(['x'*200]))\"` then `xxd`), then implement a correct pure-Python encoder that follows the spec exactly. Difficulty comes from: (1) the defect is invisible without running the binary on boundary-crossing inputs; (2) the sample validation passes, creating a false-green signal; (3) the spec must be read precisely\u2014Unicode multi-byte characters mean byte-length \u2260 character count, and the solver must use `len(field.encode('utf-8'))` not `len(field)`.",
+  "trap": "A solver who reads the spec and implements a naive encoder using `len(field)` instead of `len(field.encode('utf-8'))` will pass all ASCII hidden cases but fail on multi-byte Unicode fields. A solver who copies the `.so`'s behaviour (1-byte prefix) by mimicking its output on short strings will fail all hidden cases with fields \u2265128 bytes. A solver who only tests against the sample files and ships will fail the hidden corpus entirely on long-field records.",
+  "tests": [
+   "Import `/app/pipeline/encoder.py` without `_fastpack` on sys.path; call `encode_record(['hello', 'world'])` and verify 4-byte LE count (2) followed by 2-byte LE length (5) + b'hello' + 2-byte LE length (5) + b'world'.",
+   "Call `encode_record([''])` and verify 4-byte LE count (1) + 2-byte LE length (0) with no payload bytes.",
+   "Call `encode_record(['x'*200])` and verify the 2-byte LE length field is b'\\xc8\\x00' (200 in LE), not b'\\xc8' (1-byte truncated).",
+   "Call `encode_record(['\\u00e9'*100])` (\u00e9 is 2 UTF-8 bytes each, total 200 bytes) and verify 2-byte LE length is b'\\xc8\\x00' (200), not b'\\x64\\x00' (100, character count).",
+   "At verify time, generate 500 records with a mix of: short ASCII, long ASCII (128-500 chars), multi-byte Unicode strings (Japanese, emoji), empty strings, and records with 0\u201320 fields. Compare `encoder.encode_record(fields)` byte-for-byte against the reference (4-byte LE count + per-field 2-byte LE UTF-8-byte-length + UTF-8 bytes). Require exact-match rate = 1.00."
+  ],
+  "verifier_knob": {
+   "name": "hidden_corpus_long_field_fraction",
+   "value": "0.6",
+   "effect": "Raising the fraction of records with \u2265128-byte fields (toward 1.0) makes the task harder because even a partially correct encoder fails more cases; lowering it toward 0.0 makes the task easier because most records are short and the `.so` bug never triggers, letting a naive mimic pass."
+  },
+  "expected_failure_modes": [
+   "Agent reads spec, implements encoder with character-length instead of byte-length prefix, passes ASCII hidden tests but fails Unicode boundary cases.",
+   "Agent probes `.so` with short strings only, mimics its (buggy) 1-byte prefix behaviour, passes sample validation but fails all hidden long-field records.",
+   "Agent implements the encoder correctly for ASCII but forgets to handle the empty-field case (0-length 2-byte prefix), failing a subset of hidden records.",
+   "Agent notices the `.so` bug but implements the fix incompletely: handles the length prefix correctly but encodes field bytes as latin-1 instead of UTF-8, corrupting multi-byte characters.",
+   "Agent spends time trying to recompile the extension or find the C source (absent) instead of reverse-engineering by probing and implementing from the spec."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "binary-extension",
+   "reverse-engineering",
+   "encoding",
+   "deployment",
+   "python",
+   "systems-programming"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/pipeline/spec/encoding_spec.md",
+   "cat /app/pipeline/validate.py",
+   "python3 -c \"import sys; sys.path.insert(0,'/app/pipeline'); import _fastpack; sys.stdout.buffer.write(_fastpack.encode_record(['x'*200]))\" | xxd",
+   "# Observe: length prefix is 1 byte (0xc8) not 2 bytes (0xc8 0x00) \u2014 bug found",
+   "python3 -c \"import sys; sys.path.insert(0,'/app/pipeline'); import _fastpack; sys.stdout.buffer.write(_fastpack.encode_record(['hello','world']))\" | xxd",
+   "# Confirm spec: 4-byte LE count, 2-byte LE length per field",
+   "cat > /app/pipeline/encoder.py << 'EOF'\nimport struct\ndef encode_record(fields: list) -> bytes:\n    out = struct.pack('<I', len(fields))\n    for f in fields:\n        b = f.encode('utf-8')\n        out += struct.pack('<H', len(b)) + b\n    return out\nEOF",
+   "python3 -c \"import sys; sys.path.insert(0,'/app/pipeline'); from encoder import encode_record; r=encode_record(['hello','world']); print(r.hex())\"",
+   "python3 -c \"import sys; sys.path.insert(0,'/app/pipeline'); from encoder import encode_record; r=encode_record([chr(0xe9)*100]); import struct; print(struct.unpack('<H',r[4:6])[0])\"",
+   "python3 -c \"import sys; sys.path.insert(0,'/app/pipeline'); from encoder import encode_record; print(encode_record(['']).hex())\""
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 5,
+   "solvability": 5,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The spec is described as 'correct and complete' and fully describes the wire format with no ambiguity \u2014 a careful reader can implement the encoder without ever probing the .so, making the reverse-engineering aspect optional rather than necessary.",
+   "The task's difficulty levers (opaque component, shallow check trap) exist but the core solve path bypasses both: read spec \u2192 implement directly \u2192 done in ~10 lines.",
+   "No ambiguity about the API signature or output format exists, reducing failure surface to only implementation mistakes that are easily caught by the stated test cases.",
+   "The 'trap' for character-length vs byte-length is well-known Python idiom; any engineer who has worked with Unicode in Python will instinctively use .encode('utf-8') and len() on the result.",
+   "The difficulty is described as 'hard' but the spec fully discloses the correct answer \u2014 the only challenge is not being deceived by the .so, which is avoidable by spec-first reading."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold because the spec is described as 'correct and complete' and fully discloses the exact wire format, meaning a skilled agent can implement the encoder directly from the spec in ~10 lines of Python without needing to probe the binary at all. The speedrun is 10 commands, well under the 20-command ceiling for a score of 2. The opaque-component and shallow-check-trap levers exist but are bypassed entirely by spec-first reading \u2014 the binary is irrelevant to producing a correct solution.",
+  "fixes": [
+   "Make the spec intentionally incomplete or ambiguous (e.g., omit length-prefix width or endianness) so the solver MUST probe the .so experimentally to determine the correct format, making reverse-engineering mandatory rather than optional.",
+   "Introduce a second encoding dimension that differs between the spec draft and the correct behavior (e.g., field count encoding, a checksum, or a magic header), requiring multiple rounds of binary probing to fully characterize \u2014 raising command count and genuine exploration effort.",
+   "Replace the prose spec with a partially-redacted or version-ambiguous document (e.g., 'v1.2 or v1.3 format \u2014 check the production artifact') so the solver must reconcile the spec with actual .so behavior for short strings, forcing engagement with the binary even when the spec is the primary source.",
+   "Add a second latent bug (e.g., field count is big-endian in the .so but little-endian in spec, or there is a padding/alignment requirement for field boundaries) discovered only via probing, so the correct implementation cannot be written purely from the spec without verification steps."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a chunked CSV pipeline with deduplication and validation logic, not about reverse-engineering a binary encoding spec and writing a pure-Python replacement for a broken native extension."
+    },
+    {
+     "ref_id": "terminal-bench-science/dna-storage-codec",
+     "verdict": "distinct",
+     "reason": "That task is about designing an error-correcting codec for a noisy DNA storage channel, not about reverse-engineering a binary encoding contract from a spec and replacing a broken C extension."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-lz77-file-compressor",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a specific LZ77 compression algorithm from a precise binary format spec, not about diagnosing a silent regression in a native extension and writing a drop-in pure-Python replacement."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing correctness and performance bugs in a Node.js NDJSON log ingestion service, not about reverse-engineering a binary encoding spec to replace a broken native C extension."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing an HMAC-based WAL record audit service with TCP networking and database lookups, not about diagnosing a broken binary encoder and writing a pure-Python replacement."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.171
+    ],
+    [
+     "terminal-bench-science/dna-storage-codec",
+     0.167
+    ],
+    [
+     "terminal-bench-pro/implement-lz77-file-compressor",
+     0.138
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.135
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.131
+    ]
+   ],
+   "cost_usd": 0.014619
+  },
+  "novel": true
+ },
+ "cost_usd": 0.050214
+}

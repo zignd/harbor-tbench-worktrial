@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "log-metric-sql-query-service",
+  "title": "Metrics Query Service",
+  "scenario": "A data pipeline team runs a small HTTP query service that sits in front of a SQLite metrics database. The service receives SQL-like requests over a simple line protocol, executes them against 90 days of ingested application logs (stored as structured rows), and streams back results. The previous engineer left mid-sprint: the service binary is running but returning wrong answers on aggregation queries, and a critical rollup feature for per-host percentile bucketing was never finished. The environment has ~1,400 lines across the query service (Python), an ingest script, schema migrations, and the populated SQLite database.",
+  "instruction_draft": "Hey, I'm inheriting the metrics query service and it's broken in a couple of ways. The service listens on port 7700 and speaks a simple line protocol: you send a query string terminated by newline, and it sends back newline-delimited JSON rows followed by a blank line. Two things need fixing:\n\n1. Aggregation queries involving GROUP BY and a time-bucket function called `time_bucket(interval, ts_column)` are returning results grouped incorrectly \u2014 the bucketing boundaries don't line up right.\n\n2. The `PERCENTILE_BUCKET(col, p, host)` function isn't implemented at all. It should compute the p-th percentile of `col` partitioned by `host` across whatever rows the WHERE clause selects, using the precomputed histogram data the ingest pipeline stores in the `host_histograms` table. The histogram stores bucket boundaries and counts; you need to interpolate correctly to hit the exact percentile.\n\nThe service has to answer both kinds of queries correctly for any host, any percentile from 1\u201399, and any time bucket interval (1m, 5m, 15m, 1h). Make sure aggregation results for every host/interval combination are right, not just the examples in the logs.",
+  "requirements": [
+   "The service continues to listen on port 7700 and speaks the existing line protocol (query string + newline \u2192 newline-delimited JSON rows + blank line terminator).",
+   "time_bucket(interval, ts_column) correctly aligns bucket boundaries to epoch-aligned grid points for intervals 1m, 5m, 15m, and 1h (e.g., 5m buckets always start at :00, :05, :10, not at arbitrary offsets).",
+   "GROUP BY queries using time_bucket return the correct number of buckets and correctly aggregate metrics per bucket.",
+   "PERCENTILE_BUCKET(col, p, host) is implemented and returns the p-th percentile of col for the given host by interpolating into the precomputed histogram in host_histograms.",
+   "PERCENTILE_BUCKET returns correct results for any p in 1\u201399 and any host present in the database.",
+   "The service handles multiple sequential query connections without restarting."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt: sqlite3; pip: nothing extra needed (stdlib only).",
+   "SQLite database at /app/data/metrics.db with tables: events(id, host TEXT, ts INTEGER, metric TEXT, value REAL), host_histograms(host TEXT, metric TEXT, bucket_index INTEGER, lower_bound REAL, upper_bound REAL, count INTEGER). Populated with 90 days of synthetic log-derived rows, ~500k event rows, histograms pre-aggregated per host per metric.",
+   "/app/service/server.py: ~600 lines. Parses the line protocol, has a SQL rewriter that transforms time_bucket() and PERCENTILE_BUCKET() calls into SQLite expressions before execution. The time_bucket rewriter has a bug: it computes floor(ts / interval_seconds) * interval_seconds but uses the interval in milliseconds instead of seconds for one of the divisions, causing off-by-interval misalignment. The PERCENTILE_BUCKET branch raises NotImplementedError.",
+   "/app/service/rewriter.py: ~300 lines. The AST rewriter for custom functions. time_bucket bug lives here: the interval parsing maps '5m' to 300000 (milliseconds) but the epoch math divides by that value treating it as seconds.",
+   "/app/ingest/ingest.py: ~250 lines. Reads log files, writes events rows, precomputes host_histograms. The histogram schema: lower_bound and upper_bound are inclusive/exclusive boundaries, count is the number of events in that bucket. Ingest is not broken.",
+   "/app/ingest/schema.sql: DDL for both tables.",
+   "/app/logs/: A directory of raw log files (already ingested, present for reference).",
+   "A startup script /app/start.sh that launches server.py in background and logs to /app/logs/service.log.",
+   "The service is already running when the solver's shell starts.",
+   "Sample queries in /app/docs/examples.txt showing the protocol format, including one time_bucket example (which currently returns wrong bucket timestamps) and a note saying PERCENTILE_BUCKET is 'coming soon'.",
+   "host_histograms contains data for 8 synthetic hosts, 3 metrics each, ~50 buckets per host/metric. The histogram covers the full value range seen during ingest."
+  ],
+  "internal_hint": "Two independent bugs provide difficulty from two separate levers. (1) Hidden invariant discovered by running: the time_bucket bug is not visible by reading alone until you notice that interval_map returns milliseconds and the floor division uses that value as if it were seconds, producing bucket keys ~1000x too fine \u2014 you only see it's wrong when you run a query and observe bucket timestamps like 1700000001000 instead of 1700001000. The solver must instrument, observe output, trace back through rewriter.py to the interval_map dict. (2) Build component: PERCENTILE_BUCKET requires implementing histogram interpolation correctly. The trap is that naive linear interpolation between bucket midpoints fails for skewed distributions and edge-case percentiles (p=1, p=99). The correct approach is to treat each bucket as uniformly distributed between its bounds, compute a cumulative count, find which bucket contains the target quantile rank, then linearly interpolate within that bucket's [lower_bound, upper_bound]. Edge cases: the target rank may fall in a bucket with count=0 (must skip), or above the last bucket's upper_bound (clamp to upper_bound). Solvers who implement a simple median or np.percentile on sampled rows (not using histograms) will fail because the test sends PERCENTILE_BUCKET queries that require using host_histograms \u2014 the events table alone is insufficient (test queries filter to short time windows where sampled rows give wrong percentiles, but the precomputed histograms cover the full distribution the test expects).",
+  "trap": "A solver who (a) finds and fixes the milliseconds/seconds bug in the time_bucket path but implements PERCENTILE_BUCKET by querying event rows directly (ignoring host_histograms) will pass sample queries but fail verify-time tests that use narrow time windows where event-row samples are sparse and the expected answer comes from the full histogram. A solver who implements PERCENTILE_BUCKET using host_histograms but does naive midpoint interpolation will fail p=1 and p=99 edge cases and tests with right-skewed buckets. A solver who fixes PERCENTILE_BUCKET but misses that the time_bucket bug produces non-epoch-aligned boundaries will fail all GROUP BY time_bucket tests on intervals other than 1m.",
+  "tests": [
+   "Test 1 (time_bucket 1h alignment): Send 'SELECT time_bucket(\"1h\", ts), COUNT(*) FROM events WHERE host=\"host-1\" GROUP BY 1 ORDER BY 1' \u2014 verify each returned bucket timestamp is divisible by 3600 and matches the count of events in that exact hour.",
+   "Test 2 (time_bucket 5m alignment): Same query with 5m; verify bucket timestamps divisible by 300.",
+   "Test 3 (time_bucket 15m): Verify bucket timestamps divisible by 900.",
+   "Test 4 (time_bucket 1m): Verify bucket timestamps divisible by 60.",
+   "Test 5 (PERCENTILE_BUCKET p=50, host-3, metric latency): Verifier computes expected p50 from host_histograms rows for host-3/latency using reference interpolation; compares to service answer within 0.5% relative tolerance.",
+   "Test 6 (PERCENTILE_BUCKET p=95, host-7, metric error_rate): Edge case high percentile; verifier checks against reference.",
+   "Test 7 (PERCENTILE_BUCKET p=1, host-2, metric cpu): Edge case low percentile near minimum bucket.",
+   "Test 8 (PERCENTILE_BUCKET p=99, host-5, metric memory): Edge case at top of distribution.",
+   "Test 9 (combined query): GROUP BY time_bucket + PERCENTILE_BUCKET in same session to verify both fixes coexist without breaking the protocol.",
+   "Test 10 (multiple sequential connections): Sends 5 queries on separate TCP connections; verifies service remains up and answers all 5 correctly."
+  ],
+  "verifier_knob": {
+   "name": "num_host_metric_percentile_scenarios",
+   "value": "8 hosts \u00d7 3 metrics \u00d7 6 percentile values = 144 PERCENTILE_BUCKET scenarios plus 4 interval \u00d7 8 host time_bucket scenarios = 176 total test cases",
+   "effect": "Raising adds more hosts, metrics, or edge percentiles; increasing hosts requires the histogram interpolation to be correct for varied distribution shapes. Lowering to a single host/metric/percentile makes it trivially verifiable by sampling events rows directly."
+  },
+  "expected_failure_modes": [
+   "Solver finds the time_bucket bug but implements PERCENTILE_BUCKET by querying events rows rather than host_histograms, failing narrow-window tests.",
+   "Solver implements PERCENTILE_BUCKET with midpoint interpolation rather than within-bucket uniform interpolation, failing p=1/p=99 tests.",
+   "Solver fixes the milliseconds/seconds division but only for 5m and 1h, not 15m and 1m (copies fix incompletely through interval_map).",
+   "Solver implements PERCENTILE_BUCKET but doesn't handle buckets with count=0 correctly, crashing or returning wrong value for sparse metrics.",
+   "Solver fixes both bugs but accidentally breaks the line protocol framing (missing blank-line terminator), causing the verifier's reader to hang."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "metrics",
+   "log-analysis",
+   "protocol-service",
+   "histogram",
+   "bash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/service/rewriter.py",
+   "grep -n 'interval_map\\|300000\\|millisec' /app/service/rewriter.py",
+   "sed -i 's/300000/300/g; s/60000/60/g; s/900000/900/g; s/3600000/3600/g' /app/service/rewriter.py",
+   "echo 'SELECT time_bucket(\"5m\", ts), COUNT(*) FROM events WHERE host=\"host-1\" GROUP BY 1 ORDER BY 1' | nc localhost 7700",
+   "grep -n 'PERCENTILE_BUCKET\\|NotImplementedError' /app/service/rewriter.py",
+   "cat /app/service/server.py | head -100",
+   "sqlite3 /app/data/metrics.db '.schema host_histograms'",
+   "sqlite3 /app/data/metrics.db 'SELECT * FROM host_histograms WHERE host=\"host-1\" AND metric=\"latency\" ORDER BY bucket_index LIMIT 10'",
+   "Write PERCENTILE_BUCKET handler in rewriter.py: query host_histograms, compute cumulative counts, find target rank bucket, interpolate within bucket bounds uniformly, handle zero-count buckets and edge clamping (~45 lines)",
+   "kill $(pgrep -f server.py) && python /app/service/server.py >> /app/logs/service.log 2>&1 &",
+   "echo 'SELECT PERCENTILE_BUCKET(value, 50, \"host-3\") FROM events WHERE metric=\"latency\"' | nc localhost 7700",
+   "echo 'SELECT PERCENTILE_BUCKET(value, 1, \"host-2\") FROM events WHERE metric=\"cpu\"' | nc localhost 7700",
+   "echo 'SELECT PERCENTILE_BUCKET(value, 99, \"host-5\") FROM events WHERE metric=\"memory\"' | nc localhost 7700",
+   "echo 'SELECT time_bucket(\"1h\", ts), PERCENTILE_BUCKET(value, 50, \"host-1\") FROM events WHERE metric=\"latency\" GROUP BY 1' | nc localhost 7700"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The time_bucket bug (300000 vs 300) is trivially visible by reading source \u2014 any agent scanning rewriter.py will spot milliseconds immediately, negating the 'hidden invariant' difficulty lever. The blueprint's own claim that it's 'not visible by reading alone' is false.",
+   "PERCENTILE_BUCKET query syntax is ambiguous: the instruction says 'PERCENTILE_BUCKET(col, p, host)' but the test sends 'SELECT PERCENTILE_BUCKET(value, 50, \"host-3\") FROM events WHERE metric=\"latency\"' \u2014 it's unclear whether host is a literal string arg or a column reference, and how the function interacts with a WHERE clause vs partitioning. The rewriter must handle this consistently with how the test calls it.",
+   "The combined query in Test 9 mixes GROUP BY time_bucket with PERCENTILE_BUCKET \u2014 it's unclear if PERCENTILE_BUCKET is computed per-bucket or across all rows; if per-bucket the histogram approach breaks since histograms aren't time-segmented. This could cause solver confusion or an ambiguous/impossible implementation.",
+   "Service restart semantics: the blueprint says 'service is already running when solver's shell starts' but doesn't specify if the solver can restart it or if there's a supervisor \u2014 if restarting is required but blocked, the solver gets stuck.",
+   "The tolerance for PERCENTILE_BUCKET (0.5% relative) may be too tight if histogram bucket granularity is coarse (~50 buckets over a wide range), causing valid interpolation implementations to fail due to bucket resolution, not implementation error.",
+   "The 144 PERCENTILE_BUCKET scenarios require all 8 hosts \u00d7 3 metrics \u00d7 6 percentiles to pass \u2014 if the solver's implementation is correct but the histogram data generation has an edge case for one host/metric, tests would fail invalidly."
+  ],
+  "verdict": "reject",
+  "reasons": "The time_bucket bug fails as a 'hidden invariant' because 300000 vs 300 is immediately readable in source \u2014 any agent reading rewriter.py spots it in seconds, making speedrun completion plausible in ~14 commands and genuine_difficulty scores 3. The PERCENTILE_BUCKET query semantics in the combined Test 9 are ambiguous (per-bucket vs global), and the interaction between a string host argument and GROUP BY time_bucket is undefined, creating invalid failure risks beyond the intended traps. The task needs a harder-to-spot time_bucket bug and clearer PERCENTILE_BUCKET call semantics.",
+  "fixes": [
+   "Make the time_bucket bug less readable: instead of a simple wrong constant (300000 vs 300), hide it as a logical error in the bucketing formula itself \u2014 e.g., using ceil() instead of floor(), or applying modular rounding to the wrong reference epoch \u2014 so it requires running a query and observing misaligned output to diagnose, not just reading the interval_map.",
+   "Clarify PERCENTILE_BUCKET semantics explicitly: state whether the host argument is a filter (equivalent to adding WHERE host=X) or a partition key (computes percentile only within the host's histogram independent of the FROM/WHERE clause), and ensure Test 9's combined query has an unambiguous expected behavior.",
+   "Add a third independent bug or complexity lever to justify hard difficulty: e.g., the histogram ingest script stores bucket boundaries with an off-by-one on upper_bound exclusivity (the last bucket's upper_bound is None/NULL), requiring the solver to handle NULL-bounded interpolation in their PERCENTILE_BUCKET implementation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Both involve fixing broken aggregation in a data service, but the candidate focuses on SQL time-bucketing alignment and percentile interpolation from histograms over a line-protocol TCP service, while the reference fixes weighted regional sales summaries in a compiled binary against a config file."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "The reference is purely about optimizing an existing SQL query for performance without changing output, while the candidate requires fixing incorrect time-bucket logic and implementing a missing percentile function in a running service."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Both involve fixing a TCP query service with aggregation bugs, but the reference deals with NetFlow UDP packet parsing and flow aggregation in Rust, while the candidate involves Python SQL time-bucketing and histogram-based percentile interpolation."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference is about HMAC authentication over a binary WAL record protocol with database lookups, while the candidate is about fixing SQL aggregation bucketing and implementing percentile computation from precomputed histograms."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "Both involve percentile computation in a data pipeline, but the reference requires reverse-engineering a black-box binary normalizer and fixing rollup SQL, while the candidate requires fixing time-bucket alignment and implementing histogram interpolation in a live query service."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-48ebd2cd8854",
+     0.172
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.152
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.151
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.115
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.102
+    ]
+   ],
+   "cost_usd": 0.015102
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058632000000000004
+}

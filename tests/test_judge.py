@@ -61,3 +61,11 @@ def test_judge_trial_maps_harbor_outcomes(monkeypatch):
     )
     outcome, _labels, cost = cal.judge_trial(TASK, trial)
     assert outcome == cal.HACKED_PASS and cost == 0.1
+
+
+def test_extract_json_survives_prose_second_objects_and_trailing_commas():
+    from analysis.llm import extract_json
+
+    assert extract_json('Here: {"a": 1, "b": [1, 2,],} and then {"c": 2}') == {"a": 1, "b": [1, 2]}
+    assert extract_json('```json\n{"x": {"y": 1}}\n```\n```json\n{"z": 2}\n```') == {"x": {"y": 1}}
+    assert extract_json('note {not json} then {"ok": true}') == {"ok": True}

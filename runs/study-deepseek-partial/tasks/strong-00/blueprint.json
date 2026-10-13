@@ -1,0 +1,54 @@
+{
+ "slug": "ed25519-batch-audit-throughput",
+ "title": "Fix audit verification throughput with batch Ed25519",
+ "scenario": "The audit-log-signature verification service at /app/auditsrv verifies batches of Ed25519-signed log entries over gRPC. After a recent log-volume spike the service became a bottleneck, processing only ~10,000 verifications per second. The codebase includes a minimal Edwards25519 arithmetic package, a correct but naive single-signature verifier, and a benchmark harness. The solver must deliver a service that meets the 50,000\u2011ops/s throughput bar while rejecting every invalid batch under hidden test scenarios.",
+ "instruction_draft": "We run an internal audit-log signature verification service at /app/auditsrv. It receives batches of signed log entries over gRPC and checks each signature. After a recent spike in log volume, measurements show the service can only process about 10,000 verifications per second, which is too slow \u2013 we risk a growing backlog and gaps in the audit trail.\n\nWe need you to improve its throughput to at least 50,000 operations per second, as measured by the benchmark tool included in the project. The service must remain correct: any batch that contains an invalid signature \u2013 whether due to a forged signature, a malformed public key, a duplicate entry, or any other edge case \u2013 must be rejected. All existing unit tests must still pass.",
+ "requirements": [
+  "Running the provided benchmark in `/app/auditsrv/bench` must report at least 50,000 verified entries per second.",
+  "The gRPC `VerifyBatch` endpoint must reject (return an error) for any batch that contains at least one entry whose Ed25519 signature is invalid, whose public key is not a valid curve point, or that is a duplicate of another entry in the same batch.",
+  "All pre-existing unit tests in `/app/auditsrv/...` must pass."
+ ],
+ "environment": [
+  "Dockerfile based on `python:3.13-slim-bookworm` with Go 1.22 and pinned protobuf/grpc dependencies installed.",
+  "Project at `/app/auditsrv/` with `go.mod`, `cmd/auditsrv/main.go` (gRPC server on :50051), `proto/audit.proto` and generated stubs, `pkg/edwards25519/` (~400 lines) offering `Point`, `ScalarMul`, `ScalarBaseMul`, `Add`, `DeserializePoint`, `NewScalarFromCanonicalBytes` and the identity point.",
+  "`pkg/sig/sig.go` (~200 lines) implementing standard Ed25519 `Sign` and `Verify` using the edwards25519 package. It calls `sha512.Sum512`, reduces scalars mod l, and checks the cofactor (multiply by 8).",
+  "`internal/service/server.go` (~80 lines) with the `VerifierServer` struct whose `VerifyBatch` handler currently iterates over entries and calls `sig.Verify` individually.",
+  "`bench/bench.go` (~80 lines) a standalone program that generates N signed entries, connects to the server, sends batches of 100, and prints operations/sec.",
+  "`pkg/sig/verify_test.go` (~150 lines) unit tests that check sign/verify with valid and invalid inputs (bad R, bad S, wrong public key, identity point, etc.) and must pass.",
+  "No internet access; all source code is provided."
+ ],
+ "internal_hint": "Run the benchmark to confirm the 10k/s baseline. Read the `VerifyBatch` handler and the `sig.Verify` implementation. Notice each call does two fixed-base scalar multiplications and one variable-base multiplication, making the per-signature cost high. The path to 50k/s is to implement secure Ed25519 batch verification using the provided low-level `edwards25519` package. The batch formula: for entries i with public key A_i, message m_i, signature (R_bytes || S_bytes), decompress R_i, compute e_i = ScalarReduce(SHA512(R_bytes || A_i || m_i)) and S_i = decode scalar from S_bytes. Then, to verify a batch, pick distinct random scalars z_i (e.g., z_i = SHA512( i || batch_fingerprint ) reduced mod l). Compute L = \u03a3 z_i\u00b7R_i, R' = \u03a3 z_i\u00b7e_i, S' = \u03a3 z_i\u00b7S_i, and check that 8\u00b7(S'\u00b7B + \u03a3 z_i\u00b7e_i\u00b7A_i \u2013 \u03a3 z_i\u00b7R_i) = 0. In code this means: accum_point = ScalarMul(B, S'); then for each i, accum_point = Add(accum_point, ScalarMul(A_i, z_i*e_i)); then accum_point = Add(accum_point, ScalarMul(R_i, -z_i)); finally check that ScalarMul(accum_point, 8) is the identity. The cofactor multiplication is required for correctness. Must also reject entries where R_i or A_i is not on curve, where S_i >= l, and where any entry is duplicated (same A_i, m_i, sig_i). Integrate the new `BatchVerify` function in the `VerifyBatch` handler. Use the benchmark to confirm speed, and run `go test ./...` to keep unit tests green.",
+ "trap": "A naive aggregate that simply sums S_i, e_i, and R_i without distinct random scaling (z_i = 1 for all i) will incorrectly accept crafted batches where malicious entries cancel out. The hidden test suite includes a batch with two entries engineered so that the individual equations fail but the un-scaled sum holds, catching such an implementation.",
+ "tests": [
+  "Run the benchmark and assert throughput >= 50,000 ops/s.",
+  "Send a batch of 100 valid signed entries \u2013 must return success.",
+  "Send a batch where one entry has a single bit flipped in its signature \u2013 must return error.",
+  "Send a batch where a public key is all zeros (not a valid curve point) \u2013 must return error.",
+  "Send a batch containing two entries that are exact duplicates (same message, signature, public key) \u2013 must return error.",
+  "Send a batch with two entries designed to cancel under a linear batch equation without random coefficients (cancellation attack) \u2013 must return error (proper randomised batch verification rejects this).",
+  "All existing `go test` unit tests pass."
+ ],
+ "verifier_knob": {
+  "name": "number of request scenarios",
+  "value": "5",
+  "effect": "Adding more exotic edge cases (e.g., malformed R not on curve, S out of range, race cond) makes the verification tougher and the task more likely to uncover shallow fixes."
+ },
+ "expected_failure_modes": [
+  "Does not notice the service is a bottleneck and never changes the verification path; only does minor cleanups \u2014 benchmark still fails.",
+  "Implements a naive batch verification without random coefficients \u2013 passes simple tests but fails the hidden cancellation attack.",
+  "Does not handle duplicate entries or malformed public keys, passing only basic valid and invalid cases.",
+  "Fails to apply the cofactor multiplication, causing the batch to approve low-order points that should be rejected.",
+  "Writes a mathematically correct batch verifier but makes a scalar/point arithmetic mistake (e.g., using wrong curve addition) that makes it reject valid batches."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "security-audit",
+ "tags": [
+  "go",
+  "ed25519",
+  "batch-verification",
+  "mathematical-derivation",
+  "performance",
+  "gRPC"
+ ]
+}

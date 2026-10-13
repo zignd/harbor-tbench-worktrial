@@ -1,0 +1,46 @@
+{
+ "slug": "iot-packet-filter-blocklist-crc",
+ "title": "Fix IoT Packet Filter",
+ "scenario": "An embedded developer maintains a packet filter for an IoT hub. The filter is a bash script that checks device IDs against an allowlist and verifies CRC16 checksums via a compiled helper binary. The git repository at /app contains the script, configuration files with allow and blocklists, the binary, and sample packets that all pass the filter correctly. Recently the filter has been misbehaving\u2014incorrectly accepting some packets\u2014and you must fix it so it correctly accepts all valid packets and rejects all invalid ones from a hidden test corpus.",
+ "instruction_draft": "Fix the packet filter at /app/filter.sh so that it correctly accepts all valid packets and rejects all invalid packets.",
+ "requirements": [
+  "The filter must correctly classify every packet in the hidden test set as ACCEPT or REJECT."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm, install bash, coreutils, base64 (from coreutils).",
+  "Create /app as a git repository initialized with an initial commit containing filter.sh, config/allowlist.txt, bin/check_crc16 (compiled, no source), and samples/ directory with a few passing packets.",
+  "A second commit adds config/blocklist.txt (a list of revoked device IDs) but does not modify filter.sh to use it.",
+  "filter.sh: reads allowlist ranges, decodes base64 packets, extracts device ID (first 2 bytes big-endian), calls bin/check_crc16 with the full packet payload on stdin, and decides accept if exit code 0 and ID is in allowlist. Does not read or enforce blocklist.",
+  "bin/check_crc16: a C program that reads a payload from stdin, computes CRC-16-CCITT over all bytes except the last two (which are the expected CRC), compares, prints OK/FAIL to stdout and returns exit code 0 for OK, 1 for FAIL. Contains a bug: for payloads of exactly 64 bytes total it returns exit code 1 even when OK, due to an off-by-one in the length check when reading the last two bytes.",
+  "Sample packets: all have lengths other than 64 and device IDs in the allowlist but not on the blocklist, so the filter currently accepts them correctly.",
+  "No reproduction case is provided."
+ ],
+ "internal_hint": "The solver must explore the filter's behavior by generating many test packets with varied device IDs and payload lengths. They will discover that packets with IDs listed in /app/config/blocklist.txt are incorrectly accepted because the script never reads that file. They will also discover that valid packets of exactly 64 bytes total length are incorrectly rejected due to the binary returning exit code 1 despite printing OK. The fix requires: 1) modifing filter.sh to also read blocklist.txt and reject any device ID found there, and 2) changing the script to rely on the binary's stdout OK/FAIL string rather than its exit code. A solution that only fixes one of these will still fail many cases in the hidden adversarial corpus.",
+ "trap": "A solver who fixes only the binary exit-code handling (e.g., by checking stdout) and then tests with the provided sample packets will see all pass and might stop. The hidden corpus includes packets with blocked IDs that will still pass, and a solver who adds blocklist enforcement but does not fix the binary will still reject valid 64-byte packets. Shallow verification with the provided samples masks the remaining bug.",
+ "tests": [
+  "All packets in a hidden corpus are fed to /app/filter.sh (one per line, base64 encoded). The corpus is generated deterministically and includes: valid packets (allowed ID, correct CRC) of various lengths including exactly 64 bytes; packets with blocked IDs (on blocklist) but otherwise valid; packets from IDs not in allowlist; packets with correct ID but incorrect CRC; packets with reserved/boundary IDs; and combinations of these traits. The verify script checks that every output line is exactly ACCEPT or REJECT according to the ground-truth label."
+ ],
+ "verifier_knob": {
+  "name": "adversarial_corpus_size",
+  "value": "large corpus (hundreds of cases) covering edge-case lengths, blocklist coverage, boundary IDs, and invalid checksums",
+  "effect": "Raising it increases the chance that a partial fix is exposed because more cases hit the unfixed bug; lowering it makes it easier to pass with a one-sided fix."
+ },
+ "expected_failure_modes": [
+  "Fixes only the binary exit-code handling (e.g., uses stdout) but never notices or enforces the blocklist, so blocked IDs are still accepted.",
+  "Only adds blocklist enforcement but does not correct the binary issue, so valid 64-byte packets are still rejected.",
+  "Tries to fix the binary by patching it (disallowed, no source) or recompiling and fails.",
+  "Fails to discover the exact 64-byte length because probing is not systematic enough.",
+  "Shallow verification using only the provided sample packets after a single fix, assuming the problem is solved."
+ ],
+ "predicted_pass_rate": 0.4,
+ "difficulty": "hard",
+ "category": "networking",
+ "tags": [
+  "debugging",
+  "binary-reverse-engineering",
+  "bash",
+  "iot",
+  "checksum",
+  "blocklist"
+ ]
+}

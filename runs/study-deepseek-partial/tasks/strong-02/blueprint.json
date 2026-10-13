@@ -1,0 +1,51 @@
+{
+ "slug": "encrypted-log-pipeline-recovery",
+ "title": "Fix Encrypted Log Pipeline",
+ "scenario": "An on-call SRE is paged at 3am because the production log aggregation pipeline has been producing garbled output since the last deployment. The pipeline decrypts logs from multiple microservices (auth, payments, gateway) using an in-house legacy decryption binary and merges them into a single combined log. The environment holds the pipeline Python code, a configuration file with a master key, encrypted log files, and the compiled decryption binary without its source.",
+ "instruction_draft": "PagerDuty: ALERT \u2014 production-log-pipeline failing\nTimestamp: 2025-06-15T03:14:22Z\nSeverity: critical\nSample output from /app/output/combined.log:\n\n    \u00f0\u00df\u009b\u0092_t\u00a5?\u00be\u00a2\u25af\u25af\u00e6_\u00eb\u25af\n    `\u00c8\u00dc\u00ea\u00bc\u00eb\u2190\u00ec\u25bc\u00a7_\u00a7_\u00b3M\u25af\n    ...\n\nThe pipeline processes encrypted log files under /app/logs/<service>/ and writes a sorted, deduplicated combined log to /app/output/combined.log. The README at /app/README.md documents the encryption format and key derivation. The configuration at /app/config.yaml contains the master key and the list of services. The pipeline uses /app/bin/decrypt_tool for decryption and maintains a state file at /app/state/processed.json.\n\nFix the pipeline so that running `python /app/pipeline.py` produces a correct, human-readable combined log that satisfies the requirements below. The fix must work for any set of encrypted log files that follow the documented format.",
+ "requirements": [
+  "The output /app/output/combined.log must contain every log record from every .enc file across all services listed in config.yaml.",
+  "Records must be sorted by timestamp in ascending order.",
+  "Duplicate records with the same service name and sequence number must appear only once, keeping the first occurrence.",
+  "All lines must be valid UTF-8 text, free of any garbled or binary characters.",
+  "The fix must be correct for any set of encrypted log files that conform to the encryption format described in README.md, not just the files present at the start."
+ ],
+ "environment": [
+  "Base image python:3.13-slim-bookworm with apt packages gcc, libssl-dev and pip packages cryptography, pyyaml.",
+  "A small in-house codebase at /app containing pipeline.py (the main script that orchestrates decryption, parsing, sorting, deduplication, and output), utils.py (helpers for timestamp extraction, sequence number parsing, and state management), config.yaml (master_key and a list of service names), and README.md (describing the ChaCha20 encryption format and HKDF key derivation).",
+  "A compiled decryption binary /app/bin/decrypt_tool built from C code (source not provided) that decrypts a file given the derived key as a hex string on the command line. The binary has a hardcoded 12-byte all-zero nonce regardless of the per-file nonce prepended to the ciphertext.",
+  "Encrypted log files under /app/logs/<service>/ with nonces randomly generated per file, each containing timestamped, sequence-numbered log lines. The sample files produce garbled output when processed by the buggy binary.",
+  "A state file /app/state/processed.json that tracks processed sequence numbers per service. The first failed run stored garbage sequence numbers in this file.",
+  "A pre-existing garbled /app/output/combined.log from a previous run."
+ ],
+ "internal_hint": "The bug is in the binary: it ignores the per-file nonce and always uses a fixed 12-byte all-zero nonce, corrupting decryption of any file whose nonce is not all zeros. The fix requires replacing the subprocess call to the binary with a Python implementation using the `cryptography` library. Steps: 1) Examine the garbled output and the README to understand the format (4 bytes little-endian nonce length, then nonce, then ChaCha20 ciphertext). 2) Test the binary manually to confirm it produces garbage. 3) Hex-dump a .enc file to see the nonce prepended. 4) Implement correct decryption in Python: derive the per-service key via HKDF-SHA256 (no salt, info=service_name, length=32), read the nonce from the file, and use ChaCha20(key, nonce) to decrypt the remainder. 5) Delete the state file /app/state/processed.json so that the next run reprocesses every record from scratch. 6) Run the pipeline; verify output is readable and complete.",
+ "trap": "A shallow fix that adjusts decryption but does not clear the state file can cause missing records. The first broken run stored garbled sequence numbers (derived from incorrectly decrypted text) in the state. Even after fixing decryption, those bogus entries remain and may collide with real sequence numbers after correct decryption, leading the pipeline to skip valid records. Additionally, hardcoding key material or the set of services instead of reading config.yaml will fail the hidden tests that use a different master key and service list.",
+ "tests": [
+  "The verifier generates fresh encrypted log files using the documented format with random nonces, timestamps, and sequence numbers across multiple services, and places a new config.yaml with a distinct master key.",
+  "It runs the solver's modified `python /app/pipeline.py` and compares /app/output/combined.log byte-for-byte against the expected output produced by a reference implementation that correctly decrypts, sorts, and deduplicates.",
+  "The test is repeated with several random seeds to ensure robustness."
+ ],
+ "verifier_knob": {
+  "name": "num_log_files",
+  "value": "20",
+  "effect": "Increasing the number of encrypted log files (and total records) raises the chance that a partially correct solution (e.g., missing an edge case in deduplication, off-by-one in timestamp sorting, or incorrect nonce handling for variable-length nonces) manifests as a mismatch, making the task harder."
+ },
+ "expected_failure_modes": [
+  "Agent fixes decryption for the sample files but uses the sample's master key or service names directly, causing failure when the verifier supplies a different config.",
+  "Agent does not clear the state file, so the pipeline skips records whose sequence numbers accidentally match the previously stored garbled values.",
+  "Agent implements decryption but mis-handles the nonce format (e.g., assumes fixed nonce length instead of reading the length field) or uses an incorrect ChaCha20 variant.",
+  "Agent gets bogged down reverse-engineering the binary instead of writing a Python replacement, running out of time.",
+  "Agent fails to properly implement HKDF with the correct info parameter, producing wrong derived keys."
+ ],
+ "predicted_pass_rate": 0.4,
+ "difficulty": "hard",
+ "category": "devops",
+ "tags": [
+  "cryptography",
+  "reverse-engineering",
+  "python",
+  "logs",
+  "sre",
+  "incident-response"
+ ]
+}

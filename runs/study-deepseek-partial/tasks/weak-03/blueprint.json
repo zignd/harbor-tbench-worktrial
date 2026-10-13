@@ -1,0 +1,58 @@
+{
+ "slug": "keyspace-journal-replay-sql",
+ "title": "Reconstruct the shard map from the legacy journal",
+ "scenario": "A platform team is moving their sharded keyspace off an old monolith. The new control plane must rebuild the current shard map directly from the raw journal tables instead of calling the legacy `ksreplay` binary. The image ships that compiled binary (no source), a stale Python re-implementation of it, a month-old sample journal, and the surrounding control-plane code.",
+ "instruction_draft": "Hey - we're moving the keyspace journal off the old monolith next week and the new control plane has to rebuild the current shard map straight from the journal tables instead of shelling out to `ksreplay` like we do today. Can you write that query? Drop it at `/app/solution.sql` as a single statement - a SELECT or a WITH ... SELECT, nothing else, we run it through Python's sqlite3 `.execute()` so no temp tables and no multiple statements.\n\nIt reads three tables out of a journal database: `base_owner(shard_id, range_start, range_end)`, `txn_log(txn_id, commit_time, status)`, `op_log(op_id, txn_id, seq, local_time, range_start, range_end, shard_id)`. Ranges are half-open integers. The result must be exactly the rows the current `ksreplay` prints for that same database, same three columns in the same order: `range_start`, `range_end`, `shard_id`.\n\nThe DB under `/app/sample/` is a month-old snapshot and honestly too tidy to be useful - the journals we replay in prod are a lot messier, so please don't tune to it. The binary and the old control-plane code are both still in the image if you want to poke at them. Thanks!",
+ "requirements": [
+  "/app/solution.sql exists and contains exactly one SQL statement (SELECT or WITH ... SELECT) that Python sqlite3 execute() accepts against a journal database.",
+  "The result has exactly three columns in order: range_start (integer), range_end (integer), shard_id (text).",
+  "For any journal database containing base_owner, txn_log and op_log, the returned row set is identical to the rows the current ksreplay binary prints for that same database.",
+  "The query must be correct on fresh journals that differ from the shipped sample (different transaction mix, timing skew, boundary placement and shard-id reuse).",
+  "The query must be self-contained: it may not depend on the sample database, on files, on multiple statements, or on temp tables."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; apt-get install gcc and libsqlite3-dev with pinned versions; COPY the /app tree; RUN gcc -O2 -o /app/bin/ksreplay /build/ksreplay.c -lsqlite3 && rm -rf /build so the binary ships without its source and can only be probed.",
+  "/app/bin/ksreplay (compiled, ~350 lines of C, links libsqlite3): replays a journal DB and prints the canonical shard map as TSV. Its true semantics: only transactions with status 'committed' participate; ops are ordered by (txn.commit_time ASC, op.seq ASC, op.op_id ASC) and the latest covering op wins at each point; ranges are half-open; an op with range_start >= range_end paints nothing; the base_owner layer is the implicit earliest layer; the printed map is the maximal coalescing of consecutive elementary intervals that share the same shard_id.",
+  "/app/sample/journal.db: small tidy snapshot deliberately constructed so that the legacy append-order semantics and the real commit-order semantics produce identical output - a shallow solver who validates only here passes locally and fails at verify time. It does contain one visible adjacent same-owner merge so coalescing is discoverable.",
+  "/app/control-plane/ (~950 lines of plausible Python that is not the answer): journal/writer.py (journal append path, assigns local_time), journal/replay_v1.py (~140 lines, a stale re-implementation that orders by local_time then op_id and ignores txn_log.status, with docstrings claiming it matches ksreplay), router/shards.py (shard map and routing helpers), migrate/plan.py (cut-over planner), cli.py, tests/test_replay_v1.py.",
+  "/app/docs/keyspace.md: stale design doc that still calls append order the canonical replay order.",
+  "/app/CHANGELOG.md: one entry noting that in 2.4.0 journal replay moved to the transaction commit order (KSP-4412) without describing the rule.",
+  "/app/var/log/control-plane.log: operational log lines referencing KSP-4412 and a 'shard map drift on replay' incident.",
+  "/app/etc/control-plane.yaml: connection and keyspace config (uninvolved but plausible)."
+ ],
+ "internal_hint": "Not visible by reading: the authoritative ordering lives in txn_log.commit_time, not in op_log.local_time or op_log.op_id, and non-committed transactions are invisible to the replay - the shipped sample is built so those two readings agree, so the difference only shows when the system runs on real journal data. The solver has to run /app/bin/ksreplay against hand-built journal databases (skewed local_time vs commit_time, aborted/prepared txns, commit-time ties, zero-length and duplicate-shard ops, adjacent same-owner ranges) and diff outputs. The fix is then constructive: build a sweep over all boundaries contributed by base_owner plus committed ops, pick the winning op per elementary interval with ORDER BY commit_time DESC, seq DESC, op_id DESC LIMIT 1, fall back to base_owner, then coalesce maximal runs of equal shard_id into (range_start, range_end, shard_id) rows. Reading /app/control-plane/journal/replay_v1.py or docs/keyspace.md instead of observing leads to the wrong ordering key, wrong status filtering, and possibly no coalescing.",
+ "trap": "Porting /app/control-plane/journal/replay_v1.py (which docs/keyspace.md still calls canonical) reproduces ksreplay exactly on the shipped sample but diverges on fresh journals where a transaction's commit_time disagrees with its ops' local_time, where a transaction is 'aborted' or 'prepared', or where ops within a txn are not in local-time order. A second, quieter trap: emitting one row per elementary boundary interval instead of coalescing maximal runs of equal shard_id looks right (same coverage, no overlaps) yet fails the row-equality check.",
+ "tests": [
+  "test_solution_sql_shape: /app/solution.sql exists, contains one statement, and sqlite3 execute() returns three columns (range_start, range_end, shard_id) whose values coerce to int/int/str.",
+  "test_sample_journal: run the solver's SQL on /app/sample/journal.db and compare the sorted rows to the reference computation on that same DB (guards against nothing by itself; the sample is deliberately non-discriminating).",
+  "test_fuzz_commit_order: 40 freshly generated journals (deterministic seeds) where each op's local_time is shuffled relative to its transaction's commit_time and to its intra-txn seq; the solver's rows must equal the reference exactly.",
+  "test_fuzz_status_filtering: 30 generated journals with a heavy mix of 'aborted' and 'prepared' transactions whose ops would otherwise win; rows must equal the reference.",
+  "test_fuzz_coalescing_and_boundaries: 30 generated journals with a small shard-id pool, zero-length ops, duplicate repaints of the base owner, and ranges aligned exactly on existing boundaries; exercises maximal-run coalescing and half-open edge handling.",
+  "test_fuzz_ties_and_degenerate: 20 generated journals with equal (commit_time, seq) across transactions, ops that exactly tile a base shard, and single-op/single-txn degenerate cases.",
+  "test_broad_fuzz_randomized: 60 further journals generated with all features mixed at random; any single row mismatch fails the case and is reported with the first diverging row."
+ ],
+ "verifier_knob": {
+  "name": "generated_case_count_and_variety",
+  "value": "180 generated journals per run (60 broad-fuzz + 120 targeted edge-case families), each with its own deterministic seed",
+  "effect": "Raising the count and the per-case edge-case probability makes any semantics guess that happens to work on tidy data fail; lowering it toward the sample-only case makes a stale-ported implementation pass, so the knob directly controls whether shallow verification survives."
+ },
+ "expected_failure_modes": [
+  "Orders ops by op_log.local_time (or by op_id) instead of the transaction's commit_time, matching on the sample and failing on fresh journals with clock skew.",
+  "Includes 'aborted' or 'prepared' transactions, so a rolled-back op wins where the reference keeps the older owner.",
+  "Emits one row per elementary interval instead of coalescing adjacent intervals with the same shard_id, producing identical coverage with more rows.",
+  "Uses closed ranges (range_end inclusive) or mishandles zero-length ops, breaking only on inputs whose boundaries touch exactly.",
+  "Verifies only against /app/sample/journal.db, which is built so the wrong semantics also pass, and stops there.",
+  "Writes multiple statements or creates temp tables, so the single-statement execution path errors out instead of returning rows."
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "sql",
+ "tags": [
+  "sql",
+  "sqlite",
+  "sharding",
+  "black-box",
+  "migration",
+  "fuzz-equivalence"
+ ]
+}

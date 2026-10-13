@@ -1,0 +1,61 @@
+{
+ "slug": "radio-acl-table-compiler",
+ "title": "Compile abuse feeds into the radio's ACL table",
+ "scenario": "A two-site WISP runs cheap cellular radios whose source-address access table has exactly 64 slots and is matched longest-prefix-first. `/app/gateway` is the in-house bash toolchain (`bin/gwpolicy` plus `lib/feed.sh`, `lib/quorum.sh`, `lib/prefix.sh`, `lib/device.sh`) that turns the operator's hard-block list, three reputation feeds and an allowlist into that table; it is a real git repo with history, docs for the radio's config format, and per-site `sites/*/captures/` logs of what each radio actually decided on sampled traffic. The compiled tables no longer agree with the field captures, and the tool's own classifier disagrees with the tables it compiles.",
+ "instruction_draft": "Our two gateway sites compile their abuse feeds with the `gwpolicy` toolchain in /app/gateway, and what it pushes to the radios no longer matches what the sites are actually enforcing. An address is blocked when the operator's hard-block list contains it or at least two of the three reputation feeds contain it, and it is never blocked when the allowlist contains it; make `gwpolicy` block exactly those addresses, both in `gwpolicy classify` and in the table `gwpolicy compile` writes, and keep the compiled table inside the radio's 64 slots. `sites/*/captures/` records what each site's radio actually decided on sampled traffic.",
+ "requirements": [
+  "`gwpolicy classify --site <dir>` reads addresses (one per line) on stdin and prints one `<address> <ACCEPT|DROP>` line per input, equal to the policy decision.",
+  "`gwpolicy compile --site <dir> --out <file>` writes a radio config in the documented format (one `default <accept|drop>` line plus `entry <cidr> <accept|drop>` lines) whose longest-prefix-match evaluation equals the policy decision for every address in 0.0.0.0-255.255.255.255.",
+  "The compiled config contains at most 64 `entry` lines.",
+  "Policy: an address is blocked iff it is in `hard.block`, or it is in at least two of `feeds/r1.rep`..`r3.rep`, unless it is in `allowlist` (allowlist always wins).",
+  "Both existing sites compile within budget and reproduce their `captures/` decisions exactly, and both `compile` and `classify` agree with each other.",
+  "Compiling the same site twice produces byte-identical output."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm with pinned apt packages (git, gawk, make) and no network access; python3 only used for the provided device simulator.",
+  "/app/gateway is a git repository with ~9 fixed-date commits (feed parser, quorum rule, allowlist support, budget check, capture import, docs) and roughly 1200 lines across bin/, lib/, tools/, docs/, tests/ and site data.",
+  "bin/gwpolicy (bash) exposes `classify --site DIR` and `compile --site DIR --out FILE`; bin/gwpush, tools/feedsync, tools/radiocfg and tests/run.sh are plausible, correct, uninvolved code that also ships.",
+  "docs/device.md documents the radio config grammar, longest-prefix-match semantics, the single `default` action and the 64-entry limit; docs/feeds.md documents CIDR and `a.b.c.d-a.b.c.d` inclusive range syntax (comments with #).",
+  "tools/devsim (python) is a correct LPM evaluator/validator kept for convenience; it is not the verifier.",
+  "Planted problem 1 (lib/quorum.sh): the interval sweep labels feed intervals as half-open `[lo, hi)` (event at `lo` +1, at `hi` -1) although lib/feed.sh emits inclusive `lo..hi`, so the last address of every reputation interval is never counted toward the quorum, while the hard-list path is inclusive.",
+  "Planted problem 2 (lib/device.sh + lib/prefix.sh): the emitter blanket-converts every interval end with `hi=$((hi-1))` to 'compensate' for the sweep convention, so hard-list intervals lose their last address in the table, and the block-size loop picks the largest power of two <= remaining length without checking that `lo` is aligned to that size, emitting CIDRs that cover addresses below `lo`.",
+  "Planted problem 3 (lib/device.sh): `default accept` is hardcoded and the entry counter silently truncates the entry list at 64 with a stderr warning and exit status 0.",
+  "sites/site-a: small block list whose captures expose the emitter's misaligned CIDRs and a few hard-block interval endpoints; sites/site-b: feeds that block nearly the whole space, whose correct table needs `default drop` plus ~20-40 accept entries and whose v1 run truncates to 64 drop entries.",
+  "No failing repro, no diff tool and no expected-output file is shipped: the solver has to run the tool, compare with the captures and design the missing cases."
+ ],
+ "internal_hint": "Difficulty is not-readable-by-inspection plus substantial construction. The tool is internally inconsistent about interval conventions: lib/feed.sh yields inclusive [lo,hi], lib/quorum.sh consumes them as half-open, and lib/device.sh papers over the mismatch with a blanket hi-1. This only shows on data: the classifier is wrong exactly at addresses that are the last address of one reputation interval and inside another feed's interval, and the table is wrong exactly at the last address of every hard-block interval. Either symptom can be found by running gwpolicy on sites/site-a and diffing its output (and its compiled table, evaluated with tools/devsim) against sites/site-a/captures/*.log; neither is visible from reading one file, and fixing only the sweep makes the emitter overshoot on every interval, while removing only the hi-1 makes the quorum intervals one address short, so the two must be fixed together with one convention. Separately, lib/prefix.sh's block-size choice ignores alignment (classic interval-to-prefix bug), producing CIDRs that cover addresses below the interval start; the canonical greedy is 'take the largest block whose size divides lo and fits in the remaining length'. Finally site-b shows the cardinality constraint: with almost the whole space blocked, the drop-set decomposition needs >64 entries, so the tool must choose the `default` action dynamically and emit the accept-set decomposition of the complement (or the drop-set decomposition), whichever fits, and emit exactly the canonical maximal-prefix decomposition. The reference solution investigates first: run compile+classify on both sites, diff both channels against captures, localize the mismatching addresses, unify the interval convention, rewrite prefix decomposition with alignment, add the default-choice search and the budget check, then re-diff both sites and re-verify with self-made adversarial sites (touching intervals, /0, /32, intervals ending at 255.255.255.255, allowlist holes).",
+ "trap": "A solver who fixes only what the provided captures show, or who checks only one channel, passes their own tests and fails the hidden ones: fixing the emitter to match the captures leaves `classify` wrong at quorum endpoints that the sampling never hit; fixing only the interval convention breaks the other channel; rewriting the emitter with a hardcoded `default accept` compiles site-a but silently truncates the fresh near-total-block policies at 64 entries; and a prefix decomposition that ignores address alignment looks right on power-of-two-length intervals and over-blocks on every other one.",
+ "tests": [
+  "Generate 4 fresh policy sites deterministically (seeded RNG in the verifier, not in the container): (1) small fragmented block list, (2) feeds blocking nearly the whole space with a handful of exempt prefixes, (3) heavy allowlist holes plus feed intervals that meet exactly at endpoints, (4) intervals starting at 0.0.0.0, ending at 255.255.255.255, /0, /32, and length-not-power-of-two runs.",
+  "For each fresh site build a probe set of ~700 addresses: every interval endpoint, endpoint +/- 1, quorum-boundary addresses where two feeds meet or abut, allowlist endpoints, 0.0.0.0, 255.255.255.255, and seeded random addresses; compute expected decisions from the policy definition.",
+  "Run `gwpolicy compile --site <fresh> --out <cfg>` under a generous timeout, parse <cfg> with the verifier's own LPM evaluator (not the container's tools/devsim), and require the decision to equal the expected decision for all 100% of probes; require entry count <= 64.",
+  "Run `gwpolicy classify --site <fresh>` on the same probe list and require an exact match on 100% of probes (all must-drop addresses dropped, all must-keep addresses kept).",
+  "Require compile and classify to agree with each other on all probes for every fresh site.",
+  "Re-run on sites/site-a and sites/site-b: compiled table within 64 entries and matching captures/*.log exactly, classify matching the same captures.",
+  "Run compile twice per site and require identical output files (determinism)."
+ ],
+ "verifier_knob": {
+  "name": "fresh_policy_corpus_size_and_coverage",
+  "value": "4 generated sites x ~700 probes (~2800 hidden addresses), plus the 2 shipped sites",
+  "effect": "Raising the number/coverage of generated sites (more near-total-block policies needing the default flip, more endpoint-touching feed pairs, more non-power-of-two interval runs) makes partial fixes fail more often; lowering it to one small-block site lets a default-accept, alignment-blind implementation pass."
+ },
+ "expected_failure_modes": [
+  "Verifies against the shipped captures only, fixes the emitter to match site-a, and never notices the classifier's quorum-endpoint error.",
+  "Fixes the interval convention in one module and introduces the opposite one-address error in the other channel, then stops after one channel matches.",
+  "Rewrites prefix decomposition without alignment checking; passes on power-of-two-length intervals and over-blocks on fresh non-aligned ones.",
+  "Keeps `default accept` hardcoded, compiles fresh near-total-block policies, and ships a table truncated at 64 entries (the tool warns but exits 0, so nothing looks broken).",
+  "Implements classify correctly but emits a table built from a different (unmerged) interval list, so the two channels disagree.",
+  "Uses the container's tools/devsim as ground truth and never checks the table against the policy, or overfits to the two shipped sites' address sampling."
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "networking",
+ "tags": [
+  "networking",
+  "bash",
+  "interval-algebra",
+  "access-control",
+  "git-history",
+  "adversarial-corpus"
+ ]
+}

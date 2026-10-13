@@ -1,0 +1,49 @@
+{
+ "slug": "rust-trade-pnl-timeout",
+ "title": "Fix Slow and Inaccurate Trade P&L Processor",
+ "scenario": "A financial analyst runs a Rust CLI tool that computes daily profit/loss and 30-day moving averages from a CSV of trades. The tool takes too long on monthly files and produces slightly inaccurate totals that don't match accounting. The environment contains the Rust source, sample trade data, and a pre-cached dependency tree; the agent must refactor the slow O(n\u00b2) algorithm and fix the floating-point precision bug so the output exactly matches the expected values and finishes within 30 seconds on large hidden inputs.",
+ "instruction_draft": "```\n$ cargo run --release -- data/january.csv\nProcessing 24831 trades...\nKilled\n```\n\nI need the trade analyzer to process a full month of trades (up to 200k rows) in under 30 seconds and produce exact daily P&L totals and 30-day moving averages. The output must match our accounting system to the cent. The sample file `data/sample.csv` works but the numbers are slightly off and it fails on the big file. Fix it.",
+ "requirements": [
+  "The `/app/trade_analyzer` program must run on an arbitrary CSV file passed as argument (format: date, symbol, quantity, price, with header).",
+  "It must output a CSV to stdout with columns: date, total_pnl, moving_avg_30d, where monetary values are decimal with exactly two decimal places.",
+  "The output must exactly match the expected values (correct integer-cent arithmetic) on hidden input files of up to 200k records.",
+  "The program must complete within 30 seconds of wall-clock time on a 200k-record file on the container (1 vCPU, 2 GB RAM)."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm, installs Rust stable via rustup with pinned components, sets up `/app/trade_analyzer` with Cargo.toml and Cargo.lock, pre-builds to cache all dependencies (chrono, csv, serde, rust_decimal, itertools) so `cargo build --release` works offline.",
+  "Source file `src/main.rs` contains a naive implementation that (a) computes daily total P&L and 30-day moving average using f64 arithmetic, and (b) computes the moving average by re-summing all trades in the window for each date (O(n\u00b2) worst-case). The moving average correctly handles partial windows at the data boundaries (divides by the actual number of available days in the window).",
+  "Sample data file `data/sample.csv` has 200 trades over 15 days; small enough that both bugs are masked: it runs in < 1 second and the f64 errors are negligible (within 0.01).",
+  "No other source files or configuration; the project compiles and runs with `cargo run --release -- <file>`."
+ ],
+ "internal_hint": "The root causes: (1) The moving-average loop re-scans trades for every date, making it O(dates \u00d7 window \u00d7 trades). For 200k trades over hundreds of days this takes minutes even in release mode, causing the timeout. (2) P&L values are accumulated as f64, losing exact cents for large quantities and prices; the accounting match fails. A skilled engineer will first generate a larger synthetic file to confirm the quadratic blowup, then refactor to collect daily totals into a BTreeMap once, then compute a sliding window sum in a single pass over sorted dates. They will also switch arithmetic to integer cents (parse price string, multiply by 100, sum as i64) or use the pre-imported `rust_decimal::Decimal` for exact fixed-point math. The partial-window handling must be preserved (i.e. for the first 29 days the moving average uses however many days are available).",
+ "trap": "A naive solver will profile, spot the slow loop, refactor it, test on the tiny sample, see it passes the time limit and produces output that looks plausible, and stop. The hidden tests will then fail because the output still uses f64 and the accumulated rounding errors cause cent-level mismatches on large-value trades. Conversely, a solver who only fixes precision will still timeout. An incorrect sliding-window implementation that always divides by 30 (even for early partial windows) will also fail edge cases.",
+ "tests": [
+  "Hidden test 1 (correctness, 5000 trades): trades spanning 90 days with varied quantities and prices; verifier checks that every date's total_pnl and moving_avg_30d exactly match a reference computed with integer-cent arithmetic, including partial windows at the start.",
+  "Hidden test 2 (performance, 200k trades): randomly generated trades over 180 days; runtime measured with `/usr/bin/time -f %e cargo run --release -- <file>` must be \u2264 30 seconds.",
+  "Hidden test 3 (edge case, single day): one date with 10 trades; moving_avg_30d must equal total_pnl for that day.",
+  "Hidden test 4 (large values): trades with prices like $10,000,000.01 and large quantities; f64 would lose cents; verifier ensures exact match."
+ ],
+ "verifier_knob": {
+  "name": "time_limit_seconds",
+  "value": "30",
+  "effect": "Lowering the limit (e.g. 15 s) makes the performance constraint tighter and increases difficulty; raising it (e.g. 60 s) can let through partially optimised solutions that are still O(n\u00b2) on smaller hidden data."
+ },
+ "expected_failure_modes": [
+  "Solver only fixes the timeout by compiling with `--release` and adding simple caching but leaves the O(n\u00b2) re-scan, so still times out on 200k trades.",
+  "Solver refactors the moving average correctly but neglects to change f64 arithmetic; hidden tests fail on exact-match requirement.",
+  "Solver uses a fixed window divisor of 30 instead of the actual number of available days, failing edge cases with partial windows.",
+  "Solver adds a new crate (e.g. `bigdecimal`) that is not cached, causing a build failure off-line.",
+  "Solver mistakenly parallelises with threads, exceeding the single-CPU assumption or introducing non-determinism."
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "rust",
+  "performance",
+  "numeric-precision",
+  "algorithm-refactoring",
+  "timeout",
+  "financial-data"
+ ]
+}

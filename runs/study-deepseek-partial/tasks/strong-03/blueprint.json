@@ -1,0 +1,49 @@
+{
+ "slug": "shard-allocator-sql-migration",
+ "title": "SQL-based Shard Allocator Replacement",
+ "scenario": "A platform team used a legacy compiled binary (`allocator`) that reads query statistics (load, timestamp) and assigns each query to one of three database shards to balance total load. The team is migrating to a pure-SQL infrastructure and needs an exact replacement. The environment provides the opaque binary, a sample CSV with no load ties, a SQLite setup script, and a self-test verifier that generates fresh inputs and compares outputs. The solver must discover the binary's exact assignment logic (including tie-breaking) and implement it as a SQL script that works correctly on any input.",
+ "instruction_draft": "Your colleague messages: \"Hey, we're retiring that old allocator binary next sprint. We need a drop-in SQL replacement that behaves exactly the same for any input. The binary is at /usr/local/bin/allocator, takes a CSV like /app/sample_data.csv, and writes assignments to stdout. I've set up a SQLite table via /app/setup.sql. Can you write a SQL script /app/solution/allocate.sql that produces exactly the same rows when run? You can test with /app/tests/verify.py. Thanks!\"",
+ "requirements": [
+  "The script /app/solution/allocate.sql must output one row per input query containing the same (query_id, assigned_shard) pairs as the binary, regardless of input data.",
+  "The output must be deterministic, matching the reference assignment for all valid inputs (including zero queries, duplicate loads, large loads, etc.).",
+  "The solution must not rely on external resources or manual steps; it must be fully automated via the SQL script."
+ ],
+ "environment": [
+  "Docker image python:3.13-slim-bookworm with gcc installed; build a C allocator binary from source, then remove source and build tools.",
+  "Place the compiled binary at /usr/local/bin/allocator.",
+  "Create /app/sample_data.csv with 7-8 queries where all loads are distinct, no ties, to hide tie-breaking logic.",
+  "Create /app/setup.sql that creates a table `queries(query_id INTEGER, load INTEGER, timestamp INTEGER)` and imports the sample CSV (via .import command).",
+  "Provide /app/README.md with minimal usage: only that allocator is a legacy tool, run with `allocator input.csv`, no source available.",
+  "Create /app/tests/verify.py that reads /app/solution/allocate.sql, generates random test input CSV files (with various load distributions, duplicate loads, zero loads, many queries, empty input), runs the binary and the SQL query, and compares results. All test logic is deterministic.",
+  "Include a few extraneous files like old configuration snippets and a `migration_notes.txt` to provide a realistic but unmotivated environment of ~1200 lines."
+ ],
+ "internal_hint": "The binary uses a greedy assignment: sort queries by (load DESC, timestamp ASC, query_id ASC) then assign each to the shard (0-2) with the current smallest total load, breaking ties by smaller shard index. A naive soltion that sorts only by load and greedily assigns will produce correct output for sample (no tie cases) but fail when duplicate loads appear. To discover the complete sorting rule, the solver must create input CSVs with duplicate loads and varying timestamps, run the binary, and observe assignment order. The SQL replacement can be implemented using a recursive CTE that simulates the greedy steps: maintain cumulative loads per shard, process rows in the correct order, and assign each query to the shard with the minimum load (using MIN() or ROW_NUMBER with a CASE).",
+ "trap": "A partial solution that sorts only by `load DESC` and applies a naive greedy scan will pass the supplied sample (all loads distinct) but will mis-order equal-load queries, causing incorrect assignments when the verifier generates inputs with ties. Another trap: not updating cumulative loads correctly after each assignment, or treating shard loads independently rather than aggregate minimum.",
+ "tests": [
+  "Run verify.py which generates a large number (default 50, knob) of randomized CSV inputs covering: no queries, single query, all loads equal, many duplicate loads, varied timestamps, large load values, exact capacity spills, and random distributions.",
+  "For each test case, load the CSV into a fresh SQLite database using setup.sql, execute the solution script, collect the result set, and compare (query_id, assigned_shard) pairs with the binary's output on the same CSV. Any mismatch is a failure.",
+  "The verifier also checks that the SQL runs without errors and that the output contains exactly the query_ids from input."
+ ],
+ "verifier_knob": {
+  "name": "num_test_cases",
+  "value": "50",
+  "effect": "Increasing the number of random input cases makes the test suite more thorough, decreasing the chance that a partially correct solution (e.g., missing a specific tie-break edge) passes. Lower values reduce difficulty."
+ },
+ "expected_failure_modes": [
+  "Agent tests only the provided sample, assumes a simple load-descending sort is enough, and fails on hidden ties.",
+  "Agent implements the greedy step incorrectly (e.g., round-robin instead of picking minimum current load shard) and fails under varying loads.",
+  "Agent fails to handle edge cases like empty input (output should be header only) or a single query, causing a crash or missing row.",
+  "Agent writes a recursive CTE that exceeds recursion depth on large inputs or has a subtle logic bug that only appears on specific load distributions."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "data-engineering",
+ "tags": [
+  "sql",
+  "reverse-engineering",
+  "load-balancing",
+  "edge-cases",
+  "recursive-cte",
+  "devops"
+ ]
+}

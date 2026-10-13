@@ -1,0 +1,52 @@
+{
+ "slug": "qc-validator-config-reconstruction",
+ "title": "Reconstruct QC validator config by black-box experimentation",
+ "scenario": "A biotech lab uses a compiled QC validator (`/app/bin/qc_validator`) to approve experiment runs stored in a SQLite database. The validator's config file was lost after a crash. A colleague provides a labeled sample of past experiment records (`/app/known.csv`) and asks you to rebuild the config and a Bash pipeline that extracts runs from the DB, feeds them to the validator, and outputs rejected run IDs. The validator binary is completely opaque; its rule syntax, semantics, and built-in hard constraints must be deduced by running it with experimental inputs.",
+ "instruction_draft": "Hey, our lab's QC validator `/app/bin/qc_validator` lost its config file. It reads experiment records on stdin (pipe-delimited, 8 fields: run_id|sample_id|meas_a|meas_b|temp|press|operator|notes) and writes a PASS or FAIL line per record. We have a labeled sample at `/app/known.csv` with rows and a 'pass'/'fail' label column. Can you figure out the rules, put the config at `/app/validate.cfg`, and write a script `/app/app/run_qc.sh` that queries `/app/lab_runs.db`, outputs all runs in the right format, runs the validator with your config, and writes the list of FAILed run_ids to `/app/rejects.txt`? The tool's verdicts must match the known labels exactly, and the pipeline must handle future runs correctly.",
+ "requirements": [
+  "The script `/app/app/run_qc.sh` must extract all experiment runs from `/app/lab_runs.db` and pipe them in the expected pipe-delimited 8-field format to `/app/bin/qc_validator`, using the config `/app/validate.cfg`.",
+  "The validator must correctly classify every record in `/app/known.csv` (the produced passes/fails must match the provided pass/fail labels).",
+  "The script must write the list of failed run_ids (one per line, no extra text) to `/app/rejects.txt` based on the validator's output.",
+  "When run against a hidden corpus of experiment runs with edge cases not present in the known sample, the pipeline must produce exactly the same rejects.txt as the oracle reference solution."
+ ],
+ "environment": [
+  "Docker image `python:3.13-slim-bookworm` with `sqlite3`, `gcc`, `make` installed (gcc/make only for building test infrastructure, not exposed to solver).",
+  "Pre-compiled binary `/app/bin/qc_validator` (statically linked) that reads a config file and records from stdin, applying hardcoded constraints and config-defined rules.",
+  "SQLite database `/app/lab_runs.db` with a table `runs` containing columns: run_id (TEXT), sample_id (TEXT), meas_a (REAL), meas_b (REAL), temp (REAL), press (REAL), operator (TEXT), notes (TEXT). Populated with ~500 diverse experimental runs.",
+  "Labeled sample `/app/known.csv` with header: run_id,sample_id,meas_a,meas_b,temp,press,operator,notes,label. Contains 30 examples covering pass/fail for various rule violations and edge cases.",
+  "Hidden verification corpus: a separate SQLite database generated at verify time with 200\u2013300 records containing boundary values, duplicates, regex corner cases, negative values, blanks, and other tricky data.",
+  "No source code or documentation for the binary is provided."
+ ],
+ "internal_hint": "The binary `/app/bin/qc_validator` has built-in hardcoded rules: (1) any record with `meas_a < 0` always fails; (2) any record with an empty `operator` always fails; (3) records with `sample_id == 'BLANK'` are silently skipped (no output). The config file uses one rule per line, space-delimited. Supported rule types: `REQUIRE field <N>` (field non-empty), `RANGE field <N> <min> <max>` (numeric inclusive), `CROSS field <A> <op> field <B>` where op is `lt`, `le`, `gt`, `ge`, `eq`, `ne` (compare numeric values), `REGEX field <N> <pattern>` (POSIX ERE, pattern is the rest of the line), `UNIQUE field <N>` (values must be unique across all records). The binary prints usage on `--help` but does not explain semantics; an invalid rule line is silently ignored, making semantics deduction necessary via experimentation. To reconstruct the config, the solver must: (a) run the binary with an empty config on subsets of the known sample to identify the built-in constraints; (b) iteratively add candidate rules and observe changes in classification; (c) deduce the exact syntax (field indices are 1-based, regex flavor is POSIX ERE, range endpoints are inclusive, UNIQUE is across-all-records, etc.) by targeted trials; (d) craft a config file that together with the built-in rules reproduces the known labels exactly. The bash script must use `sqlite3` to query runs and `awk` or `sed` to ensure pipe-delimited output without headers. The hidden corpus tests boundary conditions: e.g., temp exactly at the range limit, regex patterns with special characters, duplicate sample_ids, empty fields not covered by hardcoded rules, meas_b just below meas_a, etc.",
+ "trap": "A naive solver may test their config only against the 30 known samples and stop. The hidden corpus includes edge cases like: (i) values exactly at range boundaries (the solver must verify whether the binary uses inclusive comparisons by testing with a boundary value); (ii) regex patterns that differ between Python's `re` and POSIX ERE (e.g., `\\w` vs `[[:word:]]`); (iii) a record with `meas_b` equal to `meas_a` when the config has `CROSS field 2 lt field 1` (the solver must check if `lt` is strict); (iv) duplicate sample_ids where the solver forgot to add a UNIQUE rule. If the solver's config misses any such subtlety, some hidden records will be misclassified and the `rejects.txt` will not match the oracle.",
+ "tests": [
+  "Test 1: Run `/app/app/run_qc.sh` and verify that the produced `/app/rejects.txt` matches the expected set of rejected run_ids from the known database (the script must extract all runs from `lab_runs.db`, pipe them correctly, and use the solver's `/app/validate.cfg`).",
+  "Test 2: Verify that the config causes the validator to exactly match the pass/fail labels in `/app/known.csv` when the known records are fed individually.",
+  "Test 3: Main adversarial test: replace `lab_runs.db` with a hidden verification database containing 250 records with edge cases (boundary values, special characters in notes for regex, duplicate sample_ids, negative meas_a, empty operator, BLANK sample, cross-field near-equal values). Run the script and compare `rejects.txt` with the oracle generated by the reference config + script. All lines must match, and no extra files or stdout artifacts are present.",
+  "Test 4: Check that the script works when the hidden DB is a different size and that it handles empty result (no rejects) correctly, writing an empty file."
+ ],
+ "verifier_knob": {
+  "name": "corpus_size_and_coverage",
+  "value": "250",
+  "effect": "Increasing the number of hidden records and the proportion of tricky boundary cases (e.g., adding more regex corner cases, more combinatorial interactions of rules) raises difficulty because the solver must reverse-engineer the binary's semantics more thoroughly to cover all patterns."
+ },
+ "expected_failure_modes": [
+  "Agent builds a config that matches the 30 known samples but fails on hidden boundary cases because it did not verify endpoint inclusiveness, regex dialect, or strictness of comparison operators.",
+  "Agent fails to discover the hardcoded 'BLANK' sample skipping, leading the script to over-reject or under-reject when that value appears in hidden records.",
+  "Agent incorrectly infers column order or field indexing (1-based vs 0-based) and inserts misaligned rules, causing misclassifications on edge records.",
+  "Agent writes the bash script with formatting errors (e.g., includes a header line, uses comma delimiters) causing the validator to parse wrong fields and misclassify.",
+  "Agent runs out of time because brute-force search over rule combinations without systematic hypothesis testing leads to many trials without converging to a full correct config before the hour expires.",
+  "Agent overlooks the UNIQUE rule because only one duplicate appears in the known sample and they do not test for it, leading to the hidden duplicate not being rejected."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "scientific-computing",
+ "tags": [
+  "reverse-engineering",
+  "configuration",
+  "black-box-testing",
+  "bash",
+  "sqlite",
+  "validation"
+ ]
+}

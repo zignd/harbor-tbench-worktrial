@@ -1,0 +1,67 @@
+{
+ "slug": "assay-run-billing-recon",
+ "title": "Rebuild the lab run reconciliation gate",
+ "scenario": "Kelvin Analytics runs a contract mass-spec lab. Instruments emit billable 'run records' as TSV batches; before invoicing, finance-ops classifies every run as clean (bill it) or dirty (kick it to a queue). The nightly reconciler at /app/reconcile.sh was lost when the ops box was rebuilt. The container holds the lab SQLite database (instruments, calibrations, operators, declared payload keys), the vendor's compiled signature tool /app/bin/assaykey, a documented-but-quirky payload serialisation, an adjudicated multi-quarter history of accepted and rejected runs under /app/archive, a small worked sample under /app/sample, and a stale policy overlay at /app/etc/waivers.conf.",
+ "instruction_draft": "Hey - our nightly run-recon job vanished when the box was rebuilt and I need it back before Friday's billing close. It lived at /app/reconcile.sh, gets called as `bash /app/reconcile.sh <corpus.tsv> <outdir>`, and splits a batch into <outdir>/accepted.tsv and <outdir>/rejected.tsv (the original lines, input order, no header). A run only bills if the instrument is active, the covering calibration window (UTC, half-open) contains the run converted from the instrument's local clock, the run fits the instrument's max duration, the operator's licence still covers that class, the payload matches the format notes, and the declared assay signature agrees with the vendor tool /app/bin/assaykey within the covering calibration's drift allowance - anything else, plus any run id that shows up more than once in the batch, goes to rejected. /app/etc/waivers.conf has drifted out of date; the adjudicated history under /app/archive is the ground truth for what is grandfathered in. There is a small worked sample in /app/sample you can sanity-check against, and the runbook under /app/docs has the details.",
+ "requirements": [
+  "/app/reconcile.sh runs as `bash /app/reconcile.sh <corpus.tsv> <outdir>`, exits 0, and writes <outdir>/accepted.tsv and <outdir>/rejected.tsv containing the exact input data lines (no header, no reason columns) in input order.",
+  "Every input data line lands in exactly one output file; blank lines are ignored rather than classified.",
+  "Well-formedness: exactly 7 tab-separated fields; run_id matching ^[A-Z0-9]{4}-[0-9]{6}$; start/end matching YYYY-MM-DDTHH:MM:SS and denoting real calendar instants with end >= start; sig matching ^[0-9]+$ (no sign, no whitespace); payload parsing cleanly under the documented escape rules with unique, non-empty keys and non-empty values, and no literal ';' or '=' in an unescaped value.",
+  "The payload must carry exactly the key set declared for that instrument in the payload_keys table; keys declared as numeric must hold plain decimal values (optional leading '-', optional fractional part of at most six digits, no exponent).",
+  "The instrument must exist in the DB and be active, unless an allow-inactive waiver covers it.",
+  "Exactly one calibration row must cover the run, where the run start converted to UTC by the instrument's tz_offset_min satisfies valid_from <= t_utc < valid_to (from inclusive, to exclusive); zero or two-or-more covering rows is a rejection.",
+  "Run duration (end - start) must be <= instruments.max_run_s, unless an extend-max-run waiver for that instrument is at least as large as the duration.",
+  "The operator must exist, the run's start date must be <= the operator's license_expiry, and the instrument's class must appear in the operator's class_auth list, unless a grant-class waiver covers that operator/class pair.",
+  "The declared sig must satisfy |declared - reassayed| * 1000000 <= drift_ppm * reassayed, where reassayed is the integer printed by /app/bin/assaykey for the covering calibration and the record's payload, and drift_ppm comes from that calibration row.",
+  "If a run_id appears more than once anywhere in the corpus, every record with that run_id is rejected, including byte-identical duplicates.",
+  "The effective waiver policy must match the adjudicated archive: entries in /app/etc/waivers.conf that the archive contradicts are not honoured, and grandfathered cases the archive shows as accepted must be honoured on fresh corpora.",
+  "An empty corpus produces two empty output files and exit code 0."
+ ],
+ "environment": [
+  "Dockerfile: `FROM python:3.13-slim-bookworm AS build` compiles /src/assaykey.c with `gcc -O2 -static` (gcc + libc6-dev installed only in the build stage); the final stage is `FROM python:3.13-slim-bookworm` with pinned apt packages (sqlite3, gawk, coreutils) and COPYs the binary plus /app. The C source is never present in the final image.",
+  "/app/bin/assaykey: opaque ELF, `usage: assaykey <cal_id> <instrument_id>`, reads one payload line ('k=v;k=v;...') on stdin, prints a non-negative 64-bit signature to stdout, non-zero exit on unknown calibration/instrument. It canonicalises keys (ASCII sort, whitespace trim) before hashing, so semantically equal payloads give equal signatures; it does not validate the key set or numeric kinds.",
+  "/app/lab.sqlite: tables instruments(instrument_id, model, class, max_run_s, tz_offset_min, active), calibrations(cal_id, instrument_id, valid_from, valid_to, drift_ppm, ref_sig), operators(operator_id, name, class_auth, license_expiry), payload_keys(instrument_id, key, kind). ~40 instruments (one with tz_offset_min = 345, several inactive, two calibration windows that overlap in Q1 and one zero-length window), ~60 operators, ~150 declared payload keys.",
+  "/app/docs/recon_runbook.md: the record TSV layout, the incoming payload grammar (`key:value` pairs joined by `|`, with \\| \\: \\\\ escapes, values may not unescaped-contain ';' or '='), the local-vs-UTC clock convention, the drift-allowance prose, and the history of the overlay file. This is the only prose spec; it is deliberately dated and slightly out of step with the newest archive quarter.",
+  "/app/archive/{2024-Q3,2024-Q4,2025-Q1,2025-Q2}/{accepted,rejected}.tsv: ~1400 accepted and ~900 rejected records in the identical record format, generated from the true policy including the current waiver set. Several accepted records violate a base rule and therefore pin the waivers; several rejected records violate only a stale waiver entry in the shipped overlay.",
+  "/app/etc/waivers.conf: the previous overlay in a small documented DSL (grant-class, extend-max-run, allow-inactive) - it contains some grandfathered entries that the archive contradicts and is missing the newest ones.",
+  "/app/sample/corpus.tsv + /app/sample/expected.tsv: ~40 easy records covering only the happy path; passing it proves almost nothing.",
+  "/app/incoming/2025-06-02.tsv: an unlabelled fresh batch for ad-hoc testing.",
+  "Uninvolved but present: /app/etl/ingest_instruments.py (~200 lines), /app/ops/invoice_export.sh (~80 lines), /app/etc/instruments_legacy.map, /app/README.md."
+ ],
+ "internal_hint": "The difficulty is not in reading source (there is none for the load-bearing tool) but in reconstructing the policy from three interacting stores plus one black box. (1) Characterise /app/bin/assaykey by experiment: it canonicalises payloads, so the solver's job is faithful de-escaping of the incoming '|'/' :' grammar - the signature check is the oracle that punishes a naive `tr '|' ';'`. (2) Pin the drift comparison (ppm of the reassayed value, integer, inclusive) using the archive records that sit exactly on and exactly one unit past the allowance. (3) Recover the waivers by scanning the archive for records that violate a base rule yet were accepted, and by scanning for records that only the shipped waivers.conf would accept but which the archive rejected; both directions are needed, and the effective policy is archive-overrides-file. (4) Watch the data-dependent traps: instrument-local to UTC conversion for the 345-minute offset instrument, half-open calibration windows with one overlap and one zero-length window, licence expiry compared against the start date, and payload key-set/numeric-kind rules that are independent of the signature check. A deterministic bash reference walks the corpus once, caches sqlite lookups in associative arrays, and shells out to assaykey per record.",
+ "trap": "The signature check alone looks like full validation, but several malicious records carry a correctly recomputed signature over an undeclared extra key or a non-numeric value in a numeric key - only the payload key-set/kind rule rejects them. Symmetrically, records whose payload is escaped correctly and whose signature matches are still dirty if the calibration window boundary is treated as inclusive or the tz offset is ignored. A solver that trusts /app/etc/waivers.conf verbatim passes the sample and the happy path while producing false accepts on grandfathered-but-revoked cases and false rejects on the newest ones.",
+ "tests": [
+  "sample_partition: run reconcile.sh on /app/sample/corpus.tsv and require an exact match to /app/sample/expected.tsv (order-sensitive).",
+  "hidden_benign_all_accepted: a verify-time generated corpus of ~400 clean runs, including escaped-value payloads, values in alternate decimal spellings, the 345-minute-offset instrument, calibration windows entered exactly at valid_from, duration exactly at max_run_s, licence expiring on the run date, waiver-covered operators/instruments, and drift deltas exactly at the allowance - every line must appear in accepted.tsv and none in rejected.tsv.",
+  "hidden_malicious_all_rejected: a verify-time generated corpus of ~400 dirty runs - tampered signatures one unit past the allowance, correctly-resigned payloads with an undeclared key, numeric keys holding non-numeric text, inactive instruments without a waiver, revoked grant-class operators, runs starting exactly at valid_to, overlapping calibrations, over-long durations, expired licences, unknown instruments/operators - every line must appear in rejected.tsv.",
+  "boundary_and_malformed: hand-written records for half-open window edges, both tz conventions, empty/zero-length calibration windows, sig with leading zeros, 6- and 8-field lines, duplicate keys, unterminated escapes, literal ';'/'=' in values, plus a header line, a trailing blank line and an empty file, checked for exact partitioning and exit code 0.",
+  "duplicate_run_ids: a corpus where one run_id appears twice (once byte-identical, once altered) and neighbouring unique run_ids are valid; all copies must be rejected and the neighbours kept.",
+  "determinism_repeat: the same hidden corpus run twice yields byte-identical outputs, and accepted.tsv/rejected.tsv contain no header and preserve input order."
+ ],
+ "verifier_knob": {
+  "name": "hidden_tricky_case_count",
+  "value": "120 (default); each of the boundary categories contributes up to this many generated records",
+  "effect": "Raising it adds more records per tricky category (allowance +-1, window edges, tz-shifted runs, waiver boundaries, escaped payloads, resigned-but-undeclared keys), which sharply penalises solvers whose only error is one wrong comparison or one missing key-set rule; lowering it toward 10 lets a mostly-correct-but-sloppy implementation slip through."
+ },
+ "expected_failure_modes": [
+  "Payload conversion by naive separator substitution instead of escape-aware parsing, so benign records with escaped '|'/':' in values get false-rejected by the signature check.",
+  "Reading start/end as UTC and ignoring tz_offset_min, misclassifying every run of the offset-345 instrument and every calibration boundary run.",
+  "Treating calibration valid_to as inclusive, or accepting a run covered by two overlapping calibration rows.",
+  "Implementing only the signature check and skipping the payload key-set/numeric-kind rule, so correctly-resigned malicious records are accepted.",
+  "Getting the drift allowance arithmetic wrong (absolute rather than relative, ppm of the declared rather than the reassayed value, or exclusive comparison) and failing the +-1 boundary records.",
+  "Trusting /app/etc/waivers.conf as-is (false accepts on revoked grandfathered cases, false rejects on the newest ones) instead of rebuilding the overlay from the archive.",
+  "Not detecting duplicate run_ids, so both copies of an otherwise valid run are billed.",
+  "Stopping after the shipped sample file matches."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "scientific-computing",
+ "tags": [
+  "bash",
+  "sqlite",
+  "black-box-tooling",
+  "adversarial-corpus",
+  "finance-ops",
+  "constraint-satisfaction"
+ ]
+}

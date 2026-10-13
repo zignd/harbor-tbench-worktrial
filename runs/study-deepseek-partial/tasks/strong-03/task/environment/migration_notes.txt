@@ -1,0 +1,83 @@
+=== Shard Allocator Migration Notes ===
+Last updated: 2024-11-15
+Author: infra-team
+
+Context:
+The allocator binary has been in production since Q2 2021. It was
+originally written in C by a contractor who left the company. The
+source repository was lost during the GitLab migration of 2023.
+
+Current Behavior:
+- Reads a CSV of (query_id, load, timestamp)
+- Assigns each query to one of three shards (0, 1, 2)
+- Goal: balance total load across shards
+
+Known Quirks:
+- The binary was observed to produce different outputs when the same
+  load values appeared with different timestamps (ticket DB-4721).
+- Edge case: empty input produces only a header row.
+- Large loads (> 2^31) are supported but were never tested in QA.
+- The binary is deterministic for a given input; no randomness involved.
+
+Migration Plan:
+1. Reverse-engineer the exact algorithm from observed behavior.
+2. Implement equivalent logic in pure SQL (SQLite compatible).
+3. Validate against 50+ random input cases using the verify.py harness.
+4. Deploy to staging, then production.
+
+Retirement Schedule:
+- Freeze: 2025-01-15
+- Shutdown: 2025-02-01
+
+Contacts:
+- Infra lead: ops@example.com
+- DBA team: dba@example.com
+
+=== Appendix A: Historical Incident Reports ===
+
+Incident #1427 (2023-08-12):
+  - Shard 1 received 3x more queries than shard 0 during peak hours.
+  - Root cause: several high-load queries were clustered in time with
+    identical timestamps due to batch submission; the allocator's
+    sort order placed them all on the same shard because timestamps
+    were equal and query_ids were sequential.
+  - Mitigation: upstream systems now add random jitter to timestamps.
+
+Incident #2103 (2024-02-04):
+  - Allocator binary segfaulted on CSV with > 1 million rows.
+  - Root cause: fixed-size array overflow (MAX_QUERIES = 100000).
+  - Resolution: input validation now rejects files > 90000 queries.
+
+Incident #3089 (2024-06-19):
+  - Assignments differed between staging and production for same input.
+  - Root cause: different compiler versions produced slightly different
+    qsort behavior when loads and timestamps were both equal.
+  - Resolution: standardized on gcc 12.2 with -Wall -O0 flags.
+
+=== Appendix B: Performance Benchmarks ===
+
+Test setup: 10,000 queries, random loads 0-5000, Unix epoch timestamps.
+
+| Metric          | Allocator (C) | SQL Recursive CTE |
+|-----------------|--------------|-------------------|
+| CPU time        | 0.08s        | 1.42s             |
+| Memory          | 2.3 MB       | 5.8 MB            |
+| Max input size  | 100K rows    | ~50K rows (recursion limit) |
+
+Note: The SQL implementation reaches SQLite's recursion limit around
+50,000 rows. For production workloads exceeding this, consider using
+a procedural SQL approach with temporary tables and UPDATE loops.
+
+=== Appendix C: Troubleshooting ===
+
+Q: Why do assignments change when I add more queries?
+A: The allocator uses a global greedy strategy, not per-query decisions.
+   Adding or removing queries changes the cumulative load per shard,
+   which may cascade and change assignments for earlier queries.
+
+Q: Can I predict the shard for a single query without the full CSV?
+A: No. The assignment depends on all other queries and their ordering.
+
+Q: What happens with negative loads?
+A: The binary treats negative loads as valid and subtracts from shard
+   totals. The SQL replacement should handle this identically.

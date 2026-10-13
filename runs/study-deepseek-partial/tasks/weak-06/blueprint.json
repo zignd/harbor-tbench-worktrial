@@ -1,0 +1,62 @@
+{
+ "slug": "evtguard-policy-reconstruction",
+ "title": "Reconstruct the evtguard security policy from release artifacts",
+ "scenario": "/app/evtguard is an in-house C security event gateway whose release build is broken: etc/policy.conf was scrambled and truncated while packaging, so tools/policycheck rejects it. The last known-good release left its full run artifacts under var/last_release/ (per-destination accepted logs, a signed audit log of dropped events, metrics.json) together with the exact corpus that produced them. The daemon source is intact and correct; only the policy is wrong.",
+ "instruction_draft": "The evtguard security gateway at /app/evtguard fails its release build because etc/policy.conf was damaged during packaging. Reconstruct that policy file so `make release` succeeds and the gateway reproduces exactly the routing, redaction, drop and audit output recorded under var/last_release/ for arbitrary event batches. The new release must additionally route every event=scan event to a destination named `ids` with token and note redacted, regardless of source.",
+ "requirements": [
+  "`make -C /app/evtguard release` exits 0 and builds build/evtguard and build/policycheck.",
+  "/app/evtguard/etc/policy.conf parses and passes tools/policycheck (one default action, unique rule structure, valid action/dest/fields).",
+  "Replaying /app/evtguard/corpus/last_release.events with the reconstructed policy reproduces byte-for-byte the recorded var/last_release/out/*.log files, var/last_release/audit.log and var/last_release/metrics.json.",
+  "For arbitrary event batches drawn from the same event grammar, the gateway's per-destination accepted logs, audit log (including signatures) and metrics.json match the semantics that produced the recording.",
+  "Every event with event=scan is written to destination `ids` with token and note redacted, regardless of source address.",
+  "No source under /app/evtguard/src, /app/evtguard/include or /app/evtguard/tools may need modification for the build to succeed; the fix is the policy configuration."
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; apt pinned installs of gcc-12 and make (no network at solve time); no other tooling required.",
+  "/app/evtguard/Makefile: `release` target compiles src/*.c into build/evtguard, compiles tools/policycheck.c, then runs ./build/policycheck etc/policy.conf; a rejected policy makes the target exit non-zero.",
+  "/app/evtguard/src/: evtguard.c, policy.c, match.c, redact.c, audit.c, sha256.c, metrics.c, util.c (~1500 lines total) together with include/*.h. The C code is correct and implements: tab-separated key=value events, first-match-wins rule list, CIDR matching on src/dst, exact matching on other fields, actions accept / drop / redact, per-destination output files, HMAC-SHA256 signed audit lines for drops, and a fixed-format metrics.json.",
+  "/app/evtguard/docs/policy-format.md: full grammar and semantics of policy.conf (rule ids, match predicates, CIDR, first-match-wins, redact fields=..., dest names, default action).",
+  "/app/evtguard/README.md: operational description of evtguard and the security intent (blocklisted sources are dropped and audited, credentials must never reach accepted logs, drops are signed); it deliberately does not contain the concrete rule set.",
+  "/app/evtguard/etc/policy.conf: damaged fragment containing only three rules in the wrong order (rule 30 before rule 10) with rule 40's fields= list missing `note`, and no default action, so policycheck fails.",
+  "/app/evtguard/etc/guard.key: HMAC key file used unchanged by audit.c.",
+  "/app/evtguard/corpus/last_release.events: 35-line corpus covering every rule, every overlap, and every CIDR boundary of the lost policy.",
+  "/app/evtguard/var/last_release/: out/web.log, out/secure.log, out/auth.log, out/netops.log, out/internal.log, audit.log, metrics.json produced by the reference policy at image-build time; no reference policy survives anywhere in the image.",
+  "/app/evtguard/build/: empty before solving; created by make.",
+  "No network access; gcc/make available locally."
+ ],
+ "internal_hint": "Root cause is configuration data, not code: the shipped etc/policy.conf is a scrambled/truncated fragment, so the only trustworthy description of the intended policy is the recorded runtime state. The load-bearing lever is 'not visible by reading' \u2014 the solver must build the binary with the fragment plus a placeholder default, replay corpus/last_release.events, diff against var/last_release/, and iteratively infer the missing rules (20, 50, 60, 70, default), the correct precedence (blocklist before admin_login, cred_use before tcp/22 and tcp/443, tcp/22 before the 10/8 catch-all), the full redact field set for rule 40 (token and note, not just token), the CIDR widths pinned by boundary events, and the fact that udp/443 and udp/22 do not match the tcp rules. Then add the new event=scan rule before the blocklist rules.",
+ "trap": "A shallow fix appends `default action=drop` (or trusts the surviving fragment) so `make release` passes, and stops. The hidden corpora then exercise the un-recorded cases: admin_login from a blocklisted /24, cred_use on tcp/22, udp/443 and udp/22, CIDR boundary addresses, note redaction under rule 40, and scan events from blocklisted sources. A solver that never replays the sample corpus, or that hardcodes exact sample IPs instead of CIDRs, or that places the scan rule after the blocklist, fails on fresh inputs even though the build is green and the sample corpus looks handled.",
+ "tests": [
+  "state_check: `make -C /app/evtguard release` exits 0 and build/evtguard and build/policycheck exist.",
+  "state_check: parse /app/evtguard/etc/policy.conf independently and assert one well-formed default action, valid action/dest/fields, and no duplicate rule ids.",
+  "state_check: run build/evtguard on corpus/last_release.events into a temp outdir and compare out/*.log, audit.log and metrics.json byte-for-byte against var/last_release/.",
+  "state_check: for each of 5 verify-time seeded corpora (deterministic seeds, 60-100 events, same grammar but fresh IPs/tokens/notes), run build/evtguard with the solver's policy and compare out/*.log against expected outputs computed by an independent Python reference engine embedded in the test.",
+  "state_check: on the same hidden corpora, compare audit.log lines including HMAC signatures and compare parsed metrics.json action/destination/total counters.",
+  "state_check: hidden corpora include event=scan events from blocklisted, internal and external sources; assert every one lands in out/ids.log with token and note replaced by [REDACTED] and never in audit.log.",
+  "state_check: hidden corpora include udp/443, udp/22, CIDR-boundary sources, admin_login-from-blocklist and cred_use-on-tcp/22 events; assert they follow the recorded precedence rather than the surviving fragment's order."
+ ],
+ "verifier_knob": {
+  "name": "hidden_corpus_count",
+  "value": "5",
+  "effect": "Each additional hidden corpus adds independent state properties (fresh per-destination logs, audit signatures, metrics, scan routing, boundary cases). Raising it increases the chance that an overfit or partial policy is caught; lowering it to 1-2 would let a solver that only reproduces the recorded corpus pass."
+ },
+ "expected_failure_modes": [
+  "Adds a default action to make the build pass without ever replaying the corpus, so the scrambled rule order and missing rules survive.",
+  "Trusts the surviving fragment, keeping rule 40's fields=token only and rule 30 before rule 10.",
+  "Hardcodes the sample corpus values (exact IPs, exact tokens) instead of inferring CIDR blocks and match predicates.",
+  "Infers the routing but misses that udp/443 and udp/22 must not match the tcp rules.",
+  "Places the new event=scan rule after the blocklist rules, so scan events from blocklisted sources are dropped instead of sent to ids.",
+  "Redacts note everywhere (or nowhere) instead of only under the cred_use rule.",
+  "Produces correct behavior but a metrics.json / audit.log format that no longer matches the recording."
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "security",
+ "tags": [
+  "security",
+  "configuration",
+  "c",
+  "logs",
+  "policy-reconstruction"
+ ]
+}

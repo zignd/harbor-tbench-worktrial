@@ -207,6 +207,7 @@ def make_blueprint(
     concepts: str | None = None,
     feedback: str | None = None,
     model: str | None = None,
+    max_tokens: int = 12000,
 ) -> tuple[Blueprint, float]:
     concepts = concepts if concepts is not None else novelty.concept_list()
     prompt = BLUEPRINT_PROMPT.format(spec=spec.to_prompt(), concepts=concepts)
@@ -215,7 +216,7 @@ def make_blueprint(
     reply = chat(
         prompt,
         system=SYSTEM,
-        max_tokens=12000,
+        max_tokens=max_tokens,
         temperature=0.9,
         **({"model": model} if model else {}),
     )

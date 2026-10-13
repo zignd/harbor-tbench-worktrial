@@ -13,6 +13,7 @@ official models or counted in the report's funnel. Resumable: finished steps are
 
 import argparse
 import json
+import os
 import shutil
 import threading
 import time
@@ -40,7 +41,13 @@ from generator.config import (
 from generator.pipeline import gate_functional, gate_static
 from generator.spec import TaskSpec, sample_specs
 
-MODELS = {"weak": "deepseek/deepseek-v4.1-flash", "strong": "deepseek/deepseek-v4-pro"}
+# Pair 1 (deepseek-v4.1-flash / deepseek-v4-pro) was abandoned for speed: flash spent 12-27k
+# hidden reasoning tokens per authoring step (3-6 min each). Partial evidence is archived in
+# runs/study-deepseek-partial/. Override with STUDY_WEAK / STUDY_STRONG.
+MODELS = {
+    "weak": os.environ.get("STUDY_WEAK", "google/gemini-2.5-flash-lite"),
+    "strong": os.environ.get("STUDY_STRONG", "google/gemini-3-flash-preview"),
+}
 SEED = 2026
 SOLVE_TRIALS = 5
 SOLVE_MAX_TURNS = 100
@@ -104,7 +111,9 @@ def make_bp(author: str, spec: TaskSpec, d: Path, ledger: Ledger, task: str) -> 
         guard(ledger, 0.3)
         t0 = time.monotonic()
         try:
-            bp, cost = make_blueprint(spec, model=MODELS[author])
+            bp, cost = make_blueprint(
+                spec, model=MODELS[author], max_tokens=12000 * (attempt + 1)
+            )
         except Exception as e:  # noqa: BLE001  # unparseable reply or API error: the same retry for both authors
             record(ledger, task, "study_blueprint", {"ok": False, "error": str(e)[:300]}, t0=t0)
             continue
@@ -283,7 +292,7 @@ def write_results(ledger: Ledger, n_specs: int) -> None:
         tasks = collect()
         summary = summarize(tasks)
         _write(STUDY_DIR / "results.json", {
-            "meta": {"models": MODELS, "seed": SEED, "n_specs": n_specs, "cap_usd": CAP_USD,
+            "meta": {"pair": "gemini", "models": MODELS, "seed": SEED, "n_specs": n_specs, "cap_usd": CAP_USD,
                      "solve_trials": SOLVE_TRIALS, "solve_max_turns": SOLVE_MAX_TURNS,
                      "study_spend_usd": round(study_spent(ledger), 4),
                      "updated": datetime.now(UTC).isoformat(timespec="seconds"),
@@ -315,7 +324,7 @@ def cmd_gap(ledger: Ledger) -> None:
         print(f"gap {s:6} {c:22} {r['passes']}p {r['fails_valid']}f {r['invalid']}inv ${r['cost']:.2f}",
               flush=True)  # fmt: skip
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    with ThreadPoolExecutor(max_workers=1) as pool:  # authoring needs the environment slots
         list(pool.map(one, jobs))
 
 

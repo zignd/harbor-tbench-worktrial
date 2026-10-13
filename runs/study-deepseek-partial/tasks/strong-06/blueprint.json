@@ -1,0 +1,49 @@
+{
+ "slug": "config-seed-invariant-check",
+ "title": "Fix Build Security Seed Check",
+ "scenario": "A release engineer maintains a C data processor that generates annotated output from binary inputs. The build process includes a security checker (a compiled binary without source) that rejects the output if a seed value in the processor's configuration does not satisfy a hidden relationship with the input file. Failure logs from past builds are available, and the checker prints the expected seed on error.",
+ "instruction_draft": "The release build is broken because the security checker at /app/bin/checker rejects the output. Make `make release` always pass the checker, no matter what input file is provided.",
+ "requirements": [
+  "The `make release` command must succeed (checker exits with 0) for the provided test input and for any other valid input file used during verification."
+ ],
+ "environment": [
+  "Dockerfile based on python:3.13-slim-bookworm with gcc, make, coreutils, and libc6-dev installed.",
+  "C source for the processor at /app/src/processor.c (~600 lines, performs line-oriented filtering and annotation; reads a seed from /app/config/seed.conf and writes a SEED: <number> line in the output).",
+  "Makefile at /app/Makefile with a `release` target that builds the processor, runs it on testdata/input.bin, and then invokes /app/bin/checker on the input and output.",
+  "Checker binary /app/bin/checker (compiled from C without source) that verifies the seed: computes CRC32 of the input file, XORs with a hardcoded 32-bit key (0x4a3b2c1d), compares to the seed, prints \"ERROR: Seed mismatch (expected X, got Y)\" on failure and exits 1, or \"OK\" and exits 0 on success.",
+  "Default configuration file /app/config/seed.conf containing a dummy seed (e.g., 0).",
+  "Test input /app/testdata/input.bin (random binary data, fixed).",
+  "Logs directory /app/logs/ with previous build failure logs showing checker error messages and seed mismatch details.",
+  "Metrics file /app/logs/metrics summarizing failure counts."
+ ],
+ "internal_hint": "The checker prints the expected seed when it fails. A shallow fix sets seed.conf to that value and lets the sample input pass, but verification uses multiple hidden random inputs. The required seed is CRC32(input) XOR 0x4a3b2c1d. The solver must discover this relationship by experimenting with different inputs, observing expected seeds, and XORing them with CRC32 to find the constant key (also obtainable via `strings /app/bin/checker` or binary analysis). The solution is to modify the Makefile to compute the seed dynamically: compute CRC32 of the input file (using `cksum` or a small helper), XOR with the constant, write to config/seed.conf, then run the processor and checker.",
+ "trap": "A naive fix extracts the expected seed for the sample input and hardcodes it in seed.conf, passing the provided sample but failing when the verifier runs the build on other random input files because the required seed depends on the input.",
+ "tests": [
+  "Run `make release` with the original testdata/input.bin; verify checker exits 0 and prints OK.",
+  "Replace testdata/input.bin with a deterministic random binary file of different size; run `make release`; verify checker exits 0 and that config/seed.conf contains the correct seed (computed as CRC32 of the new input XOR 0x4a3b2c1d).",
+  "Repeat the above with two additional random input files generated at verify time, verifying each passes and the seed is correct."
+ ],
+ "verifier_knob": {
+  "name": "num_hidden_inputs",
+  "value": 3,
+  "effect": "More inputs increase the probability that a naive static seed fix is caught; the solver must handle arbitrary inputs."
+ },
+ "expected_failure_modes": [
+  "Hardcodes the seed for the sample input without discovering the dependency on input.",
+  "Discovers the seed must change but fails to compute the CRC32 or XOR correctly in the Makefile.",
+  "Tries to reverse-engineer the checker binary but extracts the wrong key or misunderstands the algorithm.",
+  "Modifies the processor source instead of adjusting the build/makefile (e.g., changes hardcoded seed logic in C), which may not be accepted.",
+  "Does not explore with multiple inputs to realize the dynamic nature; assumes a constant seed suffices after passing the first sample."
+ ],
+ "predicted_pass_rate": 0.4,
+ "difficulty": "hard",
+ "category": "build-security",
+ "tags": [
+  "security",
+  "configuration",
+  "reverse-engineering",
+  "constraint-satisfaction",
+  "exploration",
+  "c"
+ ]
+}

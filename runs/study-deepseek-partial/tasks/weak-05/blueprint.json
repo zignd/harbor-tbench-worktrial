@@ -1,0 +1,61 @@
+{
+ "slug": "detector-trigger-firmware-replay",
+ "title": "Reproduce Table 2 through the legacy trigger emulator",
+ "scenario": "A research group is re-running a 2023 detector paper and Table 2 will not reproduce. The test stand ships raw event-log segments in /app/rig/capture, a naive query daemon (rigd.py, launched by serve.sh on 127.0.0.1:9310) whose event selection predates a trigger-firmware revision, a capture daemon that keeps writing new segments while the rig runs, and a stripped binary /app/rig/bin/aggex that replays the frozen FPGA trigger firmware over a 64-event FIFO. The ADC-to-keV calibration table and the old analysis notes are in the tree; the per-channel thresholds and the coincidence window exist only inside the binary.",
+ "instruction_draft": "I'm re-running our 2023 detector paper and Table 2 refuses to reproduce: the counts coming out of the rig daemon in /app/rig are not the events the instrument actually counted. The firmware revision that produced the paper is baked into the legacy emulator /app/rig/bin/aggex, and the analysis notes under /app/rig/analysis describe the selection it implements; keV conversion is in /app/rig/etc. Capture segments keep landing in /app/rig/capture while the rig is running, so the daemon has to pick them up live.\n\nMake the service on 127.0.0.1:9310 report the firmware's numbers. Per committed segment, `STATS <seg>` must answer `count=<n> energy_kev=<x.xxx> peak_kev=<x.xxx>` (energy summed over the events the firmware counts, three decimals); `LIST` must answer the committed segment names, sorted and comma-separated; `TOTAL` must answer `count=<n> energy_kev=<x.xxx> segments=<k>` over every committed segment; an unknown segment must answer `ERR unknown_segment` and an unparsable request `ERR bad_request`, without dropping the connection. One response line per request, pipelining allowed, and no work may be lost when segments appear or finish while the daemon is up. The verifier restarts the service with `bash /app/rig/serve.sh`, waits up to 10 s for the port, issues ~200 requests over a handful of connections that must all be done inside 20 s, and requires a newly committed segment to be reflected within 2 s of its commit marker appearing.",
+ "requirements": [
+  "The service listens on 127.0.0.1:9310 and is started by `bash /app/rig/serve.sh`; it accepts connections within 10 s of launch.",
+  "LIST returns the sorted, comma-separated names of committed segments only (a segment is committed when its `<name>.done` sidecar exists); in-progress or abandoned .bin files are never listed.",
+  "STATS <seg> returns `count=<n> energy_kev=<x.xxx> peak_kev=<x.xxx>` where n is the number of events the frozen trigger firmware counts in that segment, energy_kev is the sum of the per-channel calibration applied to those events' ADC values (three decimals), and peak_kev is the largest such energy (0.000 if none).",
+  "TOTAL returns `count=<n> energy_kev=<x.xxx> segments=<k>` aggregated over all committed segments.",
+  "STATS for a segment that is not committed or does not exist returns `ERR unknown_segment`; a request that does not parse returns `ERR bad_request`; the connection stays open and usable afterwards.",
+  "Exactly one response line per request, requests may be pipelined on one connection, and a subsequent valid request on the same connection still works.",
+  "Segments committed while the service is running (written by the capture daemon) are reflected in LIST/STATS/TOTAL within 2 s of their .done marker appearing, with no restart.",
+  "The verification run of about 200 requests across several connections completes within 20 s in total on one CPU, with no individual request exceeding 1 s."
+ ],
+ "environment": [
+  "Dockerfile: builder stage FROM python:3.13-slim-bookworm compiles build/aggex.c with gcc (pinned apt package) and strips it; the runtime stage is FROM python:3.13-slim-bookworm, pip-installs numpy==2.1.3, copies ONLY the compiled /app/rig/bin/aggex (source and objects deleted, never shipped), then copies the app tree and generates the shipped capture segments deterministically.",
+  "/app/rig/bin/aggex (opaque, stripped, no source in the image): `aggex fifo <file>` reads at most 64 lines of `channel adc tick quality flags` and prints 1/0 per line for the firmware's event selection. It holds a per-channel discriminator table computed at runtime by an LCG (no literal constants in the binary) plus a fixed coincident-window width, so the parameters must be recovered by experiment.",
+  "/app/rig/docs/eventlog.md: brand-new/legacy segment layout (32-byte header, format version 1 or 2, stale record_count_hint, record sizes 16 and 20 bytes, trailing partial record carries no event, .done marker semantics).",
+  "/app/rig/docs/aggex.md: the emulator's interface and the 64-event FIFO limit. /app/rig/docs/protocol.md: exact wire format of LIST/STATS/TOTAL/ERR.",
+  "/app/rig/analysis/table2_notes.md + old scripts: the methods text describing the FORM of the selection (good quality byte, ADC at/above the per-channel discriminator, time coincidence on a different channel within the firmware window) without any numbers; plus the published Table 2 for the OLD capture set, which does not match the current data.",
+  "/app/rig/capture/seg_000..seg_005 .bin with .done sidecars (about 9 MB, 94k events each, bursts of 2-9 coincident events separated by huge tick gaps). seg_002 uses format version 2 (20-byte records). seg_004 is truncated mid-record and its record_count_hint overstates the record count. seg_006.bin exists with NO .done sidecar (abandoned capture) and a partial tail.",
+  "/app/rig/bin/capture_daemon.py: writes v2 segments live_000.bin/live_001.bin (150k events each, fixed seed) with paced writes; after the data file is complete it waits ~3 s, then commits by writing <name>.done. All content is seed-deterministic.",
+  "/app/rig/rigd.py + lib/eventlog.py + lib/select.py + lib/calib.py (~500 lines): the existing service re-parses every *.bin from scratch on every request (fresh but slow), trusts record_count_hint, assumes 16-byte records, lists any *.bin it finds (including seg_006), and applies an obsolete global ADC threshold with no coincidence requirement.",
+  "/app/rig/etc/adc_kev_calib.csv: per-channel kev_per_adc and offset_kev, documented and readable. Plus tools/gen_capture.py, tools/paper_table2.py, tools/plot_spectra.py and stale tests (~300 lines of plausible, uninvolved code). Total tree ~1,200 lines."
+ ],
+ "internal_hint": "Difficulty comes from an opaque compiled component plus cross-component state consistency, not from readable bugs. The selection numbers (16 per-channel ADC discriminators and the coincidence window width) exist only inside the stripped aggex binary and must be characterised by experiment: craft a tiny FIFO file with a high-ADC event on channel c plus a partner on a different channel a few ticks away, then binary-search the ADC boundary and ramp the tick separation until acceptance flips (the truth is inclusive on both sides: adc >= thr[channel] and |dt| <= W, symmetric, W=37). Probe once more with a partner of adc 0 and quality 255 to discover the partner's own ADC and quality are irrelevant, and confirm coincidence is per-segment. Validate the recovered rule by piping random 64-event windows of a real segment through aggex and diffing against your own implementation before touching the service; anything less misses the boundary or the partner rule. Independently, the parser must branch on the header version (20-byte v2 records exist in shipped and live data), ignore the stale record_count_hint and the trailing partial record, and treat only .done-marked files as committed (seg_006 and mid-write live segments must not be listed or addressable). Finally the performance bar forces a cached design: parse and select once per segment into per-segment aggregates keyed by (size, .done presence), poll or watch the capture directory for commits, and invalidate only the affected segment, so 200 requests answer in microseconds while a live segment is indexed well inside the 2 s commit window.",
+ "trap": "A solver that implements the rule from the methods notes with plausible-but-unprobed parameters (a single global threshold, a round window such as 50 ticks, exclusive comparison, or the assumption that the coincidence partner must itself pass the threshold) produces counts that are wrong by a few percent on every segment and is never caught unless they diff their implementation against aggex on real data. A second trap: reporting every *.bin present, which silently includes the abandoned seg_006 and the half-written live segment, so LIST/STATS/TOTAL disagree with the committed set; and a third: rescanning per request to stay fresh, which blows the 20 s budget.",
+ "tests": [
+  "T1 service_up_and_list: kill anything on 9310, run bash /app/rig/serve.sh, wait <=10 s for the port, expect LIST == 'seg_000,seg_001,seg_002,seg_003,seg_004,seg_005' (no seg_006, no live_*).",
+  "T2 stats_shipped: for each shipped segment, STATS must match a reference implementation of the firmware rule (recovered thresholds + window) computed at verify time from the file bytes: counts exact, energies and peak energies within 0.01 keV.",
+  "T3 total: TOTAL must equal the sum over the committed segments (segments=6), with energy within 0.01 keV.",
+  "T4 live_commit: start capture_daemon.py; poll until live_000.bin has full expected size and no .done, then LIST must not contain live_000 and STATS live_000 must return ERR unknown_segment; after the .done marker appears, LIST must contain live_000 and STATS must match the reference within 2 s; repeat for live_001; then TOTAL must include both.",
+  "T5 errors_and_pipelining: STATS seg_006 -> 'ERR unknown_segment'; STATS ghost -> 'ERR unknown_segment'; 'LIST extra' and 'BOGUS' -> 'ERR bad_request'; a valid LIST on the same connection afterwards still succeeds; 50 requests pipelined without intermediate reads yield exactly 50 correctly ordered response lines.",
+  "T6 throughput: 200 requests (mixed LIST/STATS over every segment/TOTAL) across 4 persistent connections must complete in under 20 s wall clock with every single request under 1 s, measured after the daemon has finished."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": 6,
+  "effect": "Number of distinct verify-time request scenarios exercised against the service (baseline 6: list, per-segment stats, total, live commit, error/pipelining, throughput). Raising it to 8-9 adds a third live capture wave, a larger pipelined burst, and re-queries after commit, each of which independently exposes a service that is stale, inconsistent with the .done set, or too slow."
+ },
+ "expected_failure_modes": [
+  "Implements the documented selection form with unprobed parameters (global threshold, round window, exclusive comparison, or requiring the coincidence partner to pass the threshold) and never diffs against aggex on real data, so counts are off by a few percent on every segment.",
+  "Trusts record_count_hint or assumes 16-byte records everywhere, corrupting the truncated segment and the two version-2 segments (shipped seg_002 and both live segments).",
+  "Treats any .bin file as a segment, listing the abandoned seg_006 and the half-written live segment, so LIST and TOTAL disagree with the committed set.",
+  "Never watches the capture directory, so live segments never appear or appear only after a restart (fails the 2 s commit window) - or rescans and reparses per request, blowing the 20 s throughput budget.",
+  "Shallow validation: checks the three-decimal formatting and one segment against the old published Table 2 instead of against the emulator on fresh data, so wrong thresholds, wrong window and wrong record layout all survive.",
+  "Tries to route the whole problem through aggex (64 events per invocation, huge tick span) instead of characterising the rule, and cannot index a live segment inside the commit window."
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "black-box-probing",
+  "binary-format",
+  "tcp-service",
+  "caching",
+  "incremental-indexing",
+  "systems"
+ ]
+}

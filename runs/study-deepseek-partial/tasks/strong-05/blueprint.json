@@ -1,0 +1,55 @@
+{
+ "slug": "opaque-log-converter-repair",
+ "title": "Fix a buggy binary log converter service",
+ "scenario": "A research lab is reproducing a 2018 performance-optimization paper that relied on a custom binary `log2csv` converter whose source has been lost. They have built a caching microservice around it, but the service fails on many real-world binary logs due to crashes and incorrect index generation. The lab needs the service to handle all valid logs reliably, returning correct CSV and correct record lookups, while still using the binary for speed whenever possible.",
+ "instruction_draft": "I'm a research scientist trying to reproduce the event-log processing pipeline from a 2018 paper. The pipeline uses a custom binary `log2csv` to convert a binary log format into CSV and generate an index for fast record lookup. We've built a caching microservice around it in `/app/service.py` that exposes two endpoints: POST `/convert` returns the CSV for a given log, and GET `/record?log=<hash>&id=N` returns a specific record by ID. The service caches conversions in `/app/cache/`.\n\nThe service works on our small sample logs, but on our larger dataset it often returns server errors or wrong records. We don't have the source for the binary, but we have a correct Python reference converter at `/app/reference.py` and the log format specification in `/app/FORMAT.md`. The reference is too slow for production use.\n\nPlease make the service robust. For any valid binary log input, both endpoints must return the correct data. The service should use the binary for conversion whenever possible for performance, but it's permissible to fall back to the Python reference when the binary fails. The cache must not serve stale or incorrect results.",
+ "requirements": [
+  "The service must handle any valid binary log input without returning 5xx errors, producing correct CSV from POST /convert that matches the reference implementation.",
+  "The GET /record endpoint must return the correct record (timestamp, event_type, data_hex) for any valid log and any record ID in range.",
+  "The service must use the compiled binary for conversion when it would produce correct output, falling back to the Python reference only when the binary would fail or produce wrong results.",
+  "Any previously cached incorrect results must be corrected after the fix is deployed so that future requests for the same inputs return the correct data.",
+  "The service must remain performant enough to process a batch of 30 varied logs in under 15 seconds total wall-clock time when invoked sequentially."
+ ],
+ "environment": [
+  "Base image: python:3.13-slim-bookworm with gcc, python3-dev, flask installed.",
+  "C source for log2csv compiled at build time into /usr/local/bin/log2csv, then C source removed. Binary has three deterministic bugs: division by zero when data_len==0, out-of-bounds read on event_type==255 (signed char leads to negative index), and an off-by-one byte offset in the generated index when any record has data_len>255.",
+  "Binary log format documented in /app/FORMAT.md: 12-byte header (magic, version, num_records), then variable-length records with timestamp, event_type, data_len, and data.",
+  "/app/reference.py: a correct but intentionally slow Python implementation that reads a binary log and prints CSV and an index file.",
+  "/app/service.py: initial Flask service (port 8000) with /convert and /record endpoints. It calls the binary via subprocess without error checking, blindly trusts the binary's index, and uses a simple filesystem cache keyed by SHA256 hash of the input. No input validation or recovery logic.",
+  "/app/samples/ directory with four small sample logs: good.log (works fine), zero_datalen.log (data_len=0, crashes binary), event_ff.log (event_type=255, crashes binary), large_data.log (data_len>255, produces wrong index).",
+  "/app/verify.py: verification script used at test time (not provided in container, but concept described). It generates 30 deterministic-seeded test logs, sends sequential HTTP requests, validates CSV and record queries, checks cache consistency, and enforces a 15-second time limit."
+ ],
+ "internal_hint": "The binary has three deterministic bugs: SIGFPE on data_len=0, segfault on event_type=255 (signed char index out-of-bounds), and an off-by-one index corruption when data_len>255. The service's initial code does not handle subprocess errors and trusts the binary's index verbatim. The correct resolution is to: (1) wrap the binary call in try/except, catching non-zero return codes and falling back to reference.py for conversion; (2) implement a Python index generator based on the documented format that computes correct offsets directly from the input binary, bypassing the binary's buggy index; (3) regenerate the index for every cached conversion that used the old buggy index, either by clearing the cache or by re-processing on next request; (4) ensure the service validates the CSV line count against the header's num_records and falls back if they don't match. The solver must investigate by running the binary on the provided samples, observing failures and wrong record outputs, then deducing the index problem and implementing a robust fix.",
+ "trap": "A solver who only adds a try/except around the binary call and falls back to reference for crashes will still serve broken /record results because the index remains corrupted. A solver who tries to patch the binary's index output after the fact (e.g., by detecting and correcting the shifted offsets) will likely fail on logs with multiple large-data records where the cumulative offset drift is not a simple constant shift. A solver who replaces the binary entirely with the slow Python reference will exceed the 15-second time limit.",
+ "tests": [
+  "Start the service and verify health (GET / returns 200).",
+  "For each of 30 auto-generated binary log files (deterministic seed, including zero-length data, event_type 255, data_len>255, and mixed patterns), send POST /convert and assert response 200 with CSV matching the reference output exactly.",
+  "For each log after conversion, send 2-3 GET /record requests with random valid IDs and verify the returned record matches the expected record from the reference.",
+  "Re-send the first 10 log files (which were initially converted before the service fix) through POST /convert and GET /record, and verify they now return correct results (cache consistency after fix).",
+  "Measure total wall-clock time for all 30 conversions and 60 record queries; assert it is under 15 seconds, ensuring the binary is used for the majority of conversions rather than always falling back to the slow Python reference.",
+  "All tests are deterministic; the verify script seeds its random generator and generates the same 30 logs each run."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "30",
+  "effect": "Increasing the number of logs increases the probability of edge cases and cache interactions, making partial fixes more likely to fail. Each scenario includes both /convert and multiple /record requests."
+ },
+ "expected_failure_modes": [
+  "Agent only adds error handling for binary crashes without fixing the index, causing /record responses to be wrong.",
+  "Agent attempts to post-process the buggy index to correct offsets but fails on logs with multiple large-data records where the drift pattern is complex.",
+  "Agent replaces the entire conversion pipeline with the Python reference, exceeding the time limit.",
+  "Agent fixes both bugs but forgets to invalidate or regenerate old cache entries, so the verifier sees stale incorrect data for previously converted logs.",
+  "Agent implements a Python index generator but misparses the binary format (e.g., wrong endianness, off-by-one in record boundaries), leading to incorrect offsets."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "data-processing",
+  "opaque-component",
+  "error-recovery",
+  "modality-translation",
+  "service-fix",
+  "caching"
+ ]
+}

@@ -8,6 +8,7 @@ events are excluded; the report refuses to run in dev mode.
 """
 
 import json
+import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -149,7 +150,7 @@ def batches(rows: list[dict], events) -> list[dict]:
     for plan in sorted((Path(RUNS_DIR) / "batches").glob("*.json")):
         ids = {Candidate(TaskSpec(**d)).cand_id for d in json.loads(plan.read_text())}
         mine = [r for r in rows if r["id"] in ids]
-        evs = [e for e in events if e.task in ids or e.task.rsplit("-t", 1)[0] in ids]
+        evs = [e for e in events if re.sub(r"-(t|c|snap-[a-z_0-9]+)\d*$", "", e.task) in ids]
         red = [e for e in evs if e.stage == "gate_redteam"]
         out.append(
             {

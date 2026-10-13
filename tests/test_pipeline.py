@@ -39,7 +39,7 @@ def env(tmp_path, monkeypatch):
 
 def test_first_attempt_passes(env, monkeypatch):
     calls, ledger = env
-    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: [])
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a, **kw: [])
     cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=3)[0]), ledger)
     assert cand.status == "gated"
     assert [c["attempt"] for c in calls["author"]] == [1]
@@ -49,7 +49,7 @@ def test_first_attempt_passes(env, monkeypatch):
 def test_repair_gets_feedback_and_previous_package(env, monkeypatch):
     calls, ledger = env
     results = iter([["oracle passed 1/3"], []])
-    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: next(results))
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a, **kw: next(results))
     cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=4)[0]), ledger)
     assert cand.status == "gated"
     second = calls["author"][1]
@@ -59,7 +59,7 @@ def test_repair_gets_feedback_and_previous_package(env, monkeypatch):
 
 def test_repairs_then_one_regeneration_then_failed(env, monkeypatch):
     calls, ledger = env
-    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: ["still broken"])
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a, **kw: ["still broken"])
     cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=5)[0]), ledger)
     assert cand.status == "failed"
     # (1 build + MAX_REPAIRS repairs) x (original + one regeneration)
@@ -89,7 +89,7 @@ def test_resume_reuses_blueprint_and_continues_after_last_finished_attempt(env, 
     shutil.copytree(TASK, first.dir / "failed_a1")  # attempt 1 finished; attempt 2 was cut off
     first.save("feedback_a1.json", ["docker build failed"])
     monkeypatch.setattr(pipeline, "stage_blueprint", lambda c, l: pytest.fail("re-blueprinted"))
-    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: [])
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a, **kw: [])
     cand = pipeline.build_candidate(pipeline.Candidate(spec), ledger)
     assert cand.status == "gated" and cand.blueprint.slug == BLUEPRINT.slug
     assert calls["author"] == [
@@ -211,7 +211,7 @@ def test_attempt_interrupted_after_authoring_goes_back_to_its_gates(env, monkeyp
     h = hash_dir(first.task_dir)
     ledger.append(Event("author", first.cand_id, {"attempt": 1, "outcome": "pass"}))
     ledger.append(Event("gate_static", first.cand_id, {"problems": []}, inputs_hash=h))
-    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a: [])
+    monkeypatch.setattr(pipeline, "stage_gates", lambda c, l, a, **kw: [])
     cand = pipeline.build_candidate(pipeline.Candidate(spec), ledger)
     assert cand.status == "gated" and calls["author"] == []  # no re-authoring
 
@@ -259,6 +259,7 @@ def test_a_too_easy_built_package_goes_back_to_repair_without_a_red_team(env, mo
         pipeline.novelty, "judge_same_task",
         lambda text, index: {"novel": True, "verdicts": [], "nearest": [], "cost_usd": 0.0},
     )  # fmt: skip
+    monkeypatch.setattr(pipeline, "DIFFICULTY_GATE_BLOCKS", True)
     monkeypatch.setattr(pipeline, "review_package", lambda task_dir, intended: {
         "accepted": False, "difficulty": 2, "speedrun_commands": 6, "cost_usd": 0.05,
         "promised_difficulty_present": False, "reasons": "bugs sit in one readable file",
@@ -271,3 +272,81 @@ def test_a_too_easy_built_package_goes_back_to_repair_without_a_red_team(env, mo
     assert "missing from the environment" in problems[0] and "ship the component" in problems[0]
     assert "redteam" not in calls  # no red-team spend on a package that goes back to repair
     assert ledger.events(stage="gate_difficulty")[0].result["speedrun_commands"] == 6
+
+
+def _fake_cal(verdict, trials=None):
+    from evaluator.calibrate import Calibration
+
+    cal = Calibration(task="x", outcomes=["pass"] * 4 if verdict == "too_easy" else ["pass", "fail"],
+                      trials=trials or [])  # fmt: skip
+    cal.verdict = verdict
+    return cal
+
+
+def _gates_returning(monkeypatch, per_attempt):
+    """stage_gates stub: (problems, calibration verdict) per attempt, set like the real one."""
+    queue = iter(per_attempt)
+
+    def gates(cand, ledger, attempt, calibrate=False):
+        problems, verdict = next(queue)
+        cand.calibration = _fake_cal(verdict) if verdict else None
+        return problems
+
+    monkeypatch.setattr(pipeline, "stage_gates", gates)
+
+
+def test_calibrate_first_a_too_easy_candidate_ends_without_repair(env, monkeypatch):
+    calls, ledger = env
+    _gates_returning(monkeypatch, [(["lint: x", "quality: y"], "too_easy")])
+    cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=17)[0]), ledger)
+    assert cand.status == "calibrated" and len(calls["author"]) == 1  # no repair rounds
+    saved = json.loads((cand.dir / "status.json").read_text())
+    assert saved["verdict"] == "too_easy" and saved["pending_findings"] == ["lint: x", "quality: y"]
+
+
+def test_calibrate_first_a_learnable_candidate_is_repaired_for_its_findings(env, monkeypatch):
+    calls, ledger = env
+    _gates_returning(monkeypatch, [(["quality: needs a fix"], "learnable"), ([], "learnable")])
+    cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=18)[0]), ledger)
+    assert cand.status == "gated" and len(calls["author"]) == 2
+    assert calls["author"][1]["feedback"] == ["quality: needs a fix"]
+
+
+def test_calibrate_first_an_invalid_candidate_gets_a_spec_fix_directive(env, monkeypatch):
+    calls, ledger = env
+    trial = {"outcome": "invalid", "failure": {"valid": False, "mode": "test_overreach",
+                                               "requirement": "tie order", "explanation": "unstated"}}  # fmt: skip
+    queue = iter([(["lint: x"], "invalid"), ([], "learnable")])
+
+    def gates(cand, ledger, attempt, calibrate=False):
+        problems, verdict = next(queue)
+        cand.calibration = _fake_cal(verdict, [trial] if verdict == "invalid" else None)
+        return problems
+
+    monkeypatch.setattr(pipeline, "stage_gates", gates)
+    cand = pipeline.build_candidate(pipeline.Candidate(sample_specs(1, seed=19)[0]), ledger)
+    assert cand.status == "gated"
+    feedback = calls["author"][1]["feedback"]
+    assert feedback[0].startswith("Spec fix:") and feedback[1] == "lint: x"
+
+
+def test_stage_gates_calibrates_only_a_package_that_passed_oracle_and_nop(env, monkeypatch):
+    _, ledger = env
+    seen = []
+    monkeypatch.setattr(pipeline, "_calibrate_package",
+                        lambda cand, ledger, attempt, h: (seen.append(attempt), _fake_cal("learnable"))[1])  # fmt: skip
+    monkeypatch.setattr(pipeline, "_remaining_gates", lambda *a: [])
+    cand = pipeline.Candidate(sample_specs(1, seed=20)[0])
+    shutil.copytree(TASK, cand.task_dir)
+    ok = ([], True, True)
+    monkeypatch.setattr(pipeline, "gate_static", lambda d, tag: ok)
+    monkeypatch.setattr(pipeline, "gate_functional",
+                        lambda d, n: ([], {"oracle": [], "nop": [], "excluded": 0}))  # fmt: skip
+    assert pipeline.stage_gates(cand, ledger, 1, calibrate=True) == []
+    assert seen == [1] and cand.calibration.verdict == "learnable"
+    monkeypatch.setattr(pipeline, "gate_functional",
+                        lambda d, n: (["oracle passed 2/3"], {"oracle": [], "nop": [], "excluded": 0}))  # fmt: skip
+    pipeline.stage_gates(cand, ledger, 2, calibrate=True)
+    assert seen == [1] and cand.calibration is None  # an oracle failure is never calibrated
+    pipeline.stage_gates(cand, ledger, 3)  # calibrate off by default (tuner path)
+    assert seen == [1]

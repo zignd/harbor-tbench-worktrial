@@ -34,8 +34,10 @@ from generator.author import collect_package, make_task_toml, render_metatask
 from generator.blueprint import Blueprint, gate_blueprint, make_blueprint
 from generator.config import (
     BLUEPRINT_DRAFTS,
+    CALIBRATE_FIRST,
     CANARY_LINE,
     DEV_MODE,
+    DIFFICULTY_GATE_BLOCKS,
     GATE_CONCURRENCY,
     JOBS_DIR,
     METATASK_MAX_TURNS,
@@ -70,7 +72,8 @@ class Candidate:
     spec: TaskSpec
     cand_id: str = ""
     blueprint: Blueprint | None = None
-    status: str = "new"  # new | rejected | authored | gated | failed
+    status: str = "new"  # new | rejected | authored | gated | calibrated | failed
+    calibration: object | None = None  # set by stage_gates(calibrate=True)
     history: list[dict] = field(default_factory=list)
 
     def __post_init__(self):
@@ -332,7 +335,9 @@ def gate_functional(task_dir: Path, name: str) -> tuple[list[str], dict]:
     return problems, result
 
 
-def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
+def stage_gates(
+    cand: Candidate, ledger: Ledger, attempt: int, calibrate: bool = False
+) -> list[str]:
     """Run the gates and return every problem found. Returns [] for a package that passed.
 
     Static, functional and quality gates all run even when an earlier one fails
@@ -340,10 +345,16 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
     round sees every finding instead of discovering them one round at a time.
     Novelty and the red-team run only on a package that built, passed oracle/nop
     and lint, in parallel with the quality check.
+
+    With `calibrate`, a package that built and passed oracle/nop is also calibrated
+    against Opus at once, alongside the other gates; the result is left on
+    `cand.calibration` (None if the package didn't qualify).
     """
     h = hash_dir(cand.task_dir)
     tag = f"claude-gate-{cand.cand_id}-a{attempt}".lower()
+    cand.calibration = None
     # Image build, leak scan and oracle/nop are the CPU-heavy part: one machine-wide slot each.
+    functional_ok = False
     with machine_slots(1, GATE_CONCURRENCY, Path(JOBS_DIR) / ".gate-slots"):
         t0 = time.monotonic()
         problems, structure_ok, built = gate_static(cand.task_dir, tag)
@@ -353,6 +364,23 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
             found, result = gate_functional(cand.task_dir, f"gate-{cand.cand_id}-a{attempt}")
             _record(ledger, cand, "gate_functional", {**result, "problems": found}, 0.0, t0, h)
             problems += found
+            functional_ok = not found
+    calibration_pool = None
+    if calibrate and functional_ok:
+        calibration_pool = ThreadPoolExecutor(max_workers=1)
+        pending = calibration_pool.submit(_calibrate_package, cand, ledger, attempt, h)
+    try:
+        remaining = _remaining_gates(cand, ledger, attempt, h, problems, structure_ok)
+    finally:
+        if calibration_pool is not None:
+            cand.calibration = pending.result()
+            calibration_pool.shutdown()
+    return remaining
+
+
+def _remaining_gates(
+    cand: Candidate, ledger: Ledger, attempt: int, h: str, problems: list[str], structure_ok: bool
+) -> list[str]:
     if not structure_ok:
         return problems
     if problems:  # broken package: quality findings still go into the same repair round
@@ -364,6 +392,36 @@ def stage_gates(cand: Candidate, ledger: Ledger, attempt: int) -> list[str]:
         quality = pool.submit(stage_quality, cand, ledger, attempt, h)
         adversarial = pool.submit(_novelty_then_redteam, cand, ledger, attempt, h)
         return quality.result() + adversarial.result()
+
+
+def _calibrate_package(cand: Candidate, ledger: Ledger, attempt: int, h: str):
+    """Opus calibration of the package as built (reuses a record for the same package)."""
+    from evaluator.calibrate import calibrate
+
+    cal_file = cand.dir / "calibration.json"
+    if cal_file.exists():
+        record = json.loads(cal_file.read_text())
+        if record.get("package_hash") == h:
+            return _loaded_calibration(record)
+    cal = calibrate(cand.task_dir, f"{cand.cand_id}-c{attempt}", ledger)
+    record = {
+        "verdict": cal.verdict,
+        "outcomes": cal.outcomes,
+        "trials": cal.trials,
+        "cost_usd": round(cal.cost_usd, 4),
+        "package_hash": h,
+        "attempt": attempt,
+    }
+    cal_file.write_text(json.dumps(record, indent=1, default=str))
+    return cal
+
+
+def _loaded_calibration(record: dict):
+    from evaluator.calibrate import Calibration
+
+    cal = Calibration(task="reused", outcomes=record["outcomes"], trials=record["trials"])
+    cal.verdict, cal.cost_usd = record["verdict"], record.get("cost_usd", 0.0)
+    return cal
 
 
 def stage_quality(cand: Candidate, ledger: Ledger, attempt: int, h: str) -> list[str]:
@@ -435,7 +493,9 @@ def stage_difficulty(cand: Candidate, ledger: Ledger, h: str) -> list[str]:
         t0,
         h,
     )
-    return [] if review["accepted"] else [package_feedback(review, intended)]
+    if review["accepted"] or not DIFFICULTY_GATE_BLOCKS:
+        return []  # advice only: calibration is the ground truth
+    return [package_feedback(review, intended)]
 
 
 def stage_redteam(cand: Candidate, ledger: Ledger, attempt: int, h: str = "") -> list[str]:
@@ -523,7 +583,23 @@ def build_candidate(cand: Candidate, ledger: Ledger) -> Candidate:
         if not resumed and not stage_author(cand, ledger, attempt, feedback, previous):
             attempt = -(-attempt // per_build) * per_build  # skip to the next fresh build
             continue
-        problems = stage_gates(cand, ledger, attempt)
+        problems = stage_gates(cand, ledger, attempt, calibrate=CALIBRATE_FIRST)
+        cal = cand.calibration
+        if cal is not None and cal.verdict in ("too_easy", "too_hard"):
+            # Opus decided it: no repair for lint/quality findings on a task that can't
+            # ship as it stands. The tuner (if on) takes it from here.
+            cand.status = "calibrated"
+            cand.save(
+                "status.json",
+                {"status": cand.status, "attempts": attempt, "history": cand.history,
+                 "verdict": cal.verdict, "pending_findings": problems},
+            )  # fmt: skip
+            return cand
+        if cal is not None and cal.verdict == "invalid":
+            from analysis.tuner import directive, fix_spec_plan
+
+            plan = fix_spec_plan({"trials": cal.trials})
+            problems = [directive(plan), *problems]  # repaired together with the other findings
         if not problems:
             cand.status = "gated"
             cand.save(

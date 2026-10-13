@@ -6,6 +6,7 @@ live spend. Read-only: it never starts or stops anything.
 """
 
 import json
+import re
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -95,7 +96,7 @@ def candidate_records() -> tuple[dict[str, int], int, list[dict]]:
     path = Path(LEDGER_PATH)
     for line in path.read_text().splitlines() if path.exists() else []:
         e = json.loads(line)
-        task = e["task"].rsplit("-t", 1)[0] if "-t" in e["task"][-3:] else e["task"]
+        task = re.sub(r"-[tc]\d+$", "", e["task"])  # calibration/tuning names
         last[task] = e
     now = datetime.now(UTC)
     counts: dict[str, int] = {}

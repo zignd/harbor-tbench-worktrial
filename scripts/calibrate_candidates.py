@@ -66,6 +66,10 @@ def ship(cand_dir: Path, cal: dict) -> Path:
     return dest
 
 
+def _slug(cand_dir: Path) -> str:
+    return json.loads((cand_dir / "blueprint.json").read_text())["slug"]
+
+
 def calibrate_one(cand_dir: Path, ledger) -> dict | None:
     """Red-team (if never run), calibrate and ship one gated candidate. Returns the record."""
     status_file = cand_dir / "status.json"
@@ -79,6 +83,13 @@ def calibrate_one(cand_dir: Path, ledger) -> dict | None:
             status_file.write_text(json.dumps({"status": "hackable", "problems": problems}))
             print(f"{cand_dir.name}  red-team found an exploit; not calibrated", flush=True)
             return None
+    existing = cand_dir / "calibration.json"
+    if existing.exists():
+        # Calibrated during its gates (CALIBRATE_FIRST): ship if learnable, never recalibrate.
+        record = json.loads(existing.read_text())
+        if record["verdict"] == "learnable" and not (Path(OUTPUT_DIR) / _slug(cand_dir)).exists():
+            print(f"{cand_dir.name}  learnable -> {ship(cand_dir, record)}", flush=True)
+        return record
     cal = calibrate(cand_dir / "task", cand_dir.name, ledger)
     record = {
         "verdict": cal.verdict,

@@ -184,7 +184,7 @@ def stats():
 def top_paths():
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT path, COUNT(*) as cnt FROM events GROUP BY path ORDER BY cnt DESC LIMIT 10")
+    cur.execute("SELECT path, COUNT(*) as cnt FROM events GROUP BY path ORDER BY cnt DESC, path ASC LIMIT 10")
     rows = cur.fetchall()
     conn.close()
     result = [{"path": row["path"], "count": row["cnt"]} for row in rows]
@@ -200,7 +200,7 @@ API_SCRIPT
 
 # Rebuild DB from scratch using correct pipeline logic
 rm -f /app/data/events.db /app/data/access.log.offset
-cat > /tmp/rebuild_db.py << 'REBUILD_SCRIPT'
+python3 << 'REBUILD_SCRIPT'
 import json, subprocess, sqlite3, time, os, ipaddress, csv
 
 LOG_PATH = "/app/data/access.log"
@@ -280,10 +280,17 @@ conn.commit()
 conn.close()
 print("Inserted", count, "events from log")
 REBUILD_SCRIPT
-python3 /tmp/rebuild_db.py
 
 # Set offset to end of current log so tailer only processes new lines
-python3 -c 'import os; f=open(os.environ.get("L","/app/data/access.log"),"rb"); f.seek(0,2); off=f.tell(); f.close(); open("/app/data/access.log.offset","w").write(str(off)); print("offset set to",off)'
+python3 -c "
+import os
+with open('/app/data/access.log', 'rb') as f:
+    f.seek(0, 2)
+    off = f.tell()
+with open('/app/data/access.log.offset', 'w') as fp:
+    fp.write(str(off))
+print('offset set to', off)
+"
 
 # Restart services with fixed code
 bash /app/start.sh

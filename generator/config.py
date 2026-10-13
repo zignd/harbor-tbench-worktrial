@@ -70,6 +70,14 @@ GATE_CONCURRENCY = int(os.environ.get("GATE_CONCURRENCY", "3"))
 # curtailment waves (CALIBRATION_EAGER=0) never pay for a trial that can't change the
 # verdict. Same verdict either way; the report still computes what curtailment saves.
 CALIBRATION_EAGER = os.environ.get("CALIBRATION_EAGER", "1") == "1"
+# Calibrate a candidate as soon as its build and oracle/nop pass, alongside the remaining
+# gates: Opus calibration is the only real signal for "learnable" and takes minutes, while
+# each lint/quality finding costs a 20-40 min repair round. A too-easy/too-hard candidate
+# then ends there; only a learnable one is repaired for its other findings.
+CALIBRATE_FIRST = os.environ.get("CALIBRATE_FIRST", "1") == "1"
+# The built-package difficulty review rejected every package we had calibrated, and calibration
+# is the ground truth: it is logged as advice and blocks only when this is on.
+DIFFICULTY_GATE_BLOCKS = os.environ.get("DIFFICULTY_GATE_BLOCKS", "0") == "1"
 # Blueprint drafts generated and reviewed at once per round (the review rejects most).
 BLUEPRINT_DRAFTS = int(os.environ.get("BLUEPRINT_DRAFTS", "4"))
 

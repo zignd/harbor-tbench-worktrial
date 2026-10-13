@@ -110,6 +110,10 @@ def _install_dry_run(ledger_path: Path) -> Ledger:
         pipeline.novelty.default_index()
     )
     pipeline.budget.check = lambda expected: None
+    pipeline.CALIBRATE_FIRST = False  # a dry run never calls Opus
+    pipeline.review_package = lambda task_dir, intended: {
+        "accepted": True, "difficulty": 4, "speedrun_commands": 30, "cost_usd": 0.0,
+        "promised_difficulty_present": True}  # fmt: skip
     pipeline.redteam = lambda task_dir, name: {
         "hackable": False, "reward": 0.0, "exploit": "", "cost_usd": 0.0, "trial": None
     }  # fmt: skip
@@ -160,6 +164,9 @@ def main() -> int:
         if status.get("status") == "building" and _alive(status.get("pid")):
             print(f"{cand.cand_id}  (being built by pid {status['pid']})", flush=True)
             return None
+        if status.get("status") == "calibrated" and args.tune and not args.dry_run:
+            tune_one(cand.dir, ledger)  # resumed: tune what Opus called too easy/hard
+            return None
         if status.get("status") == "gated" and args.calibrate and not args.dry_run:
             if not (cand.dir / "calibration.json").exists():  # gated before a crash
                 calibrate_one(cand.dir, ledger)
@@ -188,6 +195,8 @@ def main() -> int:
             calibrate_one(cand.dir, ledger)
             if args.tune:
                 tune_one(cand.dir, ledger)
+        elif args.calibrate and args.tune and cand.status == "calibrated" and not args.dry_run:
+            tune_one(cand.dir, ledger)  # Opus already said too easy/hard during its gates
         cost = sum(e.cost_usd for e in ledger.events(task=cand.cand_id))
         slug = cand.blueprint.slug if cand.blueprint else "-"
         print(f"{cand.cand_id}  {slug:40}  {cand.status:9}  ${cost:.2f}", flush=True)

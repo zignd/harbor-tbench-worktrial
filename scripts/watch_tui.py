@@ -15,8 +15,10 @@ from typing import ClassVar
 
 from rich.syntax import Syntax
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widget import Widget
 from textual.widgets import DataTable, DirectoryTree, Footer, Static, TabbedContent, TabPane
 
 from generator.config import JOBS_DIR, LEDGER_PATH
@@ -112,10 +114,39 @@ class JobsTree(DirectoryTree):
         return [p for p in paths if p.parent != root or self.cand_id in p.name]
 
 
+class Splitter(Widget):
+    """Draggable divider: resizes the pane before it (`#left` width or `#tabs` height)."""
+
+    def __init__(self, target: str, axis: str) -> None:
+        super().__init__(classes=f"split-{axis}")
+        self.target, self.axis = target, axis
+        self.dragging = False
+
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        self.dragging = True
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self.dragging:
+            pane = self.app.query_one(self.target)
+            if self.axis == "x":
+                self.app.resize_pane(self.target, "x", event.screen_x - pane.region.x)
+            else:
+                self.app.resize_pane(self.target, "y", event.screen_y - pane.region.y)
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        self.dragging = False
+        self.release_mouse()
+
+
 class WatchApp(App):
     TITLE = "pipeline watch"
     CSS = """
     #left { width: 64; border: round $primary; }
+    .split-x { width: 1; background: $primary 40%; }
+    .split-y { height: 1; background: $primary 40%; }
+    .split-x:hover, .split-y:hover { background: $accent; }
     #right { width: 1fr; }
     #tabs { height: 45%; }
     #viewer { height: 1fr; border: round $primary; }
@@ -129,6 +160,10 @@ class WatchApp(App):
         ("1", "tab('timeline')", "Timeline"),
         ("2", "tab('files')", "Files"),
         ("3", "tab('jobs')", "Jobs"),
+        ("less_than_sign", "resize('#left', 'x', -4)", "Narrower"),
+        ("greater_than_sign", "resize('#left', 'x', 4)", "Wider"),
+        ("minus", "resize('#tabs', 'y', -2)", "Shorter top"),
+        ("plus", "resize('#tabs', 'y', 2)", "Taller top"),
     ]
 
     def __init__(self, every: int) -> None:
@@ -148,6 +183,7 @@ class WatchApp(App):
         with Horizontal():
             with Vertical(id="left"):
                 yield DataTable(id="cands", cursor_type="row", zebra_stripes=True)
+            yield Splitter("#left", "x")
             with Vertical(id="right"):
                 with TabbedContent(id="tabs"):
                     with TabPane("Timeline [1]", id="timeline"):
@@ -156,6 +192,7 @@ class WatchApp(App):
                         yield DirectoryTree(".", id="filetree")
                     with TabPane("Jobs [3]", id="jobs"):
                         yield JobsTree(str(JOBS_DIR), id="jobtree")
+                yield Splitter("#tabs", "y")
                 with VerticalScroll(id="viewer"):
                     yield Static("Select a candidate, then an event or file.", id="view")
         yield Footer()
@@ -166,6 +203,19 @@ class WatchApp(App):
         self.query_one("#events", DataTable).add_columns("time", "stage", "$", "secs", "summary")
         self.set_interval(self.every, self.action_refresh)
         self.action_refresh()
+
+    def resize_pane(self, selector: str, axis: str, size: int) -> None:
+        pane = self.query_one(selector)
+        total = self.size.width if axis == "x" else self.size.height
+        size = max(10, min(size, total - 20))
+        if axis == "x":
+            pane.styles.width = size
+        else:
+            pane.styles.height = size
+
+    def action_resize(self, selector: str, axis: str, delta: int) -> None:
+        region = self.query_one(selector).region
+        self.resize_pane(selector, axis, (region.width if axis == "x" else region.height) + delta)
 
     def action_tab(self, name: str) -> None:
         self.query_one("#tabs", TabbedContent).active = name

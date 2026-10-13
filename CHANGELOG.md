@@ -4,6 +4,17 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-12
 
+### 00:10 -03:00 · Calibrate first: Opus decides, repairs only for what can ship
+- **Why:** 0 learnable of 5 calibrated tasks after ~$275 (proxy ledger figure) and a day of tuning the *predictors*. Opus calibration is the only real signal for "learnable", and with eager waves it takes minutes, while each lint/quality finding costs a 20-40 min repair round. The deadline for a first approved task is 08:00, so the funnel is reordered around the cheap ground truth.
+- **Snapshots first:** 30 built packages had passed build + oracle 3/3 + nop but sat in repair for other findings. `scripts/calibrate_snapshots.py` calibrates the newest such version per candidate (11 packages; `before_tune_*` snapshots are skipped, since they are what was already calibrated). Results go to `runs/candidates/<id>/snapshots.json` and `snapshot_calibration` events. Running now; a learnable one then only needs its remaining gates fixed.
+- **`CALIBRATE_FIRST` (default on):** `stage_gates(calibrate=True)` starts the Opus calibration as soon as build + oracle/nop pass, in parallel with quality, novelty and red-team. `build_candidate` then decides:
+  - **too easy / too hard:** the candidate ends as `calibrated`, with no repair rounds. Its pending findings are saved, and the tuner takes over under `--tune`.
+  - **invalid:** repaired, with a spec-fix directive from the judged failures plus the other findings.
+  - **learnable:** repaired for its remaining findings and recalibrated if the package changed (calibration records the package hash, and a record for the same package is reused). A clean one ships.
+- **`DIFFICULTY_GATE_BLOCKS` (default off):** the built-package difficulty review rejected all 5 calibrated packages, so it blocks nothing. It's logged as advice, and calibration decides.
+- **Not changed:** the failure judge, pass audits and the red-team, so a learnable task is still checked for hacks and unfair failures before it ships. Calibrating before those gates costs a few Opus trials on packages that may later be repaired, which the credit-free instruction accepts.
+- 137 tests pass (new: too-easy ends without repair, learnable repaired for findings, invalid gets a spec-fix directive, calibration starts only after oracle/nop pass). Dry runs never call Opus or the review.
+
 ### 23:48 -03:00 · The built package loses the blueprint's difficulty; a difficulty review on what was actually built
 - **`31ca` tuning round 2 re-evaluated.** The round had failed only on `structured_data_schema`, which became advisory an hour earlier. The batch process that ran it predated that change. Under the current rubric nothing blocked the package, and it matched the one that passed red-team, so it was calibrated: **5/5, too easy**, in 4-5 turns each, every pass audited legit. The tuning record keeps `result_original: gates_failed` and the note.
 - **Finding: authoring loses the difficulty the blueprint was approved for.** `31ca`'s blueprint promised an opaque binary regression (accepted at genuine_difficulty ≥ 4). The built package ships the `qexec` binary, but the bugs are two sort-direction errors in a plain SQL file. Opus read one file and fixed it. The blueprint review only judges the *plan*, and nothing checked the *build*.

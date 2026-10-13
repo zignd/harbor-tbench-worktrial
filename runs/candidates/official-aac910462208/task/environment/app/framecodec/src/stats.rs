@@ -1,114 +1,147 @@
-// stats.rs - Service statistics tracking
-use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use serde_json::json;
 
-/// Atomic counters for service-level statistics.
-#[derive(Debug, Default)]
+/// Tracks operational statistics for the codec service.
+/// All fields use atomic counters for thread-safe access without locks.
 pub struct ServiceStats {
-    encodes: AtomicU64,
-    encodes_ok: AtomicU64,
-    decodes: AtomicU64,
-    decodes_ok: AtomicU64,
-    errors: AtomicU64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct StatsSnapshot {
-    pub encodes: u64,
-    pub encodes_ok: u64,
-    pub decodes: u64,
-    pub decodes_ok: u64,
-    pub errors: u64,
-    pub encode_error_rate: f64,
-    pub decode_error_rate: f64,
+    decode_attempts: AtomicU64,
+    decode_successes: AtomicU64,
+    decode_failures: AtomicU64,
+    encode_attempts: AtomicU64,
+    encode_successes: AtomicU64,
+    encode_failures: AtomicU64,
+    bytes_decoded: AtomicU64,
+    bytes_encoded: AtomicU64,
 }
 
 impl ServiceStats {
     pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn inc_encode(&self) {
-        self.encodes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_encode_ok(&self) {
-        self.encodes_ok.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_decode(&self) {
-        self.decodes.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_decode_ok(&self) {
-        self.decodes_ok.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn inc_error(&self) {
-        self.errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> StatsSnapshot {
-        let encodes = self.encodes.load(Ordering::Relaxed);
-        let encodes_ok = self.encodes_ok.load(Ordering::Relaxed);
-        let decodes = self.decodes.load(Ordering::Relaxed);
-        let decodes_ok = self.decodes_ok.load(Ordering::Relaxed);
-        let errors = self.errors.load(Ordering::Relaxed);
-
-        let encode_error_rate = if encodes > 0 {
-            (encodes - encodes_ok) as f64 / encodes as f64
-        } else {
-            0.0
-        };
-
-        let decode_error_rate = if decodes > 0 {
-            (decodes - decodes_ok) as f64 / decodes as f64
-        } else {
-            0.0
-        };
-
-        StatsSnapshot {
-            encodes,
-            encodes_ok,
-            decodes,
-            decodes_ok,
-            errors,
-            encode_error_rate,
-            decode_error_rate,
+        ServiceStats {
+            decode_attempts: AtomicU64::new(0),
+            decode_successes: AtomicU64::new(0),
+            decode_failures: AtomicU64::new(0),
+            encode_attempts: AtomicU64::new(0),
+            encode_successes: AtomicU64::new(0),
+            encode_failures: AtomicU64::new(0),
+            bytes_decoded: AtomicU64::new(0),
+            bytes_encoded: AtomicU64::new(0),
         }
     }
 
-    /// Reset all counters to zero.
-    pub fn reset(&self) {
-        self.encodes.store(0, Ordering::Relaxed);
-        self.encodes_ok.store(0, Ordering::Relaxed);
-        self.decodes.store(0, Ordering::Relaxed);
-        self.decodes_ok.store(0, Ordering::Relaxed);
-        self.errors.store(0, Ordering::Relaxed);
+    pub fn record_decode_attempt(&self) {
+        self.decode_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns total requests processed.
-    pub fn total_requests(&self) -> u64 {
-        self.encodes.load(Ordering::Relaxed) + self.decodes.load(Ordering::Relaxed)
+    pub fn record_decode_success(&self) {
+        self.decode_successes.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns total successful operations.
-    pub fn total_ok(&self) -> u64 {
-        self.encodes_ok.load(Ordering::Relaxed) + self.decodes_ok.load(Ordering::Relaxed)
+    pub fn record_decode_failure(&self) {
+        self.decode_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns overall error count.
-    pub fn total_errors(&self) -> u64 {
-        self.errors.load(Ordering::Relaxed)
+    pub fn record_encode_attempt(&self) {
+        self.encode_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Returns overall success rate as a float in [0.0, 1.0].
-    pub fn success_rate(&self) -> f64 {
-        let total = self.total_requests();
-        if total == 0 {
+    pub fn record_encode_success(&self) {
+        self.encode_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_encode_failure(&self) {
+        self.encode_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_bytes_decoded(&self, n: u64) {
+        self.bytes_decoded.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_bytes_encoded(&self, n: u64) {
+        self.bytes_encoded.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn decode_attempts(&self) -> u64 {
+        self.decode_attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn decode_successes(&self) -> u64 {
+        self.decode_successes.load(Ordering::Relaxed)
+    }
+
+    pub fn decode_failures(&self) -> u64 {
+        self.decode_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn encode_attempts(&self) -> u64 {
+        self.encode_attempts.load(Ordering::Relaxed)
+    }
+
+    pub fn encode_successes(&self) -> u64 {
+        self.encode_successes.load(Ordering::Relaxed)
+    }
+
+    pub fn encode_failures(&self) -> u64 {
+        self.encode_failures.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_decoded(&self) -> u64 {
+        self.bytes_decoded.load(Ordering::Relaxed)
+    }
+
+    pub fn bytes_encoded(&self) -> u64 {
+        self.bytes_encoded.load(Ordering::Relaxed)
+    }
+
+    pub fn success_rate_decode(&self) -> f64 {
+        let attempts = self.decode_attempts();
+        if attempts == 0 {
             return 1.0;
         }
-        self.total_ok() as f64 / total as f64
+        self.decode_successes() as f64 / attempts as f64
+    }
+
+    pub fn success_rate_encode(&self) -> f64 {
+        let attempts = self.encode_attempts();
+        if attempts == 0 {
+            return 1.0;
+        }
+        self.encode_successes() as f64 / attempts as f64
+    }
+
+    pub fn as_json(&self) -> serde_json::Value {
+        json!({
+            "decode": {
+                "attempts": self.decode_attempts(),
+                "successes": self.decode_successes(),
+                "failures": self.decode_failures(),
+                "bytes": self.bytes_decoded(),
+                "success_rate": self.success_rate_decode(),
+            },
+            "encode": {
+                "attempts": self.encode_attempts(),
+                "successes": self.encode_successes(),
+                "failures": self.encode_failures(),
+                "bytes": self.bytes_encoded(),
+                "success_rate": self.success_rate_encode(),
+            }
+        })
+    }
+
+    pub fn reset(&self) {
+        self.decode_attempts.store(0, Ordering::Relaxed);
+        self.decode_successes.store(0, Ordering::Relaxed);
+        self.decode_failures.store(0, Ordering::Relaxed);
+        self.encode_attempts.store(0, Ordering::Relaxed);
+        self.encode_successes.store(0, Ordering::Relaxed);
+        self.encode_failures.store(0, Ordering::Relaxed);
+        self.bytes_decoded.store(0, Ordering::Relaxed);
+        self.bytes_encoded.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Default for ServiceStats {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -117,32 +150,48 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stats_initial_zero() {
-        let s = ServiceStats::new();
-        assert_eq!(s.total_requests(), 0);
-        assert_eq!(s.total_errors(), 0);
-        assert!((s.success_rate() - 1.0).abs() < 1e-9);
+    fn test_stats_initial_state() {
+        let stats = ServiceStats::new();
+        assert_eq!(stats.decode_attempts(), 0);
+        assert_eq!(stats.encode_attempts(), 0);
     }
 
     #[test]
-    fn test_stats_increment() {
-        let s = ServiceStats::new();
-        s.inc_encode();
-        s.inc_encode_ok();
-        s.inc_decode();
-        s.inc_decode_ok();
-        assert_eq!(s.total_requests(), 2);
-        assert_eq!(s.total_ok(), 2);
-        assert_eq!(s.total_errors(), 0);
+    fn test_stats_record_decode() {
+        let stats = ServiceStats::new();
+        stats.record_decode_attempt();
+        stats.record_decode_success();
+        assert_eq!(stats.decode_attempts(), 1);
+        assert_eq!(stats.decode_successes(), 1);
+    }
+
+    #[test]
+    fn test_stats_success_rate() {
+        let stats = ServiceStats::new();
+        stats.record_decode_attempt();
+        stats.record_decode_success();
+        stats.record_decode_attempt();
+        stats.record_decode_failure();
+        assert!((stats.success_rate_decode() - 0.5).abs() < 0.001);
     }
 
     #[test]
     fn test_stats_reset() {
-        let s = ServiceStats::new();
-        s.inc_encode();
-        s.inc_error();
-        s.reset();
-        assert_eq!(s.total_requests(), 0);
-        assert_eq!(s.total_errors(), 0);
+        let stats = ServiceStats::new();
+        stats.record_decode_attempt();
+        stats.record_encode_attempt();
+        stats.reset();
+        assert_eq!(stats.decode_attempts(), 0);
+        assert_eq!(stats.encode_attempts(), 0);
+    }
+
+    #[test]
+    fn test_as_json() {
+        let stats = ServiceStats::new();
+        stats.record_encode_attempt();
+        stats.record_encode_success();
+        let j = stats.as_json();
+        assert_eq!(j["encode"]["attempts"], 1);
+        assert_eq!(j["encode"]["successes"], 1);
     }
 }

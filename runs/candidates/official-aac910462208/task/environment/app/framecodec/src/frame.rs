@@ -1,110 +1,97 @@
-// frame.rs - Frame structure and wire format definitions
-use std::fmt;
+// Frame wire format:
+//   [1 byte type][4 bytes seq BE][2 bytes payload_len BE][payload_len bytes payload]
 
-/// Frame type identifier byte
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FrameType(pub u8);
-
-impl fmt::Display for FrameType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "FrameType({})", self.0)
-    }
-}
-
-/// A decoded frame from the wire
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Frame {
-    /// Frame type (1 byte)
     pub frame_type: u8,
-    /// Sequence number (4 bytes, big-endian on wire)
     pub seq: u32,
-    /// Payload bytes
     pub payload: Vec<u8>,
 }
 
 impl Frame {
-    /// Create a new frame
     pub fn new(frame_type: u8, seq: u32, payload: Vec<u8>) -> Self {
         Frame { frame_type, seq, payload }
     }
 
-    /// Returns the total encoded length of this frame in bytes
-    pub fn encoded_len(&self) -> usize {
-        HEADER_SIZE + self.payload.len()
+    /// Returns the total wire size of this frame in bytes.
+    pub fn wire_size(&self) -> usize {
+        1 + 4 + 2 + self.payload.len()
     }
 
-    /// Returns true if this frame has a non-empty payload
-    pub fn has_payload(&self) -> bool {
-        !self.payload.is_empty()
-    }
-
-    /// Returns the payload length as a u16, saturating if needed
-    pub fn payload_len_u16(&self) -> u16 {
-        self.payload.len().min(u16::MAX as usize) as u16
-    }
-}
-
-impl fmt::Display for Frame {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Frame {{ type: {}, seq: {}, payload_len: {} }}",
+    /// Returns a description string for logging purposes.
+    pub fn describe(&self) -> String {
+        format!(
+            "Frame {{ type={}, seq={}, payload_len={} }}",
             self.frame_type,
             self.seq,
             self.payload.len()
         )
     }
-}
 
-/// Size of the fixed frame header in bytes:
-/// 1 (type) + 4 (seq) + 2 (payload_len) = 7
-pub const HEADER_SIZE: usize = 7;
+    /// Returns true if this frame has a non-empty payload.
+    pub fn has_payload(&self) -> bool {
+        !self.payload.is_empty()
+    }
 
-/// Maximum allowed payload size (64 KiB - 1)
-pub const MAX_PAYLOAD_SIZE: usize = (u16::MAX as usize);
+    /// Returns the payload as a hex string.
+    pub fn payload_hex(&self) -> String {
+        hex::encode(&self.payload)
+    }
 
-/// Wire format offsets
-pub mod offsets {
-    pub const TYPE_OFFSET: usize = 0;
-    pub const SEQ_OFFSET: usize = 1;
-    pub const PAYLOAD_LEN_OFFSET: usize = 5;
-    pub const PAYLOAD_OFFSET: usize = 7;
-}
+    /// Validates that the frame type is in a known range.
+    pub fn is_valid_type(&self) -> bool {
+        // All u8 values are structurally valid; application layer may restrict further
+        true
+    }
 
-/// Frame validation errors
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FrameError {
-    /// Buffer is too short to contain a complete header
-    HeaderTooShort { got: usize, need: usize },
-    /// Payload length field exceeds maximum
-    PayloadTooLarge { len: usize, max: usize },
-    /// Buffer is too short to contain the declared payload
-    PayloadTruncated { got: usize, need: usize },
-    /// Zero-length payload handling triggered an unexpected path
-    MultiByteLengthPrefix,
-    /// Generic decode failure
-    DecodeFailed(String),
-    /// Generic encode failure
-    EncodeFailed(String),
-}
+    /// Returns a copy with a different sequence number.
+    pub fn with_seq(mut self, seq: u32) -> Self {
+        self.seq = seq;
+        self
+    }
 
-impl fmt::Display for FrameError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            FrameError::HeaderTooShort { got, need } =>
-                write!(f, "header too short: got {} bytes, need {}", got, need),
-            FrameError::PayloadTooLarge { len, max } =>
-                write!(f, "payload too large: {} > max {}", len, max),
-            FrameError::PayloadTruncated { got, need } =>
-                write!(f, "payload truncated: got {} bytes, need {}", got, need),
-            FrameError::MultiByteLengthPrefix =>
-                write!(f, "multi-byte length prefix error"),
-            FrameError::DecodeFailed(msg) =>
-                write!(f, "decode failed: {}", msg),
-            FrameError::EncodeFailed(msg) =>
-                write!(f, "encode failed: {}", msg),
-        }
+    /// Returns a copy with a different type.
+    pub fn with_type(mut self, frame_type: u8) -> Self {
+        self.frame_type = frame_type;
+        self
     }
 }
 
-impl std::error::Error for FrameError {}
+/// Minimum header length: 1 (type) + 4 (seq) + 2 (payload_len)
+pub const HEADER_LEN: usize = 7;
+
+/// Maximum supported payload length.
+pub const MAX_PAYLOAD_LEN: usize = 65535;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_frame_wire_size() {
+        let f = Frame::new(1, 42, vec![0xde, 0xad]);
+        assert_eq!(f.wire_size(), 9);
+    }
+
+    #[test]
+    fn test_frame_describe() {
+        let f = Frame::new(5, 100, vec![]);
+        let desc = f.describe();
+        assert!(desc.contains("type=5"));
+        assert!(desc.contains("seq=100"));
+    }
+
+    #[test]
+    fn test_has_payload() {
+        let f1 = Frame::new(1, 1, vec![0x01]);
+        let f2 = Frame::new(1, 1, vec![]);
+        assert!(f1.has_payload());
+        assert!(!f2.has_payload());
+    }
+
+    #[test]
+    fn test_payload_hex() {
+        let f = Frame::new(1, 1, vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(f.payload_hex(), "deadbeef");
+    }
+}

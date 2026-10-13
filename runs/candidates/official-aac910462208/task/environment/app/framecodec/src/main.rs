@@ -1,26 +1,35 @@
-// main.rs - Entry point for the framecodec service
 mod codec;
 mod frame;
 mod server;
 mod stats;
 mod util;
 
-use tracing_subscriber::EnvFilter;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+use server::{AppState, build_router};
+use stats::ServiceStats;
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
+async fn main() {
     let port: u16 = std::env::var("FRAMECODEC_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(7000);
 
-    tracing::info!("starting framecodec service on port {}", port);
-    server::run_server(port).await?;
-    Ok(())
+    let stats = Arc::new(ServiceStats::new());
+    let state = AppState { stats };
+    let router = build_router(state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+
+    eprintln!("framecodec service listening on {}", addr);
+
+    axum::Server::bind(&addr)
+        .serve(router.into_make_service())
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Server error: {}", e);
+            std::process::exit(1);
+        });
 }

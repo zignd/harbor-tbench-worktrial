@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "tls-fingerprint-normalizer-repair",
+  "title": "TLS Fingerprint Normalizer Repair",
+  "scenario": "A research scientist is reproducing a published network security result that classifies TLS clients by their JA3 fingerprint hashes. The environment has a running Flask service (`/opt/fingerprinter/`) that accepts raw TLS ClientHello bytes (base64-encoded) via HTTP POST and returns a JA3 string and its MD5 hash. A companion Python library (`/opt/fingerprinter/ja3lib/`) does the actual parsing and normalization. The service passes smoke tests on the three samples in the README but silently produces wrong hashes on inputs the paper's test suite generates at verify time.",
+  "instruction_draft": "The fingerprinter service at http://localhost:5000/fingerprint accepts a JSON body {\"clienthello\": \"<base64>\"} and must return {\"ja3\": \"<string>\", \"hash\": \"<md5hex>\"}. Make it return the correct JA3 string and hash for all valid TLS 1.x ClientHello records.",
+  "requirements": [
+   "POST to http://localhost:5000/fingerprint with {\"clienthello\": \"<base64-encoded raw TLS record bytes>\"} returns HTTP 200",
+   "The returned JSON contains \"ja3\" (the canonical comma/dash-separated JA3 string) and \"hash\" (its lowercase MD5 hex digest)",
+   "The JA3 string and hash are correct for ClientHellos with GREASE values (must be filtered out)",
+   "The JA3 string and hash are correct for ClientHellos that contain no SNI extension (missing extension must produce empty string field, not crash)",
+   "The JA3 string and hash are correct when the supported_groups or ec_point_formats extensions are absent (missing lists produce empty fields, not skipped fields)",
+   "Cipher suite ordering in the JA3 string matches the wire order after GREASE filtering",
+   "Extension type ordering in the JA3 string matches wire order after GREASE filtering"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install -y curl (for healthcheck during setup)",
+   "pip install flask==3.0.3 cryptography==42.0.8",
+   "Directory /opt/fingerprinter/ contains: app.py (Flask service, ~120 lines), ja3lib/__init__.py (~60 lines), ja3lib/parser.py (~180 lines), ja3lib/grease.py (~30 lines), ja3lib/normalizer.py (~90 lines), tests/samples/ with 3 base64 .bin files and matching .ja3 ground-truth files",
+   "app.py starts the Flask service on port 5000 and is launched by a supervisor or systemd-equivalent entry in /etc/rc.local so it is already running when the solver enters",
+   "parser.py correctly parses the raw TLS record envelope and handshake header but has a bug: it reads extension data length fields as big-endian but advances the cursor by the host-byte-order value on platforms where struct.unpack returns an int (this is fine on LE but the real bug is it skips 2 bytes too few when extension_data_len is odd \u2014 a planted off-by-one that corrupts parsing of the NEXT extension)",
+   "normalizer.py has a second independent bug: it joins the supported_groups list with '-' correctly but joins the cipher_suites list with ',' correctly EXCEPT it sorts cipher suites alphabetically instead of preserving wire order \u2014 this only manifests when two cipher suite hex values sort differently than their wire order, which does not happen in the three sample files",
+   "grease.py correctly identifies GREASE values but is imported with a subtle name shadowing: the module-level GREASE_TABLE is a set of ints, but a local variable named GREASE_TABLE (a list) is created inside the filter function, shadowing the module set \u2014 filter always returns True for non-GREASE values but silently passes GREASE values through when they appear in extension type lists (not cipher suites), so sample tests pass",
+   "The three sample .bin files are crafted to avoid all three bugs: no odd-length extension data, cipher suites happen to be in sorted order, no GREASE in extension type lists",
+   "A ENTRYPOINT or CMD in Dockerfile launches the Flask app; healthcheck ensures it is up"
+  ],
+  "internal_hint": "Difficulty comes from runtime behavior on real data, not from reading the source. The three bugs are: (1) parser.py off-by-one on odd extension_data_len corrupts subsequent extension parsing \u2014 only triggers on ClientHellos where any extension has an odd payload length, which none of the samples have; (2) normalizer.py sorts cipher suites instead of preserving wire order \u2014 only visible when wire order differs from lexicographic order of hex strings; (3) grease.py name-shadowing causes GREASE extension types to leak through \u2014 only triggered by ClientHellos containing GREASE in extension type fields. A skilled engineer must: POST crafted inputs to observe wrong output (exploration), bisect which component corrupts which field (modality translation: raw bytes \u2192 parsed struct \u2192 JA3 string), instrument parser.py with prints to watch cursor advancement, find the off-by-one in the length-advance logic, find the sort() call that should not be there, and find the shadowed GREASE_TABLE. All three bugs must be fixed for verify-time inputs to pass because the test generator sends ClientHellos that trigger each bug independently and in combination.",
+  "trap": "A solver that fixes the most obvious symptom (wrong hash on a hand-crafted test input) will likely find and fix one or two bugs but miss the third. The off-by-one in extension parsing is the hardest to find because its symptom (wrong extension list) looks like a GREASE filtering problem, pointing at grease.py (the misleading symptom). A solver who fixes grease.py's name-shadowing first will see some tests pass and assume they are done, but inputs with odd-length extension payloads will still produce corrupt JA3 strings. The sort bug in normalizer.py is invisible unless the solver generates a ClientHello where wire cipher suite order differs from hex-sorted order. Shallow verification against the three provided samples passes even with all three bugs present.",
+  "tests": [
+   "test_grease_in_extensions: generates 20 fresh ClientHello byte sequences containing GREASE values (0x0a0a, 0x1a1a, \u2026 0xfafa) in the supported_groups extension type list; verifies the returned ja3 string contains no GREASE values and the hash matches the reference computation over the filtered string",
+   "test_odd_extension_length: generates 15 ClientHellos where one early extension (e.g., session_ticket) has an odd-byte payload, followed by SNI or supported_groups; verifies the extension after the odd-length one is parsed correctly (SNI appears in ja3 string, supported_groups list is correct)",
+   "test_cipher_suite_wire_order: generates 25 ClientHellos where cipher suites are chosen so their hex representations would sort differently from wire order (e.g., 0xc02c before 0x002f on wire, but '002f' < 'c02c' lexicographically); verifies ja3 cipher suite field matches wire order",
+   "test_missing_sni: generates 10 ClientHellos with no SNI extension; verifies ja3 string has empty string in SNI field (not a crash, not a missing field) and hash is correct",
+   "test_missing_supported_groups: generates 10 ClientHellos with no supported_groups or ec_point_formats extensions; verifies ja3 string has empty lists for those fields",
+   "test_combined_stress: generates 30 ClientHellos that simultaneously have GREASE in extension types, odd extension payload lengths, and non-sorted cipher suite wire order; verifies both ja3 string and hash against reference implementation embedded in test"
+  ],
+  "verifier_knob": {
+   "name": "num_generated_inputs",
+   "value": "110 total across all test functions",
+   "effect": "Raising the count increases the probability that edge-case combinations are hit; lowering it (e.g. to 10 total) means a partially-fixed implementation might pass by luck since the probability of triggering all three bugs simultaneously is lower"
+  },
+  "expected_failure_modes": [
+   "Solver finds and fixes the GREASE name-shadowing bug, verifies manually with a GREASE-containing ClientHello, declares done \u2014 still fails on odd-extension-length and cipher-sort inputs",
+   "Solver correctly identifies the misleading symptom (wrong extension list looking like a GREASE problem) and spends most of the hour in grease.py, fixing the shadowing but never discovering the parser off-by-one",
+   "Solver fixes the parser off-by-one and the sort bug but misses the GREASE name-shadowing because the local test ClientHellos happen not to put GREASE in extension type fields",
+   "Solver writes a test harness using the three sample files, sees all pass after fixing one bug, and submits \u2014 verify-time inputs expose the remaining two bugs",
+   "Solver rewrites normalizer.py from scratch but inadvertently reintroduces the sort (uses sorted() for deduplication) and does not test with non-sorted cipher suites"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "tls",
+   "fingerprinting",
+   "debugging",
+   "network-security",
+   "python",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/fingerprinter/ja3lib/grease.py  # spot GREASE_TABLE name shadow immediately",
+   "cat /opt/fingerprinter/ja3lib/parser.py  # spot off-by-one in extension cursor advance",
+   "cat /opt/fingerprinter/ja3lib/normalizer.py  # spot sort() call on cipher suites",
+   "# Fix 1: grease.py \u2014 rename local variable so module-level GREASE_TABLE is used",
+   "sed -i 's/GREASE_TABLE = \\[/local_grease = [/' /opt/fingerprinter/ja3lib/grease.py  # approximate fix",
+   "# Fix 2: parser.py \u2014 change cursor += extension_data_len to use the correctly parsed length",
+   "# Edit parser.py to fix the off-by-one cursor advance",
+   "# Fix 3: normalizer.py \u2014 remove sort() / sorted() on cipher suites list",
+   "# Edit normalizer.py to preserve wire order",
+   "curl -X POST http://localhost:5000/fingerprint -H 'Content-Type: application/json' -d @tests/samples/sample1.json",
+   "# Compare output hash against sample1.ja3 ground truth",
+   "# Service restart if needed: pkill -f app.py && python /opt/fingerprinter/app.py &"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "All three bugs are explicitly described in the blueprint and visible by source reading \u2014 a strong agent cat-ing the files finds them in one pass without any dynamic testing, making the 'misleading symptom' trap ineffective against source-reading agents",
+   "The speedrun is ~12 commands, well under the 20-command threshold for genuine_difficulty \u2264 2",
+   "The 'off-by-one on odd extension_data_len' description in the blueprint is precise enough that a solver reading the hint text (if leaked) or the source code comment would pinpoint the exact line immediately",
+   "Test flakiness risk: fuzz_equivalence tests generate fresh ClientHellos at verify time \u2014 if the reference implementation embedded in tests has a subtle difference from the canonical JA3 spec, valid correct fixes could still fail",
+   "The 'combined stress' test generating ClientHellos with all three properties simultaneously requires a robust ClientHello builder in the test harness; malformed test inputs could cause HTTP 400 errors that mask whether the fix is correct",
+   "Name-shadowing bug in grease.py is a Python anti-pattern immediately visible via linting tools (pylint, flake8) \u2014 an agent that runs a linter finds it in one command without reading the code"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are findable by reading source code in sequence \u2014 a strong agent will cat the four files and spot the off-by-one, sort(), and name-shadow in one pass without any dynamic testing or bisection. The 'misleading symptom' trap only catches engineers who do exclusively dynamic testing and never read source, which is not how capable agents operate. The speedrun is ~12 commands, well below the 20-command threshold. The task blueprint also over-describes the bugs in the internal hint to a degree that a test reviewer can reconstruct the exact fix without running anything.",
+  "fixes": [
+   "Make the bugs latent and non-obvious in source: instead of a clearly-named local variable shadowing a module global, hide the GREASE bug in a data transformation step (e.g., the filter returns a generator that exhausts on first iteration due to a missing list() call) \u2014 this forces dynamic testing to discover it",
+   "Make the parser bug require understanding the TLS wire format spec to identify, not just spotting a mismatched variable name \u2014 e.g., the bug could be using the wrong struct format character in a way that only manifests on specific byte patterns",
+   "Increase the number of source files and add plausible-looking but innocent code around each bug so simple grep/read passes don't isolate the bug immediately; add red-herring comments pointing at wrong locations",
+   "Add a requirement that the solver must not break the three existing sample tests while fixing bugs, forcing test-driven iteration rather than a single source-reading pass",
+   "Consider making one bug exist in a compiled C extension or a more complex data flow so it cannot be fixed by reading one function"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/fix-color-lib-hash-and-pickle",
+     "verdict": "distinct",
+     "reason": "That task is about fixing Python hash contract violations and pickle serialization in a color library, not parsing network protocol bytes or computing JA3/MD5 fingerprints."
+    },
+    {
+     "ref_id": "terminal-bench-pro/train-disruption-model-with-hash-chain",
+     "verdict": "distinct",
+     "reason": "That task involves training a machine learning model with SHA-256 hash chain integrity checks, unrelated to TLS protocol parsing or JA3 fingerprinting."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task repairs a binary frame codec (encode/decode round-trip for a custom wire format), whereas the candidate task requires fixing TLS ClientHello parsing and JA3 string normalization with GREASE filtering."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task builds an HTTP query service over a SQLite log database with windowed aggregations, which shares no meaningful overlap with TLS fingerprint computation."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task implements an HMAC-SHA256 audit service over WAL records via TCP, a different protocol, algorithm, and debugging challenge from JA3 TLS fingerprint normalization."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/fix-color-lib-hash-and-pickle",
+     0.13
+    ],
+    [
+     "terminal-bench-pro/train-disruption-model-with-hash-chain",
+     0.112
+    ],
+    [
+     "ours/official-aac910462208",
+     0.094
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.092
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.08
+    ]
+   ],
+   "cost_usd": 0.014517000000000002
+  },
+  "novel": true
+ },
+ "cost_usd": 0.047334
+}

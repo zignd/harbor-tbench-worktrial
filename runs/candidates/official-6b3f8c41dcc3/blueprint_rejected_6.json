@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "spectral-hash-corpus-verifier",
+  "title": "Broken Spectral Data Integrity Verifier",
+  "scenario": "A scientific computing team maintains a Python toolkit (~1,200 lines across 6 modules) for archiving and verifying high-volume spectroscopy datasets. The toolkit derives per-record authentication tags by combining a spectral fingerprint (a frequency-domain hash) with a chain HMAC. After a refactor of the signal-processing module, the nightly corpus verification job began silently misclassifying authentic records as corrupted. The CI suite passes because the sample dataset is too small to trigger the data-dependent failure path. The release engineer must diagnose the regression and restore correct verification so that \u226599.5% of authentic records in a hidden 10,000-record corpus are accepted.",
+  "instruction_draft": "```\n$ python verify_corpus.py --input /data/sample.bin\n[INFO] Loading corpus: 128 records\n[INFO] Verified: 128/128 authentic (100.0%)\n[OK] Sample verification passed\n\n$ python verify_corpus.py --input /data/nightly.bin\n[INFO] Loading corpus: 8192 records\n[INFO] Verified: 4031/8192 authentic (49.2%)\n[FAIL] Corpus integrity check failed: too many rejected records\n```\n\nThe nightly spectroscopy corpus verifier is failing after last week's signal-processing refactor. The CI pipeline passes on the 128-record sample but rejects roughly half the records in larger corpora. Fix the toolkit at `/app/spectools/` so that authentic records are correctly verified. A record is authentic if and only if its stored authentication tag matches the tag freshly derived from its spectral content using the documented derivation procedure in `/app/docs/tag_derivation.md`. Your fix must not alter the corpus files or the verifier's public API (`verify_corpus.py` CLI and `SpecVerifier` class interface). When the hidden 10,000-record corpus is run, \u226599.5% of authentic records must be accepted and \u22640.5% of tampered records must be falsely accepted.",
+  "requirements": [
+   "\u226599.5% of authentic records in the hidden 10,000-record corpus are accepted by verify_corpus.py",
+   "\u22640.5% of tampered records in the hidden corpus are falsely accepted",
+   "The fix is confined to /app/spectools/ source files; corpus files and the verifier's public API (CLI and SpecVerifier class) must not be modified",
+   "verify_corpus.py --input /data/sample.bin continues to report 128/128 authentic"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with: numpy==1.26.4, scipy==1.13.1, cryptography==42.0.8 pinned in requirements.txt",
+   "Six Python modules under /app/spectools/: __init__.py, loader.py (~180 lines, parses binary corpus format), fingerprint.py (~220 lines, computes DFT-based spectral fingerprint), chain.py (~160 lines, manages HMAC chain across records), tagger.py (~140 lines, combines fingerprint + chain into authentication tag), verifier.py (~200 lines, SpecVerifier class, orchestrates verification), utils.py (~120 lines, shared helpers)",
+   "/app/verify_corpus.py: thin CLI wrapper around SpecVerifier",
+   "/app/docs/tag_derivation.md: documents the correct tag derivation: (1) compute DFT of raw samples, (2) take magnitude of bins 1..N/2 (excluding DC and Nyquist), (3) quantize to 16-bit fixed-point by dividing by the RMS of the full spectrum and multiplying by 32767, (4) HMAC-SHA256 the quantized bytes with a per-record key derived from the chain state",
+   "/data/sample.bin: 128-record corpus, all authentic, verifies 128/128 before and after the bug",
+   "/data/nightly.bin: 8192-record corpus, mixture of authentic and tampered, verifies ~49% before fix",
+   "The planted bug in fingerprint.py: after refactor, the RMS normalization divisor is computed over only the selected bins (1..N/2) instead of the full spectrum (0..N-1); this is numerically identical for the 128-record sample (which all have flat-ish spectra with negligible DC) but diverges for records with large DC offsets or strong Nyquist energy, which appear only in larger corpora",
+   "A second interacting issue in chain.py: the chain HMAC key derivation uses record index as a big-endian 4-byte integer in the new code but little-endian in the tag-generation script that produced the corpus files; this only matters for indices \u2265256 (byte boundary), so sample records 0-127 are unaffected but nightly records 256+ are doubly broken",
+   "The misleading symptom: verify_corpus.py prints a 'checksum mismatch' error that points to the chain module, but adding debug prints to chain.py first shows that roughly half the failures have correct chain keys \u2014 those failures are purely from the fingerprint normalization bug, not the endianness bug; agents who fix only chain.py see the pass rate climb from 49% to ~74% and think they are converging but are still failing the threshold",
+   "A compiled reference binary /app/bin/tag_oracle (x86-64 ELF, no source provided) accepts a raw record byte blob on stdin and prints the correct authentication tag to stdout; this is the ground-truth oracle the corpus was generated with",
+   "tag_oracle uses full-spectrum RMS and big-endian record indices \u2014 consistent with docs/tag_derivation.md \u2014 providing a black-box way to verify the correct behavior without reading its source",
+   "/app/tests/test_sample.py: unit tests that pass on the 128-record sample corpus; all tests pass before and after the bug on small inputs",
+   "Corpus binary format documented in /app/docs/corpus_format.md: 8-byte magic, 4-byte record count, then records each with: 4-byte index (little-endian in file header), 4-byte sample count, float32 samples, 32-byte authentication tag"
+  ],
+  "internal_hint": "Difficulty comes from two sources: (1) data-dependent failure \u2014 both bugs only manifest on inputs outside the sample corpus (large DC offset records appear only at scale; index byte-boundary issue only affects records \u2265256), so reading the code reveals plausible-looking code without an obvious bug; the solver must run experiments comparing tag_oracle output against the Python pipeline on specific records to find the normalization difference. (2) Misleading symptom \u2014 the error message implicates chain.py, and partial fix of chain.py produces a visible but insufficient improvement (74% \u2192 not passing), causing agents to keep debugging chain.py rather than switching to fingerprint.py. The hidden invariant is that RMS normalization must use all N spectral bins including DC and Nyquist (bins 0..N-1), not just the selected authentication bins (1..N/2). Resolution: (a) extract a failing authentic record from nightly.bin, pipe its raw bytes to tag_oracle, compare with Python pipeline output, observe the tag mismatch; (b) instrument fingerprint.py to print intermediate RMS values, discover the denominator discrepancy; (c) fix fingerprint.py to use full-spectrum RMS; (d) separately, extract records with index \u2265256 and compare tag_oracle output to chain.py output, discover endianness bug; (e) fix chain.py to use big-endian record index.",
+  "trap": "An agent that fixes only chain.py (the component named in the error message) sees the pass rate rise from ~49% to ~74% on nightly.bin and may declare success without running on the hidden 10,000-record corpus. The hidden corpus contains a higher proportion of large-DC-offset records (the fingerprint bug triggers on ~30% of records) so the fingerprint-only failure alone would cause ~70% pass rate \u2014 still below the 99.5% threshold. An agent that fixes only fingerprint.py but not the endianness bug achieves ~85% on the hidden corpus \u2014 also failing. Both bugs must be fixed to clear 99.5%.",
+  "tests": [
+   "Run verify_corpus.py --input /data/sample.bin and assert the output reports 128/128 authentic",
+   "Generate a fresh 10,000-record corpus at verify time using a seeded generator that produces: 7000 authentic records with varied DC offsets (30% have |DC| > 10\u00d7 RMS of AC components), 1500 authentic records with indices \u2265256 (stressing endianness), 1500 tampered records (tag byte-flipped); run verify_corpus.py against this corpus and assert accepted_authentic/total_authentic \u2265 0.995",
+   "Assert that tampered records are rejected: falsely_accepted_tampered/total_tampered \u2264 0.005",
+   "Assert the SpecVerifier class interface is intact: import spectools; v = spectools.SpecVerifier('/data/sample.bin'); result = v.verify_all(); assert result.accepted == 128",
+   "Assert verify_corpus.py exits with code 0 on sample.bin and code 1 on a corpus with any rejections"
+  ],
+  "verifier_knob": {
+   "name": "acceptance_threshold",
+   "value": "0.995",
+   "effect": "Lowering to 0.98 makes it easier (partial fixes that only fix one bug pass); raising to 0.999 makes it harder (requires both bugs fixed with no off-by-one errors in the normalization formula)"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only chain.py (endianness) after seeing the misleading 'checksum mismatch chain' error, achieves ~85% on hidden corpus, fails threshold",
+   "Agent fixes only fingerprint.py (RMS normalization), achieves ~85% on hidden corpus because endianness bug still affects records \u2265256",
+   "Agent uses tag_oracle only on small-index records to validate their fix, misses the endianness issue which only appears for index \u2265256",
+   "Agent correctly identifies the fingerprint normalization bug but implements full-spectrum RMS incorrectly (e.g., uses N/2 bins instead of N, or forgets to include bin 0), producing a slightly wrong normalization that still fails on edge cases",
+   "Agent modifies verify_corpus.py CLI or SpecVerifier interface to work around the bug instead of fixing the underlying modules, causing interface-integrity tests to fail"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "scientific-computing",
+   "cryptography",
+   "reverse-engineering",
+   "error-recovery",
+   "systems-programming",
+   "python"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/docs/tag_derivation.md",
+   "cat /app/spectools/fingerprint.py",
+   "grep -n 'rms\\|RMS\\|norm\\|mean' /app/spectools/fingerprint.py",
+   "cat /app/spectools/chain.py",
+   "grep -n 'little\\|big\\|endian\\|to_bytes\\|index' /app/spectools/chain.py",
+   "python verify_corpus.py --input /data/sample.bin",
+   "python verify_corpus.py --input /data/nightly.bin",
+   "# In fingerprint.py: fix RMS to use full spectrum (bins 0..N-1) instead of selected bins (1..N/2)",
+   "sed or direct edit of fingerprint.py to change rms divisor to full-spectrum magnitude array",
+   "# In chain.py: fix endianness from little-endian to big-endian for record index",
+   "sed or direct edit of chain.py to change 'little' to 'big' in index.to_bytes(4, 'little')",
+   "python verify_corpus.py --input /data/sample.bin",
+   "python verify_corpus.py --input /data/nightly.bin",
+   "python -c \"import spectools; v = spectools.SpecVerifier('/data/sample.bin'); r = v.verify_all(); print(r.accepted)\""
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "tag_oracle is specified as x86-64 ELF \u2014 if the container runs on ARM64 (e.g., Apple Silicon host with Docker), the oracle binary won't execute, breaking a key diagnostic tool and potentially making the task unsolvable via the intended oracle path",
+   "The 'mixture of authentic and tampered' ratio in nightly.bin is unspecified in the instruction; if the tampered proportion is very high, the ~49% pass rate could be consistent with a pure-tampered-rejection scenario rather than a bug, potentially confusing the solver",
+   "The hidden 10,000-record corpus is generated at verify time with an unspecified seed \u2014 the solver cannot validate their fix against this exact corpus, only against nightly.bin; a seeded corpus that happens to emphasize one bug over another could cause borderline solutions to flicker",
+   "corpus_format.md states record index is little-endian in the file header, but chain.py must use big-endian \u2014 this intentional asymmetry could confuse solvers into thinking the file-format docs govern both uses",
+   "The bugs are directly readable from source code against the docs without needing the oracle or experiments, making the 'hidden invariant' difficulty lever ineffective against a careful code reader"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 falls below the required minimum of 3, disqualifying the task. The two bugs (RMS scope and endianness) are both directly visible by reading the source modules against tag_derivation.md \u2014 a systematic agent needs only ~14 commands to find and fix both without needing experiments or the oracle. The 'misleading symptom' only delays agents who read error messages instead of code, and the 'hidden invariant' is not truly hidden since it is explicitly documented in tag_derivation.md ('RMS of the full spectrum'). Additionally, the x86-64-only oracle binary creates an invalid failure risk on ARM64 build environments.",
+  "fixes": [
+   "Make the bugs non-source-readable: instead of a simple variable scope change (selected_bins vs full_spectrum), introduce a subtle numerical equivalence that breaks only under statistical conditions \u2014 e.g., the fingerprint.py code looks correct but uses np.fft.rfft normalization='ortho' instead of the default, producing values that match on balanced spectra but diverge on DC-heavy records; this requires running experiments rather than reading code",
+   "Eliminate the oracle binary's architecture dependency: either provide a Python reference implementation (tag_oracle.py) that is obfuscated/compiled with Cython, or ensure the binary is provided as both x86-64 and ARM64 fat binary, or replace it with a Docker-guaranteed x86-64 base image constraint",
+   "Increase the number of interacting bugs to three, with the third being a timing-dependent or accumulation-dependent issue (e.g., chain state drift after 512 records due to integer overflow in a counter), so that fixing two bugs produces ~90% and all three are required for 99.5%; this prevents early convergence and forces broader exploration",
+   "Remove the explicit documentation of 'full spectrum' from tag_derivation.md and instead describe it ambiguously as 'spectral RMS normalization' \u2014 forcing the solver to use the oracle to determine what 'full spectrum' means empirically, activating the intended hidden_invariant difficulty lever"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both involve a refactored multi-module codebase where regression tests pass on small inputs but silently produce wrong cryptographic/authentication outputs on larger datasets, requiring diagnosis and repair of the signal-processing/derivation logic without altering the public API or data files."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation correctness and performance in a log ingestion pipeline, not about diagnosing a cryptographic authentication regression."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about implementing correct HMAC-SHA256 computation over a binary wire protocol with TCP session handling, not debugging a regression in a spectral fingerprint authentication chain."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "That task is about matching fixed-point statistics output of a reference binary in a Rust sensor pipeline, not diagnosing a cryptographic tag derivation regression in a Python spectroscopy toolkit."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about making a bash SQL filter validator produce byte-identical output to a reference binary, a completely different domain and problem from spectral authentication tag verification."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.185
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.133
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.129
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.104
+    ],
+    [
+     "ours/official-18899524e171",
+     0.09
+    ]
+   ],
+   "cost_usd": 0.014775
+  },
+  "novel": false
+ },
+ "cost_usd": 0.060318
+}

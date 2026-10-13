@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "log-filter-daemon-config-repair",
+  "title": "Log Filter Daemon: Silent Misrouting Under Load",
+  "scenario": "A backend developer is chasing a production bug where high-severity alerts from a microservices fleet are being silently dropped or misrouted. The system includes a Python log-filter daemon (~1200 lines across several modules) that reads structured JSON logs from a spool directory, applies a multi-stage pipeline of regex-based classifiers and field transformers, and writes to severity-tiered output sinks. The daemon has two interacting configuration bugs that only manifest when processing real multi-service log volumes: a field-normalization rule that silently clobbers the 'service' tag for log lines containing a specific pattern, and a sink-routing table that uses the clobbered tag as its dispatch key. Fixing only the normalization rule makes routing appear to work on the sample data but fails on the adversarial corpus; fixing only the routing table leaves normalization broken so certain service tags are still clobbered.",
+  "instruction_draft": "```\n$ ./run_filter.sh logs/sample/\nProcessed 847 records in 2.3s\nSINK critical: 0 records\nSINK warning: 312 records  \nSINK info: 535 records\n\n$ cat expected_critical.txt | wc -l\n89\n```\n\nWe have 89 critical-severity log lines in the sample that should reach the `critical` sink but none are getting there. The filter daemon lives in `/opt/logfilter/`. The sample logs are in `/var/log/spool/sample/`. A conformance checker is at `/opt/logfilter/check_conformance.py` \u2014 run it against any directory of logs to see pass/fail. The daemon is configured via `/etc/logfilter/pipeline.yaml` and `/etc/logfilter/sinks.yaml`.\n\nFix the daemon so that:\n1. Every log record whose `severity` field is `CRITICAL` reaches the `critical` sink and no other sink.\n2. Every log record whose `severity` field is `WARNING` reaches the `warning` sink.\n3. Every log record whose `severity` field is `INFO` reaches the `info` sink.\n4. The `service` field on every output record must match the `service` field on the corresponding input record exactly.\n5. No input record is silently dropped: the total count of records across all sinks must equal the total input count.\n6. The conformance checker at `/opt/logfilter/check_conformance.py` must exit 0 when run against `/var/log/spool/sample/`.\n\nThe conformance checker is also run at verify time against a larger hidden corpus. All six requirements must hold on that corpus.",
+  "requirements": [
+   "CRITICAL severity records routed exclusively to the critical sink",
+   "WARNING severity records routed exclusively to the warning sink",
+   "INFO severity records routed exclusively to the info sink",
+   "service field on every output record matches the service field on the corresponding input record",
+   "No input record is silently dropped (total count is conserved across sinks)",
+   "conformance checker exits 0 on sample logs and on verify-time corpus"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm, installs pyyaml, jsonschema, python-dateutil",
+   "/opt/logfilter/ \u2014 the daemon source: main.py (~300 lines), pipeline.py (~400 lines), sinks.py (~250 lines), normalizer.py (~200 lines), utils.py (~100 lines)",
+   "normalizer.py contains a regex substitution rule that, for lines where the message field matches a pattern used by 3 of the 7 simulated services, replaces the 'service' field value with a normalized form that happens to be a different service name (e.g., 'payment-worker' \u2192 'payment')",
+   "sinks.yaml routes by a 'service_group' computed field, which is derived from the 'service' field via a lookup table; the lookup table has entries for the pre-normalization names but not the post-normalization names, so clobbered records fall through to a catch-all that maps them to the wrong severity bucket",
+   "The two bugs interact: bug 1 (normalizer clobbering service field) causes bug 2 (routing table miss) to manifest; fixing bug 1 alone makes sample tests pass because sample logs happen not to include the triggering pattern at high volume; fixing bug 2 alone silently passes the sample but fails on corpus because service clobbering still corrupts the service field requirement",
+   "/etc/logfilter/pipeline.yaml \u2014 references normalizer stages by name including the buggy one",
+   "/etc/logfilter/sinks.yaml \u2014 contains the routing lookup table with the missing post-normalization entries",
+   "/var/log/spool/sample/ \u2014 847 records from 3 of 7 services, deliberately chosen so the triggering pattern appears rarely (makes sample-only testing misleading)",
+   "/opt/logfilter/check_conformance.py \u2014 reads all .jsonl files in a directory, runs the daemon pipeline in dry-run mode, checks all 6 requirements, exits 0 on pass",
+   "At verify time, a corpus generator creates 50,000 records from all 7 services with realistic message distributions, ensuring the triggering pattern appears frequently for all 3 affected services",
+   "The daemon writes output as .jsonl files to /var/log/logfilter/sinks/{critical,warning,info}/ directories",
+   "A run_filter.sh convenience script exists at /opt/logfilter/run_filter.sh"
+  ],
+  "internal_hint": "Difficulty comes from observe_not_read and two_interacting_causes. Bug 1 is in normalizer.py: a regex substitution rule intended to strip version suffixes from service names (e.g., 'payment-worker-v2' \u2192 'payment-worker') uses an overly broad pattern that also matches 'payment-worker' \u2192 'payment', clobbering the service tag. Bug 2 is in sinks.yaml: the service_group routing table maps original names ('payment-worker', 'auth-service', 'job-runner') to groups but has no entry for the clobbered forms ('payment', 'auth', 'job'), so clobbered records hit a default route that sends them to 'info' regardless of severity. The interaction: fix only bug 1 and all sample tests pass because the sample has few affected records, but the corpus will fail on the service-field-match requirement for edge cases. Fix only bug 2 by adding clobbered names to routing table and severity routing appears correct on corpus, but the service field on output records is still wrong (requirement 4 fails). Both bugs must be fixed: (a) tighten the regex in normalizer.py to not clobber the service field, and (b) verify/fix the routing table in sinks.yaml. The solver must run the daemon on the sample, observe that critical=0 despite input having CRITICAL records, instrument the pipeline to trace where the records go, discover both the clobbering and the routing miss, and fix both. The sample is designed so fixing only bug 2 makes the sample pass (critical records from sample services happen to route correctly once table is fixed) \u2014 this is the trap.",
+  "trap": "A naive solver instruments the pipeline, notices the routing table miss (bug 2), adds the missing entries to sinks.yaml, and verifies against the sample \u2014 all 89 critical records now reach the critical sink, conformance checker exits 0. They stop there. The hidden corpus includes all 7 services at realistic volume: the service field is still being clobbered by the normalizer (bug 1), so requirement 4 (service field must match input) fails for ~40% of records. The corpus also includes services where the clobbered name maps to a different service group than the original, causing some records to misroute even with bug 2 fixed. A solver who patches only the routing table fails the corpus on requirements 4 and 1.",
+  "tests": [
+   "Run conformance checker against sample: must exit 0 with all 6 requirements passing after fix",
+   "Verify-time: generate 50,000-record corpus from all 7 services with realistic message distribution; run daemon; check critical sink contains exactly all CRITICAL-severity input records",
+   "Verify-time: check warning sink contains exactly all WARNING-severity input records",
+   "Verify-time: check info sink contains exactly all INFO-severity input records",
+   "Verify-time: for every output record, fetch its input record by a stable record-id field and assert service field is identical",
+   "Verify-time: assert sum of records across all three sinks equals total input count (no drops)",
+   "Verify-time: inject 500 records from the 3 affected services with the triggering message pattern at CRITICAL severity; assert all 500 appear in critical sink with correct service field",
+   "Verify-time: inject records where service name is 'payment-worker-v2' (a valid variant not affected by the bug); assert service field on output is 'payment-worker-v2' not 'payment-worker'",
+   "Adversarial: inject records with service='payment' (the clobbered form as a legitimate service name); assert they are routed by their actual severity, not mixed with clobbered 'payment-worker' records"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "50000 records across 7 services",
+   "effect": "Lowering to 1000 records makes the triggering pattern appear rarely enough that partial fixes pass; raising to 200,000 with 15 services adds more service-name collision cases and stress-tests the routing table exhaustively"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the routing table (bug 2), verifies on sample, stops \u2014 fails corpus on service-field requirement",
+   "Solver fixes only the normalizer (bug 1), verifies routing looks correct on sample \u2014 fails corpus because some services are still misrouted when message patterns cause normalization side effects",
+   "Solver adds the clobbered names to the routing table AND tightens the regex, but uses a greedy pattern that breaks a different service name variant, failing the adversarial injection test",
+   "Solver correctly identifies both bugs but rewrites normalizer in a way that drops records containing the triggering pattern instead of preserving them, failing the record-count conservation requirement",
+   "Solver patches the normalizer regex but doesn't realize the regex also affects service names with legitimate similar forms, introducing a new off-by-one in the routing for valid variant names"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "log-processing",
+   "configuration",
+   "two-interacting-bugs",
+   "observe-not-read",
+   "pipeline",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/logfilter/normalizer.py",
+   "cat /etc/logfilter/sinks.yaml",
+   "grep -n 're\\.sub\\|regex' /opt/logfilter/normalizer.py",
+   "cat /etc/logfilter/pipeline.yaml",
+   "cat /opt/logfilter/sinks.py",
+   "# Identify bug 1: overly broad regex strips '-worker' suffix from 'payment-worker'",
+   "# Identify bug 2: sinks.yaml has no entry for 'payment', 'auth', 'job' (clobbered forms)",
+   "sed -i 's/<broad_pattern>/<tight_pattern>/' /opt/logfilter/normalizer.py",
+   "# Edit sinks.yaml to add entries for clobbered names (defensive) or just rely on fix 1",
+   "python /opt/logfilter/check_conformance.py /var/log/spool/sample/",
+   "./opt/logfilter/run_filter.sh /var/log/spool/sample/",
+   "python /opt/logfilter/check_conformance.py /var/log/spool/sample/"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'observe_not_read' difficulty lever is undermined: both bugs are in readable source files (normalizer.py regex and sinks.yaml lookup table), so an agent can read and fix them without running the daemon on real data. The difficulty lever label doesn't match the actual task structure.",
+   "The trap relies on the sample being 'deliberately chosen so the triggering pattern appears rarely' but the conformance checker runs on sample \u2014 if the conformance checker is thorough (checks service field integrity requirement 4), fixing only bug 2 would still fail conformance on sample, undermining the stated trap.",
+   "Ambiguity in whether fixing only bug 1 (normalizer) is sufficient: if the routing table has no entry for 'payment' as a legitimate service, a legitimate service named 'payment' would also misroute. The adversarial test for this is stated but depends on careful implementation.",
+   "The 'payment-worker-v2' adversarial test requires careful regex crafting; the correct fix boundary is underspecified \u2014 what exactly constitutes a valid version suffix is not stated in the instruction, leaving the solver to guess.",
+   "Flakiness risk: the verify-time corpus generator uses 'realistic message distributions' which could vary between runs if seeded non-deterministically, potentially causing borderline pass/fail on count-based checks."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 reflects that both bugs are directly visible in readable source files, making the 'observe_not_read' lever a mislabel \u2014 a skilled agent reads normalizer.py and sinks.yaml in ~5 commands and fixes both bugs in ~12 total commands. The stated trap (fixing only the routing table passes sample) is also undermined if the conformance checker properly checks requirement 4 (service field integrity) even on sample data. The average score is (4+4+4+2+4)/5 = 3.6, but genuine_difficulty at 2 fails the minimum-per-score threshold of 3.",
+  "fixes": [
+   "Move bug 1 from a static regex in a readable config into runtime behavior: e.g., the normalization rule is dynamically loaded from a compiled extension or derived from observed log patterns, requiring the solver to instrument and trace the pipeline under load to discover the clobbering, not just read source.",
+   "Make the conformance checker on sample intentionally incomplete for service-field checking (e.g., only checks routing counts, not service field integrity on sample) so the sample-only trap actually works \u2014 document this explicitly in the instruction so requirement 4 is clear but the checker only enforces it at verify time.",
+   "Replace the two-file config bug with a bug that only manifests at concurrency/load (e.g., a race condition in the sink writer, or a batch-size-dependent normalization flush bug), making the 'observe_not_read' lever genuine.",
+   "Specify the exact regex semantics for valid version suffixes (e.g., '-v' followed by one or more digits) in the instruction or a comment in the code, so the solver knows what 'correct' looks like without guessing.",
+   "Seed the corpus generator with a fixed random seed to eliminate flakiness in count-based verification tests."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/log-summary-date-ranges",
+     "verdict": "distinct",
+     "reason": "That task is about counting log severities across date ranges and writing a CSV summary; the candidate is about debugging a multi-stage log-routing daemon with interacting configuration bugs causing misrouting."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Node.js log ingestion service for schema validation correctness and performance; the candidate is about fixing a Python daemon's field-normalization and sink-routing bugs."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task involves implementing TCP-based HMAC authentication over WAL records with binary serialization; the candidate is about fixing log classification and routing pipelines."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing AES-128-CTR encryption/decryption in a C library; the candidate is about fixing Python daemon configuration bugs in log routing."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a SQLite metrics database with a compiled engine; the candidate is about fixing a multi-stage log-filter daemon's normalization and routing bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/log-summary-date-ranges",
+     0.243
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.189
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.141
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.13
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.105
+    ]
+   ],
+   "cost_usd": 0.015315
+  },
+  "novel": true
+ },
+ "cost_usd": 0.050817
+}

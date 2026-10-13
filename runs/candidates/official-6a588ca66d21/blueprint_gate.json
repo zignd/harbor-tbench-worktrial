@@ -1,0 +1,111 @@
+{
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /opt/pipeline/ingest.py | grep -n 'salt\\|fingerprint\\|CRITICAL\\|ERROR'",
+   "cat /opt/pipeline/ratelimit.py",
+   "cat /opt/pipeline/metrics.py",
+   "python /opt/pipeline/run.py --config /etc/pipeline/config.yaml --replay &",
+   "cat /var/metrics/pipeline.prom  # observe 0 CRITICAL/ERROR counts",
+   "# Spot salt dict missing ERROR/CRITICAL keys in ingest.py",
+   "sed -i 's/salt_map = {/salt_map = {\"ERROR\": 2, \"CRITICAL\": 3,/' /opt/pipeline/ingest.py  # fix salt dict",
+   "/opt/verify/smoke_test.sh  # still fails - eviction.so still drops CRITICAL/ERROR",
+   "# Agent confused - tries to instrument ratelimit.py ctypes boundary",
+   "# Add debug print after eviction.so call: print(f'evict({level})={ret}')",
+   "python /opt/pipeline/run.py --config /etc/pipeline/config.yaml --replay 2>&1 | grep evict",
+   "# Observe eviction.so returns 1 (already-seen) for every CRITICAL/ERROR event",
+   "# Realize CRITICAL level code (4) << 4 = 64 overflows 8-bit to same as INFO code",
+   "# Read ratelimit.py ctypes call: find where level string is converted to numeric code",
+   "grep -n 'level\\|bitmask\\|ctypes\\|CDLL\\|argtypes' /opt/pipeline/ratelimit.py",
+   "# Patch ratelimit.py to remap CRITICAL->5, ERROR->6 (non-overflowing codes) before passing to eviction.so",
+   "# Ensure salt fix from step 7 is still present in ingest.py",
+   "python /opt/pipeline/run.py --config /etc/pipeline/config.yaml --replay",
+   "/opt/verify/smoke_test.sh  # both bugs fixed, should pass"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The level code remapping fix in ratelimit.py requires knowing which numeric codes are safe (don't overflow in 8-bit). The blueprint says 'e.g., 8 -> also collides' but never specifies what the correct mapping is or how the solver is expected to determine safe values \u2014 this could make the fix nondeterministic or require trial-and-error that isn't clearly guided by any observable artifact.",
+   "The eviction.so bitmask overflow behavior (CRITICAL code 4 shifted left 4 = 64 wraps to INFO's code) assumes the solver can reverse-engineer the internal encoding table of the binary-only .so without source. This may require binary analysis (objdump, ghidra) that exceeds the 1-hour time budget or may not be feasible in the slim container without those tools installed.",
+   "The smoke_test.sh uses --replay mode but the main instruction shows the pipeline running in tail mode. If --replay mode isn't documented in the instruction or discoverable from --help, the solver may not know how to trigger a controlled test run, making verification unclear.",
+   "The interaction between the two bugs creates a confusing signal: fixing only the salt dict makes CRITICAL fingerprints unique, but eviction.so still drops them, so smoke_test.sh still fails with what looks like the same symptom. An agent might conclude the salt fix is wrong and revert it, leaving them worse off. This is intended as a difficulty lever but could constitute an unfair trap if the signal doesn't distinguish 'wrong fix' from 'incomplete fix'.",
+   "The blueprint lists 'fingerprint collision across services is incorrectly deduplicating events' as a valid failure mode, implying the per-service deduplication scope must be clear \u2014 but the instruction only says 'unique (service, level, fingerprint) tuple per rolling window', which is clear. However, if eviction.so does per-fingerprint deduplication without considering service, fixing the Python code alone won't fix cross-service collisions, potentially introducing a third bug surface not mentioned in the instruction.",
+   "The Dockerfile includes libpython3-dev but not ltrace or strace, which the internal hint suggests as discovery tools. If the container lacks these tools, the solver must use Python-side instrumentation only, which requires editing ratelimit.py \u2014 a reasonable approach but one that should be confirmed as sufficient.",
+   "The requirement that the solver must identify a specific wrong numeric code and substitute a correct one (without source code for eviction.so) may be underdetermined: there's no clear way to know which codes are 'safe' without either binary analysis or exhaustive testing, which could make this task environment-dependent on whether binary analysis tools are available."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical solvability gap: the solver must determine safe level remapping codes for a binary-only shared library without source, and the container (python:3.13-slim-bookworm) likely lacks binary analysis tools (ltrace, strace, ghidra) needed to reverse-engineer the encoding table. The two-bug interaction creates a confusing signal where partial fixes look identical to wrong fixes, which is a valid difficulty lever, but without a clear way to discover the safe numeric codes for the ctypes remapping, the fix for bug #1 may be underdetermined. Additionally, the --replay mode needed for controlled verification is not mentioned in the instruction, and the scope of per-service deduplication in eviction.so could introduce a third undocumented bug surface.",
+  "fixes": [
+   "Install ltrace and strace in the Dockerfile, or explicitly state that Python-side ctypes instrumentation (adding print statements to ratelimit.py) is sufficient to discover the return value pattern \u2014 remove ambiguity about discovery tools.",
+   "Add a small hint in the instruction (or a discoverable artifact like a level_codes.h header or a README in /opt/pipeline/lib/) that documents the level encoding scheme used by eviction.so, so the solver can determine safe remapping codes without binary analysis. Alternatively, make the fix purely Python-side by having eviction.so expose a query function for its internal encoding table.",
+   "Explicitly document --replay mode in the instruction or in a /opt/pipeline/README, so the solver knows how to trigger deterministic test runs and doesn't have to guess the CLI interface.",
+   "Clarify in the instruction whether deduplication in eviction.so is per-(service, fingerprint) or per-fingerprint-only, to make the cross-service collision behavior unambiguous and avoid introducing a hidden third bug.",
+   "Consider making the fix for eviction.so purely a Python-side workaround (e.g., ratelimit.py must intercept the return value and override it for CRITICAL/ERROR) rather than requiring correct reverse-engineering of internal bitmask encoding, which makes the task more tractable within the time budget."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task fixes a log enrichment pipeline with GeoIP binary and Flask API endpoints; the candidate task fixes a rate-limiter/deduplication middleware with Prometheus metrics export and a C extension for sliding-window eviction."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "That task fixes encrypted audit log key derivation consistency between encryptor and verifier; the candidate task fixes silent event filtering in a rate-limiter/metrics pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/log-summary-date-ranges",
+     "verdict": "distinct",
+     "reason": "That task aggregates log severity counts into a CSV by date range; the candidate task debugs a live pipeline where CRITICAL/ERROR events are silently dropped before Prometheus export."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task fixes a canary orchestrator's rollback logic and health-window state; the candidate task fixes a log rate-limiter/deduplication middleware that silently drops high-severity events."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task fixes a schema-validation NDJSON ingestion pipeline for correctness and performance; the candidate task fixes a multi-component log pipeline where a C-extension rate-limiter silently filters out CRITICAL/ERROR events."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.216
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.16
+    ],
+    [
+     "terminal-bench-2-1/log-summary-date-ranges",
+     0.159
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.142
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.131
+    ]
+   ],
+   "cost_usd": 0.016137
+  },
+  "novel": true
+ },
+ "cost_usd": 0.063519
+}

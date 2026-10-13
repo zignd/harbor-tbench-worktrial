@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "capacity-forecast-binary-drift",
+  "title": "Capacity Forecast Binary Drift",
+  "scenario": "A sysadmin team runs a capacity planning service that ingests hourly server metrics from a SQLite database, passes them through a compiled forecasting binary that computes exponential weighted moving averages and headroom estimates, then writes results to a forecast table that the analyst queries for weekly reports. Three weeks ago the analyst noticed that the CPU headroom figures stopped matching their own spreadsheet calculations. The environment has ~1,200 lines across: a metrics ingester (Python), a compiled forecasting binary (no source), a SQL-based report generator, configuration YAML, and a schema migration script.",
+  "instruction_draft": "The capacity forecast report at `/app/report.sql` is producing CPU headroom values that disagree with manual calculations on the same raw data. Fix the pipeline so that each server's forecasted peak CPU and headroom percentage in the `forecast_summary` table are mathematically correct given the raw `metrics` table and the EWMA parameters in `config.yaml`.",
+  "requirements": [
+   "For each server_id, the `forecasted_peak` in `forecast_summary` must equal the EWMA of the hourly `cpu_pct` values using the `alpha` from `config.yaml`, applied in chronological order",
+   "The `headroom_pct` must equal `(100.0 - forecasted_peak) / 100.0 * 100` rounded to two decimal places",
+   "The pipeline must be idempotent: running it twice produces the same `forecast_summary` rows",
+   "Servers with fewer than the `min_samples` threshold in `config.yaml` must be excluded from `forecast_summary`",
+   "The pipeline must correctly handle servers whose metric rows span a daylight-saving-time boundary (timestamps stored as UTC epoch integers)"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install sqlite3, python3 packages (pyyaml, click); compile the forecasting binary from a C source that is deleted after compilation so only the binary ships",
+   "The compiled binary `/app/bin/forecaster` reads a SQLite db path and server_id as args, queries the metrics table, computes EWMA, writes a row to forecast_raw table; it has TWO bugs: (1) it initializes the EWMA accumulator with the first sample but applies alpha as `1-alpha` instead of `alpha` (inverted decay), and (2) it uses signed 32-bit integer arithmetic for the epoch timestamp comparison causing silent wrap-around that drops samples after epoch 2^31 boundary (year 2038 threshold is not hit, but a planted metric batch with epoch values near 2147483000 triggers truncation)",
+   "The C source is compiled and deleted in the Dockerfile RUN step; only the binary remains",
+   "The `config.yaml` contains: alpha: 0.3, min_samples: 24",
+   "The `metrics` table has columns: server_id TEXT, epoch_ts INTEGER, cpu_pct REAL; populated with ~2000 rows across 8 servers; one server ('srv-overflow') has epochs near 2147483500 that trigger the integer bug",
+   "The `forecast_raw` table is written by the binary; the `forecast_summary` table is populated by `/app/report.sql` which JOINs forecast_raw with a `server_registry` table; the SQL in report.sql has a bug: it computes headroom as `100 - forecasted_peak` (integer subtraction, losing the decimal) instead of `CAST(100.0 - forecasted_peak AS REAL)`",
+   "The `run_pipeline.sh` script calls the binary per server then runs report.sql via sqlite3",
+   "The schema migration script creates all tables and inserts seed data deterministically",
+   "Total codebase: ingester ~300 lines Python, run_pipeline.sh ~80 lines, report.sql ~60 lines, schema.sql ~120 lines, config.yaml ~20 lines; binary source was ~200 lines C"
+  ],
+  "internal_hint": "Two interacting bugs: (1) the compiled binary inverts alpha in the EWMA formula (uses 1-alpha where alpha should be used), producing systematically wrong forecasted_peak values that are hard to diagnose without knowing the formula; (2) the binary uses int32 for epoch timestamps so srv-overflow's samples near epoch 2147483500 overflow to negative and are excluded by a WHERE epoch_ts > 0 guard, making that server's EWMA computed from far fewer samples than expected. The misleading symptom is that report.sql's integer subtraction for headroom_pct makes ALL rows look wrong by fractional amounts, drawing attention to the SQL first. A solver who fixes only the SQL sees results that are closer but still wrong (because the EWMA itself is wrong). A solver who fixes only the binary alpha bug gets correct EWMA but still wrong headroom decimals. Only fixing both, plus recognizing the epoch overflow for srv-overflow, passes all tests. The epoch bug is discoverable by running the binary with verbose mode or by querying the forecast_raw table and noticing srv-overflow has suspiciously few samples. The alpha inversion is discoverable by computing the EWMA manually for a small server and comparing to forecast_raw. The SQL bug is discoverable by inspecting report.sql output vs forecast_raw.",
+  "trap": "Agents that fix only the SQL headroom calculation see most test cases pass but fail on (a) the absolute forecasted_peak values for any server (still wrong due to inverted alpha), and (b) the headroom and sample count for srv-overflow (epoch overflow drops samples). Agents that fix the binary by patching a wrapper script that pre-processes data may correctly handle alpha but still miss the epoch overflow if they don't probe which samples the binary is actually consuming. The hidden corpus includes servers with various epoch ranges, alpha sensitivities, and sample counts near the min_samples boundary.",
+  "tests": [
+   "For 5 deterministic servers (generated at verify time with known alpha=0.3 EWMA ground truth), assert forecast_summary.forecasted_peak matches to within 0.01",
+   "For each of those servers, assert headroom_pct equals round((100.0 - forecasted_peak) / 100.0 * 100, 2) \u2014 catches integer subtraction bug",
+   "For srv-overflow (epochs near 2147483500), assert forecast_summary includes it with the correct sample count (all samples, not the truncated set)",
+   "For a server with exactly min_samples-1 rows (23 samples), assert it is absent from forecast_summary",
+   "For a server with exactly min_samples rows (24 samples), assert it is present",
+   "Run the pipeline twice; assert forecast_summary row count and values are identical (idempotency)",
+   "Generate a fresh server 'srv-verify-N' with 48 known cpu_pct values at verify time, insert into metrics, run pipeline, assert forecasted_peak matches Python-computed EWMA with alpha=0.3 applied in chronological order to within 0.005",
+   "Assert forecasted_peak for all servers is strictly between 0 and 100 (catches inverted alpha producing values > 100 for high-CPU servers)"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "8 seeded servers + 3 verify-time generated servers",
+   "effect": "Raising adds more verify-time servers with edge-case alpha sensitivities, epoch ranges, and sample counts near thresholds; lowering to 1 verify-time server makes it easier to pass by luck"
+  },
+  "expected_failure_modes": [
+   "Agent fixes SQL headroom bug only, sees most values improve, submits \u2014 fails on wrong EWMA values and srv-overflow sample count",
+   "Agent reverse-engineers the binary's EWMA logic incorrectly (e.g., guesses simple moving average) and writes a wrapper that overrides output with wrong formula",
+   "Agent fixes the alpha inversion by writing a Python post-processing script that recomputes EWMA from raw metrics, but doesn't realize the binary is also feeding truncated samples for srv-overflow, so uses the same truncated data",
+   "Agent patches the binary's epoch handling but uses Python's datetime which also silently overflows if not using 64-bit explicitly, masking the fix",
+   "Agent doesn't discover the epoch overflow bug because srv-overflow's metrics look like a normal server with fewer samples \u2014 the min_samples threshold means it still appears in results, just with wrong values"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "debugging",
+   "ewma",
+   "integer-overflow",
+   "two-interacting-causes"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/report.sql",
+   "cat /app/config.yaml",
+   "cat /app/run_pipeline.sh",
+   "sqlite3 /app/metrics.db 'SELECT server_id, COUNT(*) FROM metrics GROUP BY server_id'",
+   "sqlite3 /app/metrics.db 'SELECT * FROM forecast_summary ORDER BY server_id'",
+   "sqlite3 /app/metrics.db 'SELECT * FROM forecast_raw ORDER BY server_id'",
+   "sqlite3 /app/metrics.db 'SELECT epoch_ts FROM metrics WHERE server_id=\"srv-overflow\" ORDER BY epoch_ts DESC LIMIT 10'",
+   "sqlite3 /app/metrics.db 'SELECT COUNT(*) FROM metrics WHERE server_id=\"srv-overflow\"' vs 'SELECT COUNT(*) FROM forecast_raw WHERE server_id=\"srv-overflow\"'",
+   "python3: manually compute EWMA with alpha=0.3 for a small server and compare to forecast_raw value \u2014 detect alpha inversion (binary uses 1-alpha=0.7)",
+   "strings /app/bin/forecaster | grep -i alpha  # look for any clues in binary",
+   "strace or ltrace /app/bin/forecaster /app/metrics.db srv-small  # observe behavior",
+   "Realize epoch values near 2147483500 overflow int32 \u2192 negative \u2192 filtered by WHERE epoch_ts > 0 guard",
+   "Write /app/fix_pipeline.py: queries metrics directly, computes EWMA with correct alpha=0.3 in chronological order, handles all epochs as 64-bit integers, writes to forecast_raw table",
+   "Fix report.sql: change '100 - forecasted_peak' to 'CAST(100.0 - forecasted_peak AS REAL)' and round to 2 decimal places",
+   "Update run_pipeline.sh to call python3 /app/fix_pipeline.py instead of /app/bin/forecaster",
+   "bash /app/run_pipeline.sh",
+   "sqlite3 /app/metrics.db 'SELECT * FROM forecast_summary'",
+   "Verify srv-overflow appears with correct sample count",
+   "Verify headroom_pct has decimal precision",
+   "bash /app/run_pipeline.sh  # run again for idempotency check",
+   "sqlite3 /app/metrics.db 'SELECT COUNT(*) FROM forecast_summary'  # same as before",
+   "python3: compute expected EWMA for srv-overflow using all samples, compare to forecast_summary",
+   "Verify no forecasted_peak > 100 or < 0"
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction says 'fix the pipeline' but does not explicitly state that replacing/wrapping the binary is permitted \u2014 an agent might waste time trying to patch a binary it cannot decompile, or might be penalized for a valid wrapper approach",
+   "The headroom formula in the instruction ('(100.0 - forecasted_peak) / 100.0 * 100') simplifies to just '100.0 - forecasted_peak', making the stated formula trivially equivalent but potentially confusing \u2014 a solver might question whether there's a normalization step",
+   "The instruction does not mention the epoch overflow bug or the srv-overflow server at all, yet tests check for it \u2014 this violates the stated requirement that 'every tested requirement is stated', making the clarity score borderline",
+   "Idempotency requirement is stated but depends on the pipeline clearing forecast_raw and forecast_summary before re-running \u2014 if run_pipeline.sh doesn't do this cleanly, an agent's correct solution could fail idempotency due to environment behavior, not agent error",
+   "The 'within 0.01' tolerance for EWMA matching could be flaky if floating-point accumulation order differs between Python verifier and the agent's implementation",
+   "If the binary cannot be reverse-engineered or strace'd in the container (e.g., strace not installed, binary stripped), the only discovery path for alpha inversion is statistical comparison \u2014 this could be prohibitively slow for an agent",
+   "The test asserting forecasted_peak is 'strictly between 0 and 100' could be overly broad \u2014 legitimate EWMA values for near-100% CPU servers rounded might hit 100.0",
+   "No mention of whether the agent is allowed to insert new rows into metrics for srv-verify-N at verify time \u2014 if the verifier does this externally after the agent's solution is 'locked in', the pipeline must be re-runnable, but the instruction doesn't clarify this flow"
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint has a critical clarity gap: the instruction never mentions the srv-overflow server, epoch overflow, or that tested requirements include handling int32 truncation \u2014 yet the tests check for it, violating the stated principle that every tested requirement must be stated. The headroom formula as written trivially simplifies to subtraction (dividing by 100 then multiplying by 100 cancels), which is confusing rather than instructive. Additionally, with ~23 commands the task is at the boundary of genuine difficulty for a frontier agent, but the primary difficulty comes from the binary being a black box \u2014 if the container lacks strace/ltrace/objdump the only path is statistical inference, which may be unreliable or may actually be too easy (just recompute from raw data with correct formula).",
+  "fixes": [
+   "Add to the instruction: 'Note that srv-overflow has metric timestamps stored near the int32 boundary; ensure your pipeline correctly includes all samples for all servers regardless of epoch magnitude' \u2014 making the epoch requirement explicit without revealing the bug",
+   "Fix the headroom formula in the instruction to be unambiguous: state it as '100.0 - forecasted_peak, rounded to two decimal places' rather than the identity expression '(100.0 - forecasted_peak) / 100.0 * 100'",
+   "Install strace and objdump in the Dockerfile so the binary is actually introspectable, or add a --verbose flag to the binary that logs the alpha value it uses (making the inversion discoverable without binary analysis tools)",
+   "Explicitly state in the instruction that the solver may replace or wrap the forecasting binary with their own implementation, since the binary has no source and this is the primary fix path",
+   "Add a stated requirement about epoch handling: 'The pipeline must correctly process all metric rows regardless of the magnitude of their epoch_ts values' \u2014 this covers the overflow requirement without giving away the bug"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both involve a compiled binary with no source that transforms data in a pipeline, requiring black-box characterization to fix downstream SQL outputs, though the candidate uses EWMA forecasting while the reference uses sensor normalization."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference is a Rust fixed-point statistics pipeline with a reference binary for exact output matching, whereas the candidate is a Python+SQLite EWMA forecasting pipeline with a drifted compiled binary."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The reference is purely a SQL query correctness problem (window functions, ranking) with no compiled binary or forecasting logic involved."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "The reference involves fixing weighted aggregation in source code (with source available for a region-sales service), whereas the candidate involves a no-source compiled binary and EWMA forecasting logic."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "The reference is about spectral entropy estimation via STFT on RNG streams with a git regression investigation, entirely different domain and algorithmic core from EWMA capacity forecasting."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.119
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.111
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.104
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.088
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.081
+    ]
+   ],
+   "cost_usd": 0.013956
+  },
+  "novel": false
+ },
+ "cost_usd": 0.058368
+}

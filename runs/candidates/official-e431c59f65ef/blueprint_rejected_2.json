@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "tcp-proxy-config-incident-repair",
+  "title": "Connection Pool TCP Proxy Misconfiguration Recovery",
+  "scenario": "A database administrator is investigating a post-incident alert: their in-house Python connection pooler (`poolman`) started silently dropping client connections and misrouting queries to wrong backends after a config reload 48 hours ago. The codebase (~1,400 lines) spans a TCP proxy core, a config parser, a health-checker, and a client simulator. The DBA has a terminal dump showing the symptom but no obvious bug in any single file.",
+  "instruction_draft": "```\n$ python /app/poolman/main.py --config /app/config/poolman.yaml\n[WARN]  2026-10-11T14:03:22 backend 'primary' selected for client 10.0.0.5:51234\n[WARN]  2026-10-11T14:03:22 backend 'replica1' selected for client 10.0.0.5:51235\n[ERROR] 2026-10-11T14:03:23 Connection to replica1 (127.0.0.1:5434) refused after 3 retries\n[WARN]  2026-10-11T14:03:23 backend 'primary' selected for client 10.0.0.5:51236\n[WARN]  2026-10-11T14:03:23 backend 'primary' selected for client 10.0.0.5:51237\n[ERROR] 2026-10-11T14:03:24 Pool exhausted for backend 'primary': 0/10 slots available\n[ERROR] 2026-10-11T14:03:24 Client 10.0.0.5:51237 dropped: no backend available\n```\n\nThe proxy was working correctly until a config reload on 2026-10-11. Fix `/app/poolman/` so that:\n\n1. Each backend is assigned the exact pool size declared in `poolman.yaml` under `backends[*].pool_size`; connections to a backend must never exceed that limit.\n2. Read-only queries (those whose first non-whitespace SQL keyword is SELECT, SHOW, EXPLAIN, or WITH) are routed to a replica backend chosen by weighted round-robin using the `weight` field; all other queries go to the primary.\n3. The routing weight computation must use the weights as declared at the time of the most recent successful config load, not accumulated across reloads.\n4. A backend whose TCP connect fails (connection refused or timeout) must be marked unhealthy for exactly `health.retry_interval_seconds` seconds, during which zero connections are opened to it; once the interval elapses the backend re-enters the pool.\n5. Implement `/app/poolman/router.py` \u2014 it is currently missing. It must expose a `Router` class whose constructor accepts the parsed config dict and whose `route(query: str) -> str` method returns the backend name that should serve the query. The router must be importable and used by the proxy core.\n\nDo not change the config file format. Do not change the public interface of any existing class or function that the tests import directly.",
+  "requirements": [
+   "Each backend's connection pool size matches exactly the `pool_size` field from config; no backend accepts more concurrent connections than declared.",
+   "SELECT, SHOW, EXPLAIN, and WITH queries (case-insensitive, ignoring leading whitespace and SQL comments) are routed to replica backends via weighted round-robin using declared weights.",
+   "All non-read-only queries are routed to the backend whose `role` is `primary`.",
+   "Routing weights are reset to config-declared values on each successful config reload and do not accumulate across reloads.",
+   "A backend that fails TCP connect is quarantined for `health.retry_interval_seconds` seconds; no new connections open to it during quarantine; it re-enters rotation after the interval.",
+   "`/app/poolman/router.py` exists and exports a `Router` class with a `route(query: str) -> str` method.",
+   "The `Router.route` method returns the correct backend name for arbitrary query strings including edge cases (leading whitespace, SQL block comments, mixed case keywords, CTEs)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm. Install: pyyaml, pytest, hypothesis.",
+   "/app/poolman/main.py \u2014 entry point (~120 lines), loads config, instantiates pool manager and health checker, starts TCP listener. Imports router.py which does not yet exist (ImportError is suppressed with a try/except that falls back to broken inline routing logic \u2014 this is one of the hidden bugs).",
+   "/app/poolman/pool.py \u2014 connection pool implementation (~280 lines). Contains a bug: pool slot accounting uses a class-level counter instead of per-instance, so all backends share one counter (the pool exhaustion symptom).",
+   "/app/poolman/config_loader.py \u2014 YAML config parser (~150 lines). Contains a bug: on reload it appends new backend weight entries to a module-level list instead of replacing them, causing weight drift across reloads.",
+   "/app/poolman/health.py \u2014 health checker (~180 lines). Correct implementation, no bugs. Marks backends unhealthy; exposes `is_healthy(name)` and `mark_unhealthy(name, duration)`.",
+   "/app/poolman/client_sim.py \u2014 client simulator used by tests (~200 lines). Sends real TCP queries to the proxy.",
+   "/app/poolman/router.py \u2014 MISSING. Must be created by solver.",
+   "/app/config/poolman.yaml \u2014 config with one primary (weight: ignored, pool_size: 10) and two replicas (replica1 weight:3 pool_size:5, replica2 weight:1 pool_size:5), health.retry_interval_seconds: 10.",
+   "/app/tests/test_router.py \u2014 test file. Uses hypothesis to generate random SQL strings and verifies Router.route output. Also runs reload scenarios and pool accounting checks.",
+   "Plant realistic filler code: /app/poolman/metrics.py (~150 lines, Prometheus-style counters, no bugs), /app/poolman/protocol.py (~120 lines, framing helpers, no bugs).",
+   "Total codebase ~1,400 lines. No external services needed; tests mock TCP connections."
+  ],
+  "internal_hint": "Difficulty comes from TWO interacting observe_not_read levers and ONE build_component lever. (1) The pool counter bug (class-level vs instance-level) only manifests when two backend instances exist simultaneously \u2014 reading pool.py alone looks fine because the counter *is* decremented on release. The solver must run the system with multiple backends active to observe the exhaustion. (2) The weight accumulation bug in config_loader.py only surfaces after a reload, which means the solver must trigger a SIGHUP or call reload() at least once to observe routing skew \u2014 the first run looks correct. (3) router.py must be built from scratch and must handle SQL comment stripping (/* ... */ and -- style) before keyword detection, otherwise hypothesis-generated queries with leading comments fail. The solver who fixes (1) and (2) but skips comment stripping in the router will pass manual tests but fail generated inputs.",
+  "trap": "A naive solver will: (a) see the ImportError suppression and write a trivial router that checks `query.strip().split()[0].upper() in READ_KEYWORDS` \u2014 this fails on queries with leading block comments like `/* read */ SELECT ...` which hypothesis generates; (b) fix the pool counter but not notice weight accumulation because they only run one config cycle; (c) not test replica1 quarantine recovery because the mock backends are always up in quick manual tests. The hidden tests generate fresh SQL strings with leading whitespace, SQL-style comments, mixed case, and CTEs, and also perform a reload + re-route sequence to catch weight drift.",
+  "tests": [
+   "test_router_basic: instantiate Router from config dict; assert route('SELECT 1') returns a replica name; assert route('INSERT INTO t VALUES (1)') returns 'primary'.",
+   "test_router_keywords: parametrize over ['select', 'SELECT', 'Select', 'SHOW', 'show tables', 'EXPLAIN SELECT', 'WITH cte AS (SELECT 1) SELECT * FROM cte']; assert all route to a replica.",
+   "test_router_leading_whitespace: hypothesis generates strings of form '\\n\\t   SELECT ...' and '   /* comment */ SELECT ...'; assert routed to replica.",
+   "test_router_block_comment: hypothesis generates '/* this is a read */ SELECT id FROM users'; assert routed to replica. Also '/* write */ INSERT ...' routed to primary.",
+   "test_router_non_readonly: hypothesis generates INSERT/UPDATE/DELETE/CREATE/DROP/BEGIN/COMMIT queries; assert all route to primary.",
+   "test_router_weighted_distribution: run Router.route(SELECT) 4000 times; assert replica1 is chosen ~75% \u00b1 5% of the time (weight 3 vs 1), replica2 ~25% \u00b1 5%.",
+   "test_router_weight_reset_on_reload: call Router with config, route 1000 times, call Router again with same config (simulating reload), route 1000 more; assert distribution in second batch matches declared weights, not accumulated counts.",
+   "test_pool_per_backend_limit: create PoolManager with two backends each pool_size=3; acquire 3 connections on backend A; assert backend B still has 3 available slots.",
+   "test_pool_exhaustion_only_local: acquire all slots on primary; assert replica slots unaffected.",
+   "test_health_quarantine: mock TCP connect to replica1 to raise ConnectionRefusedError; trigger health check; assert is_healthy('replica1') is False; advance mock time by retry_interval_seconds; assert is_healthy('replica1') is True.",
+   "test_router_unhealthy_backend_skipped: mark replica1 unhealthy in Router; run 200 SELECT queries; assert replica2 receives all of them (or primary if no replicas healthy).",
+   "test_integration_reload: load config, fire 100 SELECTs, reload config (call config_loader.load again), fire 100 more SELECTs; assert weight distribution in second batch matches fresh declared weights."
+  ],
+  "verifier_knob": {
+   "name": "hypothesis_max_examples",
+   "value": "500",
+   "effect": "Lowering to 50 makes comment-stripping bugs less likely to be caught by fuzzing; raising to 2000 reliably catches any regex that misses nested comments or unusual whitespace. At 500 the router must handle all standard SQL comment forms to pass."
+  },
+  "expected_failure_modes": [
+   "Solver writes a router that strips leading whitespace but not block comments; hypothesis finds a counterexample with `/* read */ SELECT` and the test fails.",
+   "Solver fixes the class-level pool counter by inspection but never reloads config, so weight accumulation bug remains; weight distribution test in second batch fails.",
+   "Solver notices the ImportError suppression and writes router.py but copies the broken inline routing logic from main.py verbatim, which also lacks comment stripping.",
+   "Solver fixes all three issues but Router stores a mutable reference to the config list that config_loader mutates on reload, so weight reset test fails because reload now corrupts the in-use Router.",
+   "Solver implements Router correctly but changes the public interface of PoolManager (e.g., renames acquire()), breaking the integration tests that import it directly."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "tcp-proxy",
+   "connection-pooling",
+   "sql-routing",
+   "configuration",
+   "systems-programming",
+   "python"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/poolman/main.py  # find ImportError suppression + broken inline routing",
+   "cat /app/poolman/pool.py  # find class-level counter bug",
+   "cat /app/poolman/config_loader.py  # find module-level list append bug on reload",
+   "cat /app/config/poolman.yaml  # get config schema (backends, weights, pool_sizes)",
+   "cat /app/tests/test_router.py  # confirm Router interface and test expectations",
+   "write /app/poolman/router.py with: block-comment stripper (/* */), line-comment stripper (--), keyword set, weighted round-robin over replicas, primary fallback, health-aware skip",
+   "edit pool.py: change class-level _counter/_slots to instance-level self._counter/self._slots in __init__",
+   "edit config_loader.py: on reload, replace module-level weights list instead of appending",
+   "edit main.py: remove try/except ImportError suppression; import Router properly",
+   "cd /app && python -m pytest tests/ -v 2>&1 | head -80",
+   "if hypothesis fails on block comments, fix regex in router.py comment stripper",
+   "if weight distribution flaky, verify round-robin state resets on Router re-instantiation",
+   "python -m pytest tests/ -v --tb=short  # confirm all green"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Hypothesis weighted distribution test (4000 samples, \u00b15%) could produce rare statistical false failures for a correct implementation \u2014 should use a fixed seed or wider tolerance",
+   "test_health_quarantine relies on 'advancing mock time' but health.py uses time.time() internally; if the test doesn't properly monkeypatch time, it may time out or be environment-dependent",
+   "The requirement that Router must copy config rather than hold a reference is implied by the trap section but never stated in the instruction \u2014 solver failing test_router_weight_reset_on_reload may not understand why",
+   "The instruction says 'Do not change the public interface of any existing class or function that the tests import directly' but doesn't list which classes/functions are imported \u2014 solver must infer from test file",
+   "Blueprint tells the reviewer exactly what each bug is (class-level counter, module-level append), so a frontend agent reading the environment description has a near-complete solution before opening any file \u2014 reduces genuine exploration"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 fails the minimum threshold of 3, and drags the average to 3.8 which technically passes but the difficulty shortfall is fundamental: the environment description explicitly names each bug (class-level counter, module-level list append, ImportError suppression), eliminating the discovery challenge that 'observe_not_read' difficulty levers are supposed to provide. A frontier agent reading the blueprint instruction plus file descriptions already has a near-complete repair plan before executing a single command, making the speedrun ~13 commands. The task is otherwise well-constructed with strong realism and verifiability.",
+  "fixes": [
+   "Remove the explicit bug descriptions from the environment section; instead describe pool.py as 'connection pool implementation with pool-size enforcement' and config_loader.py as 'YAML config parser with reload support' \u2014 the solver must discover the bugs by running the system and reading the code, not from the task spec",
+   "Add a realistic distractor: a third file (e.g., protocol.py) that appears suspicious but is actually correct, forcing the solver to run tests rather than fix-by-reading to know what actually needs changing",
+   "Make the weight accumulation bug harder to trigger: instead of a simple append, use a subtle off-by-one in weight normalization that only manifests after 3+ reloads, requiring the solver to do multiple reload cycles to observe drift",
+   "Explicitly state in the instruction that Router must deep-copy config on construction (removing ambiguity about the reference-vs-copy trap) OR keep it as a trap but make the test failure message informative enough to guide the solver",
+   "Fix the statistical test flakiness risk by using `random.seed(42)` inside the Router or by parametrizing the distribution test with a fixed seed to make it deterministic"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/vba-userform-port",
+     "verdict": "distinct",
+     "reason": "That task is about porting a VBA/Excel app to a React/FastAPI web app, unrelated to TCP connection pooling or query routing."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a canary deployment orchestrator with rollback logic, not a database connection pool or query router."
+    },
+    {
+     "ref_id": "terminal-bench-pro/dual-bash-python-config-parser",
+     "verdict": "distinct",
+     "reason": "That task is about creating a polyglot config file parser, not a TCP proxy connection pooler or SQL query router."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a SQL query for correct windowed aggregation results, not implementing a TCP proxy or connection pool manager."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a NetFlow v9 UDP aggregation service, not a database connection pooler or read/write query router."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/vba-userform-port",
+     0.151
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.124
+    ],
+    [
+     "terminal-bench-pro/dual-bash-python-config-parser",
+     0.119
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.069
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.068
+    ]
+   ],
+   "cost_usd": 0.015045000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057456
+}

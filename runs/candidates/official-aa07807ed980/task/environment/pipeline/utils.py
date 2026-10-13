@@ -1,142 +1,147 @@
-"""
-Logging and miscellaneous helpers for the ingestion pipeline.
-None of these functions are directly involved in chunk I/O or
-data transformation logic.
-"""
+"""Logging and miscellaneous helpers for the ingestion pipeline."""
+
+from __future__ import annotations
 
 import logging
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 
-LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-DATE_FORMAT = "%Y-%m-%dT%H:%M:%S"
+# ---------------------------------------------------------------------------
+# Logger factory
+# ---------------------------------------------------------------------------
 
-_configured = False
+_LOGGERS: dict[str, logging.Logger] = {}
 
 
-def configure_logging(level=logging.INFO, log_file=None):
+def get_logger(
+    name: str,
+    level: int = logging.INFO,
+    fmt: Optional[str] = None,
+) -> logging.Logger:
+    """Return a named logger, creating it on first call.
+
+    Subsequent calls with the same *name* return the cached logger without
+    adding duplicate handlers.
     """
-    Set up root logger.  Call once at program start.
-    Subsequent calls are no-ops.
-    """
-    global _configured
-    if _configured:
-        return
-    handlers = [logging.StreamHandler(sys.stderr)]
-    if log_file:
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        handlers.append(logging.FileHandler(log_file))
-    logging.basicConfig(format=LOG_FORMAT, datefmt=DATE_FORMAT,
-                        level=level, handlers=handlers)
-    _configured = True
+    if name in _LOGGERS:
+        return _LOGGERS[name]
+
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        if fmt is None:
+            fmt = "[%(asctime)s] %(levelname)s %(name)s: %(message)s"
+        handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
+        logger.addHandler(handler)
+    logger.setLevel(level)
+    logger.propagate = False
+    _LOGGERS[name] = logger
+    return logger
 
 
-def get_logger(name):
-    """Return a named logger, configuring root logging if needed."""
-    configure_logging()
-    return logging.getLogger(name)
+# ---------------------------------------------------------------------------
+# File-system helpers
+# ---------------------------------------------------------------------------
+
+
+def ensure_dir(path: str | Path) -> Path:
+    """Create *path* and all parents if they do not exist; return a Path."""
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def safe_remove(path: str | Path) -> bool:
+    """Delete *path* if it exists.  Return True when a file was removed."""
+    p = Path(path)
+    try:
+        p.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def list_files(directory: str | Path, suffix: str = "") -> list[Path]:
+    """Return a sorted list of files in *directory* with the given *suffix*."""
+    d = Path(directory)
+    if not d.is_dir():
+        return []
+    files = sorted(f for f in d.iterdir() if f.is_file() and f.name.endswith(suffix))
+    return files
+
+
+# ---------------------------------------------------------------------------
+# Timing context manager
+# ---------------------------------------------------------------------------
 
 
 class Timer:
-    """Simple wall-clock timer for coarse profiling."""
+    """Simple wall-clock timer usable as a context manager.
 
-    def __init__(self, label=""):
-        self.label = label
-        self._start = None
-        self._end = None
+    Usage::
 
-    def __enter__(self):
+        with Timer() as t:
+            do_work()
+        print(f"Elapsed: {t.elapsed:.3f}s")
+    """
+
+    def __init__(self) -> None:
+        self._start: float = 0.0
+        self.elapsed: float = 0.0
+
+    def __enter__(self) -> "Timer":
         self._start = time.perf_counter()
         return self
 
-    def __exit__(self, *_):
-        self._end = time.perf_counter()
-
-    @property
-    def elapsed(self):
-        if self._end is None:
-            return time.perf_counter() - self._start
-        return self._end - self._start
-
-    def __str__(self):
-        label = f"{self.label}: " if self.label else ""
-        return f"{label}{self.elapsed:.3f}s"
+    def __exit__(self, *_: object) -> None:
+        self.elapsed = time.perf_counter() - self._start
 
 
-def ensure_dir(path):
-    """Create directory (and parents) if it does not already exist."""
-    Path(path).mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# Pretty-print helpers
+# ---------------------------------------------------------------------------
 
 
-def count_lines(path, skip_header=True):
-    """
-    Count non-empty lines in a text file.
-    If skip_header is True the first line is not counted.
-    """
-    n = 0
-    with open(path, "r", encoding="utf-8") as fh:
-        for i, line in enumerate(fh):
-            if i == 0 and skip_header:
-                continue
-            if line.strip():
-                n += 1
-    return n
-
-
-def human_size(n_bytes):
-    """Return a human-readable string for a byte count."""
+def human_size(num_bytes: int) -> str:
+    """Return a human-readable file size string."""
     for unit in ("B", "KB", "MB", "GB", "TB"):
-        if n_bytes < 1024:
-            return f"{n_bytes:.1f} {unit}"
-        n_bytes /= 1024
-    return f"{n_bytes:.1f} PB"
+        if abs(num_bytes) < 1024.0:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024.0  # type: ignore[assignment]
+    return f"{num_bytes:.1f} PB"
 
 
-def safe_int(value, default=0):
-    """Convert value to int, returning default on failure."""
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return default
+def progress_bar(
+    current: int,
+    total: int,
+    width: int = 40,
+    prefix: str = "",
+) -> str:
+    """Return a simple ASCII progress bar string."""
+    frac = current / total if total else 0.0
+    filled = int(frac * width)
+    bar = "#" * filled + "-" * (width - filled)
+    pct = int(frac * 100)
+    return f"{prefix}[{bar}] {pct:3d}% ({current}/{total})"
 
 
-def chunked(iterable, size):
-    """
-    Yield successive slices of *iterable* each of length *size*.
-    The final slice may be shorter.
-    """
-    buf = []
-    for item in iterable:
-        buf.append(item)
-        if len(buf) == size:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
+# ---------------------------------------------------------------------------
+# Environment introspection
+# ---------------------------------------------------------------------------
 
 
-def flatten(list_of_lists):
-    """Flatten one level of nesting."""
-    return [item for sublist in list_of_lists for item in sublist]
+def get_env(key: str, default: str = "") -> str:
+    """Return an environment variable, falling back to *default*."""
+    return os.environ.get(key, default)
 
 
-def clamp(value, lo, hi):
-    """Clamp *value* to the closed interval [*lo*, *hi*]."""
-    return max(lo, min(hi, value))
-
-
-def read_env(key, default=None, cast=str):
-    """
-    Read an environment variable, optionally casting its type.
-    Returns *default* if the variable is absent or empty.
-    """
-    raw = os.environ.get(key, "")
-    if not raw:
-        return default
-    try:
-        return cast(raw)
-    except (ValueError, TypeError):
-        return default
+def require_env(key: str) -> str:
+    """Return an environment variable or raise RuntimeError if absent."""
+    val = os.environ.get(key)
+    if val is None:
+        raise RuntimeError(f"Required environment variable {key!r} is not set.")
+    return val

@@ -2,68 +2,59 @@
 
 const fs = require('fs');
 const path = require('path');
-const { createLogger } = require('./logger');
 
-const log = createLogger('schema_loader');
-
+/**
+ * Load and parse the JSON schema from disk.
+ * Validates that it is a valid JSON object before returning.
+ */
 function loadSchema(schemaPath) {
   const resolved = path.resolve(schemaPath);
-  log.debug('loading schema', { path: resolved });
   let raw;
   try {
     raw = fs.readFileSync(resolved, 'utf8');
-  } catch (err) {
-    throw new Error(`Failed to read schema file at ${resolved}: ${err.message}`);
+  } catch (e) {
+    throw new Error(`Failed to read schema file at ${resolved}: ${e.message}`);
   }
+
   let schema;
   try {
     schema = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(`Failed to parse schema JSON at ${resolved}: ${err.message}`);
+  } catch (e) {
+    throw new Error(`Schema file at ${resolved} is not valid JSON: ${e.message}`);
   }
-  if (typeof schema !== 'object' || schema === null) {
-    throw new Error(`Schema at ${resolved} is not a JSON object`);
+
+  if (typeof schema !== 'object' || schema === null || Array.isArray(schema)) {
+    throw new Error(`Schema at ${resolved} must be a JSON object`);
   }
-  log.debug('schema loaded', { title: schema.title, required: schema.required });
+
+  if (!schema.type && !schema.$ref && !schema.anyOf && !schema.oneOf && !schema.allOf) {
+    // Lenient: allow schemas without explicit type at root (e.g. pure $ref schemas)
+  }
+
   return schema;
 }
 
-function validateSchemaStructure(schema) {
-  const warnings = [];
-  if (!schema['$schema']) {
-    warnings.push('Schema missing $schema declaration');
+/**
+ * List all .json files in a directory (non-recursive).
+ */
+function listSchemaFiles(dir) {
+  try {
+    return fs.readdirSync(dir)
+      .filter(f => f.endsWith('.json'))
+      .map(f => path.join(dir, f));
+  } catch (e) {
+    return [];
   }
-  if (!schema.type) {
-    warnings.push('Schema missing top-level type');
-  }
-  if (!schema.required || !Array.isArray(schema.required)) {
-    warnings.push('Schema missing required array');
-  }
-  if (!schema.properties || typeof schema.properties !== 'object') {
-    warnings.push('Schema missing properties');
-  }
-  return warnings;
 }
 
-function resolveSchemaRefs(schema) {
-  // Walk schema and collect all $ref targets for diagnostic purposes
-  const refs = [];
-  function walk(node, path) {
-    if (typeof node !== 'object' || node === null) return;
-    if (Array.isArray(node)) {
-      node.forEach((item, i) => walk(item, `${path}[${i}]`));
-      return;
-    }
-    for (const [key, value] of Object.entries(node)) {
-      if (key === '$ref' && typeof value === 'string') {
-        refs.push({ ref: value, path });
-      } else {
-        walk(value, `${path}.${key}`);
-      }
-    }
-  }
-  walk(schema, '#');
-  return refs;
+/**
+ * Merge additional definitions into a base schema.
+ * Used for composing schemas from multiple fragments.
+ */
+function mergeDefinitions(baseSchema, extraDefs) {
+  const merged = Object.assign({}, baseSchema);
+  merged.definitions = Object.assign({}, baseSchema.definitions || {}, extraDefs);
+  return merged;
 }
 
-module.exports = { loadSchema, validateSchemaStructure, resolveSchemaRefs };
+module.exports = { loadSchema, listSchemaFiles, mergeDefinitions };

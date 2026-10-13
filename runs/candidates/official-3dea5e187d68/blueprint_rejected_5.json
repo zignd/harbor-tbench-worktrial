@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "syslog-quota-enforcement-binary",
+  "title": "Syslog Quota Enforcement Audit",
+  "scenario": "A sysadmin runs a multi-tenant log ingestion service where each tenant is billed per MB of syslog data stored. A compiled quota-enforcement binary reads raw syslog files, classifies lines by tenant, and writes per-tenant byte-usage records into a SQLite database. An analyst noticed that monthly invoices no longer match what the SQL reports show \u2014 some tenants are being overcharged, others undercharged, and the discrepancy grows with log volume. The environment contains: the compiled binary (no source), a Python ingest driver (~300 lines), SQL schema and stored procedures (~200 lines), sample syslog files, and a reconciliation report generator.",
+  "instruction_draft": "The quota enforcement pipeline at /opt/logquota is producing per-tenant byte totals that do not match the actual bytes in the raw syslog files. Fix the pipeline so that the byte count stored in the database for each tenant exactly equals the sum of byte lengths of that tenant's log lines (including the newline character) across all ingested files, and re-running the pipeline on the same files produces identical results.",
+  "requirements": [
+   "For every tenant, the byte_used value in the quota_usage table must equal the exact sum of len(line) for each line belonging to that tenant across all ingested syslog files, where each line includes its trailing newline byte.",
+   "Re-running the ingest pipeline on the same set of files must not double-count or change any tenant's stored total (idempotent ingestion).",
+   "Tenants whose log lines span multiple ingested files must have their totals correctly accumulated, not reset per file.",
+   "Lines that the binary classifies as belonging to the sentinel tenant '_unrouted_' must be excluded from all tenant totals and not written to the quota_usage table.",
+   "The pipeline must handle syslog lines containing RFC 5424 structured-data fields (bracketed key=value pairs) without miscounting their byte lengths."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; install sqlite3, gcc, python3 packages (click, pytest); compile the quota-enforcement binary from a hidden C source, strip symbols, place at /opt/logquota/bin/qe-classify; do NOT include the C source in the image.",
+   "The C binary reads a syslog file path as its argument and writes to stdout one JSON line per log line: {\"tenant\": \"<id>\", \"bytes\": <int>}. Bug 1 (binary): for RFC 5424 lines (those whose structured-data field starts with '['), the binary miscounts bytes by adding the length of the structured-data substring a second time \u2014 so byte counts for such lines are inflated. This is the misleading symptom: the SQL totals look wrong, but the obvious suspect is the SQL accumulation logic, not the binary.",
+   "The Python ingest driver /opt/logquota/ingest.py reads each syslog file, calls qe-classify, parses JSON output, and issues UPSERT SQL. Bug 2 (SQL/Python interaction): the UPSERT uses INSERT OR REPLACE which deletes-then-inserts, so the auto-increment file_ingestion_log row is recreated and the ON CONFLICT clause on the tenant key resets byte_used to just the current file's contribution rather than accumulating. These two bugs interact: fixing only the SQL UPSERT makes totals idempotent but wrong (because binary byte counts are still inflated for structured-data lines); fixing only the binary makes the totals accurate per-file but still non-idempotent across files.",
+   "SQLite schema at /opt/logquota/schema.sql: tables quota_usage(tenant TEXT PRIMARY KEY, byte_used INTEGER DEFAULT 0), ingestion_log(id INTEGER PRIMARY KEY AUTOINCREMENT, file_path TEXT UNIQUE, ingested_at TEXT). The UPSERT in ingest.py does INSERT OR REPLACE INTO quota_usage(tenant, byte_used) VALUES (?,?) \u2014 which resets byte_used instead of accumulating.",
+   "Sample syslog files at /opt/logquota/data/sample/*.log: ~200 lines each, mix of plain RFC 3164 lines and RFC 5424 lines with structured-data brackets, covering 5 tenant IDs plus some _unrouted_ lines.",
+   "A reconciliation script at /opt/logquota/reconcile.py that reads the raw syslog files, computes expected byte totals per tenant in pure Python, and diffs them against the quota_usage table \u2014 this is the tool the analyst uses to see the discrepancy.",
+   "An additional /opt/logquota/report.py (~150 lines) that generates billing CSV from the quota_usage table \u2014 plausible but not involved in the bugs.",
+   "A /opt/logquota/utils.py with syslog parsing helpers (~120 lines) \u2014 not involved in the bugs but present to make the codebase feel realistic."
+  ],
+  "internal_hint": "Two interacting causes: (1) The compiled binary (no source available) inflates byte counts for RFC 5424 lines with structured-data fields by adding the structured-data substring length twice. This is discoverable only by running the binary on known input and comparing its JSON output against a manual byte count. (2) The Python ingest driver uses INSERT OR REPLACE instead of INSERT INTO ... ON CONFLICT(tenant) DO UPDATE SET byte_used = byte_used + excluded.byte_used, so running ingest on multiple files resets the total to only the last file's contribution instead of accumulating. The misleading symptom is that reconcile.py shows wrong totals even after a single file, which makes the analyst look at the SQL accumulation logic first \u2014 but the single-file discrepancy is actually the binary bug. A solver who fixes only the UPSERT will see idempotent but still-wrong totals; a solver who finds the binary bug but not the UPSERT bug will see correct single-file numbers but wrong multi-file totals. The binary bug is found by: (a) running qe-classify on a hand-crafted RFC 5424 line and comparing the reported bytes to wc -c output; (b) noticing the over-count equals exactly the length of the structured-data bracket group. The fix is to write a wrapper or shim that corrects the binary's output before the Python driver processes it. The UPSERT fix is a SQL one-liner change in ingest.py.",
+  "trap": "A solver who fixes only the UPSERT accumulation bug will pass simple tests with plain RFC 3164 syslog files (no structured-data) because the binary counts those correctly. The hidden corpus includes files with RFC 5424 structured-data lines, so those tenants will still show inflated totals. Conversely, a solver who patches the binary output but not the UPSERT will fail multi-file idempotency tests. The verifier generates fresh syslog files at test time with a controlled mix of RFC 3164 and RFC 5424 lines and known tenant byte totals, then checks both accuracy and idempotency.",
+  "tests": [
+   "Generate a fresh syslog file with exactly N RFC 3164 lines and M RFC 5424 lines (with structured-data) for each of 4 tenants (N and M chosen at verify time). Run ingest.py once. Check that quota_usage.byte_used for each tenant equals the Python-computed sum of line byte lengths (including newlines). A discrepancy on structured-data tenants catches the binary bug.",
+   "Run ingest.py a second time on the same files. Check that quota_usage.byte_used values are unchanged (idempotency). A doubled total catches the UPSERT bug.",
+   "Ingest two separate syslog files each containing lines for the same tenant. Check that the final byte_used equals the sum of both files' contributions for that tenant. A total equal to only one file's worth catches the UPSERT accumulation bug.",
+   "Include lines tagged to '_unrouted_' in the test file. Check that '_unrouted_' does not appear as a row in quota_usage after ingestion.",
+   "Generate a pathological RFC 5424 line where the structured-data field is very long (200 bytes). Verify the stored byte count matches the actual line length, not the actual + 200 inflated count.",
+   "Run reconcile.py after a correct ingest and verify it reports zero discrepancies for all tenants.",
+   "Verify that running the full pipeline on the original sample files also produces zero reconciliation discrepancies (regression test on provided data)."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "4 tenants \u00d7 3 files \u00d7 50 lines each, 30% RFC 5424",
+   "effect": "Increasing the number of tenants, files, and the fraction of RFC 5424 lines increases the chance that a partial fix produces a wrong total on at least one tenant/file combination; decreasing it makes shallow fixes more likely to accidentally pass."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the UPSERT SQL bug, misses the binary byte-count inflation, and passes all plain-RFC3164 tests but fails on RFC 5424 corpus cases.",
+   "Solver notices byte discrepancies and suspects the Python parsing logic (wrong component \u2014 the misleading symptom), spends time rewriting the parser without touching the binary or the UPSERT.",
+   "Solver writes a shim that re-counts bytes from the raw line in Python (correct approach for binary bug) but forgets to also fix the UPSERT, so multi-file accumulation still fails.",
+   "Solver patches the UPSERT to accumulate correctly but does not discover the binary bug because they only test with the provided sample files (which may have too few RFC 5424 lines to make the discrepancy obvious at a glance).",
+   "Solver assumes the binary is correct (because it is the 'compiled authority') and only hunts for bugs in Python/SQL, never running a controlled byte-count comparison against the binary's output."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "system-administration",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "debugging",
+   "data-processing",
+   "syslog",
+   "two-interacting-causes"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/logquota/ingest.py  # read full Python driver, spot INSERT OR REPLACE immediately",
+   "cat /opt/logquota/schema.sql  # confirm schema, see quota_usage structure",
+   "cat /opt/logquota/reconcile.py  # understand ground-truth comparison tool",
+   "ls /opt/logquota/data/sample/  # enumerate syslog files",
+   "head -10 /opt/logquota/data/sample/*.log  # find RFC 5424 lines with structured-data",
+   "printf '<34>1 2026-10-13T12:00:00Z host app 1234 ID1 [exampleSDID@32473 iut=3] test msg\\n' > /tmp/rfc5424_test.log",
+   "wc -c /tmp/rfc5424_test.log  # get true byte count",
+   "/opt/logquota/bin/qe-classify /tmp/rfc5424_test.log  # compare binary's 'bytes' field to wc -c output",
+   "# Observe: binary reports inflated bytes (true_len + structured_data_len), confirming bug 1",
+   "# Observe in ingest.py: INSERT OR REPLACE resets byte_used to current file only (bug 2)",
+   "# Fix 1: patch ingest.py to recompute byte count from raw line length instead of trusting binary",
+   "sed -i 's/INSERT OR REPLACE INTO quota_usage(tenant, byte_used) VALUES (?,?)/INSERT INTO quota_usage(tenant, byte_used) VALUES(?,?) ON CONFLICT(tenant) DO UPDATE SET byte_used = byte_used + excluded.byte_used/' /opt/logquota/ingest.py",
+   "# Also patch ingest.py to compute bytes from len(line) on the raw line, not from binary JSON output",
+   "python3 -c \"import re; src=open('/opt/logquota/ingest.py').read(); print(src)\"  # find where bytes from JSON are used",
+   "# Edit ingest.py: replace 'bytes_val = record[\"bytes\"]' with 'bytes_val = len(line)' (raw line including newline)",
+   "nano /opt/logquota/ingest.py  # apply both fixes: byte recomputation + ON CONFLICT accumulation",
+   "python3 /opt/logquota/ingest.py /opt/logquota/data/sample/*.log  # first ingest run",
+   "python3 /opt/logquota/reconcile.py  # verify zero discrepancies",
+   "python3 /opt/logquota/ingest.py /opt/logquota/data/sample/*.log  # second run (idempotency test)",
+   "python3 /opt/logquota/reconcile.py  # verify still zero discrepancies after re-run"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction says 'Fix the pipeline' but does not explicitly state that modifying ingest.py to override the binary's byte output (rather than writing a separate shim) is acceptable \u2014 a solver who writes a wrapper/shim that corrects binary output before ingest.py sees it would also be correct, but if tests only check the final DB state this is fine.",
+   "The instruction requires 'including the newline character' in byte counts but the sample syslog files may use CRLF on some platforms, making len(line) platform-dependent if files are opened in text mode vs binary mode \u2014 this could cause test flakiness if file reading mode is inconsistent between reconcile.py ground truth and ingest.py.",
+   "The 'idempotent ingestion' requirement combined with ingestion_log tracking by file_path means if a solver implements idempotency by skipping already-ingested files (rather than accumulating correctly), they pass the idempotency test but fail multi-file accumulation tests only if files differ \u2014 the test descriptions should disambiguate skip-vs-accumulate semantics.",
+   "Bug 1 requires the solver to override binary output with raw line byte counts \u2014 but the instruction says 'fix the pipeline', which could be interpreted as only fixing the SQL and Python, not intercepting binary output. A strict reading might penalize a solver who correctly patches ingest.py to recount bytes from the raw line (which is actually the right fix).",
+   "The 'two-interacting-causes' framing claims fixing only the SQL makes totals 'idempotent but wrong' \u2014 but if the solver replaces binary byte counts with raw line lengths in ingest.py, they fix both bugs simultaneously with a single conceptual change plus the SQL fix, potentially making the task easier than anticipated for systematic solvers."
+  ],
+  "verdict": "accept",
+  "reasons": "The task is well-constructed with realistic dual-bug interaction, strong verifiability via generate-at-verify-time corpora with known ground truth, and genuine realism as a billing-accuracy problem. The genuine_difficulty scores 3 rather than higher because both bugs are visible in source code (INSERT OR REPLACE is immediately obvious to any SQL reader, and binary testing requires only 2 commands), and a systematic agent will likely spot both within 20 commands \u2014 the 'misleading symptom' mainly affects less systematic solvers. The platform/newline risk is a minor but real flakiness concern that should be addressed.",
+  "fixes": [
+   "Explicitly state in the instruction that the binary's byte output may not be trusted and the pipeline fix should ensure byte counts are derived from the raw line data \u2014 this prevents ambiguity about whether intercepting binary output is in scope.",
+   "Ensure all syslog test files are generated and read in binary mode (open with 'rb') both in ingest.py and reconcile.py to avoid CRLF vs LF discrepancies that could cause spurious test failures on non-Linux platforms.",
+   "Add one sentence clarifying that idempotency means re-running on already-ingested files must not change totals (not that files are skipped) \u2014 this prevents a solver from implementing file-skip logic that passes idempotency tests while failing multi-file accumulation tests.",
+   "To raise genuine_difficulty, consider obfuscating the SQL UPSERT slightly (e.g., hiding it in a helper function in utils.py rather than inline in ingest.py) so it is not immediately visible on first read, forcing the solver to trace the code path."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a data pipeline that produces incorrect per-entity byte/usage totals stored in a file/DB, with requirements for idempotency and multi-file accumulation, differing mainly in domain (syslog/SQLite vs NetFlow/CSV) and specific bug types."
+    },
+    {
+     "ref_id": "terminal-bench/data-anonymization",
+     "verdict": "distinct",
+     "reason": "Data anonymization with cross-file entity linking is a fundamentally different problem from byte-counting quota enforcement."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-lz77-file-compressor",
+     "verdict": "distinct",
+     "reason": "Implementing a compression algorithm is unrelated to fixing a log ingestion quota pipeline."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing an ETL pipeline writing aggregated totals to SQLite with idempotency requirements, differing in domain (syslog byte quotas vs revenue/user aggregation) and specifics like tenant routing and binary components."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "Fixing a Rust sensor-aggregation pipeline with fixed-point arithmetic to match a reference binary is a fundamentally different problem from debugging a syslog quota enforcement pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e5238fcac164",
+     0.152
+    ],
+    [
+     "terminal-bench/data-anonymization",
+     0.111
+    ],
+    [
+     "terminal-bench-pro/implement-lz77-file-compressor",
+     0.1
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.099
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.098
+    ]
+   ],
+   "cost_usd": 0.013874999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056751
+}

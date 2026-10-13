@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "hmac-stream-audit-recovery",
+  "title": "HMAC Stream Audit Log Recovery",
+  "scenario": "A scientific computing platform generates cryptographically chained audit logs for reproducible experiment tracking. After a refactor of the key derivation module three weeks ago, the audit verifier has been silently accepting corrupted logs from certain instrument clusters while rejecting valid ones from others. The release engineer must diagnose why the verifier passes some clusters and fails others, restore correct HMAC chain verification, and ensure the decryption pipeline achieves \u226595% correct record recovery on hidden instrument clusters.",
+  "instruction_draft": "```\n$ python /app/audit/verify_chain.py --cluster alpha\nCluster alpha: 847/847 records verified OK\n$ python /app/audit/verify_chain.py --cluster beta\nCluster beta: 0/412 records verified OK\nVerification failed: HMAC mismatch at record 0\n$ python /app/audit/verify_chain.py --cluster gamma\nCluster gamma: 412/412 records verified OK\n$ python /app/audit/decrypt_records.py --cluster beta --out /tmp/beta_out.csv\nDecrypted 0/412 records\n$ python /app/audit/decrypt_records.py --cluster alpha --out /tmp/alpha_out.csv\nDecrypted 847/847 records\n```\n\nThe audit verification and decryption pipeline at `/app/audit/` is broken for a subset of instrument clusters. The pipeline must correctly verify and decrypt records from ALL clusters, not just those it happens to pass today.\n\nA hidden test suite will run `verify_chain.py` and `decrypt_records.py` against six additional instrument cluster archives in `/app/clusters/`. Your fix must achieve:\n- \u226595% HMAC verification pass rate across all hidden clusters combined\n- \u226595% successful record decryption across all hidden clusters combined\n- Correct plaintext content: decrypted scientific measurements must match the embedded checksums inside each record\n\nAll cluster archives are in `/app/clusters/`. The pipeline source is in `/app/audit/`. Do not modify the cluster data files. The verifier must remain a chain verifier (each record's HMAC must depend on the previous record).",
+  "requirements": [
+   "\u226595% HMAC verification pass rate across all hidden clusters combined",
+   "\u226595% successful record decryption across all hidden clusters combined",
+   "Decrypted record content must match per-record embedded checksums",
+   "The verifier must remain a chained HMAC verifier (each record depends on the previous)",
+   "Cluster data files must not be modified"
+  ],
+  "environment": [
+   "Python 3.13-slim-bookworm base image",
+   "pip install cryptography==42.0.8 (pinned)",
+   "Directory /app/audit/ with ~900 lines across: verify_chain.py, decrypt_records.py, kdf.py, chain.py, record_codec.py, cluster_config.py, utils.py, __init__.py",
+   "Directory /app/clusters/ with subdirectories alpha/, beta/, gamma/ each containing: manifest.json (cluster metadata including instrument_class), records/ (100-900 binary .rec files)",
+   "Six additional hidden cluster archives (delta, epsilon, zeta, eta, theta, iota) generated at verify time with the same format, spanning both instrument classes",
+   "kdf.py: derives a per-cluster HMAC key from a master secret + cluster_id; the refactored version encodes cluster_id as UTF-8 bytes BUT the old code encoded it as ASCII with a length prefix \u2014 the new code is correct for clusters registered after the refactor but wrong for legacy clusters",
+   "cluster_config.py: maps cluster names to instrument_class ('legacy' or 'modern'); the manifest.json inside each cluster archive also records instrument_class",
+   "chain.py: computes chained HMACs; has a second subtle bug where it uses the cluster HMAC key directly for records with even index and XORs with a constant for odd-index records \u2014 this XOR was intended to be applied to the record hash before HMAC, not to the HMAC output",
+   "The misleading symptom: verify_chain.py prints 'HMAC mismatch at record 0' for beta cluster, which makes it look like a key derivation failure; but gamma also uses the same key derivation path and passes \u2014 the real splitter is instrument_class in the manifest, which controls a code path in record_codec.py that pads measurement data differently for legacy vs modern instruments",
+   "record_codec.py: for 'modern' instrument_class, applies PKCS7-style padding before encrypting; for 'legacy', applies zero-padding; the refactor accidentally swapped these two branches",
+   "The HMAC chain bug (odd/even XOR) affects ALL clusters but is masked for alpha and gamma because their record counts are all-even or the test happens to pass; the hidden clusters expose it",
+   "decrypt_records.py: calls record_codec.py's decode() function, which also has the swapped padding bug; fixing kdf.py alone makes verify pass for legacy clusters but decrypt still fails due to the codec bug",
+   "visible 'passing' clusters use modern instrument class; beta uses legacy; the hidden clusters include 3 legacy and 3 modern to ensure both code paths are tested",
+   "master secret is stored in /app/audit/config/master.key as a hex string",
+   "utils.py and __init__.py are correct red herrings with plausible-looking code"
+  ],
+  "internal_hint": "Difficulty source 1 (not visible by reading): The key derivation bug only manifests for legacy instrument clusters. Reading kdf.py shows two encoding paths but does not reveal which clusters use which path \u2014 the solver must cross-reference manifest.json inside each cluster archive with cluster_config.py to discover that 'legacy' clusters get the broken path. The misleading symptom (HMAC mismatch at record 0) points at KDF, but gamma uses the same KDF path as beta and passes, so pure KDF analysis is insufficient. Difficulty source 2 (hidden invariant discovered by running): The odd-index HMAC XOR bug in chain.py is masked in the sample clusters but exposed in hidden clusters with odd-record-count runs. A solver who only fixes the KDF and codec bugs will pass alpha/beta/gamma but fail ~30% of hidden clusters. The solver must: (1) notice that beta fails but gamma passes despite similar size \u2192 instrument_class is the discriminator; (2) find the swapped padding branches in record_codec.py; (3) discover the chain.py XOR bug by running against a synthetic odd-length cluster or by careful reading of the HMAC computation; (4) fix all three bugs. The misleading symptom (record 0 mismatch) points at KDF but the real first bug is the codec padding swap \u2014 fixing only KDF causes decryption to still fail.",
+  "trap": "A solver who fixes only the KDF encoding path will see beta cluster verification pass (because the HMAC key is now correct for legacy clusters) but decryption still fails because record_codec.py has the swapped padding branches. A solver who fixes KDF and codec will pass ~70% of hidden clusters but fail those with odd record counts due to the chain.py XOR bug. The hidden test clusters are generated with a mix of even and odd record counts specifically to expose this. Shallow verification against only the three visible clusters gives a false all-clear.",
+  "tests": [
+   "Run verify_chain.py against each of 6 hidden clusters (3 legacy, 3 modern, with record counts ranging 150-600, mix of odd and even); aggregate pass rate must be \u226595%",
+   "Run decrypt_records.py against each hidden cluster; aggregate decryption success rate must be \u226595%",
+   "For each successfully decrypted record, parse the embedded CRC32 checksum in the last 4 bytes and verify it matches the payload; pass rate on this check must be \u226595%",
+   "Spot-check: run verify_chain.py on a synthetically generated 7-record odd-count modern cluster to confirm the chain.py XOR bug is fixed",
+   "Confirm cluster data files are unmodified by comparing SHA256 of all .rec and manifest.json files against recorded hashes",
+   "Confirm the chain property: modify one record byte in a test cluster and verify the pipeline rejects it (chain integrity preserved)"
+  ],
+  "verifier_knob": {
+   "name": "threshold",
+   "value": "0.95",
+   "effect": "Lowering to 0.85 makes the task easier (only 2 of 3 bugs need fixing); raising to 0.99 requires all bugs fixed including edge cases in odd-record chains. Current 0.95 requires fixing all 3 bugs but tolerates minor edge case failures."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the KDF encoding bug (the obvious suspect from the symptom), sees beta pass verification, declares victory without testing decryption \u2014 hidden clusters expose the codec padding bug",
+   "Solver fixes KDF and codec bugs, validates against visible clusters which all happen to have even record counts, misses the chain.py XOR bug \u2014 hidden odd-count clusters fail",
+   "Solver finds the chain.py XOR on odd indices, inverts it in the wrong direction (applies XOR at verification instead of removing it from generation), producing a brittle fix that passes some clusters and fails others",
+   "Solver modifies cluster data files to 'normalize' them rather than fixing the pipeline code, triggering the file integrity check",
+   "Solver correctly identifies the instrument_class discriminator and fixes record_codec.py but applies the fix only in decrypt_records.py, not in verify_chain.py which also calls the codec for MAC computation"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "hmac",
+   "chained-verification",
+   "reverse-engineering",
+   "hidden-invariant",
+   "scientific-computing",
+   "error-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/audit/kdf.py",
+   "cat /app/audit/cluster_config.py",
+   "cat /app/clusters/alpha/manifest.json && cat /app/clusters/beta/manifest.json && cat /app/clusters/gamma/manifest.json",
+   "cat /app/audit/chain.py",
+   "cat /app/audit/record_codec.py",
+   "cat /app/audit/verify_chain.py",
+   "cat /app/audit/decrypt_records.py",
+   "cat /app/audit/config/master.key",
+   "Edit kdf.py: add legacy branch using ASCII+length-prefix encoding based on instrument_class lookup",
+   "Edit record_codec.py: swap padding branches (PKCS7 for modern, zero-pad for legacy)",
+   "Edit chain.py: move XOR from HMAC output to record hash input (or remove if unintended), matching original spec",
+   "python /app/audit/verify_chain.py --cluster alpha",
+   "python /app/audit/verify_chain.py --cluster beta",
+   "python /app/audit/verify_chain.py --cluster gamma",
+   "python /app/audit/decrypt_records.py --cluster beta --out /tmp/beta_out.csv",
+   "python /app/audit/decrypt_records.py --cluster alpha --out /tmp/alpha_out.csv",
+   "python /app/audit/decrypt_records.py --cluster gamma --out /tmp/gamma_out.csv",
+   "Create synthetic 7-record odd-count cluster, run verify_chain.py to confirm chain.py fix handles odd indices"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'remain a chain verifier' constraint is ambiguous: fixing chain.py necessarily changes the chaining logic, and a strict reading could penalize any modification to chain.py even if it restores correct behavior.",
+   "The odd-index XOR bug description says 'XOR was intended to be applied to record hash before HMAC, not to HMAC output' \u2014 if the hidden test clusters were generated with the buggy code (XOR on output), fixing it to the 'intended' behavior would cause all clusters to fail, not pass. The blueprint must clarify whether hidden clusters were generated with the buggy or correct chain logic.",
+   "Synthetic 7-record cluster spot-check: if the verifier test generates this cluster at verify-time, the generation code must also be correct \u2014 but if it uses the same chain.py, a wrong fix that's self-consistent (both generate and verify use same buggy logic) might pass the spot-check.",
+   "The three bugs are all directly readable in source code, making genuine_difficulty effectively 2 \u2014 the hidden cluster mechanism only provides quantitative confirmation of bugs already visible by static reading.",
+   "If the hidden clusters (delta through iota) are generated at verify-time using the *fixed* pipeline, then any self-consistent fix (even wrong) could pass; if generated with original buggy code, the XOR fix direction becomes critical and may be underspecified."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because all three bugs are directly visible by reading ~7 source files \u2014 a skilled agent can identify kdf.py's encoding branch, record_codec.py's swapped padding, and chain.py's XOR placement without running any code or exploring hidden data. The blueprint's own framing acknowledges this shape scores at most 2. Additionally, there is a critical underspecification: the hidden test clusters must be generated with either the buggy or fixed chain.py, and the correct direction of the XOR fix depends entirely on this \u2014 if hidden clusters were generated with the buggy code, 'fixing' chain.py will cause mass failures, making the correct answer ambiguous.",
+  "fixes": [
+   "Make at least one bug require runtime exploration to discover: for example, the odd-index XOR bug should only be triggerable by examining a cluster with an odd record count, and the connection between instrument_class and code path should require reading the manifest inside a binary-format archive (not plaintext JSON) so grepping source is insufficient.",
+   "Replace the directly-readable padding swap in record_codec.py with a conditional that depends on a value computed at runtime from cluster metadata, so the bug is not visible by static reading alone \u2014 e.g., the padding mode is looked up from a config table that is itself generated from instrument_class in a non-obvious way.",
+   "Clarify the generation provenance of hidden clusters: explicitly state whether they are generated with the original buggy pipeline or the intended-correct pipeline, and ensure the chain.py fix direction is unambiguous (add a comment or spec doc in the environment stating the intended chain algorithm).",
+   "Add a fourth bug that is genuinely a hidden invariant: e.g., a timing-dependent salt in the KDF that only manifests when record timestamps cross a UTC midnight boundary, requiring the solver to notice timestamp patterns in the data rather than reading code.",
+   "Reduce clarity of the kdf.py bug by encoding the legacy/modern split in a non-obvious way (e.g., a bitmask in the cluster_id rather than an explicit config lookup), forcing the solver to cross-reference more sources before understanding the discriminator."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-science/spatial-cell-annotation",
+     "verdict": "distinct",
+     "reason": "Completely different domain (cell type annotation via clustering) with no cryptographic or audit log elements."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task requires building a TCP service that computes HMAC tags on demand, not diagnosing why a chained HMAC verifier fails on some clusters and fixing key derivation."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "variant",
+     "reason": "Both tasks involve diagnosing and fixing a broken HMAC chain verifier that gives wrong answers on some logs but not others, with the core problem being the same chained-HMAC verification bug."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "variant",
+     "reason": "Both tasks involve an audit log system where decryption/verification fails on some windows/clusters but not others due to a key derivation inconsistency introduced by a recent refactor, requiring the same diagnostic and fix approach."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about AES-CTR per-record cipher producing wrong plaintexts after a refactor, not about a chained HMAC verifier accepting/rejecting clusters inconsistently."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-science/spatial-cell-annotation",
+     0.284
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.22
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.189
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.183
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.14
+    ]
+   ],
+   "cost_usd": 0.015375
+  },
+  "novel": false
+ },
+ "cost_usd": 0.062049
+}

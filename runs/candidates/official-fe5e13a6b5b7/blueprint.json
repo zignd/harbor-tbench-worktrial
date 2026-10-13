@@ -1,0 +1,61 @@
+{
+ "slug": "fx-margin-call-engine-rust",
+ "title": "FX Margin Call Engine Silent Miscalculation",
+ "scenario": "A finance-ops team runs a small in-house Rust codebase (~1,400 lines) that computes daily margin requirements for a book of foreign-exchange forward contracts. The pipeline reads raw trade CSV files, calls a compiled black-box pricer binary (no source available) to get mark-to-market values, aggregates per-counterparty exposure, and writes results to SQLite. After a recent refactor the nightly reconciliation job started flagging unexplained discrepancies \u2014 but the built-in self-test passes and the log shows no errors.",
+ "instruction_draft": "Hey \u2014 our margin engine is giving wrong numbers again and the self-test is lying to us. The job reads trades from `/app/data/trades/`, prices them through `pricer` (the binary in `/app/bin/`), rolls everything up per counterparty, and writes to `/app/db/margin.db` (tables: `positions`, `margin_calls`). The self-test in `cargo test` passes but reconciliation keeps failing.\n\nCan you get `cargo run --release -- --settle` to produce correct per-counterparty `net_mtm` and `margin_required` values in `margin_calls`? Margin required = max(0, net_mtm \u00d7 haircut_rate - collateral_posted). The pricer outputs MTM in the trade's currency; everything must be converted to USD before aggregating. Each counterparty's net_mtm in `margin_calls` must match the sum of its position-level USD MTM values in `positions`, and margin_required must be non-negative and computed from the correct net_mtm. All values must be stored with exactly 2 decimal places (banker's rounding). Thanks",
+ "requirements": [
+  "Running `cargo run --release -- --settle` must complete without error",
+  "The `margin_calls` table must have one row per counterparty present in the trades",
+  "Each row's `net_mtm` must equal the sum of that counterparty's `positions.mtm_usd` values, rounded to 2 decimal places using banker's rounding",
+  "Each row's `margin_required` must equal max(0, net_mtm \u00d7 haircut_rate - collateral_posted), rounded to 2 decimal places using banker's rounding",
+  "margin_required must never be negative",
+  "The `positions` table must contain one row per trade with `mtm_usd` equal to the pricer's MTM output converted to USD using the correct FX rate for that trade's currency",
+  "All monetary values stored in SQLite must use exactly 2 decimal places (banker's rounding, not truncation or f64 round())"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs rustup (stable), sqlite3, and sets up the workspace",
+  "~1,400 lines of Rust across: src/main.rs (CLI entry), src/loader.rs (CSV parsing), src/pricer.rs (calls binary, parses output), src/aggregator.rs (per-counterparty rollup with THE BUG: uses f64 arithmetic and f64::round() instead of integer cent arithmetic with banker's rounding; also silently drops the currency conversion for JPY trades because it checks currency == 'USD' with a typo \u2014 actually checks usd_rate.is_nan() which is never true, so it multiplies by 1.0 for all non-USD when it should use the rate), src/db.rs (SQLite writes), src/health.rs (self-test that only checks USD trades in its fixture \u2014 the fixture has no JPY trades, so the test always passes)",
+  "Compiled black-box pricer binary at /app/bin/pricer: takes args --trade-id <id> --notional <n> --tenor-days <d> --currency <ccy> and prints 'MTM: <value> <ccy>' \u2014 the value is in the trade's currency (e.g. JPY); the binary uses an internal model; source not present; must be probed experimentally to understand its output format and sign convention (it returns negative MTM for trades where the bank is short, positive when long \u2014 opposite of the initial reader assumption in src/pricer.rs which negates the value, doubling the sign error for short trades)",
+  "Trade CSV files in /app/data/trades/ with columns: trade_id, counterparty_id, currency, notional, tenor_days, position_side (long/short), collateral_posted",
+  "FX rate table in /app/data/fx_rates.csv: currency,usd_rate (e.g. JPY,0.006734)",
+  "SQLite database initialized at /app/db/margin.db with empty tables on first run",
+  "A counterparty config YAML at /app/config/counterparties.yaml specifying haircut_rate per counterparty",
+  "Self-test in src/health.rs uses a hardcoded fixture with only USD trades and only long positions \u2014 passes trivially despite the bugs",
+  "The misleading symptom: running without --settle shows a 'health: OK' status, and cargo test passes, so the obvious diagnosis is a SQLite write problem \u2014 but the real bugs are in aggregator.rs (currency conversion + rounding) and pricer.rs (sign flip for short trades)"
+ ],
+ "internal_hint": "Difficulty comes from two sources: (1) The opaque pricer binary must be probed experimentally \u2014 it returns MTM in the trade currency with a sign convention that is opposite to what src/pricer.rs assumes (the code negates the value, so short trades get wrong sign). The solver must call the binary directly with test arguments to discover its actual output format and sign. (2) The currency conversion bug in aggregator.rs is not in a commented TODO or obvious location \u2014 the code looks plausible (it calls get_usd_rate()) but the rate lookup silently returns 1.0 for non-USD currencies due to a logic error in the HashMap lookup (looks up by the wrong key after a trim() call on the rate table, causing a None \u2192 unwrap_or(1.0) fallback). The rounding bug uses f64::round() \u00d7 0.01 arithmetic instead of integer cent arithmetic with banker's rounding, causing wrong values at .5 cent boundaries. The self-test only covers USD long trades so all three bugs are invisible to it. A solver who only reads source will likely spot the f64 rounding but miss the pricer sign convention (requires running the binary) and may also miss the subtle lookup failure (looks correct on first read). The fix requires: patching pricer.rs to not negate (or to negate correctly for short), patching aggregator.rs FX lookup (fix the key lookup), and replacing f64::round() with proper banker's rounding using a cents-based i64 approach.",
+ "trap": "A shallow solver fixes the visible f64 rounding issue (replacing round() with a custom banker's round function) and sees the self-test pass, then runs --settle and checks a counterparty with only USD long trades \u2014 it looks correct. But: (1) counterparties with JPY trades still have wrong net_mtm (\u00d71.0 instead of \u00d70.006734), and (2) counterparties with short trades have doubly-wrong MTM (sign flipped twice). The verifier generates fresh trade fixtures at verify time that include JPY trades, short positions, and .5-cent rounding boundary cases, so partial fixes fail on multiple independent properties.",
+ "tests": [
+  "Generate 3 counterparties with a mix of USD-long, USD-short, JPY-long, JPY-short trades at verify time; run `cargo run --release -- --settle`; check positions.mtm_usd for each trade equals pricer output (probed at verify time by calling the binary directly) \u00d7 correct FX rate, with correct sign (positive for long, negative for short)",
+  "Check margin_calls.net_mtm for each counterparty equals the exact sum of its positions.mtm_usd values rounded to 2 decimal places with banker's rounding (verified by Python decimal module at check time)",
+  "Check margin_calls.margin_required = max(0, net_mtm \u00d7 haircut_rate - collateral_posted) with banker's rounding; inject a counterparty whose formula result is exactly X.005 to test .5-cent boundary",
+  "Check margin_required is never negative (inject a counterparty with large collateral_posted that makes the formula negative)",
+  "Check that the number of rows in margin_calls equals the number of distinct counterparty_ids in all trade CSV files",
+  "Check that the number of rows in positions equals the total number of trade rows across all CSV files",
+  "Verify the pricer binary sign convention by calling it directly with a known notional and checking the sign of the output, then confirm positions.mtm_usd has the correct sign for a short trade"
+ ],
+ "verifier_knob": {
+  "name": "number_of_independent_state_properties_checked",
+  "value": "7",
+  "effect": "Raising adds more currency/position-side combinations and more .5-cent boundary cases; lowering removes JPY or short-position checks, making partial fixes pass"
+ },
+ "expected_failure_modes": [
+  "Agent fixes f64 rounding only and misses the pricer sign convention bug (JPY and short-position checks still fail)",
+  "Agent probes the pricer binary but misreads its output format and applies a wrong correction",
+  "Agent patches the FX lookup by hardcoding a rate table instead of fixing the HashMap key lookup, causing the fix to not generalize to verify-time currencies",
+  "Agent implements a custom round() that rounds half-up instead of half-to-even (banker's rounding), failing .5-cent boundary tests",
+  "Agent correctly fixes the sign and FX bugs but stores values as REAL (f64) in SQLite and the floating-point representation drifts from the required 2 decimal places",
+  "Agent runs `cargo test` after each fix, sees it pass, and assumes correctness without testing JPY or short-trade scenarios"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "rust",
+  "sqlite",
+  "opaque-binary",
+  "financial",
+  "devops",
+  "rounding"
+ ]
+}

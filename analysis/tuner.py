@@ -21,6 +21,7 @@ import shutil
 from pathlib import Path
 
 from analysis.llm import chat, extract_json
+from generator.config import TUNE_BREADTH
 from generator.spec import LEVERS
 
 PLAN_PROMPT = """You tune the difficulty of a Terminal-Bench task. A frontier agent (Claude Opus class) must solve
@@ -110,6 +111,33 @@ def plan_mutation(
     return plan, reply.cost_usd
 
 
+BREADTH_CHANGE = """Make the task harder by BREADTH, not by one more visible bug. Opus solved the current
+version by reading the code and patching a few readable defects in 4-35 commands, 4-5 times out of 5
+(adding a third or fourth readable bug changed nothing). Rework it so that a correct solution must
+satisfy at least {n} INDEPENDENT requirements, each a different class of edge case that:
+- appears only on verify-time inputs the solver never sees (the tests generate fresh inputs),
+- is not visible by reading one file: it comes from how the data and the components behave
+  (empty, duplicate or out-of-order records, boundary values, unit or encoding quirks, ordering of
+  operations, idempotency, partial failures, large inputs),
+- is stated in the instruction as one short observable rule (fairness: nothing the tests check may
+  be unstated, and no rule may be a description of the defect),
+- is checked by its own test(s) on at least 3 fresh inputs.
+The environment must contain realistic data and code where those cases genuinely occur. A solution
+that handles the obvious cases but misses any one of the {n} rules must fail. Keep the tests
+deterministic, keep the instruction outcome-only and short per rule, and keep the oracle passing 3/3."""
+
+
+def breadth_plan(rnd: int) -> dict:
+    """A deterministic 'harder' plan: many independent hidden-input requirements.
+
+    If Opus finds each with probability ~0.9, {n} of them leaves a pass rate of ~0.43
+    (n=8) or ~0.23 (n=14): the band, with every failure traceable to a missed rule.
+    """
+    n = 8 if rnd == 1 else 14
+    return {"kind": "breadth", "direction": "harder", "change": BREADTH_CHANGE.format(n=n),
+            "n": n}  # fmt: skip
+
+
 def fix_spec_plan(calibration: dict) -> dict:
     """A repair plan for a task whose calibration failed for the task's own reasons."""
     reasons = []
@@ -139,7 +167,7 @@ def directive(plan: dict) -> str:
     )
 
 
-def _resume_rounds(cand_id: str, ledger) -> tuple[list[dict], dict | None]:
+def _resume_rounds(cand_id: str, ledger, offset: int = 0) -> tuple[list[dict], dict | None]:
     """Rounds a crashed tuning run already finished, and the calibration they left."""
     # A round whose authoring never ran (infra error: Docker out of networks, proxy down) is
     # not a tuning result: it is redone, not counted.
@@ -147,11 +175,12 @@ def _resume_rounds(cand_id: str, ledger) -> tuple[list[dict], dict | None]:
         e.result
         for e in ledger.events(stage="tune", task=cand_id)
         if e.result.get("gate_problems") != ["authoring failed"]
+        and e.result.get("offset", 0) == offset
     ]
     if not rounds:
         return [], None
     last = rounds[-1]
-    name = f"{cand_id}-t{last['round']}"
+    name = f"{cand_id}-t{last['round'] + offset}"
     trials = [e.result for e in ledger.events(stage="calibration_trial", task=name)]
     return rounds, {
         "verdict": last["result"],
@@ -160,8 +189,14 @@ def _resume_rounds(cand_id: str, ledger) -> tuple[list[dict], dict | None]:
     }
 
 
-def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
+AGAIN_OFFSET = 20  # a second tuning generation: keeps job names, files and records apart
+
+
+def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2, again: bool = False) -> dict:
     """Mutate -> re-author -> gates -> recalibrate, up to max_rounds. Returns the tuning record.
+
+    A too-easy task gets the breadth mutation (many independent hidden-input requirements);
+    `again` starts a second generation of rounds for a task that was already tuned.
 
     Resumable: finished rounds come back from the ledger, and a round whose new
     package already passed every gate goes straight to calibration.
@@ -178,14 +213,16 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
     cand.blueprint = Blueprint(**json.loads((cand_dir / "blueprint.json").read_text()))
     calibration = json.loads((cand_dir / "calibration.json").read_text())
     record = {"start": calibration["verdict"], "rounds": []}
-    record["rounds"], resumed = _resume_rounds(cand.cand_id, ledger)
+    offset = AGAIN_OFFSET if again else 0
+    record["rounds"], resumed = _resume_rounds(cand.cand_id, ledger, offset)
     calibration = resumed or calibration
 
     for rnd in range(len(record["rounds"]) + 1, max_rounds + 1):
         if calibration["verdict"] not in ("too_easy", "too_hard", "invalid"):
             break
-        previous = cand_dir / f"before_tune_r{rnd}"
-        plan_file = cand_dir / f"tune_plan_r{rnd}.json"
+        rid = rnd + offset  # round id in file names, job names and calibration names
+        previous = cand_dir / f"before_tune_r{rid}"
+        plan_file = cand_dir / f"tune_plan_r{rid}.json"
         resuming = previous.exists() and plan_file.exists()
         if (
             resuming
@@ -199,6 +236,8 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
             else:
                 if calibration["verdict"] == "invalid":
                     plan, plan_cost = fix_spec_plan(calibration), 0.0
+                elif calibration["verdict"] == "too_easy" and TUNE_BREADTH:
+                    plan, plan_cost = breadth_plan(rnd), 0.0
                 else:
                     plan, plan_cost = plan_mutation(
                         cand.blueprint.to_markdown(spec), calibration, record["rounds"]
@@ -209,8 +248,8 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
                     shutil.rmtree(previous)
                 shutil.copytree(cand.task_dir, previous)
                 plan_file.write_text(json.dumps(plan, indent=1))
-            problems = _retune(cand, ledger, rnd, plan, previous)
-        round_rec = {"round": rnd, "plan": plan, "gate_problems": problems}
+            problems = _retune(cand, ledger, rid, plan, previous)
+        round_rec = {"round": rnd, "offset": offset, "plan": plan, "gate_problems": problems}
         if problems == ["authoring failed"]:
             # Infrastructure, not the task: log it, keep no final record, and let a later
             # run redo the round from the same snapshot and plan.
@@ -223,7 +262,7 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
             record["rounds"].append(round_rec)
             ledger.append(Event("tune", cand.cand_id, round_rec, cost_usd=plan_cost))
             break
-        cal = calibrate(cand.task_dir, f"{cand.cand_id}-t{rnd}", ledger)
+        cal = calibrate(cand.task_dir, f"{cand.cand_id}-t{rid}", ledger)
         calibration = {
             "verdict": cal.verdict,
             "outcomes": cal.outcomes,
@@ -235,7 +274,8 @@ def tune_candidate(cand_dir: Path, ledger, max_rounds: int = 2) -> dict:
         record["rounds"].append(round_rec)
         ledger.append(Event("tune", cand.cand_id, round_rec, cost_usd=plan_cost))
     record["final"] = calibration["verdict"]
-    (cand_dir / "tuning.json").write_text(json.dumps(record, indent=1, default=str))
+    tuning_file = "tuning_again.json" if again else "tuning.json"
+    (cand_dir / tuning_file).write_text(json.dumps(record, indent=1, default=str))
     (cand_dir / "calibration.json").write_text(json.dumps(calibration, indent=1, default=str))
     return record
 

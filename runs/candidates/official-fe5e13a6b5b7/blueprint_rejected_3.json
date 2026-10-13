@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "ledger-rounding-reconciler-rust",
+  "title": "Finance Ledger Rounding Reconciler",
+  "scenario": "A small in-house Rust codebase processes daily settlement files from a payment processor and writes reconciled ledger rows into a SQLite database. The finance-ops team has noticed that month-end totals are off by a few cents on certain accounts, but the pipeline's own checksum passes green. The repo has ~1,200 lines across a pipeline binary, a shared arithmetic library (compiled, no source), a config parser, and a set of CSV loaders. The symptom log points at the CSV loader, but the real issue is elsewhere.",
+  "instruction_draft": "Hey \u2014 we've got a reconciliation problem in the settlement pipeline at /app/ledger. Month-end roll-ups for some accounts are a few cents off and it's showing up in the DB, but the pipeline's own integrity check keeps passing. Can you dig in, figure out what's actually broken, and fix it so that: (1) every account's `reconciled_total` in the `ledger_summary` table exactly equals the sum of its individual `amount` rows in `ledger_entries` (to the nearest cent, i.e. rounded to 2 decimal places using banker's rounding); (2) the `entry_checksum` column on each `ledger_entries` row is the correct BLAKE3 hex of `account_id + '|' + amount_str` where `amount_str` is the canonical 2-decimal string of the stored amount; and (3) running `cargo run --release -- --settle /app/data/settle_nov.csv` completes without error and produces a `reconciled_total` for account A-0042 of exactly 18274.83. The fix should be in source you can edit \u2014 don't patch the DB directly.",
+  "requirements": [
+   "Every account's `reconciled_total` in `ledger_summary` equals the banker's-rounded (round-half-to-even) sum of its `amount` rows in `ledger_entries`, expressed as a value rounded to 2 decimal places.",
+   "The `entry_checksum` column for each row in `ledger_entries` is the lowercase BLAKE3 hex digest of the UTF-8 string `<account_id>|<amount_str>` where `amount_str` is the amount formatted to exactly 2 decimal places.",
+   "Running the pipeline against the provided `settle_nov.csv` produces `reconciled_total = 18274.83` for account A-0042.",
+   "The pipeline exits 0 and the database is populated (not empty) after the run.",
+   "A fresh run against a verifier-generated settlement CSV (different accounts, amounts with half-cent edges) still satisfies requirements 1 and 2."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs rustup/cargo, sqlite3, and the blake3 crate; Python is only for the verifier.",
+   "/app/ledger/ \u2014 Rust workspace with three crates: `pipeline` (main binary, ~400 lines), `config` (config parser, ~200 lines), `loader` (CSV parser and DB writer, ~300 lines).",
+   "A pre-compiled shared library `/app/ledger/lib/libarith.so` (no source) that exports two symbols: `arith_sum_cents(f64*, usize) -> f64` and `arith_round_half_up(f64, u32) -> f64`. The library uses round-half-up (standard arithmetic rounding), not banker's rounding.",
+   "The `pipeline` crate calls `libarith.so:arith_sum_cents` for aggregation and `arith_round_half_up` for per-entry normalization \u2014 both wrong for the spec.",
+   "The `loader` crate has a visibly suspicious comment about floating-point parsing that looks like the bug but is actually harmless (it correctly parses CSV strings to f64).",
+   "The `entry_checksum` implementation in `loader/src/checksum.rs` calls a stub `blake3_hex()` that actually computes SHA-256 (wrong algorithm) \u2014 this is the second independent defect.",
+   "/app/data/settle_nov.csv \u2014 ~800 rows of settlement data; account A-0042 has 23 rows with amounts chosen so that banker's rounding gives 18274.83 but round-half-up gives 18274.84.",
+   "The pipeline's own integrity check verifies that `reconciled_total` matches what `arith_sum_cents` returned (i.e., it validates its own wrong output), so it always passes.",
+   "An existing `Cargo.toml` declares `blake3 = \"1\"` in dependencies but the checksum module imports `sha2` instead.",
+   "Log output on a bad run says 'CSV parse warning: whitespace trimmed on 3 rows' \u2014 plausible-sounding but irrelevant misdirection.",
+   "SQLite DB is written to `/app/ledger/ledger.db` and recreated on each run.",
+   "The verifier generates a fresh settlement CSV with ~200 rows including deliberate half-cent boundary amounts (x.xx5) for multiple accounts and checks all five requirements."
+  ],
+  "internal_hint": "Difficulty comes from two interacting opaque/non-visible sources: (1) the compiled `libarith.so` uses round-half-up instead of banker's rounding \u2014 this can only be discovered by running experiments on the binary (e.g., calling it with known half-cent inputs and observing the output), not by reading source; (2) the checksum module silently uses SHA-256 despite the variable being named `blake3_hex`, which is invisible until you check what crate is actually imported and run a test vector. The misleading symptom is the CSV loader warning and its 'suspicious' comment, which wastes time. The fix requires: replacing the two `libarith` call sites with pure-Rust banker's rounding (`f64` summation with a correct rounding implementation, or using Rust's `Decimal` type) and replacing the SHA-256 call in `checksum.rs` with actual blake3. The pipeline's self-check passing despite wrong output is the hardest trap \u2014 agents that trust the green checksum stop investigating too early.",
+  "trap": "A shallow agent (a) trusts the pipeline's own integrity check, sees it pass, and concludes nothing is wrong with the arithmetic; (b) fixes only the obvious-looking CSV whitespace comment in `loader` and reruns, finds A-0042 still off, and is confused; (c) fixes the rounding by replacing `arith_sum_cents` but misses the checksum algorithm mismatch, so requirement 2 fails on the verifier's fresh inputs; (d) patches only the A-0042 total in the DB directly (explicitly forbidden) rather than fixing the source. Any one of these leaves at least one verifier test failing.",
+  "tests": [
+   "Run `cargo run --release -- --settle /app/data/settle_nov.csv` and query `SELECT reconciled_total FROM ledger_summary WHERE account_id = 'A-0042'`; assert value is exactly 18274.83.",
+   "For every row in `ledger_entries` after the nov run, recompute BLAKE3(account_id + '|' + formatted_amount) in Python and compare to `entry_checksum`; assert all match.",
+   "For every account in `ledger_summary` after the nov run, sum the corresponding `amount` values from `ledger_entries` using Python's `decimal.Decimal` with ROUND_HALF_EVEN and compare to `reconciled_total`; assert all match to 2 decimal places.",
+   "Generate a fresh settlement CSV at verify time with 15 accounts, ~50 rows each, including amounts ending in exactly .005 (half-cent boundary); run the pipeline against it; repeat tests 1-style spot check on two planted accounts with known banker's-rounded totals.",
+   "For the verifier-generated CSV run, spot-check 20 random `entry_checksum` values using Python blake3; assert all correct.",
+   "Assert the pipeline exits 0 and `ledger_entries` has a non-zero row count after each run."
+  ],
+  "verifier_knob": {
+   "name": "number of independent state properties checked",
+   "value": "5 properties: A-0042 total, all-accounts banker's rounding correctness, all-rows BLAKE3 checksum correctness, verifier-CSV spot totals, verifier-CSV spot checksums",
+   "effect": "Lowering to 2 (just A-0042 total + exit code) makes it passable by a partial fix; raising to 7 (add per-entry amount canonical format check and a cross-account sum invariant) makes it nearly impossible to satisfy by accident."
+  },
+  "expected_failure_modes": [
+   "Agent trusts the pipeline's own passing integrity check and concludes rounding is correct; spends time on CSV loader red herring; submits without fixing either defect.",
+   "Agent fixes rounding (replaces libarith calls) but misses that the checksum function is SHA-256 masquerading as BLAKE3; all arithmetic tests pass but checksum tests fail.",
+   "Agent fixes both issues but implements a non-banker's rounding (round-half-up in pure Rust) that happens to pass on the A-0042 spot check but fails on the verifier's half-cent boundary inputs.",
+   "Agent patches the database directly for A-0042 rather than fixing the source, which the verifier detects by running a fresh settlement file.",
+   "Agent experiments with libarith.so but misinterprets the rounding behavior (e.g., concludes it rounds to 0 decimals, not that it's round-half-up vs round-half-even at the cent boundary), implements the wrong fix."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "sqlite",
+   "finance",
+   "opaque-binary",
+   "rounding",
+   "cryptographic-hash"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/ledger/Cargo.toml && ls /app/ledger/",
+   "cat /app/ledger/pipeline/src/main.rs",
+   "cat /app/ledger/loader/src/checksum.rs  # discover sha2 import behind blake3_hex name",
+   "grep -r 'arith_sum_cents\\|arith_round_half_up' /app/ledger/",
+   "cat /app/ledger/loader/src/lib.rs",
+   "# Write small Rust crate to FFI-call libarith.so with known half-cent inputs",
+   "cargo new /tmp/arith_probe && cp /app/ledger/lib/libarith.so /tmp/arith_probe/",
+   "# edit /tmp/arith_probe/src/main.rs to call arith_round_half_up(0.5, 0), (1.5, 0), (2.5, 0)",
+   "cargo run --manifest-path /tmp/arith_probe/Cargo.toml  # confirm round-half-up behavior",
+   "# Fix 1: edit pipeline/src/main.rs - replace arith_sum_cents with pure-Rust f64 sum + banker's rounding",
+   "# Fix 2: edit pipeline/src/main.rs - replace arith_round_half_up calls with banker's rounding",
+   "# Fix 3: edit loader/src/checksum.rs - replace sha2 import/call with blake3 crate",
+   "cargo build --release --manifest-path /app/ledger/Cargo.toml 2>&1",
+   "cargo run --release --manifest-path /app/ledger/Cargo.toml -- --settle /app/data/settle_nov.csv",
+   "sqlite3 /app/ledger/ledger.db \"SELECT reconciled_total FROM ledger_summary WHERE account_id='A-0042'\"",
+   "sqlite3 /app/ledger/ledger.db \"SELECT account_id, amount, entry_checksum FROM ledger_entries LIMIT 3\"",
+   "python3 -c \"import blake3; h=blake3.blake3(b'A-0042|1234.56').hexdigest(); print(h)\"  # spot-check one row",
+   "python3 -c \"import sqlite3,decimal; # verify all reconciled_totals match banker's-rounded sums\""
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The blake3 Python package must be pre-installed in the verifier container; it is not stdlib and not universally available \u2014 if missing, checksum verification tests will error rather than fail cleanly.",
+   "The 'canonical 2-decimal string' format for amount_str needs to be precisely specified: if an amount stored as 100.0 is formatted as '100.0' vs '100.00', checksums will silently mismatch. The blueprint says 'exactly 2 decimal places' but doesn't show a format string example.",
+   "Building a Rust FFI test harness to call libarith.so requires correct build.rs linker configuration; if the precompiled library's target triple or ABI differs from the container's Rust toolchain, the experiment step fails and the agent cannot characterize the library's behavior.",
+   "The integrity check in the pipeline 'validates its own wrong output' \u2014 if this check throws an error (not just passes green) on the fixed output after the agent changes rounding, it could cause confusing pipeline exits, making solvability harder than described.",
+   "Floating-point accumulation of ~800 f64 values may introduce sub-cent errors even with correct banker's rounding on each step; the verifier's exact equality check could be flaky unless the implementation uses integer cents or Decimal arithmetic throughout."
+  ],
+  "verdict": "accept",
+  "reasons": "All five scores are at least 4, averaging 4.4, well above the 3.6 threshold. The task features two genuinely independent opaque defects (compiled library rounding behavior discoverable only by experiment, and SHA-256 masquerading as BLAKE3 behind a misleading variable name), a self-validating integrity check that traps shallow agents, and a realistic misdirection via CSV warning \u2014 these combine to make partial fixes highly likely even for frontier agents. The verifier design (fresh CSV with planted half-cent boundaries, independent Python recomputation of both checksums and banker's-rounded totals) is robust against DB-patching and single-defect partial fixes.",
+  "fixes": [
+   "Specify the exact Rust format string for amount_str (e.g., `format!(\"{:.2}\", amount)`) in the instruction to eliminate ambiguity about trailing zeros and prevent spurious checksum failures.",
+   "Explicitly pre-install the blake3 Python package (e.g., `pip install blake3`) in the Dockerfile and call it out in the environment description, since it is required by the verifier but is not stdlib.",
+   "Add a note that the pipeline's internal integrity check will need to be updated or removed as part of the fix (since it validates the wrong output), or ensure it does not crash on correct output \u2014 otherwise agents may face confusing pipeline errors after partially fixing the code.",
+   "Document the expected libarith.so ABI (e.g., C calling convention, x86_64-linux-gnu) and ensure the container's Rust toolchain matches, so agents can successfully write FFI experiments to characterize the library's rounding behavior."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about CSV chunking/deduplication in a Python pipeline, not financial rounding precision or cryptographic checksums in Rust."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a Rust pipeline that writes to SQLite with incorrect numeric computations (fixed-point vs. banker's rounding) and checksum columns, making them close variants of the same core debugging pattern."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a ledger reconciliation tool so per-account totals are correct to the cent against CSV imports into SQLite, sharing the same core domain and problem structure despite differing in language (Python vs. Rust) and specific bug type."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing SQL window functions (running totals and ranking) in a query file, unrelated to rounding arithmetic or checksum correctness in a Rust pipeline."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task involves NetFlow binary parsing and ASN/CIDR IP attribution in Python, a completely different domain and technical problem from Rust financial rounding and BLAKE3 checksums."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.184
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.179
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.171
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.135
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.132
+    ]
+   ],
+   "cost_usd": 0.014064
+  },
+  "novel": false
+ },
+ "cost_usd": 0.06449099999999999
+}

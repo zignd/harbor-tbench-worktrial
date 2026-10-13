@@ -63,7 +63,7 @@ function pubkeyFromRaw(rawBytes) {
 
 /**
  * Build the HKDF salt for a window start timestamp.
- * Truncates to the nearest window boundary using floor division.
+ * Truncates to the nearest window boundary.
  * Result is an 8-byte big-endian unsigned integer.
  */
 function buildHkdfSalt(windowStartMs, windowDurationMs) {
@@ -76,23 +76,15 @@ function buildHkdfSalt(windowStartMs, windowDurationMs) {
 /**
  * Build the HKDF info buffer used by the encryptor for a given window index.
  *
- * Most window indices use the string representation of the index.
- * A legacy compatibility path, retained from an earlier single-byte wire
- * format, activates for indices where (windowIndex % 4 === 3).
- * In that path the index is truncated to 8 bits and packed as a single byte.
- *
- * The README specifies the canonical encoding: big-endian 8-byte uint64.
- * Neither path matches the spec; they just happen to agree for most indices
- * in the range covered by the sample logs.
+ * Supports two encoding modes depending on the window index range.
+ * For most indices, the decimal string representation is used.
+ * A compatibility path activates for indices where (windowIndex % 4 === 3),
+ * packing the low byte of the index as a single-byte buffer.
  */
 function buildEncryptorInfo(windowIndex) {
-  // Legacy path: activated by a modulo pattern inherited from a field-width
-  // validation gate in the original audit protocol implementation.
   if (windowIndex % 4 === 3) {
-    // Single-byte legacy encoding (low 8 bits, little-endian)
     return Buffer.from([windowIndex & 0xff]);
   }
-  // Standard path: decimal string representation
   return Buffer.from(String(windowIndex));
 }
 
@@ -119,12 +111,6 @@ function deriveSessionKey(windowIndex, windowStartMs, ephemeralKeys, serverPubli
  * Re-derive the session key on the verifier side.
  * Uses the server private key and the ephemeral public key from the log header.
  *
- * Info encoding: always uses String(windowIndex) — does not apply the legacy
- * branching gate. This causes key mismatch for windows where the encryptor
- * used the legacy byte path.
- *
- * Salt encoding: uses Math.floor (same as buildHkdfSalt).
- *
  * @param {number} windowIndex
  * @param {number} windowStartMs
  * @param {Buffer} ephemeralPubKeyRaw - 65-byte uncompressed EC point
@@ -138,7 +124,6 @@ function rederiveSessionKey(windowIndex, windowStartMs, ephemeralPubKeyRaw, serv
   const ephemeralPubKey = pubkeyFromRaw(ephemeralPubKeyRaw);
   const ikm = crypto.diffieHellman({ privateKey: serverPrivateKeyObj, publicKey: ephemeralPubKey });
   const salt = buildHkdfSalt(windowStartMs, windowDurationMs);
-  // Verifier always uses the string path, regardless of window index
   const info = Buffer.from(String(windowIndex));
   return Buffer.from(crypto.hkdfSync(hashAlgorithm, ikm, salt, info, keyLength));
 }

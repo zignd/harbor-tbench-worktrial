@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "ledger-rollup-binary-audit",
+  "title": "Financial Ledger Rollup Audit",
+  "scenario": "An analyst at a financial services firm noticed that weekly and monthly account-balance roll-ups produced by the in-house `ledger-rollup` binary stopped agreeing with raw transaction sums about six weeks ago. The binary is a compiled C tool that reads transactions from a SQLite database, applies configurable aggregation rules from a YAML config, and writes summary rows back to a `rollups` table. The source is not available in the container; only the binary, the database, config files, and roughly 1,800 lines of surrounding Python ETL code exist.",
+  "instruction_draft": "The `ledger-rollup` binary at `/opt/ledger/bin/ledger-rollup` and the ETL pipeline in `/opt/ledger/etl/` together produce account-balance summaries in the `rollups` table of `/opt/ledger/data/ledger.db`. Each summary row must equal the exact arithmetic sum of the signed `amount` values for that `(account_id, period)` pair in the `transactions` table, where credits are positive and debits are negative. Fix the pipeline so that every rollup row satisfies this invariant for all accounts and periods, including those generated after you deploy your fix.",
+  "requirements": [
+   "Every row in the `rollups` table must have a `balance` equal to the exact SQL SUM(amount) for its (account_id, period) key from the `transactions` table.",
+   "The fix must be durable: a fresh run of the pipeline on a newly generated transaction batch must also produce correct rollup rows.",
+   "The pipeline must complete without Python exceptions or non-zero exit codes.",
+   "No transactions may be deleted, altered, or duplicated in the `transactions` table."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, pyyaml, and builds the `ledger-rollup` C binary (source kept out of the image, only the binary is COPY'd in at /opt/ledger/bin/ledger-rollup).",
+   "The binary accepts: `ledger-rollup --db <path> --config <yaml> --period <YYYY-WW or YYYY-MM>` and writes/upserts a row into `rollups(account_id, period, balance, computed_at)`. It reads the YAML key `debit_sign_convention` which can be `positive` or `negative`.",
+   "Bug 1 (in the binary, invisible without running it): When `debit_sign_convention: negative` the binary negates debits a second time during accumulation, making debits add instead of subtract. This only manifests when that config value is set.",
+   "Bug 2 (in the ETL Python, readable but subtle): `etl/pipeline.py` calls `ledger-rollup` with `--period` derived from a pandas `Period` object formatted as `period.strftime('%Y-%U')` (using `%U` Sunday-based week number). SQLite stores the period key using `strftime('%Y-%W', ...)` (Monday-based ISO week). The mismatch means the binary writes rollup rows under keys that never match what the verifier queries, so old correct rows accumulate alongside new wrong ones and the per-period SELECT returns the stale correct value \u2014 masking the sign bug until the stale row is overwritten.",
+   "The two bugs interact: fixing only the week-format bug causes the binary to overwrite rows correctly \u2014 but now exposes that the sign convention doubles debits. Fixing only the sign convention leaves keys mismatched so tests appear to pass on sample data that doesn't overlap with re-run keys.",
+   "The SQLite database is pre-seeded with ~800 transaction rows across 20 accounts and 12 periods (mix of credits and debits), plus ~40 rollup rows computed under the buggy pipeline.",
+   "A YAML config at `/opt/ledger/config/rollup.yaml` contains `debit_sign_convention: negative` and other innocuous settings.",
+   "The ETL has ~1,800 lines total: data-loader, reconciler, notifier, CLI entry-point. Only `pipeline.py` (~120 lines) and the binary behavior are relevant.",
+   "A helper script `/opt/ledger/etl/run_pipeline.sh` drives the full pipeline end-to-end."
+  ],
+  "internal_hint": "Two interacting causes: (1) The compiled binary double-negates debits when `debit_sign_convention: negative` is set \u2014 this is invisible by reading source but discoverable by running the binary on crafted test data and comparing SUM(amount) to the rollup output. (2) The ETL formats the period key using `%Y-%U` (Sunday week) while the binary and verifier use `%Y-%W` (Monday week) \u2014 this causes rollup rows to be written under wrong keys, so the old (stale, correct) rollup row survives and the per-period query returns the stale value, masking bug 1. The misleading symptom is that the analyst sees some periods look correct (stale correct rows) and others wrong, pointing at data corruption or a recent schema change rather than the binary. Fix path: (a) probe the binary directly with `echo 'INSERT...' | sqlite3 testdb` + run binary, compare to manual SUM \u2014 reveals sign error; (b) query the rollups table for period values, compare to dates in transactions table \u2014 reveals the week-number key mismatch; (c) patch `pipeline.py` to use `'%Y-%W'` format and set `debit_sign_convention: positive` (or negate amounts at the ETL layer before passing to the binary, since source unavailable) to compensate for the binary's bug.",
+  "trap": "A naive agent reads `pipeline.py`, sees the `%Y-%U` format string, fixes it to `%Y-%W`, re-runs on the sample data, observes that the 12 pre-seeded periods now match \u2014 and stops. The hidden corpus includes fresh periods with debit-heavy accounts where the sign bug makes `balance` positive instead of negative. Those accounts were masked in sample data because the stale correct rows dominated. The adversarial corpus also includes accounts with zero credits (pure debit accounts) where the double-negation produces a large positive balance, and accounts spanning a week boundary where `%U` and `%W` produce the same number, hiding the format bug but exposing the sign error.",
+  "tests": [
+   "Generate 30 fresh (account_id, period) pairs with known SUM(amount) including debit-only accounts; run the patched pipeline; assert each rollup.balance == SUM(transactions.amount) within 0.01.",
+   "For each of the 12 original periods, assert rollup.balance equals the directly computed SUM from transactions.",
+   "Assert no row in transactions has been modified (checksum the table).",
+   "Run the pipeline twice on the same data; assert idempotency \u2014 rollup values do not change on second run.",
+   "Probe with a synthetic batch where every transaction is a debit (negative amount); assert rollup.balance is negative.",
+   "Check that the period key format in rollups matches '%Y-%W' (ISO Monday week) by querying a known Monday-spanning week."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "30 fresh (account, period) pairs including 10 debit-only, 10 credit-only, 10 mixed; 6 periods spanning %U/%W boundary disagreement",
+   "effect": "Reducing to 5 pairs with only mixed accounts lets a partial fix (only period format) pass; increasing to 60 pairs with adversarial debit concentrations makes the sign bug impossible to miss."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the `%Y-%U` \u2192 `%Y-%W` period format bug, re-runs on sample data, sees all 12 periods pass, and submits \u2014 fails on debit-only accounts in the hidden corpus.",
+   "Agent notices the binary double-negates and tries to work around it by negating amounts in Python before passing to the binary, but does not fix the period key mismatch \u2014 rollup rows are written under wrong keys, verifier queries correct keys and gets NULL or stale values.",
+   "Agent changes `debit_sign_convention: positive` in the YAML to disable the binary's negation path, fixing the sign error, but does not fix `%Y-%W` \u2014 stale rows with wrong keys remain; fresh periods generate keys that the verifier cannot find.",
+   "Agent patches both bugs but introduces an off-by-one in week number calculation for year boundaries, failing corpus entries in late December / early January.",
+   "Agent verifies only the 12 pre-seeded periods (which include some stale correct rows that survive both bugs), declares success, and misses the sign inversion on fresh debit-heavy corpus entries."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "system-administration",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "debugging",
+   "data-processing",
+   "two-interacting-causes",
+   "misleading-symptom"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/ledger/config/rollup.yaml",
+   "cat /opt/ledger/etl/pipeline.py",
+   "sqlite3 /opt/ledger/data/ledger.db \"SELECT period FROM rollups LIMIT 5;\"",
+   "sqlite3 /opt/ledger/data/ledger.db \"SELECT strftime('%Y-%W', date) FROM transactions LIMIT 5;\"",
+   "sed -i \"s/%Y-%U/%Y-%W/\" /opt/ledger/etl/pipeline.py",
+   "bash /opt/ledger/etl/run_pipeline.sh",
+   "sqlite3 /opt/ledger/data/ledger.db \"SELECT r.balance, SUM(t.amount) as expected FROM rollups r JOIN transactions t ON r.account_id=t.account_id AND r.period=strftime('%Y-%W',t.date) GROUP BY r.account_id, r.period LIMIT 20;\"",
+   "# Periods look correct on seeded data \u2014 agent stops here (TRAP). Thorough agent continues:",
+   "sqlite3 /tmp/test.db \"CREATE TABLE transactions(id INT, account_id INT, date TEXT, amount REAL, type TEXT); INSERT INTO transactions VALUES(1,99,'2026-01-05',-200.00,'debit');\"",
+   "sqlite3 /tmp/test.db \"CREATE TABLE rollups(account_id INT, period TEXT, balance REAL, computed_at TEXT);\"",
+   "/opt/ledger/bin/ledger-rollup --db /tmp/test.db --config /opt/ledger/config/rollup.yaml --period 2026-01",
+   "sqlite3 /tmp/test.db \"SELECT balance FROM rollups;\"",
+   "# Sees +200 instead of -200 \u2014 discovers sign bug",
+   "sed -i \"s/debit_sign_convention: negative/debit_sign_convention: positive/\" /opt/ledger/config/rollup.yaml",
+   "bash /opt/ledger/etl/run_pipeline.sh",
+   "sqlite3 /opt/ledger/data/ledger.db \"SELECT r.balance, SUM(t.amount) as expected FROM rollups r JOIN transactions t ON r.account_id=t.account_id AND r.period=strftime('%Y-%W',t.date) GROUP BY r.account_id, r.period;\"",
+   "bash /opt/ledger/etl/run_pipeline.sh  # idempotency check"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The binary's schema expectations (table structure, column names) are not fully specified \u2014 if the binary expects a specific schema that differs from what the blueprint implies, agent-created test DBs may fail silently or with unhelpful errors, making bug discovery harder than intended.",
+   "The stale-row masking mechanism depends on the binary doing an UPSERT (not INSERT or replace-all) \u2014 if the binary always replaces all rows for a given account, the masking effect disappears and bug 1 is immediately visible after fixing bug 2, reducing the deceptive interaction.",
+   "Week boundary edge cases (%U vs %W disagreement) are mentioned in the corpus but the exact dates are not specified in the blueprint; if the container's locale or SQLite version interprets strftime differently, some boundary corpus entries could be flaky.",
+   "The instruction says 'fix the pipeline' but does not explicitly permit editing the YAML config \u2014 a strict reading might disallow the `debit_sign_convention: positive` fix, causing disputes about what constitutes a valid solution.",
+   "The fix for the sign bug (changing YAML vs negating in Python) produces identical results on normal data but may differ if the binary has other sign-dependent logic paths; this ambiguity in valid fix paths could cause inconsistent test outcomes.",
+   "If the pipeline's run_pipeline.sh re-generates the period list from the transactions table using Python's pandas, the period format used for querying may also have the %U bug, potentially causing zero rows to be processed after fixing only pipeline.py's format string."
+  ],
+  "verdict": "accept",
+  "reasons": "The task is a well-constructed two-bug interaction with a genuine deceptive trap: fixing the visible Python bug causes the seeded test data to pass while hiding the binary's sign inversion on debit-heavy accounts in the hidden corpus. The realism is high (compiled binary, ETL pipeline, SQLite, YAML config is a plausible real stack), verifiability is strong (deterministic SQL arithmetic), and the difficulty is genuine \u2014 frontier agents frequently stop after the first plausible fix passes visible tests. The 17-command speedrun for a thorough agent (vs ~9 for a trapped agent) correctly reflects hard difficulty.",
+  "fixes": [
+   "Explicitly state in the environment spec that the YAML config is editable (or alternatively specify that only pipeline.py may be modified and require the Python ETL layer to compensate for the sign bug), to eliminate ambiguity about valid fix paths.",
+   "Specify the exact SQLite schema (CREATE TABLE statements) in the environment description so agents and test harnesses agree on column types and the binary's UPSERT behavior is unambiguous.",
+   "Confirm and document the UPSERT vs INSERT behavior of the binary \u2014 the entire masking mechanism depends on it doing key-based upsert, so this should be explicitly tested in the verifier setup rather than assumed.",
+   "Add a note that the test harness clears or ignores pre-existing stale rollup rows before running the verifier, or alternatively make the verifier query only rows written after a timestamp threshold, to prevent stale rows from polluting the verification of fresh pipeline runs.",
+   "Specify at least one concrete week-boundary date pair where %U and %W diverge (e.g., first week of a year where Jan 1 is a Tuesday) so corpus construction is deterministic and not locale-dependent."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both involve fixing a financial ledger pipeline so that computed balances match raw transaction sums, but the candidate adds a compiled binary (no source), YAML config, and a SQLite rollups table rather than CSV imports and per-merchant reporting."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task centers on reverse-engineering a black-box binary's transformation function for sensor normalization; the candidate's core problem is fixing arithmetic correctness in a financial rollup pipeline."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "That task requires fixing Rust source code to match a reference binary's fixed-point statistics on binary-format sensor data; the candidate involves a financial ledger rollup correctness bug in a C binary + Python ETL system."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a SQL query for correct window-function semantics (running totals, RANK); the candidate is about fixing an ETL pipeline so rollup rows equal transaction sums."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both tasks require fixing an ETL pipeline so that aggregate rows in a SQLite table exactly match the arithmetic sum (and distinct counts) from source records, with idempotency; the candidate differs mainly in domain (financial ledger vs. revenue events) and the addition of a closed-source binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.243
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.183
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.148
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.122
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.12
+    ]
+   ],
+   "cost_usd": 0.014046
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056084999999999996
+}

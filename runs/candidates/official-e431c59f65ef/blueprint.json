@@ -1,0 +1,61 @@
+{
+ "slug": "db-connection-pool-reassembly",
+ "title": "Connection Pool Packet Reassembler Repair",
+ "scenario": "A database administrator is investigating a post-incident outage. The internal tooling team wrote a small Python codebase (~1,400 lines) that proxies connections to a PostgreSQL replica pool, logs all query packets to a binary rolling log, and has a reassembler service that reconstructs multi-fragment query sessions from those logs for forensic replay. After a partial failover last night, the reassembler started producing garbled session replays; the DBA needs the replay output to be byte-for-byte identical to what the live replica actually executed, so they can audit which queries ran. The codebase has a running log emitter (a compiled C extension, no source in the repo) that produces the binary log, a broken Python reassembler that the DBA must diagnose and repair, and a reference replay validator that the DBA must also implement from scratch.",
+ "instruction_draft": "```\n$ python3 replay_validator.py --session-log /var/log/pgproxy/sessions.binlog --output /tmp/replay.sql\nTraceback (most recent call last):\n  File \"replay_validator.py\", line 11, in <module>\n    from reassembler import SessionReassembler\nImportError: cannot import name 'SessionReassembler' from 'reassembler'\n\n$ python3 -c \"import log_emitter; log_emitter.emit_test_session('/tmp/t.binlog')\"\n[emitter] wrote 47 fragments across 3 sessions to /tmp/t.binlog\n\n$ python3 reassembler.py /tmp/t.binlog\nSession 1: 2 queries recovered\nSession 2: 0 queries recovered   <-- should be 3\nSession 3: 1 queries recovered   <-- should be 2\n```\n\nThe DBA left this note: \"After the failover, some sessions span log-file boundary segments (the emitter rotates files mid-session and the fragment stream can arrive out-of-order by up to the configured reorder_window). The reassembler never handled this correctly \u2014 it was masked because pre-incident traffic was too light to trigger cross-file sessions or reorder. Fix the reassembler so that every session's queries are recovered completely and in execution order. Then implement the missing `SessionReassembler` class that `replay_validator.py` imports, so the validator produces a valid SQL replay file.\n\nRequirements:\n1. `python3 reassembler.py <binlog>` must recover every query in every session in the correct execution order for any single log file.\n2. `python3 reassembler.py --merge <dir>` must correctly reassemble sessions that span multiple rotated log files in the directory, handling fragments delivered out of order within the configured `reorder_window`.\n3. The `SessionReassembler` class exported from `reassembler.py` must accept a list of log file paths, reassemble all sessions, and expose a `sessions` dict mapping session_id to an ordered list of query byte strings.\n4. `python3 replay_validator.py --session-log <binlog_dir> --output <file>` must write a valid SQL replay: each session's queries in order, separated by a session header comment, with sessions ordered by their first query's global sequence number.\n5. The reassembler must correctly handle: fragments arriving out-of-order within the reorder window, sessions split across log file rotation boundaries, and fragment deduplication (the emitter may re-emit the last fragment of a file at the start of the next file as a continuity marker).",
+ "requirements": [
+  "reassembler.py single-file mode recovers every query in every session in correct execution order",
+  "reassembler.py --merge <dir> mode handles sessions spanning multiple rotated log files",
+  "reassembler.py --merge handles fragments delivered out of order within the configured reorder_window",
+  "SessionReassembler class is importable from reassembler and exposes sessions dict mapping session_id to ordered list of query bytestrings",
+  "replay_validator.py produces valid SQL replay with sessions ordered by first query's global sequence number",
+  "Reassembler correctly deduplicates continuity-marker fragments that appear at both the end of one log file and the start of the next",
+  "Reassembler correctly handles the reorder_window parameter from the proxy config file"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm; installs: build-essential, libpq-dev, sqlite3",
+  "Compiled C extension /app/lib/log_emitter.so (built from hidden source during Docker build, installed as importable log_emitter); exports emit_test_session(path), emit_stress_session(path, seed, n_sessions, n_files) \u2014 no source in image",
+  "Binary log format: each fragment is a 32-byte header (magic 4B, session_id 4B uint32, frag_seq 4B uint32, global_seq 8B uint64, payload_len 4B uint32, flags 4B: bit0=first, bit1=last, bit2=continuation_dup, reserved 8B) followed by payload bytes; a session's query boundaries are encoded as null-byte delimiters within the assembled payload",
+  "/app/proxy_config.ini with [pool] section containing reorder_window=8 and log_rotation_bytes=1048576",
+  "/app/reassembler.py: ~350 lines, broken \u2014 correctly parses single-file single-session cases, but: (a) ignores frag_seq ordering, naively appends in read order; (b) has no cross-file merging logic; (c) does not deduplicate continuation_dup fragments; (d) SessionReassembler class stub raises NotImplementedError",
+  "/app/replay_validator.py: ~120 lines, imports SessionReassembler, calls it, formats output \u2014 complete except for the missing class",
+  "/app/schema/fragment_format.md: precise binary format documentation including all header fields, flag definitions, the null-byte query delimiter convention, and the continuation_dup semantics",
+  "/app/tests/: directory with sample .binlog files covering simple single-session cases only (the cross-file and reorder cases are absent from samples)",
+  "/var/log/pgproxy/: directory with a pre-generated multi-file log set (sessions.d/) produced by the emitter at build time using a fixed seed, demonstrating the broken behavior",
+  "At verify time, tests call log_emitter.emit_stress_session() with fresh seeds to generate new log sets and compare reassembler output against the emitter's own ground-truth session manifest (also returned by emit_stress_session)"
+ ],
+ "internal_hint": "Difficulty source 1 (observe_not_read): The reassembler's bugs only manifest with cross-file sessions and out-of-order fragments \u2014 the test data in /app/tests/ never triggers them, and reading the reassembler code shows logic that looks plausible for the simple case. The solver must run the emitter against the pre-generated logs in /var/log/pgproxy/ to see the wrong output, read the fragment_format.md to understand the binary protocol fully (especially continuation_dup and frag_seq ordering), and instrument the reassembler to observe the actual fragment stream. Difficulty source 2 (build_component): SessionReassembler is a non-trivial class that must: parse binary headers with struct.unpack, sort fragments by frag_seq within session within file, merge across files by matching session_id and continuing frag_seq ranges, deduplicate continuation_dup-flagged fragments (bit2 set means 'I am a copy of the last fragment of the previous file \u2014 skip me if you've already seen this frag_seq for this session'), split assembled payloads on null bytes to recover individual queries, and respect reorder_window from proxy_config.ini by buffering out-of-order fragments up to that many positions before flushing. A solver who only reads the broken code and patches the obvious parts (adding a sort by frag_seq) will pass the simple tests but fail on: cross-file sessions (no cross-file tracking), continuation_dup deduplication (will double-count that query), reorder_window buffering (will emit queries too early or too late on stressed inputs).",
+ "trap": "A solver who sorts fragments by frag_seq within a single file passes the provided sample tests. The hidden tests use emit_stress_session with fresh seeds that generate: (1) sessions whose fragment streams span 3+ log files, (2) fragment sequences with gaps up to reorder_window-1 that must be buffered before flushing, (3) continuation_dup fragments that if not deduplicated corrupt the query boundary detection causing downstream queries to be split wrong. Any of these three failures causes query-level mismatches against the ground truth manifest.",
+ "tests": [
+  "Single-file correctness: emit_stress_session(seed=X, n_sessions=5, n_files=1), run reassembler.py on output, compare recovered query lists to ground-truth manifest returned by emitter \u2014 must match exactly for all sessions",
+  "Cross-file session recovery: emit_stress_session(seed=Y, n_sessions=10, n_files=6), run reassembler.py --merge on the directory, compare all sessions \u2014 each session's query list must match ground truth",
+  "Out-of-order fragment handling: emitter generates logs with reorder_window-magnitude out-of-order delivery; reassembler must still produce correct order",
+  "Continuation_dup deduplication: verify that sessions spanning file boundaries have exactly the correct number of queries (not one extra per boundary crossing)",
+  "SessionReassembler import and API: from reassembler import SessionReassembler; sr = SessionReassembler([path1, path2, ...]); assert all session_ids present; assert each session's queries match ground truth",
+  "replay_validator.py output: sessions appear in global_seq order; each session has correct header comment; queries are valid SQL byte strings (non-empty, no null bytes)",
+  "reorder_window from config: modify proxy_config.ini to reorder_window=3 vs reorder_window=12 and verify behavior is consistent with the configured value"
+ ],
+ "verifier_knob": {
+  "name": "n_stress_seeds",
+  "value": "5 seeds \u00d7 (n_sessions=15, n_files=8)",
+  "effect": "Raising seeds/sessions/files increases the probability that all three bug classes (cross-file, dedup, reorder) are exercised and that partial fixes are caught; lowering to 1 seed with 1 file makes it trivially passable by sorting alone"
+ },
+ "expected_failure_modes": [
+  "Solver sorts by frag_seq within each file but never implements cross-file session merging \u2014 passes single-file tests, fails cross-file tests",
+  "Solver implements cross-file merging but doesn't read fragment_format.md carefully enough to find the continuation_dup flag semantics \u2014 produces double query at every file boundary",
+  "Solver implements SessionReassembler but doesn't read proxy_config.ini for reorder_window \u2014 hardcodes a value that works on the sample but fails stress tests",
+  "Solver implements the class correctly but replay_validator.py session ordering is wrong (orders by session_id instead of first global_seq) \u2014 validator output fails ordering test",
+  "Solver relies only on the /app/tests/ samples to validate, never runs the emitter against the /var/log/pgproxy pre-generated logs to observe cross-file failures, and submits a partial fix"
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "networking",
+ "tags": [
+  "binary-protocol",
+  "session-reassembly",
+  "observe-not-read",
+  "build-component",
+  "database-forensics",
+  "configuration"
+ ]
+}

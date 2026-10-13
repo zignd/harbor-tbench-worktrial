@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "jwt-auth-throughput-hardening",
+  "title": "JWT Auth Service Throughput Hardening",
+  "scenario": "A security engineer is auditing a Node.js authentication microservice that validates JWT tokens before proxying requests to internal APIs. The service runs in a single Docker container and exposes an HTTP endpoint on port 3000. Recent load tests showed the service degrades severely under concurrent requests, and the security team suspects the token validation pipeline has configuration defects that cause both correctness failures and throughput collapse under realistic load. No reproduction script or load profile was provided; the engineer must discover the failing cases by probing the running service.",
+  "instruction_draft": "You are auditing a JWT authentication service running on port 3000 in this container. The service validates Bearer tokens on POST /auth/validate, forwarding claims to POST /api/proxy when valid. Your security review has two gates:\n\n1. **Correctness**: Every token the service accepts must be cryptographically valid (correct signature, unexpired, correct issuer `svc-internal`, correct audience `api-gateway`). Every token the service rejects must be truly invalid \u2014 no valid token may be silently dropped or returned as invalid. The service must correctly handle RS256 tokens signed with the key at /opt/auth/keys/private.pem, as well as HS256 tokens signed with the shared secret in /opt/auth/config/service.yaml. Expired tokens must be rejected. Tokens with a missing or wrong audience must be rejected. Tokens with a missing or wrong issuer must be rejected.\n\n2. **Throughput**: Under a concurrency of 50 simultaneous requests with a mix of valid RS256 and valid HS256 tokens, the service must sustain at least 200 requests per second with p99 latency below 500 ms. The current implementation fails this bar on the hardware available in this container.\n\nFix the service so both gates pass. The service must keep running (do not replace it with a stub). All fixes must be in the service source under /opt/auth/src/. Restart the service with `systemctl restart auth-service` after making changes.",
+  "requirements": [
+   "POST /auth/validate accepts valid RS256 tokens signed with /opt/auth/keys/private.pem, issuer 'svc-internal', audience 'api-gateway'",
+   "POST /auth/validate accepts valid HS256 tokens signed with the secret in /opt/auth/config/service.yaml, same issuer and audience",
+   "Expired tokens are rejected with HTTP 401",
+   "Tokens with wrong or missing issuer are rejected with HTTP 401",
+   "Tokens with wrong or missing audience are rejected with HTTP 401",
+   "Tokens with invalid signatures are rejected with HTTP 401",
+   "No valid token is incorrectly rejected (false negative rate must be 0)",
+   "Under 50 concurrent clients sending valid tokens, throughput must be >= 200 req/s",
+   "Under 50 concurrent clients sending valid tokens, p99 latency must be < 500 ms"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20, openssl, systemd-substitute (s6-overlay or a simple supervisor), and required npm packages",
+   "/opt/auth/src/server.js: main Express server, ~300 lines, mounts routes",
+   "/opt/auth/src/middleware/validate.js: JWT validation middleware, ~150 lines \u2014 has THREE planted defects: (1) reads the RSA private key from disk on every request using synchronous fs.readFileSync instead of caching it at startup; (2) calls jsonwebtoken.verify with a callback but also awaits a mis-constructed Promise wrapper that causes double-invocation and event-loop starvation under concurrency; (3) the HS256 secret is fetched by re-parsing the YAML config file on every request rather than being cached at module load",
+   "/opt/auth/src/middleware/ratelimit.js: a naive per-IP rate limiter that adds ~50 ms artificial delay per request due to a misconfigured sliding-window check \u2014 this is NOT a defect to fix; it's plausible middleware the solver might investigate first",
+   "/opt/auth/src/routes/proxy.js: forwards validated claims to a mock internal API, ~100 lines, not involved in the defect",
+   "/opt/auth/src/utils/logger.js: structured JSON logger, ~80 lines, not involved",
+   "/opt/auth/config/service.yaml: contains hs256_secret, issuer, audience, rate_limit config",
+   "/opt/auth/keys/private.pem and public.pem: RS256 key pair generated at image build time",
+   "/opt/auth/keys/other_private.pem: a second RSA key pair whose public key is NOT registered \u2014 tokens signed with this key must be rejected",
+   "A systemd-compatible service file or supervisor config that runs `node /opt/auth/src/server.js` and allows `systemctl restart auth-service` or equivalent",
+   "A mock internal API listening on localhost:3001 that accepts POST /internal/claims and returns 200",
+   "No load test script is provided; the solver must write their own to discover the throughput failure",
+   "The npm package 'js-yaml' is pre-installed; 'jsonwebtoken' pinned to 9.0.2; 'express' 4.18.x",
+   "Approximately 900-1100 total lines across all source files with plausible but uninvolved code in logger and proxy modules"
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources that only appear at runtime: (1) throughput collapse is data-dependent \u2014 it only manifests under concurrent load, not in sequential testing, so the solver must write a load test to discover it; (2) the three performance defects are in validate.js but their interaction is non-obvious: the double-invocation Promise wrapper causes event-loop starvation that makes even the disk-read problem look like a crypto issue. A solver who finds and fixes only the fs.readFileSync issue will still fail the throughput bar because the Promise double-invocation is the dominant bottleneck. A solver who fixes both but misses the YAML re-parse will pass throughput at low concurrency but fail at 50 concurrent clients. The correctness requirements (wrong-issuer, wrong-audience, expired, wrong-algorithm-key rejection) are tested on fresh tokens generated at verify time, so a solver who only tests with their own tokens may miss edge cases like a token signed with other_private.pem being accepted if the validation caches the wrong key object.",
+  "trap": "A naive solver fixes only the synchronous fs.readFileSync by caching the key, observes improved latency in sequential tests, and declares success. The hidden tests generate 50 concurrent clients and measure actual req/s \u2014 the Promise double-invocation defect still causes event-loop starvation and the YAML re-parse adds per-request overhead that together keep throughput well below 200 req/s. Additionally, the hidden correctness tests include tokens signed with other_private.pem (must be rejected) and tokens where audience is an array containing 'api-gateway' plus an extra value (must be accepted per JWT spec) \u2014 implementations that do string equality instead of array membership on audience will produce false negatives.",
+  "tests": [
+   "Generate a fresh RS256 token with correct issuer/audience/expiry signed with /opt/auth/keys/private.pem and POST to /auth/validate \u2014 expect HTTP 200",
+   "Generate a fresh HS256 token with correct issuer/audience/expiry signed with the secret from service.yaml and POST to /auth/validate \u2014 expect HTTP 200",
+   "Generate an RS256 token signed with /opt/auth/keys/other_private.pem (wrong key) \u2014 expect HTTP 401",
+   "Generate a token with exp set 60 seconds in the past \u2014 expect HTTP 401",
+   "Generate a token with issuer 'evil-service' \u2014 expect HTTP 401",
+   "Generate a token with audience 'wrong-audience' \u2014 expect HTTP 401",
+   "Generate a token with audience as array ['api-gateway', 'extra'] \u2014 expect HTTP 200 (array membership check)",
+   "Generate a token with audience omitted entirely \u2014 expect HTTP 401",
+   "Run 50 concurrent HTTP clients for 15 seconds each sending valid RS256 tokens, measure req/s \u2014 must be >= 200",
+   "Run 50 concurrent HTTP clients for 15 seconds, measure p99 latency \u2014 must be < 500 ms",
+   "Verify the service process is still running under /opt/auth/src/ (not replaced with a stub)"
+  ],
+  "verifier_knob": {
+   "name": "concurrency_level",
+   "value": "50",
+   "effect": "Raising to 100 makes even two-of-three fixes insufficient to hit the bar; lowering to 20 lets a solver who only fixes the fs.readFileSync pass the throughput gate, making the task easier"
+  },
+  "expected_failure_modes": [
+   "Solver fixes fs.readFileSync caching only, runs a sequential smoke test, declares success \u2014 fails throughput gate due to Promise double-invocation bottleneck",
+   "Solver fixes two of three defects, runs a light concurrent test with 10 clients, sees >200 req/s, declares success \u2014 fails at 50 concurrent clients due to YAML re-parse overhead",
+   "Solver writes the audience check as strict string equality instead of array membership, passes their own tests but fails the hidden ['api-gateway', 'extra'] audience test",
+   "Solver restarts the service after partial fixes and doesn't re-run a full load test, misses that the Promise wrapper issue requires a code change not just a configuration change",
+   "Solver investigates the ratelimit.js red herring extensively, wastes time adjusting rate limit config, does not identify the validate.js Promise wrapper as the dominant bottleneck"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "security-engineering",
+  "tags": [
+   "jwt",
+   "nodejs",
+   "performance",
+   "security-audit",
+   "configuration",
+   "concurrency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/auth/src/middleware/validate.js",
+   "cat /opt/auth/config/service.yaml",
+   "cat /opt/auth/src/server.js",
+   "# Identify all 3 defects by reading validate.js source",
+   "# Fix 1: Move fs.readFileSync for private key to module top-level",
+   "# Fix 2: Move yaml.load(service.yaml) for HS256 secret to module top-level",
+   "# Fix 3: Rewrite mis-constructed Promise wrapper using util.promisify or direct callback",
+   "vi /opt/auth/src/middleware/validate.js  # apply all 3 fixes",
+   "systemctl restart auth-service",
+   "curl -X POST http://localhost:3000/auth/validate -H 'Authorization: Bearer <valid_rs256_token>'",
+   "node -e \"const jwt=require('jsonwebtoken'); /* generate test tokens and curl each correctness case */\"",
+   "node /tmp/loadtest.js  # write and run 50-concurrent load test, verify >=200 req/s and p99<500ms"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Throughput threshold (200 req/s at p99<500ms under 50 concurrent) may be flaky depending on Docker container resource limits and host machine speed \u2014 a correct fix could still fail on underpowered hardware",
+   "The audience array test (['api-gateway', 'extra'] must return 200) depends on jsonwebtoken v9.0.2's native array audience handling \u2014 if the test generates the token differently than jsonwebtoken expects, behavior could be surprising",
+   "The 'service must keep running under /opt/auth/src/' stub-check is ambiguous \u2014 it's unclear exactly what constitutes a 'stub' vs a legitimate refactor of server.js",
+   "No baseline performance is established for the container hardware, so 200 req/s threshold could be either trivially easy or impossible depending on allocated CPU/RAM",
+   "The ratelimit.js '50ms artificial delay per request' could itself prevent hitting 200 req/s at 50 concurrency if the solver doesn't investigate it \u2014 but the instruction says not to fix it, creating a potential conflict with the throughput requirement"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three defects are plainly visible by reading validate.js source code \u2014 a skilled agent reads the file, spots module-level vs handler-level variable initialization, and applies fixes in one edit pass without needing runtime discovery. The ratelimit.js '50ms artificial delay that must NOT be fixed' combined with a 200 req/s threshold at 50 concurrency is a potentially invalid failure mode: 50 concurrent \u00d7 (50ms delay + processing) may mathematically cap throughput below 200 req/s regardless of how well validate.js is fixed, making the task unsolvable as specified. The task needs its defects hidden from source inspection (e.g., defects in compiled/minified code, or runtime behavior that differs from source) to achieve genuine difficulty.",
+  "fixes": [
+   "Hide defects from static source inspection: use runtime configuration (environment variables, encrypted config) or behavioral defects (race conditions, cache invalidation bugs) that don't appear as obvious 'variable declared in wrong scope' patterns",
+   "Resolve the ratelimit.js conflict: either (a) make the rate limiter defect-free so it adds no overhead, (b) allow solvers to fix it too, or (c) reduce the throughput threshold to something achievable with the 50ms-per-request delay in place \u2014 as written, the math may make the task unsolvable",
+   "Add a 'no source reading allowed' constraint or make defects emergent from interactions between correct-looking components rather than visible misuse of synchronous APIs",
+   "Specify container resource guarantees (e.g., '2 vCPU, 4GB RAM') so the throughput threshold is deterministically achievable and not flaky across different host machines"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a SQLite database with a compiled shared library, not about JWT authentication or throughput hardening."
+    },
+    {
+     "ref_id": "terminal-bench-pro/sanitize-dclm-repo-secrets",
+     "verdict": "distinct",
+     "reason": "That task is about scanning and sanitizing leaked credentials in a repository, not about fixing JWT validation correctness or service throughput."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/count-dataset-tokens",
+     "verdict": "distinct",
+     "reason": "That task is about counting tokenizer tokens in a HuggingFace dataset, completely unrelated to JWT auth services."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted aggregation in a sales service, not about JWT token validation or concurrency performance."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a binary frame codec encode/decode regression, not about JWT authentication or throughput hardening."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.224
+    ],
+    [
+     "terminal-bench-pro/sanitize-dclm-repo-secrets",
+     0.216
+    ],
+    [
+     "terminal-bench-2-1/count-dataset-tokens",
+     0.167
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.155
+    ],
+    [
+     "ours/official-aac910462208",
+     0.128
+    ]
+   ],
+   "cost_usd": 0.013413
+  },
+  "novel": true
+ },
+ "cost_usd": 0.051948
+}

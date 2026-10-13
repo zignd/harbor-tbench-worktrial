@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "go-ring-buffer-clock-drift",
+  "title": "Ring Buffer Telemetry Aggregator: Silent Clock Skew",
+  "scenario": "A backend telemetry service aggregates sensor readings into fixed-width time buckets using a ring buffer. The service has been running in production for three months and recently started producing subtly wrong per-bucket statistics during high-ingestion bursts. The repo has about 1,400 lines of Go across six files: a ring buffer implementation, a bucket aggregator, a statistics calculator, an HTTP ingest handler, a compiled black-box 'clock normalizer' binary (no source), and a test harness. Git history shows the clock normalizer was swapped in six weeks ago.",
+  "instruction_draft": "Hey, the telemetry aggregator at /app is producing wrong bucket statistics when bursts of readings come in close together in time. The service takes timestamped sensor readings via HTTP, groups them into 1-second buckets, and for each bucket computes mean, p95, and sample count. When I replay the production capture at /app/data/burst_capture.jsonl against the running service and then call /stats, the bucket counts are right but the mean and p95 values are wrong \u2014 they're systematically off in a way that depends on the burst rate. The compiled clock normalizer at /app/bin/clocknorm takes raw nanosecond timestamps and is supposed to output normalized bucket-aligned timestamps; characterise what it actually does by experiment and fix the aggregator so that mean, p95, and sample count are all correct for every bucket. Write the fixed aggregator to /app/aggregator_fixed.go \u2014 it should be a drop-in replacement for /app/aggregator.go with the same package and exported API. The service must also correctly handle readings that arrive out of order by up to 5 seconds.",
+  "requirements": [
+   "A file /app/aggregator_fixed.go exists with the same package name and exported function/type signatures as /app/aggregator.go",
+   "When the fixed aggregator is substituted and the service is rebuilt, replaying /app/data/burst_capture.jsonl produces correct per-bucket mean (within 1e-6 relative error), correct p95 (exact, within integer rounding), and correct sample count for every bucket",
+   "The aggregator correctly handles out-of-order readings arriving up to 5 seconds late (assigns them to the bucket matching their timestamp, not arrival time)",
+   "The fix accounts for what clocknorm actually does to timestamps, characterised by experiment, not assumption",
+   "The service continues to compile and the HTTP API remains unchanged"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.23 via apt/tarball",
+   "/app/aggregator.go: ~250 lines, ring buffer of 64 buckets, each bucket accumulates samples; bug: it passes raw nanosecond timestamps to clocknorm but then uses clocknorm's output directly as a bucket index without re-flooring to seconds, causing samples in mid-bucket bursts to land in wrong buckets; additionally the running-mean update uses Welford's algorithm but with an off-by-one on n that biases mean slightly",
+   "/app/bucket_stats.go: ~180 lines, p95 computed from sorted slice \u2014 correct but only correct if bucket assignment is correct",
+   "/app/ingest.go: ~150 lines, HTTP handler that calls aggregator; passes arrival time not payload timestamp to aggregator (second bug source for out-of-order)",
+   "/app/ring_buffer.go: ~120 lines, correct circular buffer implementation",
+   "/app/stats_server.go: ~200 lines, serves /stats endpoint",
+   "/app/main.go: ~80 lines, wires everything together",
+   "/app/bin/clocknorm: compiled amd64 ELF binary (no source); takes one argument (nanosecond timestamp as int64 string), prints a transformed int64; actual behaviour: applies a fixed 37-millisecond forward offset then integer-divides by 1e9 to get seconds \u2014 so for timestamps near a second boundary, the offset can push the timestamp into the next second, causing cross-bucket misassignment; this is discoverable only by probing with crafted inputs",
+   "/app/data/burst_capture.jsonl: ~2000 lines of JSON {sensor_id, value, timestamp_ns} generated deterministically with numpy seed 42; includes bursts where multiple readings arrive within 50ms of a second boundary",
+   "/app/go.mod: module definition",
+   "git repo with 8 commits: initial service, add ring buffer, add stats, swap in clocknorm binary (commit 6 weeks ago), minor logging changes",
+   "A Makefile that builds and runs the service on port 8080",
+   "Verifier script generates fresh burst traces with different seeds at verify time and checks all three statistics per bucket"
+  ],
+  "internal_hint": "Difficulty comes from two interacting invisible bugs, one of which requires probing an opaque binary. Bug 1 (opaque component): clocknorm adds 37ms before dividing by 1e9. A reading at t=999,980,000 ns (20ms before second boundary) becomes 999,980,000+37,000,000=1,016,980,000 \u2192 bucket 1 instead of bucket 0. The fix is to subtract the offset before using the output, or bypass clocknorm and implement correct bucket assignment directly. Bug 2 (mathematical): the Welford running-mean update in aggregator.go uses `n` before incrementing (n starts at 0, so first sample weight is 1/0 = division by zero avoided by special-casing, but second sample uses n=1 giving wrong weight). The correct Welford formula increments n first. Bug 3 (cross-component): ingest.go passes time.Now().UnixNano() instead of the payload's timestamp_ns to the aggregator, so out-of-order readings always land in the arrival-time bucket. The solver must: (1) probe clocknorm with timestamps near second boundaries to find the 37ms offset, (2) derive the correct Welford formula, (3) trace ingest.go to find it uses arrival time. All three must be fixed for tests to pass.",
+  "trap": "A solver who reads aggregator.go, spots the Welford off-by-one, fixes only that, and tests with the provided capture may see bucket counts match and means improve slightly but still fail on the hidden burst trace because (a) the clocknorm offset still misassigns boundary-straddling samples and (b) ingest.go still uses arrival time. The provided capture has few exact-boundary events so the clocknorm effect is small; the verify-time trace is generated with higher burst density near boundaries, making the clocknorm offset the dominant error. A solver who fixes only the binary's effect but not the Welford bug fails p95 checks on buckets with small sample counts.",
+  "tests": [
+   "Build the service with aggregator_fixed.go substituted for aggregator.go; fail if build fails",
+   "Replay /app/data/burst_capture.jsonl and check all bucket means within 1e-6 relative error",
+   "Replay /app/data/burst_capture.jsonl and check all bucket p95 values are correct",
+   "Replay /app/data/burst_capture.jsonl and check sample counts per bucket",
+   "Generate a fresh burst_capture with numpy seed 137, higher burst density (30% of readings within 20ms of second boundaries), replay and check mean, p95, count for every bucket",
+   "Generate out-of-order test: inject 50 readings with timestamps 3 seconds in the past, verify they appear in the correct historical buckets not the current bucket",
+   "Generate a fresh burst_capture with seed 999 and burst density near second boundaries; verify clocknorm-sensitive boundary readings are in correct buckets (requires the 37ms offset to be accounted for)"
+  ],
+  "verifier_knob": {
+   "name": "boundary_burst_fraction",
+   "value": "0.30 at verify time vs 0.05 in provided sample",
+   "effect": "Raising the fraction of readings within 20ms of a second boundary amplifies the clocknorm misassignment error, making it detectable and making the fix essential; lowering it makes the binary's effect small enough that fixing only the Welford bug might pass"
+  },
+  "expected_failure_modes": [
+   "Fixes Welford off-by-one only; passes provided sample but fails verify-time high-boundary-density trace because clocknorm still misassigns samples",
+   "Characterises clocknorm offset correctly but applies correction in wrong direction (subtracts instead of accounting for the forward push), fixing nothing",
+   "Fixes clocknorm and Welford but misses the ingest.go arrival-time bug; out-of-order test fails",
+   "Probes clocknorm with timestamps far from boundaries, observes no effect (offset < 1 second for mid-bucket timestamps), concludes clocknorm is a no-op, misses the boundary case entirely",
+   "Implements a new bucket assignment that ignores clocknorm entirely but keeps calling it in the hot path, causing a subtle race on concurrent ingestion that the verifier catches with concurrent replay"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "go",
+   "systems",
+   "opaque-binary",
+   "ring-buffer",
+   "telemetry",
+   "numerical"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/aggregator.go",
+   "cat /app/ingest.go",
+   "cat /app/bucket_stats.go",
+   "git log --oneline",
+   "/app/bin/clocknorm 999980000000",
+   "/app/bin/clocknorm 999950000000",
+   "/app/bin/clocknorm 999963000000",
+   "/app/bin/clocknorm 1000000000000",
+   "# Deduce offset: (input + 37_000_000) / 1_000_000_000",
+   "cp /app/aggregator.go /app/aggregator_fixed.go",
+   "# Edit aggregator_fixed.go: replace clocknorm call with direct ns/1e9 bucket assignment",
+   "# Edit aggregator_fixed.go: fix Welford to increment n before delta2 (n++ before mean update)",
+   "# Edit ingest.go: pass req payload timestamp_ns instead of time.Now().UnixNano()",
+   "make build",
+   "make run &",
+   "cat /app/data/burst_capture.jsonl | while read line; do curl -s -X POST localhost:8080/ingest -d \"$line\"; done",
+   "curl localhost:8080/stats | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d)'",
+   "# Verify counts, means, p95 look correct"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction explicitly scopes the fix to /app/aggregator_fixed.go as a drop-in replacement, but the ingest.go arrival-time bug requires editing a different file (ingest.go) not mentioned in the instruction. A solver following instructions literally writes only aggregator_fixed.go and fails the out-of-order test through no fault of their own \u2014 this is an invalid failure mode caused by instruction underspecification.",
+   "The amd64 ELF clocknorm binary will silently fail or error on ARM-based CI/Docker hosts (Apple Silicon M-series) unless --platform linux/amd64 is explicitly set in the Dockerfile. If clocknorm cannot be probed, the characterization step is blocked entirely.",
+   "The verifier's fresh trace (seed 137, 30% boundary density vs 5% in sample) is much harder than the provided data. If the service state from the sample replay isn't flushed before the verify-time replay, bucket state may bleed across runs, producing spurious failures unrelated to correctness.",
+   "The 'drop-in replacement with same exported API' constraint on aggregator_fixed.go conflicts with needing to change the timestamp argument source in ingest.go \u2014 if the aggregator's exported function signature accepts nanosecond timestamps, fixing ingest.go is required but out-of-scope per the instruction wording.",
+   "The concurrent ingestion race mentioned in the failure modes ('subtle race on concurrent replay') could produce flaky verifier results even on a correct fix if the verifier replays concurrently without synchronization."
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: all three bugs are discoverable by linear source reading (Welford, ingest.go) plus ~4 targeted probes (clocknorm), putting the speedrun at ~18 commands \u2014 solidly in the 'solvable by Opus in 9-25 commands' band that scores at most 2. More critically, the instruction contains an invalid failure risk: it explicitly restricts the fix to /app/aggregator_fixed.go as a drop-in replacement but the out-of-order test requires editing ingest.go, a file not mentioned; a solver following the stated instructions would produce a valid aggregator_fixed.go and still fail, constituting an unfair test failure. The average score is (4+3+5+2+5)/5 = 3.8 but genuine_difficulty is below the minimum threshold of 3.",
+  "fixes": [
+   "Increase genuine difficulty: hide one bug inside a correct-looking abstraction that requires dynamic tracing (e.g., clocknorm's offset varies by a function of sensor_id, not a fixed 37ms), forcing the solver to probe many inputs and fit a model rather than detect a constant offset in 4 probes.",
+   "Fix the invalid failure risk: either (a) explicitly state in the instruction that ingest.go may also need to be modified, or (b) move the arrival-time bug into aggregator.go itself (make aggregator accept both arrival_ns and payload_ns but use arrival_ns for bucket assignment), keeping the fix entirely within the aggregator_fixed.go scope.",
+   "Add a fourth interacting bug that requires reading ring_buffer.go to find \u2014 e.g., the circular buffer wrap-around discards the oldest bucket's partial state before it's flushed to the stats server, causing systematic undercounting on long runs \u2014 making source reading alone insufficient and requiring runtime observation to correlate.",
+   "Explicitly specify --platform linux/amd64 in the Dockerfile and add a health-check step that verifies clocknorm executes before the task starts, to prevent environment-caused failures on ARM hosts.",
+   "Make the verifier stateless by requiring the solver to write a self-contained replay script that starts a fresh service instance, replays the trace, and outputs JSON stats \u2014 eliminating state bleed between the sample and verify-time traces."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks require characterizing a compiled black-box binary by experiment and then fixing a downstream data pipeline to account for what the binary actually does, differing mainly in domain (telemetry/Go vs sensor pipeline/SQL) and output format."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is a misconfigured weight lookup in a sales aggregator with no black-box binary to characterize; the candidate's core challenge is reverse-engineering a compiled clock normalizer."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "variant",
+     "reason": "Both tasks require experimentally characterizing a compiled black-box component (shared library vs binary) and building/fixing a service that correctly accounts for its undocumented behavior, though the domain and deliverable differ."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "That task is about fixing NetFlow binary parsing and CIDR lookup logic with no black-box binary characterization; the candidate centers on reverse-engineering a clock normalizer's timestamp transformation."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a NetFlow v9 aggregation service's flow parsing and query logic with full source available, not characterizing a black-box binary's undocumented transformation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.19
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.16
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.16
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.147
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.014955
+  },
+  "novel": false
+ },
+ "cost_usd": 0.065334
+}

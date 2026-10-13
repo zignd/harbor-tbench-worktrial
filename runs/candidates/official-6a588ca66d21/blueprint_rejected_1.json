@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "log-filter-two-cause-repair",
+  "title": "Production Log Filter Silent Drop",
+  "scenario": "A backend developer is chasing a production bug where the alerting pipeline is silently dropping a subset of error events. The system consists of a log ingestion daemon (~400 lines Python), a DSL-based filter configuration engine (~350 lines Python), a metrics emitter (~200 lines Python), and a replay tool (~150 lines Python). The developer has pasted a confusing output from a live replay run and suspects the filter config is wrong, but the actual bug only manifests when replaying real historical log data.",
+  "instruction_draft": "```\n$ python /app/replay.py --input /app/logs/prod_2024_11.log.gz --window 1h --emit-metrics\n[INFO] Loaded filter config: /app/config/filters.yaml\n[INFO] Replaying 48,302 events...\n[WARN] metrics emit: 'error_rate' for service 'auth' is 0.000 (expected ~0.031 based on raw counts)\n[WARN] metrics emit: 'error_rate' for service 'payment' is 0.000 (expected ~0.018 based on raw counts)\n[INFO] Done. 48,302 events processed, 0 alerts fired.\n```\n\nYou are a backend developer chasing a production alerting gap. The replay tool above processes a compressed log archive and should fire alerts when service error rates exceed the threshold defined in `/app/config/filters.yaml`. According to raw grep counts, the `auth` and `payment` services both have error rates above the configured alert threshold during the replay window, but zero alerts fire and the emitted error-rate metrics show 0.000 for both.\n\nFix the system so that:\n1. Each log line that matches a filter rule's conditions is correctly classified and counted toward the appropriate metric bucket.\n2. Each metric bucket's rate is computed against the correct denominator for its service (total events for that service in the window, not total events across all services).\n3. An alert fires for every (service, metric) pair whose computed rate exceeds the threshold defined in `filters.yaml` for that rule, using the threshold value exactly as configured.\n4. The filter engine correctly handles rules whose `level` field uses a comma-separated list of log levels (e.g. `\"ERROR,CRITICAL\"`) in addition to rules with a single level.\n5. After your fix, running `python /app/replay.py --input /app/logs/prod_2024_11.log.gz --window 1h --emit-metrics` must fire at least one alert for `auth` and at least one alert for `payment`, and emitted error-rate values must be non-zero for both services.\n6. The filter engine must correctly classify all benign (non-error) events as non-alerting \u2014 no false alerts on INFO or DEBUG lines that do not match any alert rule.\n\nDo not modify `replay.py` or the log archive. You may modify any other file under `/app/`.",
+  "requirements": [
+   "Each log line matching a filter rule's conditions is correctly classified and counted toward its metric bucket.",
+   "Each metric bucket rate uses the total events for that service in the window as the denominator, not total events globally.",
+   "An alert fires for every (service, metric) pair whose computed rate exceeds the configured threshold.",
+   "Filter rules with comma-separated level fields (e.g. 'ERROR,CRITICAL') are handled correctly.",
+   "Running the replay command fires at least one alert for service 'auth' and at least one for service 'payment'.",
+   "No false alerts fire for INFO or DEBUG lines that do not match any alert rule."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm with pyyaml, and a small set of standard libs.",
+   "/app/replay.py: 150-line replay harness, reads gzipped log, calls filter engine, calls metrics emitter, calls alert checker. NOT to be modified.",
+   "/app/ingestion/parser.py: 200-line log line parser producing structured dicts with fields: timestamp, service, level, message, request_id.",
+   "/app/filter/engine.py: 350-line DSL filter engine. BUG 1: when loading rules, it splits the 'level' field on '|' instead of ',' so rules like 'ERROR,CRITICAL' never match any line (all lines have level 'ERROR' or 'CRITICAL', not 'ERROR,CRITICAL'). This is invisible from reading only the YAML \u2014 it only bites when real data arrives. BUG 2: the metric rate computation divides matched_count by total_all_events (a global variable accumulated across all services) instead of total_events_for_service[service]. The global counter is populated correctly, but the per-service counter dict is also populated \u2014 the wrong variable is just referenced. Fixing only BUG 1 makes alerts still not fire because rates remain near zero due to the wrong denominator. Fixing only BUG 2 makes rates look reasonable but still no alerts fire because no events match the rules (wrong delimiter).",
+   "/app/metrics/emitter.py: 200-line metrics emitter. Correct code, no bugs.",
+   "/app/config/filters.yaml: YAML defining filter rules. Rules use comma-separated levels: '\"ERROR,CRITICAL\"'. Thresholds are set at 0.01 (1%) for both auth and payment error_rate. This file is correct \u2014 the bug is in the engine reading it.",
+   "/app/logs/prod_2024_11.log.gz: compressed gzipped log with 48,302 lines. Generated deterministically with a fixed seed. auth service has ~3.1% error rate, payment has ~1.8% error rate, well above threshold. Log lines are in the format: '2024-11-01T10:23:45Z auth ERROR [req-abc123] connection refused'.",
+   "A log generator script (used only at Docker build time, not shipped) produces the gzipped log deterministically. Plausible non-error traffic (INFO lines for api, worker, cache services) is also present to provide false-alert coverage.",
+   "The environment has ~1100 lines of code across 5 files, realistic enough that the solver must read and understand each component."
+  ],
+  "internal_hint": "Two interacting bugs in /app/filter/engine.py. BUG 1 (observe_not_read): the level-field splitter uses '|' instead of ',', so no rule ever matches any log line. This is only visible when real log data flows through \u2014 reading the YAML and the code separately, both look plausible (the YAML has commas, the code has pipes, neither is obviously wrong without pairing them). BUG 2 (observe_not_read, interacts): the rate denominator is total_all_events (a module-level accumulator) instead of self.service_totals[service]. With BUG 1 present, rates are 0/N = 0.0 regardless of denominator, so BUG 2 is hidden. Fix BUG 1 alone: matched counts are now correct but the denominator is ~48302 for every service, so auth's ~1500 errors / 48302 \u2248 0.031 which IS above 0.01 \u2014 wait, that would actually trigger alerts. Re-calibrate: make BUG 2 cause the denominator to be total events globally INCLUDING other services whose volume dominates, AND set the log corpus so auth+payment are small slices of a high-volume total. Specifically: the log has 48,302 total lines; auth has 2,100 lines (3.1% \u00d7 2100 \u2248 65 errors), payment has 1,600 lines (1.8% \u00d7 1600 \u2248 29 errors), and the remaining 44,602 are other services. With BUG 2 only fixed and BUG 1 still present: 0 matches \u2192 0 alerts. With BUG 1 only fixed: auth error rate = 65/48302 \u2248 0.00135 < 0.01 threshold \u2192 no alert. With BOTH fixed: auth error rate = 65/2100 \u2248 0.031 > 0.01 \u2192 alert fires. The solver must observe both effects by running the replay, then inspect the engine code to find both bugs.",
+  "trap": "A solver that fixes only the level-delimiter bug will see rates remain below threshold because the denominator is still the global event count (~48K) rather than the per-service count (~2K), so alerts still don't fire and the solver may incorrectly conclude their fix worked because the emitted metric is now non-zero (0.00135) but still below threshold. The hidden tests generate fresh log corpora at verify time with varying service volume ratios, so any solution that hard-codes denominators or thresholds fails. Tests also inject single-level rules (no comma) to verify those still work, and inject pure-INFO services to verify no false alerts.",
+  "tests": [
+   "Run replay on prod_2024_11.log.gz and assert at least one alert fires for auth and at least one for payment.",
+   "At verify time: generate a fresh log corpus (different seed, different service volumes) where auth has 500 events with 10% error rate and total corpus is 50,000 events. The correct per-service rate is 0.10 > 0.01 threshold. Assert alert fires. A solution still using global denominator sees 50/50000 = 0.001 < 0.01 and does not alert \u2014 test fails.",
+   "At verify time: generate a log where a service named 'cache' has 40,000 INFO-only events and no errors. Assert zero alerts fire for cache (no false positives).",
+   "At verify time: add a filter rule with a single level 'ERROR' (no comma). Generate logs with that single-level rule matching. Assert the single-level rule still fires correctly (regression test that the comma-fix didn't break single-level rules).",
+   "At verify time: generate a corpus where 'CRITICAL' level events (not 'ERROR') drive a service over threshold. The rule is 'ERROR,CRITICAL'. Assert alert fires \u2014 confirming both levels in the comma list are matched.",
+   "Direct unit call: invoke engine.load_rules() and engine.classify(line) with a line of level 'CRITICAL' against a rule specifying levels 'ERROR,CRITICAL'. Assert it returns a match.",
+   "Direct unit call: invoke engine.compute_rate(service='auth', matched=65, service_total=2100, global_total=48302). Assert result is approximately 0.031, not 0.00135.",
+   "Run replay on the original prod_2024_11.log.gz with fixed engine and assert emitted error_rate for auth is between 0.025 and 0.040, and for payment between 0.010 and 0.030."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size_and_service_ratio",
+   "value": "5 services, 48302 events, auth/payment together ~8% of total",
+   "effect": "Increasing the number of services and making auth/payment a smaller fraction of total events makes the denominator bug cause a larger discrepancy, increasing difficulty. Decreasing makes a naive one-bug fix accidentally pass."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the delimiter bug, sees non-zero metric output, assumes done, and doesn't notice the rate is still below threshold due to wrong denominator.",
+   "Solver correctly identifies both bugs in the engine but introduces a regression by breaking single-level rule matching when fixing the comma-split.",
+   "Solver modifies replay.py (forbidden) or patches the YAML to use '|' delimiters instead of fixing the engine.",
+   "Solver hard-codes the denominator as the observed per-service count from the prod log, passing the sample test but failing the verify-time generated corpora.",
+   "Solver identifies the level-split bug from reading the code, fixes it, runs the replay, sees rates are still low, and incorrectly concludes the threshold is the problem and lowers it rather than finding the denominator bug."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "log-processing",
+  "tags": [
+   "log-processing",
+   "configuration",
+   "devops",
+   "two-interacting-bugs",
+   "observe-not-read",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/filter/engine.py",
+   "cat /app/config/filters.yaml",
+   "python /app/replay.py --input /app/logs/prod_2024_11.log.gz --window 1h --emit-metrics",
+   "# Identify split('|') bug and total_all_events denominator bug in engine.py from reading source",
+   "# Edit engine.py: change level field split('|') to split(',')",
+   "# Edit engine.py: change total_all_events denominator to self.service_totals[service]",
+   "python /app/replay.py --input /app/logs/prod_2024_11.log.gz --window 1h --emit-metrics",
+   "# Confirm alerts fire for auth and payment with non-zero error rates"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Both bugs are in one file and visible by static code reading \u2014 the 'observe_not_read' tag overstates required runtime observation; a careful agent reads engine.py and finds both bugs without running anything.",
+   "The unit test asserts a specific API signature for engine.compute_rate(); a solver who correctly fixes the bug but refactors the interface would fail this test invalidly.",
+   "Verify-time corpus generation with Python random seeding must be platform-stable; if any platform variation shifts event counts, the threshold boundary (e.g., 0.00135 vs 0.01) could accidentally flip, making partial fixes pass.",
+   "The constraint 'Do not modify replay.py' combined with verify-time corpus injection could cause failures if replay.py has hardcoded paths or assumptions the test harness changes.",
+   "The trap relies on auth having exactly ~2,100 lines out of 48,302 total; if the build-time log generator is not perfectly deterministic across Docker build layers or Python versions, the calibration could break."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine difficulty score of 2 falls below the minimum threshold of 3: both bugs reside in a single ~350-line file and are directly visible by reading the source code, making the speedrun only ~8 commands with no runtime observation required. The 'observe_not_read' and 'two-interacting-bugs' difficulty levers are real properties of the scenario but are insufficient to prevent a methodical code-reading agent from solving this in well under 20 commands. Additionally, the unit test for engine.compute_rate() with a specific function signature creates an invalid failure risk for solvers who fix the bug correctly but through refactoring.",
+  "fixes": [
+   "Elevate genuine difficulty by splitting the two bugs across different files (e.g., BUG 1 in engine.py, BUG 2 in a separate rate-computation module or in the metrics emitter's aggregation logic), forcing the solver to explore multiple files to find both bugs.",
+   "Make BUG 1 less statically visible: instead of a literal split('|'), use a config-driven separator that reads from a separate config file with the wrong default, or use a regex that appears plausible but fails on comma-lists \u2014 something that requires runtime observation to distinguish correct from incorrect behavior.",
+   "Replace the unit test with a specific API signature (engine.compute_rate(...)) with a behavioral integration test that doesn't constrain the solver's refactoring approach, reducing invalid failure risk while maintaining verifiability."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about a log enrichment pipeline with GeoIP enrichment, SQLite storage, and Flask API endpoints; the candidate is about a DSL filter config engine silently dropping alerting events during log replay."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service on top of a compiled windowed aggregation engine; the candidate is about fixing bugs in a filter classification and metrics computation pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/break-filter-js-from-html",
+     "verdict": "distinct",
+     "reason": "That task is a security/evasion challenge to bypass an HTML JavaScript filter; the candidate is a backend debugging task about fixing silent alert drops in a log filter pipeline."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task is about a WAF rule compiler and deployment consistency across three components with YAML rules and a binary filter; the candidate is about fixing a DSL-based log filter config engine that silently drops error events before alerting."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "That task is about ECDH session key derivation consistency between an encryptor and verifier for encrypted audit logs; the candidate is about fixing log filter classification and metrics rate computation bugs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.188
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.169
+    ],
+    [
+     "terminal-bench-2-1/break-filter-js-from-html",
+     0.164
+    ],
+    [
+     "ours/official-10912a593843",
+     0.148
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.123
+    ]
+   ],
+   "cost_usd": 0.015426
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05606100000000001
+}

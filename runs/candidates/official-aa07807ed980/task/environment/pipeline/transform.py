@@ -1,176 +1,172 @@
-"""
-Transform: applies column-type coercion, schema validation, and
-data-quality rules to a single chunk DataFrame.
+"""Apply column-type coercion, schema validation, and deduplication.
 
-Each chunk is processed independently so that validation errors
-in one chunk do not abort processing of others.
+This module is called once per chunk by the pipeline driver.  It returns
+two DataFrames: the validated (and cleaned) rows, and the rejected rows.
 """
+
+from __future__ import annotations
+
+import hashlib
+from datetime import datetime
+from typing import Optional
 
 import pandas as pd
-from pipeline.schema import (
-    REQUIRED_COLUMNS,
-    SchemaValidationError,
-    check_columns,
-    validate_row,
-)
+
+from pipeline.schema import REQUIRED_COLUMNS, split_valid_invalid, validate_columns
 from pipeline.utils import get_logger
 
-logger = get_logger(__name__)
-
-
-class TransformError(Exception):
-    """Raised when a chunk cannot be transformed at all (e.g. wrong schema)."""
-    pass
+_log = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Type-coercion helpers
+# Type coercion helpers
 # ---------------------------------------------------------------------------
 
-def _coerce_record_id(series):
-    """Convert record_id column to nullable integer strings."""
-    return pd.to_numeric(series, errors="coerce").astype("Int64").astype(str)
+
+def _coerce_amount(series: pd.Series) -> pd.Series:
+    """Parse *series* as float64, replacing unparseable values with NaN."""
+    return pd.to_numeric(series, errors="coerce")
 
 
-def _coerce_amount(series):
-    """Round amount to two decimal places after coercing to float."""
-    return pd.to_numeric(series, errors="coerce").round(2)
+def _coerce_date(series: pd.Series) -> pd.Series:
+    """Normalise date strings to YYYY-MM-DD; malformed values become empty."""
+    def _parse(val: object) -> str:
+        if pd.isna(val):
+            return ""
+        s = str(val).strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%Y%m%d"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+            except ValueError:
+                continue
+        return s  # return as-is; validator will reject it
+    return series.map(_parse)
 
 
-def _coerce_status(series):
-    """Normalise status to lower-case."""
-    return series.str.strip().str.lower()
+def _coerce_status(series: pd.Series) -> pd.Series:
+    """Lower-case and strip whitespace from status values."""
+    return series.map(
+        lambda v: str(v).strip().lower() if not pd.isna(v) else ""
+    )
 
 
-def _coerce_date(series):
-    """Strip whitespace from date strings."""
-    return series.str.strip()
-
-
-def _coerce_name(series):
-    """Strip leading/trailing whitespace from name."""
-    return series.str.strip()
-
-
-COERCION_MAP = {
-    "record_id": _coerce_record_id,
-    "amount": _coerce_amount,
-    "status": _coerce_status,
-    "date": _coerce_date,
-    "name": _coerce_name,
-}
+def _coerce_record_id(series: pd.Series) -> pd.Series:
+    """Strip whitespace from record_id values."""
+    return series.map(lambda v: str(v).strip() if not pd.isna(v) else "")
 
 
 # ---------------------------------------------------------------------------
-# Main transform logic
+# Deduplication
 # ---------------------------------------------------------------------------
 
-class ChunkTransformer:
+
+def _remove_duplicates(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Remove duplicate rows, keeping the first occurrence.
+
+    Deduplication is performed on a stable subset of business columns so
+    that rows with identical business data but different metadata do not
+    appear twice in the output.
+
+    Returns the deduplicated DataFrame and the number of rows dropped.
     """
-    Applies validation and transformation rules to a chunk DataFrame.
+    before = len(df)
+    # Use a stable subset of columns for deduplication; record_id alone
+    # would be too narrow because it may vary between otherwise-identical rows.
+    dedup_cols = [c for c in ["name", "amount"] if c in df.columns]
+    if dedup_cols:
+        df = df.drop_duplicates(subset=dedup_cols, keep="first")
+    dropped = before - len(df)
+    if dropped:
+        _log.debug("Deduplication removed %d row(s)", dropped)
+    return df, dropped
+
+
+# ---------------------------------------------------------------------------
+# Column-type coercion
+# ---------------------------------------------------------------------------
+
+
+def coerce_types(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of *df* with columns coerced to their canonical types."""
+    df = df.copy()
+    if "amount" in df.columns:
+        df["amount"] = _coerce_amount(df["amount"])
+    if "date" in df.columns:
+        df["date"] = _coerce_date(df["date"])
+    if "status" in df.columns:
+        df["status"] = _coerce_status(df["status"])
+    if "record_id" in df.columns:
+        df["record_id"] = _coerce_record_id(df["record_id"])
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Public transform entry point
+# ---------------------------------------------------------------------------
+
+
+def transform_chunk(
+    df: pd.DataFrame,
+    *,
+    run_dedup: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Process one chunk of the ingestion pipeline.
+
+    Steps performed (in order):
+    1. Validate that required columns are present.
+    2. Coerce column types to their canonical representations.
+    3. Remove duplicate rows.
+    4. Split into valid and invalid rows using the schema validator.
 
     Parameters
     ----------
-    rejected_rows : list
-        Accumulator list; rows that fail validation are appended here
-        as dicts so that callers can write a rejected.csv file.
+    df:
+        Raw chunk DataFrame (all columns typed as str on entry).
+    run_dedup:
+        Set to False to skip the deduplication step (useful in tests).
+
+    Returns
+    -------
+    (valid, rejected)
+        Two DataFrames: accepted rows and rows that failed schema validation.
     """
+    validate_columns(df)
 
-    def __init__(self, rejected_rows=None):
-        self.rejected_rows = rejected_rows if rejected_rows is not None else []
-        self._stats = {"input": 0, "accepted": 0, "rejected": 0, "duplicates_removed": 0}
+    df = coerce_types(df)
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    if run_dedup:
+        df, _n_dropped = _remove_duplicates(df)
 
-    def transform(self, df):
-        """
-        Transform *df* and return a cleaned DataFrame.
+    valid, rejected = split_valid_invalid(df)
 
-        Steps:
-          1. Verify required columns are present.
-          2. Coerce column types.
-          3. Validate each row; invalid rows go to rejected_rows.
-          4. Remove duplicate rows to avoid double-counting.
-          5. Return cleaned DataFrame.
-        """
-        missing = check_columns(df)
-        if missing:
-            raise TransformError(f"Missing required columns: {missing}")
-
-        self._stats["input"] += len(df)
-
-        df = self._coerce_types(df.copy())
-        df, rejected = self._validate_rows(df)
-        self.rejected_rows.extend(rejected)
-        self._stats["rejected"] += len(rejected)
-
-        df = self._remove_duplicates(df)
-
-        self._stats["accepted"] += len(df)
-        return df
-
-    @property
-    def stats(self):
-        """Return a copy of the running statistics dict."""
-        return dict(self._stats)
-
-    # ------------------------------------------------------------------
-    # Private helpers
-    # ------------------------------------------------------------------
-
-    def _coerce_types(self, df):
-        """Apply column-level type coercions."""
-        for col, fn in COERCION_MAP.items():
-            if col in df.columns:
-                df[col] = fn(df[col])
-        return df
-
-    def _validate_rows(self, df):
-        """
-        Iterate rows and separate valid from invalid.
-        Returns (valid_df, list_of_rejected_dicts).
-        """
-        valid_indices = []
-        rejected = []
-        for idx, row in df.iterrows():
-            row_dict = row.to_dict()
-            try:
-                validate_row(row_dict)
-                valid_indices.append(idx)
-            except SchemaValidationError as exc:
-                row_dict["_rejection_reason"] = str(exc)
-                rejected.append(row_dict)
-                logger.debug("Row %s rejected: %s", idx, exc)
-        return df.loc[valid_indices], rejected
-
-    def _remove_duplicates(self, df):
-        """
-        Remove duplicate rows from the chunk.
-
-        Deduplication is performed on the business-key columns that
-        identify logically equivalent records within a delivery batch.
-        When duplicates are found, the first occurrence is kept.
-        """
-        before = len(df)
-        df = df.drop_duplicates(subset=["name", "amount"], keep="first")
-        removed = before - len(df)
-        if removed:
-            logger.debug("Removed %d duplicate row(s) in chunk", removed)
-        self._stats["duplicates_removed"] += removed
-        return df
+    _log.debug(
+        "transform_chunk: %d valid, %d rejected",
+        len(valid), len(rejected),
+    )
+    return valid, rejected
 
 
 # ---------------------------------------------------------------------------
-# Convenience function
+# Utility: fingerprint a row for audit logging
 # ---------------------------------------------------------------------------
 
-def transform_chunk(df, rejected_rows=None):
-    """
-    Apply all transformations to *df* and return the cleaned DataFrame.
 
-    Rejected rows are appended to *rejected_rows* if provided.
-    """
-    transformer = ChunkTransformer(rejected_rows=rejected_rows)
-    return transformer.transform(df)
+def row_fingerprint(row: pd.Series) -> str:
+    """Return a short hex digest that uniquely identifies *row*'s content."""
+    payload = "|".join(
+        str(row.get(c, "")) for c in sorted(row.index)
+    ).encode()
+    return hashlib.sha1(payload).hexdigest()[:12]
+
+
+# ---------------------------------------------------------------------------
+# Utility: summarise a DataFrame for logging
+# ---------------------------------------------------------------------------
+
+
+def summarise(df: pd.DataFrame, label: str = "DataFrame") -> str:
+    """Return a one-line summary string for *df*."""
+    return (
+        f"{label}: {len(df)} rows x {len(df.columns)} cols "
+        f"| columns={list(df.columns)}"
+    )

@@ -1,0 +1,158 @@
+{
+ "blueprint": {
+  "slug": "chacha20-keystream-splice-repair",
+  "title": "ChaCha20 Keystream Splice Repair",
+  "scenario": "A small scientific computing team ships a Python library (`scienc_crypt`) for encrypting simulation checkpoint files before archiving. The CI pipeline has started failing: re-encrypted checkpoints are silently corrupted on round-trip for files larger than 64 bytes, but the unit tests (which only cover short messages) still pass. The library lives under `/app/scienc_crypt/` (~1,200 lines across six modules), uses a hand-rolled ChaCha20 implementation, and ships alongside a C extension (`_chacha_ext.so`) that provides the quarter-round primitive\u2014source for the extension is not present. The release engineer needs to make the archiver pass a throughput-correctness threshold on hidden test inputs.",
+  "instruction_draft": "--- CI failure dump (truncated) ---\n```\n$ python -m pytest tests/ -x\n...........\n11 passed in 0.43s\n$ python scripts/archive_verify.py checkpoints/sim_run_042.ckpt\nERROR: round-trip mismatch at offset 64 (got 0x3a expected 0x7f)\n$ python scripts/archive_verify.py checkpoints/sim_run_001.ckpt\nOK\n```\n\nYou are a release engineer unblocking the build. The archiver at `/app/scripts/archive_verify.py` encrypts a checkpoint file with a 256-bit key and a 96-bit nonce drawn from `/app/config/archive.cfg`, then immediately decrypts and compares byte-for-byte. It must produce a correct round-trip for every input file.\n\nFix the `scienc_crypt` library (any files under `/app/scienc_crypt/`) so that:\n1. Every call to `encrypt(plaintext, key, nonce)` followed by `decrypt(ciphertext, key, nonce)` returns the original plaintext exactly, for plaintexts of any length up to 4 MiB.\n2. The throughput of `encrypt` on a 1 MiB input must be at least 40 MB/s (measured on the grading host).\n3. All existing tests in `/app/tests/` continue to pass.\n\nDo not modify any test files. Do not replace or recompile `_chacha_ext.so`.",
+  "requirements": [
+   "encrypt(plaintext, key, nonce) followed by decrypt(ciphertext, key, nonce) returns original plaintext for any length 1..4194304 bytes",
+   "encrypt throughput on a 1 MiB buffer is >= 40 MB/s",
+   "all pre-existing tests in /app/tests/ pass without modification"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y gcc; pip install pytest pycparser",
+   "Directory /app/scienc_crypt/ with ~1,200 lines across: __init__.py, stream.py (main encrypt/decrypt), keystream.py (block generator), utils.py (padding/serialization), header.py (nonce/key packing), counter.py (block counter logic)",
+   "Compiled C extension /app/scienc_crypt/_chacha_ext.so providing `quarter_round(state, a, b, c, d)` \u2014 no source; behaves correctly per the RFC 8439 spec",
+   "Bug plant 1 (hidden_invariant): counter.py resets the block counter to 0 at the start of every 64-byte keystream block instead of incrementing it; this produces identical keystream for blocks 0 and 1, 2 and 3, etc. \u2014 the pattern is only visible when running on >64-byte data because the first block always has counter=0 which is correct",
+   "Bug plant 2 (misleading_symptom): stream.py logs a warning 'WARNING: nonce reuse detected' whenever it is called more than once in the same process, making the agent initially hunt for a nonce-reuse bug in the calling code or header.py rather than the counter logic",
+   "keystream.py calls the C extension quarter_round correctly and produces correct output for a *given* (key, counter, nonce) triple; the bug is upstream in counter.py which supplies the wrong counter value",
+   "/app/tests/ contains 11 pytest tests, all using plaintexts <= 48 bytes; they all pass with the buggy code",
+   "/app/scripts/archive_verify.py: reads key+nonce from /app/config/archive.cfg, calls scienc_crypt.encrypt then scienc_crypt.decrypt, reports first mismatching offset",
+   "/app/checkpoints/ contains sim_run_001.ckpt (32 bytes, passes) and sim_run_042.ckpt (128 bytes, fails)",
+   "/app/config/archive.cfg: YAML with key_hex and nonce_hex fields",
+   "utils.py and header.py are correct and irrelevant to the bug",
+   "The throughput requirement rules out a naive pure-Python block-by-block loop that recomputes state from scratch; the agent must call the C extension efficiently (it already does, once counter.py is fixed)"
+  ],
+  "internal_hint": "Root cause: counter.py has a bug where the `block_counter` variable is reassigned to 0 inside the keystream-generation loop instead of being incremented. Specifically, a line reads `block_counter = 0` inside the for-loop body (perhaps disguised as a reset of a local variable with a similar name, e.g., `block_state_counter = 0` that shadows the outer `block_counter` due to Python scoping, or an off-by-one in the counter passed to the C extension). This means block 0 and block 1 get the same keystream, block 2 and block 3 get the same keystream, etc. The XOR encryption of block 0 is correct (counter=0 is right), but block 1 is XORed with keystream(counter=0) instead of keystream(counter=1). On decryption, block 1 is again XORed with keystream(counter=0), which does NOT recover the plaintext (it produces encrypt_block_0_keystream XOR decrypt_block_1_keystream XOR original, not original). The misleading symptom is the false 'nonce reuse' warning emitted by stream.py, which points investigators toward the calling convention or header.py. The invariant to discover by running: if you encrypt two separate 64-byte blocks and XOR them with each other's keystreams you get scrambled output \u2014 only visible by running on >=65-byte input. Fix: correct the counter increment in counter.py so each 64-byte block uses its sequential block index (0, 1, 2, ...). The throughput requirement is met by the existing C-extension path once the counter bug is fixed; no algorithmic rewrite is needed.",
+  "trap": "A naive agent sees the 'nonce reuse' warning and audits header.py and stream.py for nonce management, finding nothing wrong. It may even patch the warning away and re-run the 48-byte unit tests, which still pass. The hidden test inputs are 65-byte, 127-byte, 513-byte, 100003-byte, and 4194304-byte plaintexts. All of them expose the counter bug. An agent that only fixes the warning or only tests <=64-byte round-trips will fail every hidden test. Additionally, if the agent rewrites keystream generation in pure Python to avoid touching counter.py, it will fail the 40 MB/s throughput test on the 1 MiB hidden input.",
+  "tests": [
+   "Round-trip test on 65-byte random plaintext (straddles first block boundary): encrypt then decrypt must return original bytes exactly",
+   "Round-trip test on 127-byte random plaintext (two full blocks minus one): must match exactly",
+   "Round-trip test on 513-byte random plaintext (eight blocks plus one): must match exactly",
+   "Round-trip test on 100003-byte random plaintext: must match exactly",
+   "Round-trip test on 4194304-byte (4 MiB) random plaintext: must match exactly",
+   "Throughput test: encrypt a freshly generated 1 MiB plaintext, measure wall time, assert bytes/second >= 40e6",
+   "Pytest suite: run `python -m pytest /app/tests/ -x` and assert exit code 0",
+   "Determinism test: encrypt the same 200-byte plaintext twice with the same key+nonce, assert identical ciphertext (checks no stateful mutation bug was introduced by the fix)"
+  ],
+  "verifier_knob": {
+   "name": "throughput_threshold_mbps",
+   "value": "40",
+   "effect": "Raising to 80+ MB/s forces the agent to ensure the C extension is used on every block path and no Python-level per-block overhead was introduced; lowering to 5 MB/s makes a pure-Python fallback acceptable and removes the architectural constraint"
+  },
+  "expected_failure_modes": [
+   "Agent follows the misleading 'nonce reuse' warning into stream.py and header.py, spends most time there, never reaches counter.py, and ships a patch that silences the warning without fixing the counter \u2014 all hidden tests fail",
+   "Agent discovers the counter bug but rewrites keystream generation in pure Python to avoid the C extension, correctly fixing correctness but failing the 40 MB/s throughput test on the 4 MiB hidden input",
+   "Agent patches counter.py correctly but introduces a Python-level loop that calls the C extension one byte at a time, passing correctness but failing throughput",
+   "Agent verifies only the provided 32-byte and 128-byte checkpoints, declares success, but the hidden 65-byte and 513-byte tests fail because the agent fixed only specific offsets rather than the general counter increment logic",
+   "Agent mistakes the counter reset for an intentional feature (e.g., 'CTR mode with periodic re-keying') and implements a more complex but still broken scheme"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "cryptography",
+   "reverse-engineering",
+   "error-recovery",
+   "systems-programming",
+   "scientific-computing",
+   "python"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/scienc_crypt/counter.py",
+   "cat /app/scienc_crypt/stream.py  # spot the nonce-reuse warning",
+   "cat /app/scienc_crypt/keystream.py",
+   "python scripts/archive_verify.py checkpoints/sim_run_042.ckpt",
+   "grep -n 'block_counter\\|counter\\|= 0' /app/scienc_crypt/counter.py",
+   "# Identify: block_counter reset to 0 inside loop instead of incrementing",
+   "# Edit counter.py: change 'block_counter = 0' inside loop to use loop index",
+   "python -m pytest /app/tests/ -x",
+   "python scripts/archive_verify.py checkpoints/sim_run_042.ckpt",
+   "python -c \"import time, os; import scienc_crypt; d=os.urandom(1<<20); k=os.urandom(32); n=os.urandom(12); t=time.time(); scienc_crypt.encrypt(d,k,n); print((1<<20)/(time.time()-t)/1e6,'MB/s')\""
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Throughput threshold of 40 MB/s may be flaky on a loaded or slow grading host \u2014 the task blueprint does not specify a minimum CPU or isolation guarantee",
+   "Pre-compiled _chacha_ext.so must exactly match the Python 3.13-slim-bookworm ABI; any mismatch makes the task unsolvable and produces an invalid failure",
+   "The bug disguise form (variable shadowing vs. literal reset vs. off-by-one) is underspecified in the blueprint \u2014 the actual planted code must be unambiguous to implement correctly",
+   "A strong agent that reads source files top-to-bottom finds the counter bug in counter.py in 1-2 commands without ever being misled by the nonce-reuse warning, making the intended trap ineffective"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2, which is below the required minimum of 3 and violates the accept threshold. The bug is directly visible by reading counter.py source (a single cat command exposes it), and the speedrun completes in ~10 commands \u2014 firmly in the 'solved 4/4 by Opus' regime that the rubric caps at 2. The misleading warning does not add meaningful resistance because a systematic agent reads all source files rather than following the warning, and the fix is a single-line change. The task is well-constructed in every other dimension but fails the core difficulty requirement.",
+  "fixes": [
+   "Obscure the counter bug: instead of a literal reset, implement it as a correct-looking but subtly wrong counter that passes the first block (e.g., off-by-one that only manifests at block boundaries beyond block 1, or a counter that wraps incorrectly at 32 blocks), requiring the agent to write a test harness to detect the pattern rather than spot it visually",
+   "Distribute the bug across multiple files: have counter.py pass a value that keystream.py then transforms incorrectly (e.g., a byte-order conversion bug that only affects counters > 0), so no single file reveals the root cause on inspection",
+   "Add a second genuine (but lower-priority) bug in utils.py that causes padding corruption on 4 MiB inputs, requiring the agent to fix both bugs and correctly prioritize them to pass all hidden tests simultaneously",
+   "Make the throughput requirement more challenging (e.g., 200 MB/s) so that a pure-Python fallback fix genuinely fails, and the agent must understand the C extension call pattern \u2014 currently 40 MB/s is too easy to achieve even with a suboptimal implementation"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a hand-rolled symmetric cipher implementation that passes short-input regression tests but silently corrupts data beyond a certain size boundary, with the same round-trip correctness and throughput constraints\u2014only the cipher (ChaCha20 vs AES-CTR) and language (Python vs C) differ."
+    },
+    {
+     "ref_id": "terminal-bench/interleaved-vigenere",
+     "verdict": "distinct",
+     "reason": "That task is a classical cipher cryptanalysis/cracking challenge; this task is debugging a modern stream cipher implementation bug."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/feal-linear-cryptanalysis",
+     "verdict": "distinct",
+     "reason": "That task requires implementing a linear cryptanalysis attack on a custom cipher; this task is fixing a library implementation bug."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a Rust codec service with both correctness and latency regressions traceable via git history; this task fixes a Python ChaCha20 implementation bug in a specific cipher module."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bash SQL filter validator script; this task is about fixing a cryptographic library implementation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.302
+    ],
+    [
+     "terminal-bench/interleaved-vigenere",
+     0.169
+    ],
+    [
+     "terminal-bench-2-1/feal-linear-cryptanalysis",
+     0.163
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.123
+    ],
+    [
+     "ours/official-18899524e171",
+     0.092
+    ]
+   ],
+   "cost_usd": 0.014172
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05319
+}

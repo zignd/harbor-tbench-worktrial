@@ -1,4 +1,3 @@
-ALERT [03:14 UTC]: canary=payments-v2 PROMOTED_TO_100PCT | p99_error_rate=23.4% | 847 downstream 5xx in 5min | PagerDuty #INC-4821
 
 The canary orchestrator at /app promoted a broken deployment without rolling back. The orchestrator feeds incoming request telemetry through /app/bin/traffic-sampler (pre-compiled, no source) before updating its health window and deciding whether to promote or roll back.
 

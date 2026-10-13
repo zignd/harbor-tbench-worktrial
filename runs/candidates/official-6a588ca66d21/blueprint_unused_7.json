@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "metrics-rollup-pipeline-ghost-series",
+  "title": "Metrics Rollup Pipeline: Ghost Series Corruption",
+  "scenario": "A backend developer is chasing a production alerting bug: the metrics rollup service occasionally fires false-positive alerts on services that are completely healthy, while simultaneously missing real degradation events on a subset of high-throughput services. The system aggregates raw per-request timing logs into 1-minute rollup windows, then a threshold checker compares rollups against per-service SLO baselines stored in a config file. The environment contains ~1,400 lines across a log ingestor, a rollup aggregator, a config loader, and a threshold alerter, plus six months of compressed historical log data.",
+  "instruction_draft": "```\n$ ./bin/check_alerts --since 6h\nALERT  svc=auth_service  p99_ms=47  threshold=200  [FIRING: below threshold???]\nALERT  svc=payment_svc   p99_ms=9182  threshold=500  [OK: not alerting]\nALERT  svc=inventory_svc p99_ms=310   threshold=300  [FIRING]\nOK     svc=search_svc    p99_ms=88    threshold=150  [OK]\n$ \n```\n\nThe metrics rollup pipeline at `/opt/rollup/` is producing incorrect alert decisions. `auth_service` is alerting despite being well under its threshold, `payment_svc` is silent despite being 18\u00d7 over its threshold, and the p99 values reported for at least two services are wrong.\n\nThe pipeline works as follows: raw JSONL request logs land in `/var/log/reqlog/` (rotated hourly, compressed), `bin/ingest` reads them and writes per-service per-minute bucket files under `/var/cache/rollup/buckets/`, `bin/rollup` aggregates buckets into `/var/cache/rollup/windows/` (1-minute P50/P99/count rollups), `bin/alertcheck` reads the rollups and the SLO config at `/opt/rollup/conf/slo.yaml` and emits alert decisions.\n\nFix the pipeline so that:\n1. P99 latency is computed correctly for every service across every time window.\n2. Each service's alert threshold is taken from its own entry in `slo.yaml`; no service may use another service's threshold.\n3. An alert fires if and only if the computed P99 exceeds the configured threshold for that service.\n4. The fix must be a change to configuration or code in `/opt/rollup/` only; do not modify raw log files or cache files.\n5. After your fix, `bin/alertcheck --since 6h` must produce correct FIRING/OK decisions for all services, and `bin/rollup --validate` must exit 0.\n\nThe hidden test suite will replay a fresh set of synthetic log streams through your modified pipeline and verify alert correctness on services and load patterns not present in the current logs.",
+  "requirements": [
+   "P99 latency is computed correctly for every service across every time window",
+   "Each service uses its own SLO threshold from slo.yaml; no cross-service threshold contamination",
+   "An alert fires if and only if p99 exceeds the configured threshold for that service",
+   "All fixes are confined to /opt/rollup/ (code and/or config only)",
+   "bin/alertcheck --since 6h produces correct FIRING/OK decisions for all services",
+   "bin/rollup --validate exits 0",
+   "Pipeline correctly handles fresh synthetic log streams at verify time"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: python3-yaml, python3-numpy, zstandard pip package",
+   "/opt/rollup/bin/ingest: Python script (~280 lines) that reads compressed JSONL from /var/log/reqlog/, parses {ts, service, duration_ms} records, and writes per-service per-minute bucket files as numpy arrays of raw durations; has a bug: when a service name contains an underscore, it hashes the name using only the substring before the first underscore as the bucket filename key, causing auth_service and auth_gateway to share a bucket file (collision), so auth_service accumulates durations from both services",
+   "/opt/rollup/bin/rollup: Python script (~320 lines) that reads bucket files and computes percentile rollups; has a bug: it computes P99 using numpy.percentile with interpolation='linear' but on low-cardinality windows (fewer than 50 samples) it applies a floor by reading a 'min_samples' config key that was renamed in slo.yaml from 'min_samples' to 'minimum_samples' six weeks ago; the rollup falls back to returning the P50 value as P99 for any window with fewer than the (now-missing) min_samples key, silently substituting P50 for P99 \u2014 this makes payment_svc (a low-volume internal service with ~20 req/min) always report a falsely low P99",
+   "/opt/rollup/bin/alertcheck: Python script (~210 lines) that reads rollup windows and slo.yaml; correctly implemented but depends on correct upstream outputs",
+   "/opt/rollup/bin/ingest, rollup, alertcheck are executable Python scripts driven by a shared /opt/rollup/lib/ package (~400 lines across config.py, buckets.py, percentile.py, alert.py)",
+   "/opt/rollup/conf/slo.yaml: YAML file with per-service entries; contains 'minimum_samples: 50' (new key name); rollup reads 'min_samples' (old key name) which evaluates to None, triggering the P99\u2192P50 fallback",
+   "/var/log/reqlog/: six months of hourly compressed (.zst) JSONL log files, roughly 800 MB total; payment_svc has genuine p99 spikes to 9000ms in the last 6 hours; auth_service logs are correctly healthy but auth_gateway (a different service) has high latency that bleeds into auth_service's bucket",
+   "/var/cache/rollup/: pre-populated bucket and window cache from a previous run (already corrupted by the bugs); solver must re-run the pipeline after fixing it",
+   "A /opt/rollup/bin/generate_test_stream helper script that creates synthetic JSONL streams for a given service name, duration distribution, and time range (used by verifier to inject fresh data)",
+   "The two bugs interact: fixing only the bucket filename collision (Bug 1) reveals that auth_service was masking payment_svc's true P99 indirectly through shared cache state; fixing only the min_samples key rename (Bug 2) still leaves auth_service alerting incorrectly due to the bucket collision"
+  ],
+  "internal_hint": "Two bugs interact and neither is visible without running the pipeline on real data. Bug 1: ingest.py uses service.split('_')[0] as the bucket filename key instead of the full service name, causing name-prefix collisions (auth_service and auth_gateway share a bucket). This only manifests when both services exist in the log history \u2014 reading ingest.py shows a hashing function that looks reasonable but its behavior on underscore names only becomes clear when you look at the actual bucket files on disk and notice auth_service's bucket file is larger than expected or contains two distinct latency populations. Bug 2: rollup.py reads config key 'min_samples' from slo.yaml, but slo.yaml was migrated to 'minimum_samples' six weeks ago (visible in git log or by diffing the config key names against what the code reads). When min_samples is None/missing, rollup silently returns P50 as P99 for low-volume services. Fixing Bug 2 alone leaves auth_service still alerting (because its P99 includes auth_gateway's high-latency traffic from the bucket collision). Fixing Bug 1 alone fixes auth_service's alert but payment_svc still reports falsely low P99 (P50 substitution). The solver must: (1) observe anomalous bucket sizes on disk, (2) read ingest.py's key function, (3) notice the config key mismatch by comparing slo.yaml keys to rollup.py's config.get() calls, (4) fix both, then re-run the pipeline.",
+  "trap": "A naive solver reads alertcheck.py and slo.yaml looking for threshold assignments, finds them correct, then checks rollup.py's percentile math which also looks correct in isolation. They may fix only the config key rename (min_samples \u2192 minimum_samples) and see payment_svc start alerting correctly, declare victory, and miss that auth_service's p99 is still wrong because of the bucket collision in ingest.py. The hidden test suite injects services with underscore-containing names paired with a same-prefix different-suffix service; if the bucket collision bug is unfixed, these services bleed into each other and alert decisions are wrong. Fixing only Bug 2 passes the sample check (payment_svc now fires) but fails the adversarial corpus on underscore-collision pairs.",
+  "tests": [
+   "Inject a synthetic log stream with two services: 'cache_fast' (p99=30ms, threshold=100ms) and 'cache_slow' (p99=800ms, threshold=200ms); verify cache_fast is OK and cache_slow FIRES \u2014 fails if bucket collision merges them into one bucket",
+   "Inject a low-volume service 'job_worker' with 15 req/min and genuine p99=950ms against threshold=500ms; verify it FIRES \u2014 fails if min_samples fallback substitutes P50 for P99",
+   "Inject a high-volume service 'api_gateway' with 500 req/min and p99=80ms against threshold=150ms; verify it is OK \u2014 checks that fixing min_samples fallback doesn't break high-volume correct behavior",
+   "Inject a service named 'auth_proxy' alongside existing 'auth_service' with very different latency distributions; verify their alert decisions are independent \u2014 directly tests bucket collision fix",
+   "Run bin/rollup --validate and verify exit code 0",
+   "Verify that no bucket file on disk contains duration samples from more than one service name (structural correctness of the bucket layer)",
+   "Inject a service with exactly 49 req/min (just below old min_samples=50) and genuine p99=600ms against threshold=300ms; verify it FIRES \u2014 the hardest case for the min_samples bug"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "7 test scenarios with 4 adversarial service-name collision pairs",
+   "effect": "Lowering to 3 scenarios (only payment_svc and one collision pair) makes it passable if the solver fixes both bugs but misses edge cases; raising to 12 scenarios with mixed underscore depths (a_b_c style) and boundary sample counts (48, 50, 52 req/min) requires the solver to generalize the fix correctly"
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the min_samples config key rename, sees payment_svc alert correctly, and stops \u2014 fails the bucket collision tests",
+   "Solver finds the bucket collision by reading ingest.py but misreads the fix scope and patches the cache files directly instead of fixing the code \u2014 fails requirement 4 (must fix /opt/rollup/ only) and fails on fresh test streams",
+   "Solver correctly identifies both bugs but fixes the bucket key function in a way that still collides for services like 'a_b' vs 'a_c' (uses split('_')[:2] instead of full name) \u2014 fails the adversarial corpus with three-component names",
+   "Solver re-runs the pipeline but forgets to clear the stale /var/cache/rollup/ before re-ingesting, so old corrupted buckets persist and contaminate results",
+   "Solver patches rollup.py to hard-code minimum_samples=50 as a default instead of reading from config, which works for the sample but breaks when the verifier uses a different minimum_samples value in the injected slo.yaml"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "log-processing",
+   "metrics",
+   "configuration",
+   "observe-not-read",
+   "two-interacting-bugs",
+   "alerting"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /opt/rollup/conf/slo.yaml",
+   "grep -rn 'min_samples' /opt/rollup/bin/ /opt/rollup/lib/",
+   "cat /opt/rollup/bin/ingest",
+   "grep -n 'split\\|bucket\\|key' /opt/rollup/bin/ingest /opt/rollup/lib/buckets.py",
+   "ls -lah /var/cache/rollup/buckets/ | sort -k5 -rh | head -20",
+   "# Identify Bug 1: service.split('_')[0] used as bucket key in ingest/buckets.py",
+   "# Identify Bug 2: code reads 'min_samples', slo.yaml has 'minimum_samples'",
+   "sed -i \"s/config.get('min_samples')/config.get('minimum_samples')/g\" /opt/rollup/bin/rollup",
+   "# Edit ingest or lib/buckets.py to use full service name instead of split('_')[0]",
+   "sed -i \"s/service\\.split('_')\\[0\\]/service/g\" /opt/rollup/lib/buckets.py",
+   "rm -rf /var/cache/rollup/buckets/* /var/cache/rollup/windows/*",
+   "cd /opt/rollup && ./bin/ingest --since 6h",
+   "./bin/rollup",
+   "./bin/rollup --validate",
+   "./bin/alertcheck --since 6h"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Requirement 4 says 'do not modify raw log files or cache files' but clearing stale /var/cache/rollup/ before re-ingesting is necessary for correctness \u2014 the verifier may penalize cache deletion even though it is the correct action, or conversely a solver who does NOT clear cache may pass sample checks but fail the hidden corpus if stale buckets persist",
+   "The 'no bucket file contains samples from more than one service' structural test is ambiguous about timing: if checked on pre-existing (pre-fix) buckets rather than freshly ingested ones, legacy corrupted buckets that were not overwritten could cause spurious failures",
+   "Re-ingesting 800MB of 6-month compressed logs on 1 CPU / 2 GB RAM may take several minutes; if the verifier imposes a wall-clock timeout shorter than ingest+rollup time, correct solutions fail for environmental reasons rather than logic errors",
+   "The generate_test_stream helper writes synthetic logs; if it writes to /var/log/reqlog/ and the verifier re-runs ingest on the full log directory (including synthetic logs), timing and isolation assumptions may be violated for some test scenarios",
+   "Bug 1 fix fragility: if split('_')[0] appears in multiple places or is wrapped in a helper, a targeted sed substitution may miss occurrences or corrupt surrounding logic, causing a partial fix that passes some tests and fails others non-deterministically"
+  ],
+  "verdict": "accept",
+  "reasons": "All five scores meet the minimum threshold of 3 and the average is 4.0, above the 3.6 floor. The task is realistic, clearly specified, and has strong verifiability through deterministic synthetic stream injection and structural bucket integrity checks. The main concern is that both bugs are readable from source (speedrun ~15 commands), making genuine difficulty borderline at 3 rather than higher, but the two-bug interaction, the stale-cache trap, and the adversarial underscore-collision corpus provide enough real failure modes to justify the hard rating.",
+  "fixes": [
+   "Clarify requirement 4 explicitly: 'Do not modify raw log files in /var/log/reqlog/; clearing and regenerating /var/cache/rollup/ after fixing the code is permitted and expected'",
+   "Add a note that solvers must clear /var/cache/rollup/ before re-running the pipeline to avoid stale cache contamination \u2014 this turns the trap from an invalid failure risk into an explicit tested requirement",
+   "To raise genuine_difficulty closer to 4, make Bug 1 less directly readable: instead of service.split('_')[0], use a hash-based sharding function that visually looks like a namespace sanitizer, requiring the solver to trace actual output values on example inputs rather than reading intent from the code",
+   "Add a wall-clock budget note in the environment spec (e.g., 'ingest completes in under 90 seconds on the provided hardware') to prevent timeout-based false failures",
+   "Specify whether generate_test_stream writes to a separate directory (e.g., /tmp/testlogs/) or to /var/log/reqlog/ so that solvers and verifiers agree on where synthetic logs land and whether the full ingest pipeline needs to be re-run"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task requires building an HTTP query service implementing a specific protocol against a compiled shared library; the candidate is about debugging P99 computation and threshold-routing bugs in a metrics alerting pipeline."
+    },
+    {
+     "ref_id": "terminal-bench/embedding-drift-monitor",
+     "verdict": "distinct",
+     "reason": "That task involves fixing statistical drift-detection tests (KS, PSI, MMD) and an alert debouncer for embedding distributions; the candidate is about fixing percentile computation and SLO-threshold routing in a log-based metrics rollup pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering a black-box binary normalizer and repairing a SQL rollup pipeline for sensor data; the candidate is about source-level bugs in a metrics aggregation and alerting system."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about weighted aggregation being wrong due to a misconfigured weight cache in a sales-aggregation service; the candidate is about P99 computation errors and cross-service SLO threshold contamination in a metrics alerting pipeline."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a GeoIP enrichment pipeline and implementing a missing Flask API endpoint; the candidate is about debugging a metrics rollup and threshold-alerting pipeline for latency SLOs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.162
+    ],
+    [
+     "terminal-bench/embedding-drift-monitor",
+     0.12
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.119
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.113
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.107
+    ]
+   ],
+   "cost_usd": 0.015573
+  },
+  "novel": true
+ },
+ "cost_usd": 0.067719
+}

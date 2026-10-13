@@ -1,0 +1,173 @@
+{
+ "blueprint": {
+  "slug": "sql-audit-binary-filter-repair",
+  "title": "SQL Audit Filter: Silent Data Corruption",
+  "scenario": "An analytics team's nightly SQL audit pipeline runs a compiled C binary (`/usr/local/bin/auditfilter`) that validates database transaction records and emits a filtered, sanitized result set. The analyst noticed that aggregate totals in downstream reports stopped matching raw ledger sums three weeks ago. The binary reads transaction rows from a SQLite database, applies a validation filter defined by a SQL schema and embedded business rules, and writes accepted rows to an output table. The environment includes ~1,200 lines across the filter runner, schema definitions, a SQL post-processing view layer, and sample data.",
+  "instruction_draft": "The audit filter pipeline at /app writes accepted transaction rows to /app/output/accepted.db. Fix it so every row that satisfies the validation rules in /app/schema/rules.sql is accepted and every row that violates them is rejected. The output table's running_balance column must equal the cumulative sum of amount for each account_id, ordered by transaction_ts.",
+  "requirements": [
+   "Every transaction row that satisfies all rules in /app/schema/rules.sql must appear in /app/output/accepted.db with no modifications to amount, account_id, transaction_id, or transaction_ts.",
+   "Every transaction row that violates at least one rule must be absent from /app/output/accepted.db.",
+   "The running_balance column in accepted.db must equal the exact cumulative sum of amount per account_id ordered by transaction_ts (no rounding, no off-by-one).",
+   "The pipeline must produce identical results when re-run on any conforming input database placed at /app/input/transactions.db."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, gcc, python3, and pre-compiles /usr/local/bin/auditfilter from a provided C source (source NOT left in image).",
+   "The compiled binary reads /app/input/transactions.db, applies an embedded validation pass, then calls back into a SQL view defined in /app/schema/rules.sql to do a secondary filter, and writes to /app/output/accepted.db.",
+   "Bug 1 (data-dependent, not visible by reading): The binary uses a signed 32-bit integer accumulator for running_balance. For accounts whose cumulative sum exceeds 2^31-1 (about $21M), the accumulator silently wraps, producing wrong running_balance values. This only manifests on accounts with large balances \u2014 the sample data stays safely under threshold, so the symptom only appears on hidden corpus inputs.",
+   "Bug 2 (interacting, misleading symptom): The SQL view in /app/schema/rules.sql has an off-by-one in its date-range boundary condition: it uses `transaction_ts < cutoff_date` instead of `transaction_ts <= cutoff_date`, causing valid rows at exactly the cutoff timestamp to be wrongly rejected. This looks like a timezone bug or data formatting issue when first observed, because the affected rows are always at midnight UTC.",
+   "Interaction: Fixing Bug 2 alone causes previously-excluded boundary rows (which can have large amounts) to be included \u2014 these rows are the ones that push the accumulator over the 32-bit overflow threshold, so Bug 1 only manifests after Bug 2 is fixed. An agent that fixes Bug 2, runs the sample test (which has no large-balance accounts), and stops will pass sample validation but fail the hidden corpus.",
+   "/app/pipeline.py: ~300-line Python orchestrator that invokes auditfilter, then runs SQL post-processing, and writes output.",
+   "/app/schema/rules.sql: ~150 lines of validation SQL with the boundary bug embedded in a multi-condition WHERE clause.",
+   "/app/schema/schema.sql: table definitions for input and output.",
+   "/app/lib/postprocess.py: ~200 lines of Python that calls the binary and handles the output pipeline.",
+   "/app/data/sample_transactions.db: 400-row sample database with no account whose cumulative sum exceeds 2^31-1 and no rows at exactly the cutoff timestamp.",
+   "/app/logs/last_run.log: Shows 'filter accepted N rows' with no error \u2014 misleading, because it counts pre-overflow.",
+   "/app/README.md: describes the pipeline at high level, mentions running_balance is 'computed by the filter binary'.",
+   "No C source in the image; binary is stripped. The agent must black-box probe the binary to discover the overflow, then fix it by modifying pipeline.py or postprocess.py to recompute running_balance in SQL/Python after the binary produces its output."
+  ],
+  "internal_hint": "Difficulty comes from two sources that are not visible by reading: (1) a compiled binary with no source that has an integer overflow bug only triggered by large cumulative balances, and (2) a SQL boundary condition bug that, when fixed, is the precise trigger for the overflow. The misleading symptom is that the log reports a plausible row count with no error, and the sample data never trips either bug independently. A skilled engineer must: (a) read rules.sql and find the < vs <= boundary bug, fix it; (b) notice that the binary's running_balance values are sometimes wildly wrong on corpus inputs with large totals, hypothesize overflow, instrument by feeding crafted large-balance inputs to the binary; (c) conclude the binary's accumulator is broken for large values; (d) patch pipeline.py or postprocess.py to recompute running_balance via a SQL window function (SUM(amount) OVER (PARTITION BY account_id ORDER BY transaction_ts)) after accepting the binary's row-selection decisions, bypassing the broken C accumulator.",
+  "trap": "An agent that fixes only the SQL boundary condition (< to <=) and re-runs against the sample data will see correct results and stop. The hidden corpus includes accounts with cumulative balances above 2^31-1, causing running_balance to overflow silently. An agent that discovers the overflow bug but not the boundary bug will also fail, because its recomputed running_balance will still exclude boundary-timestamp rows. Both bugs must be fixed together; fixing either alone passes the sample but fails the corpus.",
+  "tests": [
+   "Correctness on sample: run pipeline on sample_transactions.db, verify all non-boundary rows are accepted/rejected correctly per rules.sql, and running_balance matches window-function result.",
+   "Boundary inclusion: inject 50 rows at exactly the cutoff_date timestamp with valid data; verify all 50 appear in accepted.db.",
+   "Overflow correctness: inject an account with 500 transactions summing to $50,000,000 (safely above 2^31-1 in cents); verify running_balance at each step matches exact cumulative sum, never wrapping.",
+   "Rejection correctness: inject 30 rows violating each of the distinct rule conditions in rules.sql (amount <= 0, missing required fields, duplicate transaction_id per account in same second, etc.); verify none appear in accepted.db.",
+   "Combined: a corpus of 10 synthetic databases, each with ~800 rows, including boundary-timestamp rows and at least one high-balance account; running_balance and inclusion/exclusion must be exactly correct for every row in every database.",
+   "Idempotency: run pipeline twice on same input; output must be bit-identical.",
+   "No spurious rejections: every valid row in the corpus must appear exactly once in accepted.db."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "10 synthetic databases \u00d7 800 rows",
+   "effect": "Increasing corpus size and balance magnitudes increases the probability that the overflow manifests on more accounts; increasing coverage of boundary-condition edge cases (rows at cutoff_ts, rows 1 second before/after) makes it harder to guess the fix without understanding the exact predicate."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the SQL boundary bug, tests against sample (no overflow), declares done \u2014 fails corpus overflow tests.",
+   "Agent discovers the overflow in the binary but, not having fixed the boundary bug first, never sees boundary rows included, so does not notice the accumulator is being fed wrong inputs \u2014 recomputes running_balance correctly for non-boundary rows but still fails boundary tests.",
+   "Agent attempts to rewrite pipeline to recompute running_balance but uses Python float accumulation instead of a SQL window function, introducing floating-point rounding errors on large cent values.",
+   "Agent modifies rules.sql to fix the boundary but does not update postprocess.py to use window-function running_balance, still relying on the binary's broken output column.",
+   "Agent finds no C source, concludes the binary is correct, and spends time looking for the bug only in Python/SQL \u2014 misses the overflow entirely."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "integer-overflow",
+   "debugging",
+   "two-interacting-causes",
+   "system-administration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/README.md",
+   "cat /app/schema/rules.sql  # spot < vs <= boundary bug",
+   "cat /app/pipeline.py",
+   "cat /app/lib/postprocess.py",
+   "sed -i 's/transaction_ts < cutoff_date/transaction_ts <= cutoff_date/' /app/schema/rules.sql",
+   "python /app/pipeline.py  # run on sample data",
+   "sqlite3 /app/output/accepted.db 'SELECT count(*) FROM accepted'",
+   "# Note README says running_balance computed by binary; plan to verify",
+   "python3 -c \"import sqlite3; c=sqlite3.connect('/tmp/bigtest.db'); c.execute('CREATE TABLE transactions ...'); [c.execute('INSERT ...', (i, 1, 100000000, ...)) for i in range(500)]; c.commit()\"",
+   "cp /tmp/bigtest.db /app/input/transactions.db && python /app/pipeline.py",
+   "sqlite3 /app/output/accepted.db 'SELECT account_id, MAX(running_balance) FROM accepted GROUP BY account_id'  # detect wrap",
+   "# Confirm overflow: running_balance goes negative or resets",
+   "# Decide to recompute running_balance via SQL window function in postprocess.py",
+   "grep -n 'running_balance' /app/lib/postprocess.py",
+   "# Edit postprocess.py: after binary writes accepted rows, run UPDATE using SUM OVER window",
+   "nano /app/lib/postprocess.py  # add window function recomputation step",
+   "cp /app/data/sample_transactions.db /app/input/transactions.db && python /app/pipeline.py",
+   "sqlite3 /app/output/accepted.db 'SELECT running_balance, SUM(amount) OVER (PARTITION BY account_id ORDER BY transaction_ts) FROM accepted LIMIT 20'",
+   "cp /tmp/bigtest.db /app/input/transactions.db && python /app/pipeline.py",
+   "sqlite3 /app/output/accepted.db 'SELECT * FROM accepted ORDER BY account_id, transaction_ts'  # verify no overflow",
+   "python /app/pipeline.py  # idempotency second run",
+   "sqlite3 /app/output/accepted.db 'SELECT count(*) FROM accepted'  # confirm same count"
+  ],
+  "speedrun_commands": 21,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The C integer overflow relies on signed integer wraparound which is undefined behavior in C; aggressive compiler optimizations (e.g., -O2 with gcc) may eliminate or alter the overflow, making Bug 1 non-reproducible or manifesting differently than a clean wrap.",
+   "If the binary is stripped and statically linked but behaves unexpectedly on crafted inputs (segfault, assertion, early exit) rather than silently wrapping, the agent gets a misleading signal and the test expectation is wrong.",
+   "Ambiguity in the idempotency requirement: if pipeline.py does not clear /app/output/accepted.db before re-running, a second run may append rows or fail with UNIQUE constraint; the instruction does not specify whether the pipeline is expected to truncate output first.",
+   "The 'interaction' ordering (Bug 2 fix causes Bug 1 to surface) only holds if the hidden corpus specifically places large-balance rows at exactly the cutoff timestamp. If large-balance accounts have no boundary-timestamp rows, an agent can fix Bug 1 independently without ever fixing Bug 2 and still pass overflow tests.",
+   "Build complexity: the Dockerfile must compile the C binary in a way that reliably produces signed 32-bit integer overflow (not UB-optimized away), requiring specific compiler flags (-fwrapv or -m32 or similar); if not pinned correctly, the bug may not exist in the built image."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical build risk: C signed integer overflow is undefined behavior, and without explicit compiler flags (-fwrapv), gcc may optimize it away, making Bug 1 non-existent in the image and invalidating the central challenge. Bug 2 (< vs <=) is trivially visible by reading rules.sql, which by the rubric's own standard (bugs visible by reading score \u22642) limits genuine_difficulty. The speedrun reaches a complete solution in ~21 commands, and the blueprint itself reveals the fix strategy (recompute via SQL window function), further reducing difficulty.",
+  "fixes": [
+   "Use a well-defined overflow mechanism instead of C UB: store running_balance as a 32-bit INTEGER in the SQLite output table (SQLite enforces column affinity but not width, so instead use a compiled Python extension or a deliberate modulo operation) \u2014 or document the required compiler flag (-fwrapv) explicitly in the Dockerfile so the overflow is guaranteed.",
+   "Make Bug 2 non-obvious by embedding it deeper: instead of a simple < vs <= in a WHERE clause, hide it in a BETWEEN expression, a computed date arithmetic expression, or a CTE alias that requires understanding the full date normalization logic \u2014 so it is not findable by a single grep for '<'.",
+   "Strengthen the interaction by ensuring the hidden corpus places ALL large-balance accounts exclusively at boundary timestamps, so neither bug can be fixed independently without fixing both; add a test that explicitly checks this coupling.",
+   "Clarify idempotency: specify whether pipeline.py truncates output before writing, and include a schema migration or DROP/CREATE in the pipeline to make re-run behavior unambiguous.",
+   "Reduce file count or total line count so a skilled agent can read everything within the time budget; 1,200 lines across 4+ files plus binary probing is aggressive for under an hour at hard difficulty."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "variant",
+     "reason": "Both involve fixing a SQL pipeline that computes running/cumulative sums per partition, but the candidate adds a compiled C binary audit filter, schema-based validation rules, and accept/reject row filtering on top of the window function logic."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference is a Rust binary pipeline with fixed-point statistics and binary file formats; the candidate is a SQL audit filter in C with SQLite validation rules and row acceptance/rejection."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference involves reverse-engineering a black-box normalizer binary and fixing SQL rollup queries for sensor data; the candidate is about debugging a C audit filter that validates and filters transaction rows by schema rules."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The reference is a Python CSV chunking pipeline with duplicate/omission and header-handling bugs; the candidate is a compiled C binary SQLite audit filter with validation rules and running balance computation."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is a Node.js JSON schema validation service with a performance requirement; the candidate is a compiled C binary SQLite audit filter with business rule validation and cumulative sum correctness."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-31ca491030e9",
+     0.306
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.293
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.233
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.184
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.176
+    ]
+   ],
+   "cost_usd": 0.013770000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.06398100000000001
+}

@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "log-filter-daemon-dual-misconfiguration",
+  "title": "Production Log Filter Daemon: Dual Misconfiguration",
+  "scenario": "A backend developer is chasing a silent data-quality bug in a log-processing pipeline. The system reads structured JSON application logs from /var/log/app/, runs them through a configurable filter daemon (/opt/logfilter/), and forwards 'clean' events to a downstream sink at /var/spool/filtered/. In production, the team is seeing two symptoms: (1) some known-malicious events are reaching the sink, and (2) some legitimate high-volume events are being dropped entirely. The daemon has ~1,200 lines across several modules\u2014a config loader, a rule engine, a normalizer, and a dispatcher\u2014and the symptoms only reproduce when the daemon processes realistic log traffic, not the tiny smoke-test fixture.",
+  "instruction_draft": "The log filter daemon at /opt/logfilter/ is misbehaving in production. When run against the provided replay corpus at /var/log/app/replay/, it should:\n\n1. Pass every event whose `severity` is `INFO` or lower (DEBUG, TRACE) through to /var/spool/filtered/ unchanged, regardless of any other field.\n2. Reject every event where `severity` is ERROR or CRITICAL **and** the `source` field matches any pattern in /opt/logfilter/conf/blocklist.conf (one glob pattern per line).\n3. For events with severity WARNING: pass through only if the `request_id` field is present and non-empty; drop silently otherwise.\n4. Never drop or alter a field named `trace_id` in any event that reaches the sink.\n5. Produce one JSON object per line in the sink files (newline-delimited JSON, no trailing commas, no arrays).\n\nThe daemon is invoked as: `python3 /opt/logfilter/main.py --config /opt/logfilter/conf/daemon.conf --input /var/log/app/replay/ --output /var/spool/filtered/`\n\nAfter your fix, the verifier will run the daemon against a fresh hidden corpus of 2,000 events and check that every event is routed exactly according to the five rules above. The current code contains exactly two interacting configuration defects; fixing only one will cause the other's effect to surface on different event classes. Investigate by running the daemon on the replay corpus and observing which events are misrouted.",
+  "requirements": [
+   "INFO/DEBUG/TRACE events always reach the sink, never dropped",
+   "ERROR/CRITICAL events matching any blocklist.conf glob are rejected; non-matching ones pass through",
+   "WARNING events with a present, non-empty request_id pass through; others are silently dropped",
+   "Any event that reaches the sink retains its trace_id field unchanged if it was present",
+   "Sink output is newline-delimited JSON (one object per line, no wrapping array)",
+   "Daemon exits 0 and processes all input files in the replay/corpus directory"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install -y python3-fnmatch (already in stdlib) \u2014 no extra apt needed",
+   "pip install: no external deps beyond stdlib",
+   "/opt/logfilter/ directory tree (~1,200 lines across): main.py, config_loader.py, rule_engine.py, normalizer.py, dispatcher.py, utils.py",
+   "/opt/logfilter/conf/daemon.conf: INI-style config; contains the two planted misconfigs as described below",
+   "/opt/logfilter/conf/blocklist.conf: ~40 glob patterns for malicious sources (e.g. 'crawler.*', 'bot-*', 'scraper_*', etc.)",
+   "/var/log/app/replay/: 6 JSON-log files, ~300 events total, covering all severity levels and source patterns, but only ~50 events exercise the interacting code path that reveals both bugs simultaneously",
+   "/var/spool/filtered/: empty directory, writable",
+   "Bug 1 (config+data interaction, not visible by reading alone): daemon.conf sets severity_order = DEBUG,TRACE,INFO,WARNING,ERROR,CRITICAL but the rule_engine.py compares severities by list-index, and the config loader strips whitespace inconsistently\u2014when a severity token has a leading space (e.g. ' WARNING'), the index lookup silently returns -1 (not found), causing WARNING to be treated as lower-than-DEBUG, so WARNING events pass even without request_id. This only surfaces on the ~80-event subset of the corpus that has WARNING severity\u2014the smoke test has none.",
+   "Bug 2 (interacting with Bug 1): The normalizer.py applies a field-rename step driven by daemon.conf key field_aliases = trace_id:tid. This was meant to normalize an old field name on ingest, but the alias is applied bidirectionally\u2014when writing to the sink, it renames trace_id back to tid, silently dropping the trace_id key from output. Bug 1 must be fixed first (correcting severity parsing); once WARNING events are correctly filtered, a second test class that checks trace_id preservation becomes non-trivially testable. If only Bug 2 is fixed, Bug 1 causes WARNING events to leak through without request_id, failing a different test class.",
+   "Plausible but uninvolved code: dispatcher.py has retry logic, batching, and file-rotation code (~300 lines) that is correct and irrelevant; normalizer.py has ~200 lines of timestamp normalization that works fine; utils.py has logging helpers"
+  ],
+  "internal_hint": "Root cause 1 (observe_not_read): daemon.conf has severity_order with a leading space on ' WARNING' (and ' ERROR', ' CRITICAL'). The config_loader does `token.strip()` only when splitting on commas, but not after\u2014actually it strips the first token and last but skips interior tokens due to a slice bug: `parts = line.split(','); return [parts[0].strip()] + parts[1:-1] + [parts[-1].strip()]`. So interior severity tokens retain their leading spaces. rule_engine.py does `self.severity_levels.index(event_severity)` and catches ValueError by returning -1, treating unknown severities as lower than DEBUG. The fix is correcting the config_loader's strip logic to apply `.strip()` to every token. This only shows up when running on WARNING/ERROR/CRITICAL events in volume\u2014the smoke test has only INFO and DEBUG events. Root cause 2 (two_interacting_causes): normalizer.py reads field_aliases from daemon.conf and applies them in both directions (ingest rename AND output rename), renaming trace_id\u2192tid in the output. The fix is making the alias map unidirectional (ingest only). After fixing Bug 1, the WARNING events that now correctly require request_id expose a new test class checking trace_id preservation on those events, revealing Bug 2. A solver who fixes only Bug 2 will see the hidden tests for WARNING-without-request_id still fail. A solver who fixes only Bug 1 will see trace_id preservation tests fail.",
+  "trap": "A naive agent runs the daemon on the smoke-test replay corpus, sees INFO/DEBUG events pass correctly and a few ERROR events from obvious bot sources get blocked, declares it working, and submits. The hidden corpus has 400 WARNING events (200 with request_id, 200 without), 300 ERROR/CRITICAL events from non-blocklisted sources, and 500 events with trace_id fields. The WARNING routing is wrong (both pass when they shouldn't, or both drop), and trace_id fields are silently renamed to tid in all output. A solver who fixes only the severity parsing will still fail the trace_id tests. A solver who only fixes trace_id aliasing will still fail the WARNING routing tests.",
+  "tests": [
+   "Generate 200 WARNING events with request_id present: all must appear in sink output",
+   "Generate 200 WARNING events without request_id: none must appear in sink output",
+   "Generate 300 INFO/DEBUG/TRACE events: all must appear in sink output",
+   "Generate 150 ERROR events with source matching blocklist patterns: none must appear in sink",
+   "Generate 150 ERROR events with source NOT matching blocklist patterns: all must appear in sink",
+   "Generate 500 events with a trace_id field (mix of severities, all expected to pass): every event in sink must have trace_id key with original value (not renamed to tid or dropped)",
+   "Generate 50 CRITICAL events matching blocklist: all rejected; 50 CRITICAL not matching blocklist: all pass",
+   "Verify sink files contain valid newline-delimited JSON (parse each line independently, no array wrappers)",
+   "Verify daemon exits with code 0 when run on the hidden corpus directory"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "2000 events across 8 files",
+   "effect": "Increasing corpus size and adding more edge cases (e.g. mixed-case severity strings, empty source fields, events with both trace_id and tid, glob patterns with wildcards in blocklist) raises difficulty. Lowering to 200 events with only canonical cases makes it easier."
+  },
+  "expected_failure_modes": [
+   "Agent reads the source code, spots the field_alias issue in normalizer.py (visible by reading), fixes only that, and misses the config parsing bug which only shows on WARNING-volume traffic",
+   "Agent runs the daemon on the replay corpus, sees most output looks correct (INFO/DEBUG dominate), doesn't probe the WARNING subset specifically, and misses both bugs",
+   "Agent fixes the severity_order parsing bug but doesn't notice the bidirectional alias application because the smoke test has no events with both a trace_id field and a severity that passes the fixed filter",
+   "Agent fixes both bugs but introduces a new bug in the config_loader strip logic that breaks CRITICAL severity parsing, causing non-blocklisted CRITICAL events to be dropped",
+   "Agent patches normalizer.py to not rename trace_id on output but leaves the config-loader bug, so WARNING events are still misrouted; tests that check WARNING+trace_id together catch both failure modes at once but agent thinks only one fix was needed"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "log-processing",
+   "configuration",
+   "two-interacting-bugs",
+   "observe-not-read",
+   "filter-pipeline",
+   "json-logs"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/logfilter/conf/daemon.conf",
+   "cat /opt/logfilter/config_loader.py",
+   "cat /opt/logfilter/rule_engine.py",
+   "cat /opt/logfilter/normalizer.py",
+   "cat /opt/logfilter/main.py",
+   "cat /opt/logfilter/dispatcher.py",
+   "python3 /opt/logfilter/main.py --config /opt/logfilter/conf/daemon.conf --input /var/log/app/replay/ --output /var/spool/filtered/",
+   "ls /var/spool/filtered/",
+   "head -5 /var/spool/filtered/<output_file>",
+   "grep -n 'split\\|strip' /opt/logfilter/config_loader.py",
+   "grep -n 'alias' /opt/logfilter/normalizer.py",
+   "# Identify bug 1: parts[1:-1] not stripped in config_loader.py",
+   "# Identify bug 2: bidirectional alias rename in normalizer.py",
+   "sed -i 's/\\[parts\\[0\\]\\.strip()\\] + parts\\[1:-1\\] + \\[parts\\[-1\\]\\.strip()\\]/[p.strip() for p in parts]/' /opt/logfilter/config_loader.py",
+   "# Edit normalizer.py to remove output-direction alias application (use editor or sed)",
+   "python3 -c \"open('/opt/logfilter/normalizer.py').read()\" && nano /opt/logfilter/normalizer.py",
+   "rm /var/spool/filtered/*",
+   "python3 /opt/logfilter/main.py --config /opt/logfilter/conf/daemon.conf --input /var/log/app/replay/ --output /var/spool/filtered/",
+   "python3 -I -c \"import json,os; [json.loads(l) for fn in os.listdir('/var/spool/filtered/') for l in open('/var/spool/filtered/'+fn) if l.strip()]\"",
+   "echo $?"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Bug 1 is described as 'observe_not_read' but the slice defect in config_loader.py is fully visible by static code reading \u2014 a careful agent who reads all source files will find it without running any traffic, undermining the intended difficulty lever.",
+   "The replay corpus has only ~80 WARNING events but the task says symptoms 'only reproduce on realistic log traffic, not tiny smoke-test fixture' \u2014 if the replay corpus is large enough to show the bug, a careful agent running it once may spot misrouted events directly without needing to understand the root cause.",
+   "The fix for Bug 1 via sed or string replacement is fragile \u2014 the exact whitespace in daemon.conf must match what config_loader.py expects; if the builder uses slightly different quoting or escaping, the fix may not apply cleanly.",
+   "The verifier description says 'adversarial corpus' but the test cases are fully specified in the blueprint (exact counts: 200 WARNING with request_id, 200 without, etc.) \u2014 there is no adversarial element beyond the stated rules, making this a standard functional test.",
+   "The interaction between Bug 1 and Bug 2 described ('fixing Bug 1 reveals Bug 2') is slightly overstated \u2014 Bug 2 (bidirectional alias) affects ALL events reaching the sink regardless of severity, so it is independently testable even before Bug 1 is fixed, just on INFO/DEBUG events with trace_id fields.",
+   "If the smoke-test replay corpus includes any events with trace_id fields at INFO/DEBUG severity, Bug 2 is detectable even without fixing Bug 1, weakening the 'interacting bugs' claim."
+  ],
+  "verdict": "reject",
+  "reasons": "The task's central difficulty claim \u2014 that Bug 1 only surfaces on runtime data and cannot be found by reading \u2014 is false; the slice bug in config_loader.py (`parts[1:-1]` not stripped) is statically visible in ~10 lines of code, making this solvable in ~20 commands by a careful code reader. Additionally, Bug 2 (bidirectional alias) affects all severities reaching the sink, so it is independently discoverable on INFO/DEBUG events with trace_id before Bug 1 is fixed, breaking the claimed 'interacting causes' structure. The genuine_difficulty score of 2 disqualifies acceptance under the scoring rules (average cannot reach 3.6 with a 2 in one category when others are capped by this flaw).",
+  "fixes": [
+   "To make Bug 1 truly 'observe_not_read': instead of a visible slice bug in config_loader.py, embed the misconfiguration purely in daemon.conf (e.g., severity_order uses a Unicode non-breaking space character before WARNING that looks identical to a regular space in most editors), so the code is correct but the config data is subtly wrong \u2014 this cannot be found by reading code alone.",
+   "To strengthen the interacting-bugs structure: make Bug 2 conditional on severity level (e.g., the alias is only applied when the severity index exceeds a threshold set in daemon.conf), so Bug 2 literally cannot manifest until Bug 1's severity parsing is corrected \u2014 this enforces true sequencing.",
+   "Reduce the replay corpus WARNING event count to 0 (smoke test has only INFO/DEBUG/ERROR) so running the daemon on replay produces no evidence of Bug 1; only running against volume traffic (or the hidden corpus) reveals it.",
+   "Add a third 'distractor' config key in daemon.conf that looks suspicious but is actually correct, to slow agents who pattern-match on 'anything unusual in the config must be a bug'.",
+   "Specify that the verifier checks trace_id preservation ONLY on WARNING events that correctly passed (not INFO/DEBUG), so Bug 2 is undetectable until Bug 1 is fixed \u2014 this enforces strict sequencing and validates the 'two interacting causes' claim."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a log enrichment pipeline with GeoIP enrichment, a SQLite event store, and a Flask API endpoint, whereas the candidate task is about fixing configuration defects in a log filter daemon with rule-based routing logic."
+    },
+    {
+     "ref_id": "terminal-bench/session-window-debug",
+     "verdict": "distinct",
+     "reason": "That task involves debugging a session window processor for grouping timestamped events by inactivity gaps, whereas the candidate is about fixing configuration defects in a log filter daemon that routes events based on severity and blocklist rules."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a rule-based filter/firewall that has configuration defects causing both false positives and false negatives, with the fix requiring correcting interacting bugs across multiple modules; the WAF task and log-filter-daemon task share essentially the same core debugging structure and problem type."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a bash validator script to produce byte-identical output matching a reference binary for SQL filter specs, whereas the candidate is about fixing configuration defects in a Python log filter daemon."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a CSV chunking and transformation pipeline with issues around row counts, deduplication, and header handling, whereas the candidate is about fixing configuration defects in a log filter daemon with severity-based routing rules."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.191
+    ],
+    [
+     "terminal-bench/session-window-debug",
+     0.148
+    ],
+    [
+     "ours/official-10912a593843",
+     0.134
+    ],
+    [
+     "ours/official-18899524e171",
+     0.117
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.075
+    ]
+   ],
+   "cost_usd": 0.015512999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.060306
+}

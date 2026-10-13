@@ -1,0 +1,65 @@
+{
+ "slug": "log-rate-limiter-silent-overflow",
+ "title": "Log Rate-Limiter Silent Overflow",
+ "scenario": "A backend developer is chasing a production bug where a Prometheus-scrape-based alerting pipeline is silently missing critical events. The system has three components: a log ingestion daemon (~400 lines Python) that tails application logs, a rate-limiter/deduplication middleware (~350 lines Python) that is supposed to pass through one event per unique (service, level, fingerprint) tuple per rolling window, and a metrics exporter (~250 lines Python) that aggregates counts and writes a Prometheus-format text file scraped by an external alerting system. The rate-limiter uses a compiled C extension (shared library, no source) for the sliding-window eviction logic. About 1000 lines of plausible supporting code (config loader, schema validator, CLI, health endpoint) provide realistic noise.",
+ "instruction_draft": "```\n$ python /opt/pipeline/run.py --config /etc/pipeline/config.yaml\n[2026-10-13 03:14:22] INFO  ingestion: started tail on /var/log/app/*.log\n[2026-10-13 03:14:22] INFO  ratelimit: window=60s, capacity=500\n[2026-10-13 03:14:23] WARN  ratelimit: eviction_ext loaded from /opt/pipeline/lib/eviction.so\n[2026-10-13 03:14:51] WARN  metrics: exported 0 CRITICAL events in last scrape window\n[2026-10-13 03:14:51] WARN  metrics: exported 0 ERROR events in last scrape window\n...\n[2026-10-13 04:00:00] INFO  pipeline: 1 hour elapsed, 0 critical/error events exported\n```\n\nThe alerting team reports that CRITICAL and ERROR log lines are being produced by the application but are not appearing in the Prometheus metrics file at `/var/metrics/pipeline.prom`, so all CRITICAL/ERROR alerts are suppressed. INFO events do appear correctly.\n\nYour job: find and fix every defect in the pipeline so that the Prometheus metrics file correctly counts and exports events at all severity levels. The pipeline must:\n1. Pass every unique (service, level, fingerprint) event through to the metrics exporter exactly once per 60-second window, regardless of severity level.\n2. Correctly count events per (service, level) pair in `/var/metrics/pipeline.prom` using the label format `pipeline_events_total{service=\"<name>\",level=\"<LEVEL>\"}` with no label reordering or whitespace variation.\n3. Reject duplicate events (same fingerprint within the rolling window) for any severity level.\n4. Never emit a count for a (service, level) pair that received zero events in the current scrape window.\n5. Write the metrics file atomically (write to a temp file then rename) so the scraper never reads a partial file.\n\nThe application log files are at `/var/log/app/`. The pipeline config is at `/etc/pipeline/config.yaml`. Verify your fix by running `/opt/verify/smoke_test.sh`, which replays a log corpus and checks the metrics output.",
+ "requirements": [
+  "Every unique (service, level, fingerprint) event passes through to the metrics exporter exactly once per 60-second rolling window",
+  "CRITICAL and ERROR events appear in /var/metrics/pipeline.prom with correct counts",
+  "INFO events continue to appear correctly",
+  "Prometheus label format is exactly pipeline_events_total{service=\"<name>\",level=\"<LEVEL>\"} with no variation",
+  "Duplicate events (same fingerprint within the rolling window) are rejected for all severity levels",
+  "Zero-count (service, level) pairs are never emitted",
+  "Metrics file is written atomically via temp-file rename",
+  "The smoke test at /opt/verify/smoke_test.sh passes"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs gcc, make, libpython3-dev; pip installs prometheus-client==0.20.0, watchdog==4.0.0, pyyaml==6.0.1",
+  "A compiled C shared library /opt/pipeline/lib/eviction.so (no source) that implements sliding-window eviction; it has two intentional bugs: (1) the eviction function uses an unsigned integer for the level bitmask that silently overflows when level='CRITICAL' (numeric value 4) is shifted, causing CRITICAL and ERROR events to always appear as 'already seen' and be dropped; this only manifests at runtime with actual level strings, not by reading Python code",
+  "/opt/pipeline/ingest.py (~400 lines): tails log files, parses lines into (timestamp, service, level, message, fingerprint) tuples, calls the rate-limiter; contains a second bug: the fingerprint computation XORs the message hash with a level-derived salt, but for ERROR and CRITICAL it reuses the same salt value (0) due to a dictionary lookup that silently returns 0 for missing keys, meaning all CRITICAL/ERROR events share fingerprints with each other and with INFO events that have message hash 0 \u2014 this interacts with the eviction.so bug: fixing only eviction.so still drops CRITICAL/ERROR because their fingerprints collide; fixing only the fingerprint still fails because eviction.so drops them",
+  "/opt/pipeline/ratelimit.py (~350 lines): Python wrapper around eviction.so; the ctypes call passes level as a string that eviction.so encodes to a numeric bitmask internally",
+  "/opt/pipeline/metrics.py (~250 lines): aggregates counts, formats Prometheus text, writes atomically \u2014 this file is correct",
+  "/opt/pipeline/config.py, cli.py, health.py, schema.py (~350 lines total): plausible supporting code, no bugs",
+  "/etc/pipeline/config.yaml: sets window=60, capacity=500, log_paths, metrics_path=/var/metrics/pipeline.prom",
+  "/var/log/app/: contains rotating application log files in format: '2026-10-13T03:14:22Z service=authsvc level=INFO msg=...' \u2014 pre-seeded with a mix of INFO, ERROR, CRITICAL lines across multiple services",
+  "/opt/verify/smoke_test.sh: replays a deterministic 200-line log corpus through the full pipeline (using --replay mode) and asserts correct counts appear in pipeline.prom; checks all five requirements above; the corpus includes CRITICAL and ERROR events for three services and INFO for two, including duplicate fingerprints that must be deduplicated",
+  "The verifier generates a hidden corpus of 50 test cases at verify time covering: single-event windows, burst deduplication across all three severity levels, service names with hyphens and underscores, fingerprint collisions across services (allowed) vs within-service same-window (must deduplicate), empty windows (no output), and atomic write verification via concurrent reader"
+ ],
+ "internal_hint": "Two interacting bugs: (1) eviction.so has an unsigned integer bitmask overflow for the 'CRITICAL' level code (value 4, shifted left 4 becomes 64 which wraps in an 8-bit field to the same value as 'INFO'), causing CRITICAL and ERROR to always be classified as already-seen/duplicate and dropped. This is only discoverable by running the pipeline on real data with level=CRITICAL and observing the drop \u2014 strace, ltrace, or ctypes instrumentation reveals the eviction call returns 1 (duplicate) for every CRITICAL/ERROR event. (2) In ingest.py, the fingerprint salt dictionary has keys 'DEBUG', 'INFO', 'WARNING' but not 'ERROR' or 'CRITICAL', so dict.get() returns 0 (default) for those levels, making all ERROR/CRITICAL fingerprints collide with zero-hash INFO messages. Fixing only (1) still causes CRITICAL/ERROR to appear as duplicates of each other via fingerprint collision. Fixing only (2) still drops CRITICAL/ERROR because eviction.so marks them all as seen. The solver must: run the pipeline on live data and observe zero CRITICAL/ERROR output, instrument the ctypes boundary to see eviction.so returning 1 for all CRITICAL events, read ingest.py to find the salt lookup bug, patch the salt dict, patch the ctypes call to pass a corrected level code (or add a wrapper that remaps CRITICAL->a non-overflowing value), and verify both fixes together.",
+ "trap": "A naive agent reads metrics.py and ratelimit.py, finds no bug, then reads ingest.py and spots the salt dictionary and adds CRITICAL/ERROR keys \u2014 but the pipeline still fails the hidden tests because eviction.so still drops CRITICAL/ERROR via bitmask overflow. The salt fix alone makes CRITICAL/ERROR fingerprints unique, but they still never appear in metrics because eviction.so sees them as duplicates. The agent sees smoke_test.sh fail, assumes the salt fix is incomplete, and may revert it or spiral. Only by instrumenting the ctypes call boundary (printing the return value from eviction.so per event) does the agent discover the second, non-readable bug in the compiled extension.",
+ "tests": [
+  "smoke_test.sh replays 200-line deterministic corpus: asserts CRITICAL count for authsvc=3, ERROR count for paymentsvc=2, INFO count for authsvc=5 in pipeline.prom",
+  "Hidden corpus test: single CRITICAL event for a service that has no prior events \u2014 must appear in output as count=1",
+  "Hidden corpus test: two identical CRITICAL events within the same window (same fingerprint) \u2014 must appear as count=1, not 2",
+  "Hidden corpus test: CRITICAL and INFO events with different messages but same service \u2014 must both appear with correct counts",
+  "Hidden corpus test: 10 ERROR events for the same service in one window, all unique fingerprints \u2014 must appear as count=10",
+  "Hidden corpus test: service name 'data-pipeline-v2' with CRITICAL events \u2014 label format must be exact",
+  "Hidden corpus test: empty window (no events) \u2014 no metric line for that service/level pair",
+  "Hidden corpus test: concurrent reader during metric write \u2014 reader must never see partial file (atomic write verification)",
+  "Hidden corpus test: fingerprint that collides across two different services (same hash value) \u2014 each service must independently track its own window, so both events pass",
+  "Hidden corpus test: mixed burst of 20 events across all 3 levels for 3 services in one window \u2014 all 9 (service, level) pairs must have correct counts in output"
+ ],
+ "verifier_knob": {
+  "name": "corpus_size",
+  "value": "50 test cases",
+  "effect": "Increasing corpus size and adding more edge cases (service names with dots, fingerprint=0, window boundary timing) raises difficulty; decreasing to 20 cases with only basic severity coverage lowers it"
+ },
+ "expected_failure_modes": [
+  "Agent fixes the salt dictionary bug in ingest.py, runs smoke_test.sh and still sees CRITICAL/ERROR missing, concludes the fix is wrong and reverts it, never discovering the eviction.so bug",
+  "Agent discovers eviction.so is the problem, writes a Python-side workaround that remaps CRITICAL to a different numeric code, but chooses a code that also overflows (e.g., 8 -> also collides in 8-bit), so hidden tests for ERROR still fail",
+  "Agent fixes both bugs but breaks the atomic write guarantee by changing metrics.py to write directly to the target path during debugging and forgetting to restore the temp-file rename pattern",
+  "Agent correctly patches the salt dict and the ctypes level mapping, passes smoke_test.sh, but the hidden tests reveal the fingerprint collision across services is incorrectly deduplicating events for different services that happen to produce the same hash",
+  "Agent identifies the eviction.so bitmask problem via ltrace/strace but misreads the level encoding table and maps CRITICAL to a code that works for CRITICAL but inadvertently breaks WARNING-level deduplication, causing hidden corpus tests for WARNING to fail"
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "devops",
+ "tags": [
+  "log-processing",
+  "compiled-extension",
+  "two-interacting-bugs",
+  "observe-not-read",
+  "prometheus",
+  "configuration"
+ ]
+}

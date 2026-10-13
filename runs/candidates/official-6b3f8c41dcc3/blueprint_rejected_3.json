@@ -1,0 +1,158 @@
+{
+ "blueprint": {
+  "slug": "chacha-keystream-recovery-pipeline",
+  "title": "ChaCha20 Keystream Recovery Pipeline",
+  "scenario": "A small in-house scientific data pipeline at a genomics lab uses a custom Python library (`libscienc`) to encrypt intermediate results with ChaCha20 before writing them to disk. After a recent 'performance refactor', the nightly build is failing: encrypted blobs written by the new code can no longer be decrypted by the reference reader. The release engineer has a terminal dump showing a MAC verification failure, but the obvious symptom (the MAC) is a red herring \u2014 the real defect is upstream in how the keystream counter is initialized. The codebase spans ~1,200 lines across six modules, including plausible-but-uninvolved compression and serialization code.",
+  "instruction_draft": "```\n$ python -m scienc.pipeline --run nightly\n[INFO] Stage 1: compress ... OK\n[INFO] Stage 2: encrypt  ... OK\n[INFO] Stage 3: transmit ... OK\n[ERROR] Stage 4: verify  ... MAC mismatch on record 0 (expected a0f3..., got 7c21...)\nTraceback (most recent call last):\n  File \"/app/scienc/pipeline.py\", line 84, in verify_stage\n    assert hmac.compare_digest(expected_mac, actual_mac)\nAssertionError\n```\n\nThe nightly pipeline at `/app` is broken. Encrypted records produced by `scienc.pipeline` can no longer be validated by the reference reader at `/app/tools/ref_reader.py`.\n\nYour job: repair the pipeline so that `ref_reader.py` successfully decrypts and MAC-verifies **every** record it is handed. The reference reader is read-only and must not be modified.\n\nAcceptance threshold: the verifier will generate 200 fresh plaintext records of varying length (16\u20134096 bytes), pipe them through the fixed pipeline, and hand the resulting blobs to `ref_reader.py`. **All 200 records must decrypt correctly** (zero MAC failures, zero decryption errors). Records that decompress to the wrong plaintext also count as failures. A pass requires 200/200.",
+  "requirements": [
+   "All 200 verifier-generated records (16\u20134096 bytes) must decrypt and MAC-verify correctly when processed by the fixed pipeline and read by the unmodified ref_reader.py.",
+   "Zero MAC failures across all 200 records.",
+   "Zero decryption errors (plaintext must round-trip exactly) across all 200 records.",
+   "ref_reader.py must not be modified.",
+   "The pipeline must handle records of any byte length from 16 to 4096 bytes."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; pip install pycryptodome==3.20.0 zstandard==0.22.0",
+   "/app/scienc/__init__.py \u2014 package init, ~20 lines",
+   "/app/scienc/pipeline.py \u2014 orchestrates compress\u2192encrypt\u2192MAC stages, ~220 lines; calls encrypt.py and mac.py",
+   "/app/scienc/encrypt.py \u2014 ChaCha20 encryption; THE DEFECT: after the refactor the counter initialization uses `counter = block_index` where block_index is the sequential blob index (0,1,2,...) rather than the ChaCha20 spec's initial counter of 0 (or the per-record nonce-derived value). The reference reader always starts the counter at 0 for each record. This means record 0 decrypts fine (counter=0 coincides), record 1 fails (counter=1 vs 0), and so on \u2014 discoverable only by running the pipeline on multiple records.",
+   "/app/scienc/mac.py \u2014 HMAC-SHA256 over (nonce \u2016 ciphertext), correct implementation, ~60 lines; the MAC failure is a symptom of the wrong ciphertext, not a MAC bug",
+   "/app/scienc/compress.py \u2014 zstandard compression wrapper, correct, ~80 lines",
+   "/app/scienc/serialise.py \u2014 record framing (length-prefix + nonce + ciphertext + mac), correct, ~90 lines",
+   "/app/scienc/util.py \u2014 key loading from /app/config/pipeline.key, correct, ~40 lines",
+   "/app/config/pipeline.key \u2014 32-byte random key written at image build time (deterministic seed so verifier can reproduce)",
+   "/app/tools/ref_reader.py \u2014 REFERENCE READER, read-only; decrypts with ChaCha20 counter=0 per record, verifies HMAC; ~120 lines",
+   "/app/tests/sample_records/ \u2014 5 sample plaintext files; running pipeline on them shows record 0 passes, records 1-4 all fail MAC \u2014 this is the observable clue that the problem is per-record counter, not the MAC itself",
+   "/app/scienc/stats.py \u2014 plausible but uninvolved: computes checksum statistics for audit, ~150 lines",
+   "/app/scienc/compress_util.py \u2014 plausible but uninvolved: zstd level tuning, ~80 lines",
+   "Total codebase ~940 lines across 9 files; defect is in encrypt.py, ~3 lines changed in the 'refactor'"
+  ],
+  "internal_hint": "DIFFICULTY SOURCE: Not visible by reading alone \u2014 the bug only manifests on record indices > 0. Reading encrypt.py shows `counter = block_index` which looks like it could be intentional (streaming counter across a session). Only running the pipeline on 2+ records reveals that record 0 passes and record 1+ fails, exposing that `block_index` is the pipeline's blob counter, not the ChaCha20 internal block counter. MISLEADING SYMPTOM: the error is 'MAC mismatch', which points at mac.py; inspecting mac.py finds it correct, wasting time. HIDDEN INVARIANT: the ref_reader.py always initializes ChaCha20 with counter=0 per record (per RFC 8439 \u00a72.4 which uses nonce for uniqueness, not counter); the fix is to change `counter = block_index` to `counter = 0` in encrypt.py, and ensure nonces are per-record unique (they already are via os.urandom, seeded deterministically at build time in the pipeline). ROOT CAUSE: in the refactor, the developer confused the ChaCha20 internal block counter (should be 0 at start of each message) with a session-level record index, storing it in `counter = self._record_idx` which is incremented per encrypt() call.",
+  "trap": "A solver who sees 'MAC mismatch' and reads mac.py finds it correct and may then patch the MAC comparison (e.g., recomputing over different fields) \u2014 this makes record 0 pass but all others still fail. A solver who only tests record 0 (because it coincidentally passes with counter=0=block_index=0) declares victory. The verifier generates 200 records starting from various pipeline states, so counter values 0\u2013199 are exercised; only the fix (always counter=0 per record) yields 200/200. A solver who randomizes the counter per record still fails because ref_reader expects counter=0.",
+  "tests": [
+   "Verifier generates 200 plaintext blobs with lengths drawn from [16, 32, 64, 128, 256, 512, 1024, 4096] bytes using deterministic seed; feeds them through the fixed pipeline; passes each output blob to ref_reader.py --verify; counts failures. Threshold: 0 failures (200/200 pass).",
+   "Verifier calls the pipeline starting at record index 0 through 199 in a single pipeline run, ensuring the counter bug at indices 1\u2013199 is exercised.",
+   "Verifier checks ref_reader.py has not been modified (sha256 of ref_reader.py matches the planted hash).",
+   "Verifier decrypts each blob and byte-compares plaintext to original; any mismatch counts as a failure even if MAC is accepted.",
+   "Verifier checks at least one record of length exactly 4096 bytes (multi-block ChaCha20) passes, catching solvers who only fix single-block-length cases."
+  ],
+  "verifier_knob": {
+   "name": "pass_threshold",
+   "value": "200/200",
+   "effect": "Lowering to 190/200 makes it easier (a solver who partially fixes the counter bug, e.g., counter = block_index % 2, might pass more records); raising above 200 is impossible; the current 200/200 means any systematic counter error fails completely since every record > 0 fails."
+  },
+  "expected_failure_modes": [
+   "Agent reads the MAC mismatch error, audits mac.py, finds it correct, then patches the error handling or MAC comparison rather than the keystream \u2014 still fails records 1+.",
+   "Agent tests only the sample records at indices 0-4 but only checks record 0 output (which passes trivially), declares fix complete without running the full suite.",
+   "Agent correctly identifies encrypt.py as the problem, but changes counter to a random value per record instead of 0, breaking compatibility with ref_reader's fixed counter=0.",
+   "Agent modifies ref_reader.py (forbidden) to accept the buggy counter scheme instead of fixing the pipeline.",
+   "Agent finds the counter bug but also 'fixes' the nonce generation (unnecessarily changing it to deterministic), breaking uniqueness guarantees for longer record sequences."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "chacha20",
+   "reverse-engineering",
+   "error-recovery",
+   "scientific-computing",
+   "systems-programming",
+   "python"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls /app/scienc/",
+   "cat /app/scienc/encrypt.py",
+   "cat /app/tools/ref_reader.py",
+   "python -m scienc.pipeline --run nightly",
+   "# Observe record 0 passes, records 1-4 fail; see counter=block_index in encrypt.py vs counter=0 in ref_reader",
+   "sed -i 's/counter = self._record_idx/counter = 0/' /app/scienc/encrypt.py",
+   "python -m scienc.pipeline --run nightly",
+   "# All 5 sample records pass; submit"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The deterministic seed for pipeline.key and nonce generation must be carefully implemented so the verifier can reproduce the exact key used during pipeline encryption; if the seed is not truly deterministic or leaks entropy, verifier blobs may be undecryptable even with the correct fix.",
+   "The instruction says 'plausible-but-uninvolved' files add ~1200 lines but the environment spec totals ~940 lines \u2014 minor inconsistency that could confuse blueprint builders.",
+   "If the verifier starts a fresh pipeline instance for each of the 200 records (resetting _record_idx to 0 each time), then the unfixed pipeline would actually pass all 200 records (counter=0 every time), making the test meaningless. The spec must ensure all 200 records run in a single pipeline session so _record_idx increments 0..199.",
+   "The 5 sample records in /app/tests/sample_records/ make the bug immediately observable (record 0 passes, 1-4 fail), which effectively exposes the root cause within 2 commands \u2014 undermining the intended difficulty.",
+   "A solver who reads encrypt.py first (a natural first step) sees 'counter = block_index' directly and can fix it without ever running the pipeline, making the misleading MAC symptom irrelevant as a difficulty lever."
+  ],
+  "verdict": "reject",
+  "reasons": "The bug is directly readable in encrypt.py source code ('counter = block_index') and the fix is a single-line change, making this solvable in ~8 commands \u2014 well below the 20-command threshold for genuine_difficulty \u2265 3. The task's own description contradicts its claimed difficulty source by stating the bug is visible by reading the source. The misleading MAC symptom is ineffective because a systematic agent reads all relevant files before acting, and the sample records immediately expose the multi-record failure pattern.",
+  "fixes": [
+   "Make the bug non-obvious from source reading: instead of a clearly-named 'counter = block_index', use an opaque computation like 'counter = self._ctx.session_offset >> 6' where session_offset is populated through a chain of method calls \u2014 forcing the agent to trace execution rather than grep for the defect.",
+   "Remove the 5 sample records or make them all single-record runs so the per-record counter failure is not immediately observable; instead require the agent to construct their own multi-record test to discover the bug.",
+   "Add a second real defect (e.g., in serialise.py: the nonce is written but not read back in correct byte order) that must also be fixed, making a single-line patch insufficient and requiring the agent to validate end-to-end with the verifier's full 200-record suite.",
+   "Obfuscate the relationship between block_index and the ChaCha20 counter by introducing it through a config object or inheritance chain so it cannot be found by simple grep/read of encrypt.py alone."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve debugging a broken encryption pipeline after a refactor where the real bug is in cipher initialization (counter vs nonce derivation), with plausible red-herring symptoms and a reference implementation that must not be modified."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "This task is about fixed-point arithmetic correctness in a Rust sensor-aggregation pipeline, not cryptographic cipher repair."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "This task is about CSV chunking and row deduplication bugs in a data pipeline, unrelated to cryptography."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "distinct",
+     "reason": "This task is about spectral entropy computation regressions in an RNG auditing pipeline, unrelated to encryption or cipher bugs."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "distinct",
+     "reason": "This task is about incorrect SQL aggregations in an ETL pipeline, unrelated to cryptography or cipher initialization."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-71317ce41ff0",
+     0.186
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.157
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.141
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.097
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.096
+    ]
+   ],
+   "cost_usd": 0.014397
+  },
+  "novel": false
+ },
+ "cost_usd": 0.043674
+}

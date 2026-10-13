@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "capacity-forecast-binary-validator",
+  "title": "Server Capacity Forecast Reconciliation",
+  "scenario": "An infrastructure analyst noticed that server capacity forecasts for the next quarter consistently undercount peak load by 12-18%, causing under-provisioning alerts. The forecasting system consists of a compiled binary `/opt/forecast/fcstbin` (no source available) that reads historical utilization samples from a SQLite database and writes normalized daily metric summaries into the `daily_rollups` table, plus a Python forecasting layer that runs SQL window functions over those rollups to project forward. The analyst has raw per-minute samples in `raw_samples` and suspects the rollup values are wrong, but the binary's own validation report claims zero errors.",
+  "instruction_draft": "The daily capacity forecasts in `/opt/forecast/forecast.db` undercount peak load. Fix the pipeline so that each row in `daily_rollups` correctly reflects the actual peak and mean utilization for that host and day from `raw_samples`, and so that the SQL forecast query in `/opt/forecast/forecast.sql` computes a 30-day rolling peak that excludes maintenance windows recorded in the `maintenance_windows` table.",
+  "requirements": [
+   "Each row in `daily_rollups` must have `peak_util` equal to the true maximum `util_pct` across all `raw_samples` rows for that `(host_id, date)` pair.",
+   "Each row in `daily_rollups` must have `mean_util` equal to the arithmetic mean of `util_pct` for that `(host_id, date)` pair, rounded to 4 decimal places.",
+   "The forecast query must compute a 30-day rolling peak per host that excludes any sample whose timestamp falls within an interval in `maintenance_windows` for that host.",
+   "Re-running the full pipeline must produce the same `daily_rollups` contents (idempotent).",
+   "No `daily_rollups` row may exist for a `(host_id, date)` that has no corresponding `raw_samples` rows."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3 CLI, gcc, python3-dev.",
+   "Compiled binary `/opt/forecast/fcstbin` built from C source (source NOT included in image) that reads `raw_samples` and upserts into `daily_rollups`; it has two bugs: (1) it computes peak as MAX(util_pct) WHERE util_pct < 100.0, silently dropping legitimate 100% saturation samples; (2) it uses integer division when computing mean_util (casting sum to int before dividing), truncating the decimal. The binary prints 'Validation OK: 0 anomalies detected' regardless.",
+   "SQLite database `/opt/forecast/forecast.db` with schema: `raw_samples(id INTEGER PRIMARY KEY, host_id TEXT, ts INTEGER, util_pct REAL, is_maintenance INTEGER DEFAULT 0)`, `daily_rollups(host_id TEXT, date TEXT, peak_util REAL, mean_util REAL, PRIMARY KEY(host_id,date))`, `maintenance_windows(host_id TEXT, win_start INTEGER, win_end INTEGER)`.",
+   "Database pre-seeded with ~15,000 raw_samples rows across 8 hosts and 60 days; ~5% of samples have util_pct=100.0; maintenance_windows has 12 intervals; is_maintenance column in raw_samples is pre-set correctly for maintenance-window rows.",
+   "Script `/opt/forecast/run_pipeline.sh` that invokes the binary then runs `forecast.sql` via sqlite3 and writes results to `/opt/forecast/forecast_output.csv`.",
+   "File `/opt/forecast/forecast.sql` with a 30-day rolling-peak query that uses `WHERE is_maintenance = 0` instead of a JOIN/anti-join against `maintenance_windows` \u2014 this is wrong because `is_maintenance` in `raw_samples` is only set for samples already in the DB at load time, but new samples inserted after initial load won't have it set correctly (verifier inserts fresh samples at test time).",
+   "A Python helper `/opt/forecast/validate.py` that runs the binary's self-check and reports 'OK', giving a misleading green signal.",
+   "About 600 lines of plausible but uninvolved Python code for trend analysis, alert thresholds, and report generation in `/opt/forecast/lib/`.",
+   "The binary is a stripped ELF with no debug symbols; running `strings` on it reveals the query fragments including `< 100.0` and the integer cast."
+  ],
+  "internal_hint": "Two interacting causes: (1) The compiled binary drops util_pct=100.0 samples from peak computation (bug visible only by comparing binary output against ground-truth SQL queries on real data), and (2) the forecast SQL excludes maintenance windows via `is_maintenance=0` on raw_samples rather than a join against maintenance_windows \u2014 this is wrong for freshly inserted samples. Fixing only bug 1 (by replacing fcstbin calls with correct SQL) still fails hidden tests because fresh-inserted samples lack is_maintenance flags. Fixing only bug 2 leaves peak undercounted. The binary's 'Validation OK' output and validate.py's green signal point the solver at the Python layer first (misleading symptom). The solver must: run the binary, compare its daily_rollups output against manual SQL aggregation to discover the dropped-100 bug; realize the binary cannot be fixed (no source) and replace it with SQL INSERT/REPLACE statements; then notice that forecast.sql's maintenance exclusion is wrong by testing with a freshly inserted maintenance-window sample and seeing it still appears in output because is_maintenance=0 was never set for it.",
+  "trap": "A solver who replaces the binary call with a straightforward `SELECT host_id, date(ts,'unixepoch') as date, MAX(util_pct), AVG(util_pct) FROM raw_samples GROUP BY host_id, date` will pass all visible sample checks but fail hidden tests: the verifier inserts new raw_samples rows (including maintenance-window rows) without setting is_maintenance, so the forecast.sql still includes those rows. The solver must replace the maintenance exclusion with a proper anti-join: `WHERE NOT EXISTS (SELECT 1 FROM maintenance_windows mw WHERE raw_samples.host_id=mw.host_id AND raw_samples.ts BETWEEN mw.win_start AND mw.win_end)`.",
+  "tests": [
+   "Verifier inserts 500 fresh raw_samples rows for 3 hosts including rows with util_pct=100.0 and rows whose ts falls in maintenance_windows intervals (without setting is_maintenance); runs run_pipeline.sh; checks daily_rollups peak_util matches MAX(util_pct) from raw_samples including 100.0 values.",
+   "Verifier checks mean_util in daily_rollups equals ROUND(AVG(util_pct),4) for each (host_id,date) group \u2014 integer-truncated values fail this.",
+   "Verifier runs run_pipeline.sh twice and diffs daily_rollups \u2014 checks idempotency.",
+   "Verifier queries forecast_output.csv for a host on a day that has maintenance-window samples inserted post-load and verifies those samples are excluded from the rolling peak (requires join-based exclusion, not is_maintenance flag).",
+   "Verifier inserts a (host_id,date) pair where ALL samples have util_pct=100.0 and checks that daily_rollups has peak_util=100.0 for that pair.",
+   "Verifier checks no daily_rollups row exists for a host_id and date that has zero raw_samples rows.",
+   "Verifier checks that forecast_output.csv rolling peaks for maintenance-heavy days are strictly lower than days without maintenance, given inserted data designed to trigger this."
+  ],
+  "verifier_knob": {
+   "name": "fresh_sample_count",
+   "value": "500 rows across 3 hosts with 20 maintenance-window insertions",
+   "effect": "Increasing coverage adds more hosts, more util_pct=100.0 samples, and more post-load maintenance insertions, exposing partial fixes more reliably; decreasing it makes it easier to pass by luck."
+  },
+  "expected_failure_modes": [
+   "Agent trusts validate.py and binary's 'Validation OK' output, spends time debugging forecast.sql window functions while missing the binary's dropped-100 and integer-division bugs.",
+   "Agent replaces binary with correct SQL for peak/mean but copies the is_maintenance=0 filter verbatim from forecast.sql, failing maintenance-exclusion tests on fresh inserts.",
+   "Agent fixes forecast.sql maintenance exclusion to use JOIN but forgets to apply the same join logic inside the daily_rollups rebuild step.",
+   "Agent fixes peak computation but uses ROUND(AVG(...),2) instead of ROUND(AVG(...),4), failing precision checks.",
+   "Agent makes pipeline non-idempotent by appending rather than upserting into daily_rollups."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-pipeline",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "debugging",
+   "data-processing",
+   "system-administration",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/forecast/run_pipeline.sh",
+   "cat /opt/forecast/forecast.sql",
+   "cat /opt/forecast/validate.py",
+   "strings /opt/forecast/fcstbin | grep -E 'util_pct|100|AVG|MAX|CAST|INT'",
+   "sqlite3 /opt/forecast/forecast.db \"SELECT host_id, date(ts,'unixepoch') d, MAX(util_pct), ROUND(AVG(util_pct),4) FROM raw_samples GROUP BY host_id,d LIMIT 10\"",
+   "sqlite3 /opt/forecast/forecast.db \"SELECT * FROM daily_rollups LIMIT 10\"",
+   "# Observe mismatch: peak_util missing 100.0 values, mean_util truncated \u2014 confirms binary bugs from strings output (< 100.0 filter, integer cast)",
+   "sqlite3 /opt/forecast/forecast.db \"SELECT COUNT(*) FROM raw_samples WHERE util_pct=100.0\"",
+   "sqlite3 /opt/forecast/forecast.db \".schema maintenance_windows\" && sqlite3 /opt/forecast/forecast.db \"SELECT * FROM maintenance_windows LIMIT 5\"",
+   "# Read forecast.sql: spot WHERE is_maintenance=0 \u2014 recognize this fails for freshly inserted rows that never had is_maintenance set",
+   "# Plan: (1) replace fcstbin in run_pipeline.sh with SQL upsert; (2) fix forecast.sql maintenance exclusion to use NOT EXISTS join",
+   "cat > /tmp/rebuild.sql <<'EOF'\nINSERT OR REPLACE INTO daily_rollups(host_id,date,peak_util,mean_util)\nSELECT host_id, date(ts,'unixepoch'), MAX(util_pct), ROUND(AVG(util_pct),4)\nFROM raw_samples GROUP BY host_id, date(ts,'unixepoch');\nEOF",
+   "sed -i 's|/opt/forecast/fcstbin|sqlite3 /opt/forecast/forecast.db < /tmp/rebuild.sql|' /opt/forecast/run_pipeline.sh",
+   "# Also add DELETE FROM daily_rollups for rows with no raw_samples (idempotency + orphan cleanup)",
+   "# Edit forecast.sql: replace WHERE rs.is_maintenance=0 with WHERE NOT EXISTS (SELECT 1 FROM maintenance_windows mw WHERE mw.host_id=rs.host_id AND rs.ts BETWEEN mw.win_start AND mw.win_end)",
+   "sed -i 's/WHERE.*is_maintenance.*=.*0/WHERE NOT EXISTS (SELECT 1 FROM maintenance_windows mw WHERE mw.host_id=raw_samples.host_id AND raw_samples.ts BETWEEN mw.win_start AND mw.win_end)/' /opt/forecast/forecast.sql",
+   "# Verify forecast.sql syntax is correct",
+   "sqlite3 /opt/forecast/forecast.db < /opt/forecast/forecast.sql",
+   "bash /opt/forecast/run_pipeline.sh",
+   "sqlite3 /opt/forecast/forecast.db \"SELECT peak_util FROM daily_rollups WHERE peak_util=100.0 LIMIT 3\"",
+   "bash /opt/forecast/run_pipeline.sh && diff <output1> <output2>  # idempotency",
+   "sqlite3 /opt/forecast/forecast.db \"INSERT INTO raw_samples(host_id,ts,util_pct) VALUES ('h1', (SELECT win_start+60 FROM maintenance_windows LIMIT 1), 99.5)\"",
+   "bash /opt/forecast/run_pipeline.sh",
+   "# Verify maintenance-window fresh sample excluded from forecast_output.csv"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The sed command to patch forecast.sql may not match the exact whitespace or quoting in the actual file, causing silent failure or syntax error \u2014 agents must verify the edit succeeded.",
+   "The idempotency requirement combined with INSERT OR REPLACE is sensitive to schema details: if daily_rollups has no PRIMARY KEY enforcement at SQLite level (e.g., WITHOUT ROWID), REPLACE semantics may differ \u2014 but the schema specifies PRIMARY KEY so this should be fine.",
+   "The 'strings reveals < 100.0' assumption depends on the binary not being UPX-packed or otherwise obfuscated; blueprint says stripped ELF with no debug symbols but doesn't say uncompressed \u2014 if packed, strings won't show query fragments, making the task significantly harder and potentially unsolvable in the stated time.",
+   "The instruction says 'Fix the pipeline so that each row in daily_rollups correctly reflects...' but does not explicitly state that the solver must NOT use the binary \u2014 an agent might try to patch the binary or wrap it, which is impossible without source. This ambiguity could cause wasted effort but wouldn't cause an invalid failure.",
+   "The forecast.sql fix requirement (30-day rolling peak excluding maintenance windows) is mentioned in the instruction but the exact SQL window function structure needed isn't specified \u2014 if the verifier checks a specific query structure rather than just output correctness, an agent with a functionally correct but structurally different query might be wrongly penalized.",
+   "Rounding requirement of 4 decimal places for mean_util: ROUND(AVG(...),4) in SQLite returns a REAL, but comparisons in the verifier need to handle floating-point epsilon correctly. If verifier does exact string comparison on CSV output, floating-point representation differences could cause false failures."
+  ],
+  "verdict": "accept",
+  "reasons": "The task is well-constructed with two genuinely interacting bugs (binary's dropped-100/integer-division and SQL's is_maintenance flag staleness), realistic scenario, and adversarial verifier that inserts fresh samples to catch partial fixes. The binary-strings hint makes the first bug findable without reversing, keeping it solvable in ~24 commands, but the maintenance-window flag insight still requires careful reasoning about data lifecycle. The main risk is the UPX-packing assumption for strings visibility, which the blueprint should explicitly address.",
+  "fixes": [
+   "Explicitly state in environment spec that the binary is NOT compressed/packed so that `strings` reliably reveals query fragments \u2014 add 'compiled without compression; strings output includes SQL fragments' to the Dockerfile build instructions.",
+   "Add a precise example of the expected forecast.sql output structure (e.g., columns: host_id, forecast_date, rolling_30d_peak) so the verifier can check output correctness rather than query structure, removing ambiguity about what constitutes a valid maintenance-exclusion implementation.",
+   "Specify the verifier's comparison method for mean_util floating-point values (e.g., ABS(actual-expected) < 0.00005) to prevent false failures from REAL representation differences in CSV output.",
+   "Add an explicit instruction sentence: 'The compiled binary cannot be modified or replaced at the binary level; fix the pipeline by replacing its invocation with correct SQL statements.' This removes the ambiguity about whether agents should attempt binary patching."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both involve a black-box compiled binary corrupting a data pipeline feeding SQLite rollup tables, requiring reverse-engineering the binary's behavior and fixing downstream SQL aggregations."
+    },
+    {
+     "ref_id": "terminal-bench-pro/optimize-postgresql-analytics-query",
+     "verdict": "distinct",
+     "reason": "That task is purely about optimizing a SQL query for performance while preserving semantics; the candidate task is about fixing incorrect rollup data produced by a faulty binary pipeline."
+    },
+    {
+     "ref_id": "terminal-bench-science/hysteretic-aquifer-control",
+     "verdict": "distinct",
+     "reason": "That task involves scientific model calibration, forecasting, and control design for an aquifer simulation; the candidate task is a data pipeline repair problem."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task fixes a SQL query file to produce correct window function output from a working binary; the candidate task requires repairing rollup table data written by a faulty compiled binary and then fixing a forecast SQL query."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both involve fixing an ETL pipeline that writes incorrect aggregate summaries (peak/mean vs revenue/distinct users) into SQLite tables with idempotency and no orphan rows requirements, though the candidate adds a black-box binary and SQL forecast query components."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.163
+    ],
+    [
+     "terminal-bench-pro/optimize-postgresql-analytics-query",
+     0.12
+    ],
+    [
+     "terminal-bench-science/hysteretic-aquifer-control",
+     0.118
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.107
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.092
+    ]
+   ],
+   "cost_usd": 0.014415
+  },
+  "novel": false
+ },
+ "cost_usd": 0.063228
+}

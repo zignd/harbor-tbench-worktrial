@@ -1,0 +1,58 @@
+{
+ "slug": "tls-fingerprint-extraction-service",
+ "title": "TLS Client Hello Fingerprint Extraction Service",
+ "scenario": "A research scientist is trying to reproduce a network fingerprinting paper that classifies TLS clients by their ClientHello handshake attributes. The lab environment contains a running packet capture replay service (on port 7823) that streams raw TLS record bytes, a partially implemented Python fingerprint extractor at /app/extractor/, and a reference binary /app/bin/ref_fingerprint that accepts the same byte stream and emits a canonical JA3-style fingerprint string. The extractor crashes or produces wrong output on certain ClientHello variants, and the symptom points to the wrong parsing stage.",
+ "instruction_draft": "The fingerprint extractor at /app/extractor/extract.py must produce output identical to /app/bin/ref_fingerprint for every ClientHello the replay service emits. Run the extractor as: python /app/extractor/extract.py <host> <port>, where it connects to the given host:port, reads TLS records, and prints one fingerprint string per ClientHello to stdout.",
+ "requirements": [
+  "Running `python /app/extractor/extract.py 127.0.0.1 7823` produces a fingerprint string per ClientHello, one per line, in arrival order.",
+  "Each fingerprint string must exactly match the output of `/app/bin/ref_fingerprint 127.0.0.1 7823` for the same stream.",
+  "The extractor must handle ClientHello records that span multiple TCP segments (fragmented TLS records).",
+  "The extractor must correctly handle the GREASE extension values that appear in some ClientHellos.",
+  "The extractor must handle ClientHellos with no SNI extension, empty cipher suite lists after GREASE filtering, and compression methods other than null.",
+  "The fingerprint format is: SSLVersion,Ciphers,Extensions,EllipticCurves,EllipticCurvePointFormats \u2014 all as comma-separated decimal lists joined by dashes between fields, with GREASE values stripped from every field."
+ ],
+ "environment": [
+  "FROM python:3.13-slim-bookworm base.",
+  "apt-get install -y tcpdump libpcap-dev; pip install scapy==2.5.0 cryptography==42.0.8",
+  "/app/bin/ref_fingerprint: a compiled C binary (no source) that connects to host:port, reads the raw byte stream, parses TLS records, strips GREASE from all fields, and emits fingerprints. It handles fragmented records correctly and uses a specific GREASE mask list (0x?a?a pattern).",
+  "/app/replay/server.py: a service that binds on port 7823 and replays a corpus of raw TLS ClientHello bytes. It includes: (1) unfragmented ClientHellos, (2) ClientHellos split across two sends with a 10ms delay, (3) ClientHellos with multiple GREASE values in cipher suites AND extensions, (4) a ClientHello with no extensions at all, (5) a ClientHello with a 0-length session ID followed by legacy compression list with non-null value, (6) a ClientHello with SNI hostname of length 0. The replay server sends a 4-byte little-endian length prefix before each record so the client knows where records end.",
+  "/app/extractor/extract.py: connects to host:port, reads length-prefixed records, attempts to parse ClientHello. Has a bug: it reads extension type but does NOT correctly skip GREASE values that appear as elliptic curve group IDs (it only strips GREASE from cipher suites). A second bug: when reassembling fragmented records it reads only the first chunk and silently truncates. The code is ~400 lines with plausible-looking helper functions for unrelated fields (session ticket parsing, ALPN display) that are correct and serve as distractors.",
+  "/app/extractor/tls_types.py: ~150 lines of TLS constant definitions, some with minor naming inconsistencies that look suspicious but are not the actual bugs.",
+  "/app/extractor/utils.py: ~120 lines including a `is_grease` function that checks only the low byte, not the full 0x?a?a two-byte pattern. This is the subtle GREASE bug \u2014 single-byte check passes most cases but fails when the high byte differs from the low byte.",
+  "/app/extractor/README.md: describes the fingerprint format and mentions 'GREASE filtering' without specifying the exact check.",
+  "Startup: `python /app/replay/server.py &` runs at container build time via CMD or entrypoint.",
+  "The replay corpus is baked into /app/replay/corpus.bin as a sequence of length-prefixed raw bytes; the server reads and replays on each connection."
+ ],
+ "internal_hint": "There are two bugs that must both be fixed. (1) GREASE detection in utils.py checks only the low byte (`val & 0xFF == 0x0a`) instead of the full two-byte pattern (`val & 0x0f0f == 0x0a0a` or equivalently both bytes end in 0xa and they are equal). This passes for 0x0a0a but fails for 0x1a1a, 0x2a2a, etc., which appear in the elliptic curves field of real Chrome ClientHellos. The symptom is wrong curve lists in the fingerprint \u2014 but because GREASE also appears in cipher suites (where the check accidentally works for low-value GREASE), the agent sees correct cipher suite output and suspects the curve-parsing code, not the GREASE checker. (2) The fragmentation reassembly in extract.py calls `recv(n)` once and assumes it gets all n bytes; on fragmented replays this silently truncates the ClientHello, causing an IndexError or wrong parse. The misleading symptom is that the error surfaces as a struct.unpack failure inside the extensions parser (making the agent think the extensions loop is buggy), when the real problem is incomplete data from the socket. A skilled engineer runs the extractor against the replay service, sees some fingerprints wrong and some crashes, instruments the raw bytes received vs the declared length, discovers the truncation, then compares fingerprints field-by-field against the reference binary on GREASE-heavy inputs to find the two-byte vs one-byte check.",
+ "trap": "A naive agent fixes only the fragmentation bug (adding a `recvall` loop) and tests against a few ClientHellos where GREASE values happen to have equal high and low bytes (0x0a0a passes the broken check). The fingerprints match on those inputs. The verifier generates fresh ClientHellos with 0x1a1a, 0x3a3a GREASE curve values \u2014 the broken GREASE filter lets them through, producing a fingerprint that differs from the reference. The agent never catches this because the sample corpus includes only 0x0a0a GREASE in curves.",
+ "tests": [
+  "Generate 30 synthetic ClientHello byte sequences at verify time: 10 with no GREASE, 10 with GREASE values 0x0a0a/0x1a1a/0x2a2a/0x3a3a/0x4a4a in cipher suites and curves, 10 fragmented across two TCP sends. Inject them into the replay server. Run ref_fingerprint and the extractor against the same stream; assert every output line matches.",
+  "Generate ClientHellos with edge cases: (a) no extensions field at all \u2014 fingerprint must be 'SSLVersion,,,,'; (b) extensions present but curves extension absent \u2014 curves field empty; (c) SNI extension with 0-length hostname \u2014 SNI absent from fingerprint; (d) compression method 0x01 (deflate) present \u2014 must not affect fingerprint fields. Compare extractor vs reference.",
+  "Generate a ClientHello with all 16 GREASE two-byte values (0x0a0a through 0xfafa with step 0x1111) in the cipher suite list and in the supported_groups extension. After GREASE stripping, both lists must be empty. Assert extractor produces the same empty-field fingerprint as the reference.",
+  "Inject a ClientHello whose TLS record is split into 3 TCP sends with 5ms gaps. Assert the extractor emits exactly one fingerprint (no crash, no truncation) matching the reference.",
+  "Run extractor and reference against 50 randomly seeded ClientHello sequences generated from a parametric builder (seeded with fixed seeds for determinism); compare all outputs for exact string equality."
+ ],
+ "verifier_knob": {
+  "name": "num_generated_inputs",
+  "value": "50",
+  "effect": "Increasing from 10 to 100 raises the probability that a random GREASE value (0x?a?a with non-equal bytes) appears in the curve list, making the partial GREASE fix more likely to be caught. At 10 inputs the partial fix may pass; at 100 it almost certainly fails."
+ },
+ "expected_failure_modes": [
+  "Agent fixes only the fragmentation reassembly bug, tests on the provided corpus (which uses only 0x0a0a GREASE), sees matching output, stops \u2014 fails on verify-time inputs with 0x1a1a/0x2a2a GREASE curve values.",
+  "Agent fixes only the GREASE check, tests on unfragmented inputs, misses the truncation bug \u2014 verify-time fragmented inputs cause crashes or wrong parses.",
+  "Agent reads tls_types.py looking for the bug (distractor file), spends time on naming inconsistencies there, never instruments the actual byte stream to find the recv truncation.",
+  "Agent rewrites the extractor from scratch but misreads the GREASE spec and implements the same single-byte check, or forgets to strip GREASE from the point_formats field (which the reference binary does strip but the instruction doesn't make obvious).",
+  "Agent correctly identifies both bugs but makes an off-by-one error in the `recvall` loop that only manifests when the second fragment arrives with exactly 1 byte \u2014 a rare but verify-time-generated case."
+ ],
+ "predicted_pass_rate": 0.35,
+ "difficulty": "hard",
+ "category": "security",
+ "tags": [
+  "tls",
+  "protocol-parsing",
+  "fingerprinting",
+  "network-security",
+  "devops",
+  "python"
+ ]
+}

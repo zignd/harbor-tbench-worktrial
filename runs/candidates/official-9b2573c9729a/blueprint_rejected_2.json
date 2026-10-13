@@ -1,0 +1,167 @@
+{
+ "blueprint": {
+  "slug": "go-ring-buffer-clock-drift",
+  "title": "Ring Buffer Metrics Clock Drift Bug",
+  "scenario": "A backend metrics aggregation service written in Go maintains per-second rate counters in a fixed-size ring buffer. The service has a compiled opaque plugin (`libmetrics.so`, a Go plugin binary shipped without source) that handles the actual bucket arithmetic and exports a single `Aggregate` symbol. Over the past week, production dashboards started showing subtle but systematic under-counting under high-frequency event bursts \u2014 only reproducible when the event rate briefly exceeds the ring buffer's window, causing the head pointer to lap the tail. The repo has about 1,400 lines across five Go files plus the precompiled plugin, and git history shows the plugin was rebuilt six commits ago right after a 'fix bucket alignment' commit message.",
+  "instruction_draft": "Hey, we've got a gnarly under-counting bug in the metrics service at ~/metricsvc. The ring buffer aggregator produces wrong totals whenever events arrive faster than one per millisecond for more than a ring-window worth of time \u2014 the count you read back is always lower than what was actually emitted. I need you to: (1) characterize exactly how the plugin's Aggregate function behaves (it's a compiled plugin, source isn't here), (2) find the off-by-N in the ring buffer head/tail accounting that interacts badly with the plugin's output, and (3) ship a fix so the service passes its own integration harness at ~/metricsvc/cmd/verify/main.go with at least three window sizes (64, 128, 256 buckets) and burst factors (1.5x, 2x, 3x capacity). The fix must not change the plugin binary. Final state: `go run ./cmd/verify/main.go` exits 0, and the config file at `config/ring.yaml` has the correct `bucket_shift` and `overflow_strategy` fields set to match what the plugin actually expects.",
+  "requirements": [
+   "`go run ./cmd/verify/main.go` exits 0 for all nine combinations of window size {64,128,256} \u00d7 burst factor {1.5x,2x,3x}",
+   "`config/ring.yaml` contains a `bucket_shift` field whose integer value equals the actual right-shift the plugin applies to timestamps (determined by experiment)",
+   "`config/ring.yaml` contains an `overflow_strategy` field set to the string token the plugin returns for lapped-bucket handling (one of 'saturate', 'wrap', 'drop')",
+   "The ring buffer head/tail accounting in `internal/ring/ring.go` correctly tracks lapped buckets so counts are exact, not lower bounds",
+   "The fix compiles cleanly: `go build ./...` exits 0 with no modified plugin binary"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs Go 1.23 via official tarball, gcc, make",
+   "Repo at ~/metricsvc with git history of ~18 commits; `git log --oneline` shows 'fix bucket alignment' six commits back which is when the plugin was rebuilt",
+   "~/metricsvc/internal/ring/ring.go: ~220 lines, ring buffer with configurable size; has an off-by-one in the lapped-bucket count: when head laps tail it increments tail by (head-tail) instead of (head-tail+1), causing one bucket's worth of events to be silently dropped per lap",
+   "~/metricsvc/internal/ring/ring.go reads `bucket_shift` and `overflow_strategy` from `config/ring.yaml` at startup; config file currently has wrong values (bucket_shift=0, overflow_strategy='wrap') that don't match what the plugin actually does",
+   "~/metricsvc/plugin/libmetrics.so: precompiled Go plugin (built with -buildmode=plugin), no source in repo; exports `Aggregate(buckets []uint64, shift int) (uint64, string)` \u2014 the string return is the overflow strategy token; the plugin right-shifts timestamps by 3 bits (not 0) and returns 'saturate' for overflow strategy",
+   "~/metricsvc/internal/aggregator/aggregator.go: ~180 lines, loads the plugin via plugin.Open, calls Aggregate; passes config values through; has a secondary bug: it reads bucket_shift from config but passes it as-is to Aggregate even though Aggregate ignores the passed shift and uses its own internal constant \u2014 so the config value only matters for the ring.go head/tail modular arithmetic",
+   "~/metricsvc/cmd/server/main.go: ~120 lines, wires ring buffer and aggregator together, exposes HTTP endpoint",
+   "~/metricsvc/cmd/verify/main.go: ~200 lines, integration harness that runs the service in-process with deterministic synthetic bursts and checks exact counts; currently fails with under-count errors; prints diff between expected and actual counts",
+   "~/metricsvc/config/ring.yaml: bucket_shift: 0, overflow_strategy: 'wrap', window_size: 128",
+   "~/metricsvc/internal/emitter/emitter.go: ~100 lines, event emission logic (correct, not involved in bug)",
+   "~/metricsvc/internal/store/store.go: ~80 lines, in-memory KV store for aggregated results (correct)",
+   "The plugin's Aggregate signature is documented in ~/metricsvc/docs/plugin-api.md with the signature but NOT the internal shift constant or overflow token \u2014 the solver must discover those by experiment",
+   "A small probe harness ~/metricsvc/cmd/probe/main.go (~60 lines) is provided that calls the plugin with controlled inputs and prints the string return value, making it easy to discover overflow_strategy empirically; the shift can be deduced by trying inputs whose timestamps differ by powers of two and observing bucket grouping"
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources both requiring experiment/instrumentation, not code reading. (1) OPAQUE COMPONENT: the plugin's internal shift constant (3) and overflow token ('saturate') are not in any source file \u2014 they must be discovered by running the probe harness with controlled inputs and observing outputs. A solver who guesses shift=0 or overflow='wrap' from the stale config will pass the small synthetic test in verify/main.go for burst\u22641.5x but fail for larger bursts because the ring arithmetic diverges. (2) CROSS-COMPONENT CONSISTENCY: the ring.go off-by-one (increments tail by head-tail instead of head-tail+1 per lap) interacts with the plugin's actual shift: the number of silently-dropped events per lap equals the bucket size implied by shift=3 (8 nanosecond-resolution ticks per bucket), so the error is invisible in the small-burst case but accumulates proportionally to (laps \u00d7 8). The fix requires: (a) probing the plugin to find shift=3 and 'saturate', (b) updating config/ring.yaml with the correct values, (c) patching ring.go tail advancement from `tail += head - tail` to `tail = head + 1` (mod ring size) \u2014 these three changes must all be present for verify to pass at all nine burst/window combinations.",
+  "trap": "A naive solver reads ring.go, spots the tail-increment expression, patches it, and re-runs the harness on the default window=128 with burst=1.5x. This single combination passes even with the wrong config values because at 1.5x burst and the default (wrong) shift=0, the per-lap error is small enough to fall within the harness's default tolerance. The hidden tests use all nine combinations including burst=3x and window=64, where the per-lap error (8 events \u00d7 3 laps) is large and unmistakable. The solver also fails if they set overflow_strategy='wrap' (the stale config value) instead of 'saturate' \u2014 the harness checks the config file directly as a state property, not just the runtime output.",
+  "tests": [
+   "Run `go run ./cmd/verify/main.go` with window=64, burst_factor=1.5 \u2014 checks exact count, must be within 0 error (not just tolerance)",
+   "Run `go run ./cmd/verify/main.go` with window=64, burst_factor=2.0 \u2014 at 2x burst the off-by-one accumulates 2 laps \u00d7 8 events = 16 event under-count if ring.go not patched",
+   "Run `go run ./cmd/verify/main.go` with window=64, burst_factor=3.0 \u2014 3 laps \u00d7 8 = 24 event under-count",
+   "Run all three window=128 burst combinations \u2014 medium window",
+   "Run all three window=256 burst combinations \u2014 large window",
+   "Parse config/ring.yaml and assert `bucket_shift` field equals 3 (integer)",
+   "Parse config/ring.yaml and assert `overflow_strategy` field equals 'saturate' (string)",
+   "Run `go build ./...` and assert exit 0 with unmodified plugin binary (verified by SHA-256 of libmetrics.so matching pre-task value)",
+   "At verify time, the harness is regenerated with a fresh random seed for event timestamps so hardcoded event-count patches won't work"
+  ],
+  "verifier_knob": {
+   "name": "burst_factor_max",
+   "value": "3.0",
+   "effect": "Raising to 4x or 5x makes the per-lap error larger and more obvious, but also makes the correct plugin shift easier to reverse-engineer from large count discrepancies. Lowering to 1.2x makes the off-by-one nearly invisible even without the fix, reducing difficulty. 3x is the sweet spot where the bug is only visible through careful experiment."
+  },
+  "expected_failure_modes": [
+   "Solver patches ring.go correctly but leaves config/ring.yaml with wrong bucket_shift=0 or overflow_strategy='wrap', passing runtime checks but failing config state checks",
+   "Solver discovers overflow_strategy by reading plugin-api.md (which lists possible tokens) and guesses 'saturate' without probing \u2014 but guesses wrong shift (e.g., 1 or 2), causing ring arithmetic to be off by a different factor",
+   "Solver fixes ring.go off-by-one but uses the wrong formula (sets tail=head instead of tail=head+1 mod size), which is correct for non-circular but wrong at the wrap boundary, causing failures only at window=64 burst=3x",
+   "Solver correctly probes the plugin for overflow token but misidentifies the shift by testing insufficiently many input values (e.g., only powers of 2 that are multiples of 8, making shift=3 indistinguishable from shift=0 on those samples)",
+   "Solver modifies the plugin binary or replaces it with a recompiled version, failing the SHA-256 integrity check"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "go",
+   "systems",
+   "ring-buffer",
+   "opaque-component",
+   "cross-component",
+   "git-history"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd ~/metricsvc && ls -la && cat go.mod",
+   "cat internal/ring/ring.go  # find off-by-one: tail += head-tail instead of tail=head+1 mod size",
+   "cat config/ring.yaml  # see bucket_shift=0, overflow_strategy='wrap'",
+   "cat docs/plugin-api.md  # note signature, no shift constant or overflow token listed",
+   "cat cmd/probe/main.go  # understand probe harness interface",
+   "go run ./cmd/probe/main.go  # observe overflow token in string return",
+   "# Probe with varied timestamp inputs to detect shift: try timestamps 0,1,2,...,15 to see bucket boundaries",
+   "go run ./cmd/probe/main.go --timestamps 0,7,8,15  # or equivalent experiment",
+   "# Observe buckets group at multiples of 8 \u2192 shift=3; string return is 'saturate'",
+   "sed -i 's/bucket_shift: 0/bucket_shift: 3/' config/ring.yaml",
+   "sed -i \"s/overflow_strategy: 'wrap'/overflow_strategy: 'saturate'/\" config/ring.yaml",
+   "# Edit internal/ring/ring.go: fix tail advancement from 'tail += head - tail' to 'tail = (head + 1) % size'",
+   "go build ./...  # verify no compilation errors",
+   "go run ./cmd/verify/main.go  # run all 9 window\u00d7burst combinations",
+   "sha256sum plugin/libmetrics.so  # confirm plugin unmodified"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Go plugin ABI compatibility: if libmetrics.so was compiled with a different Go minor version than what's installed in the container, plugin.Open will panic or fail at runtime \u2014 this would make the task unsolvable regardless of correct logic",
+   "Probe harness UX ambiguity: the blueprint says 'the shift can be deduced by trying inputs whose timestamps differ by powers of two and observing bucket grouping' but if cmd/probe/main.go only accepts fixed input patterns, agents may not be able to run the necessary experiments without modifying probe itself",
+   "Off-by-one formula ambiguity at wrap boundary: blueprint lists 'tail=head instead of tail=head+1 mod size' as a failure mode, but if the correct fix is actually 'tail = (head + 1) % size', the modular wrap edge case might behave differently from 'tail = head + 1' in linear mode \u2014 needs to be precisely specified",
+   "Harness random seed behavior: 'regenerated with fresh random seed at verify time' \u2014 if the verify binary is recompiled rather than re-seeded, the counts must still be exact (not within tolerance), which is fine, but any floating-point or timing-dependent behavior in the harness could introduce flakiness",
+   "The 1.5x burst 'trap' passing with wrong config is stated as a known partial-pass failure mode, but if verify/main.go does not exit non-zero for partial failures (only some combinations fail), a half-fixed solution might still exit 0 on easy cases and the test framework might not distinguish"
+  ],
+  "verdict": "reject",
+  "reasons": "The average score is 3.8 (above 3.6) but genuine_difficulty scores 3, which is at the minimum threshold. The primary concern is the Go plugin ABI compatibility risk \u2014 if libmetrics.so is built with a slightly different Go version than the container installs, the entire task becomes unsolvable due to runtime panics, which is an invalid failure mode unrelated to the bug-finding skill being tested. Additionally, the provided probe harness significantly reduces the opaque-component difficulty (the main difficulty lever), making the task closer to 'read source + run provided tool' than genuine reverse engineering, and the speedrun lands at ~15 commands which is near the threshold for genuine_difficulty \u2264 2.",
+  "fixes": [
+   "Pin Go plugin compatibility explicitly: build libmetrics.so in the Dockerfile itself using the same Go 1.23.x toolchain that will be used at solve time, and include a build script (without source) so the SHA can be verified \u2014 this eliminates ABI mismatch as an invalid failure mode",
+   "Make the probe harness less informative: instead of cmd/probe/main.go being a ready-made tool that calls Aggregate with controlled inputs, provide only a minimal example showing how to load the plugin, requiring the solver to write their own probe \u2014 this raises genuine_difficulty to 4 by requiring instrumentation work",
+   "Add a third difficulty lever: make the ring.go bug more subtle \u2014 instead of a simple off-by-one in one expression, split it across two functions (tail advancement and bucket index calculation) so it requires understanding the full ring buffer lifecycle, not just spotting one wrong expression"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/prove-nat-mult-commutativity-in-coq",
+     "verdict": "distinct",
+     "reason": "Completely different domain (Coq theorem proving vs. Go ring buffer debugging); no overlapping core problem."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "Focuses on reverse-engineering a stream cipher encryption algorithm, not ring buffer accounting or metrics aggregation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/decode-go-ctf-credentials",
+     "verdict": "distinct",
+     "reason": "CTF credential extraction via XOR decoding, entirely unrelated to ring buffer or metrics aggregation bugs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Weighted aggregation correctness bug in a sales service with SQLite, not a ring buffer clock-drift/off-by-N problem with a compiled plugin."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "variant",
+     "reason": "Both tasks require reverse-engineering a compiled opaque shared library/plugin by experimentation, then fixing host code to correctly integrate with it under edge-case conditions \u2014 the same core challenge structure even though the domain differs (log windowed aggregation vs. ring buffer metrics)."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/prove-nat-mult-commutativity-in-coq",
+     0.132
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.12
+    ],
+    [
+     "terminal-bench-pro/decode-go-ctf-credentials",
+     0.119
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.088
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.088
+    ]
+   ],
+   "cost_usd": 0.014487
+  },
+  "novel": false
+ },
+ "cost_usd": 0.060204
+}

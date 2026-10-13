@@ -1,15 +1,21 @@
-The pipeline at `/app` reads a CSV, splits it into fixed-size chunks written to disk, processes each chunk through `pipeline/transform.py`, and concatenates the results into an output CSV. A recent batch run produced wrong row counts and duplicate records in the output without raising any exception.
+You have inherited a Python ETL pipeline at /app. The pipeline reads a CSV file, splits it into fixed-size chunks, processes each chunk through pipeline/transform.py (which applies type coercion, schema validation, and deduplication), and concatenates the results into a final output CSV.
 
-Fix the pipeline so that all of the following hold for any valid CSV input of up to 500,000 rows with columns `record_id,name,amount,date,status`:
+Run it with:
 
-1. The output CSV at `/app/out/result.csv` contains exactly one row per unique `record_id` from the input (no duplicate `record_id` values, no omissions of valid rows). The output CSV has the same columns as the input: `record_id,name,amount,date,status`.
-2. The row count of the output equals the number of input rows that pass schema validation. Rows that fail validation must be written to `/app/out/rejected.csv` instead. The rejected CSV has the same columns as the input plus a `_rejection_reason` column describing why each row was rejected.
-3. The pipeline produces correct output when the input row count is not evenly divisible by the chunk size; no input rows may be silently dropped.
-4. The pipeline correctly handles chunk files that each begin with a header row; header rows must not appear as data rows in the output or be counted as valid records.
-5. All changes must be committed to the repository at `/app`; `git log --oneline` must show at least one commit you authored, and the working tree must be clean.
+    python run_pipeline.py --input data/sample.csv --output out/result.csv
 
-The default chunk size is 2000. The pipeline is invoked as:
+The pipeline currently produces incorrect output: the output row count does not match the input, and duplicate record_id values appear in the result.
 
-```
-python /app/run_pipeline.py --input <input.csv> --output /app/out/result.csv
-```
+Fix the pipeline so that:
+
+1. The output CSV at /app/out/result.csv contains exactly one row per unique record_id from the input. No duplicate record_id values may appear in the output, and no valid input row may be omitted.
+
+2. The output row count equals the number of input rows minus any rows that fail schema validation. Rows that fail schema validation must be written to /app/out/rejected.csv instead of the output CSV.
+
+3. The pipeline correctly handles chunk files where each file on disk begins with a header row. The output must contain no duplicate header rows and the row count must be accurate regardless of how many chunks are produced.
+
+4. The pipeline must produce correct output for any valid CSV input of up to 500,000 rows, including inputs whose total row count is not evenly divisible by the configured chunk size.
+
+5. All fixes must be committed to the git repository at /app. Running git log --oneline in /app must show at least one new commit that you authored, and the working tree must be clean.
+
+The primary key column is record_id. The schema requires columns: record_id, name, amount, date, status. A valid row has a record_id starting with "REC", a non-empty name, a non-negative numeric amount, a date in YYYY-MM-DD format, and a status that is one of: active, inactive, pending, closed.

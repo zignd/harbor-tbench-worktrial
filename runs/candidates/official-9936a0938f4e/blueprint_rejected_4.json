@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "tls-fingerprint-classifier-repair",
+  "title": "TLS Fingerprint Classifier Silent Failure",
+  "scenario": "A research scientist is reproducing a published TLS traffic fingerprinting result. The environment runs a Python service that captures synthetic TLS ClientHello packets from a local packet generator, extracts JA3-style fingerprint features, and classifies them using a pre-trained classifier. The pipeline appears to work on the bundled sample inputs, but the scientist's reproduction numbers diverge from the paper's reported accuracy \u2014 and the symptom points at the classifier, not the feature extractor.",
+  "instruction_draft": "The TLS fingerprint classification service at /app/classifier/ produces wrong predictions when run against the packet replay generator on port 7654. Repair it so the service's classification accuracy on all traffic categories matches the expected values in /app/expected_results.json.",
+  "requirements": [
+   "The service must correctly classify TLS ClientHello traffic into all categories present in /app/expected_results.json",
+   "Classification accuracy for each category must match the expected values within the tolerance specified in /app/expected_results.json",
+   "The packet feature extraction pipeline must correctly handle all edge cases in the TLS ClientHello format including empty extension lists, unknown extension types, and GREASE values",
+   "The service must produce stable deterministic output when replaying the same packet stream"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm with scapy, scikit-learn, numpy, joblib, cryptography pinned",
+   "/app/classifier/ directory (~900 lines across 5 files): pipeline.py (main service), feature_extractor.py (JA3 feature extraction with a subtle bug), model_loader.py (loads pre-trained sklearn model), packet_parser.py (raw byte -> TLS record parsing), utils.py (normalization helpers with a second subtle bug)",
+   "/app/classifier/models/fingerprint_clf.joblib: a pre-trained RandomForestClassifier trained on correctly-extracted features",
+   "/app/generator/: a packet replay service that binds to localhost:7654 and streams synthetic TLS ClientHello packets encoded as length-prefixed binary frames; about 400 lines across 3 files",
+   "/app/expected_results.json: per-category accuracy targets (8 categories including 'browser', 'bot', 'scanner', 'mobile', 'voip', 'iot', 'cdn', 'unknown') with tolerance 0.02",
+   "/app/samples/: 12 sample packets (3 per category subset) that the broken service correctly classifies \u2014 these are the easy cases that mask the bugs",
+   "Bug 1 (feature_extractor.py, invisible until runtime): GREASE values (0xAAAA, 0xBABA, etc.) in the cipher suite list are supposed to be filtered before hashing into the JA3 string, but the code filters them from extensions only, leaving them in the cipher suite field; the sample packets happen to contain no GREASE values so the samples all pass",
+   "Bug 2 (utils.py, misleading symptom): the extension-type sort used before MD5 hashing uses lexicographic sort on integers (sorts as strings), which happens to match for all single and double digit extension IDs in the samples, but diverges for extension IDs >= 100 (e.g., 0x0017=23, 0xff01=65281) that appear only in the generator's full traffic mix",
+   "The symptom that appears on live traffic is high misclassification of 'browser' and 'cdn' categories \u2014 which looks like a classifier calibration or training-data issue, pointing the solver toward the model rather than the feature extractor",
+   "/app/classifier/model_loader.py contains a comment suggesting the model may need retraining, as a red herring",
+   "A plausible-looking but wrong 'fix' (retraining the model on extracted features) will make accuracy worse because the extracted features are wrong and the model was trained on correct features",
+   "The packet generator serves about 800 unique packets covering all 8 categories with diverse extension sets including GREASE and large extension IDs"
+  ],
+  "internal_hint": "Difficulty comes from two interacting runtime bugs that are invisible by reading only the relevant files until you observe the feature extractor's output on live data. Bug 1: GREASE filtering in feature_extractor.py only strips GREASE from the extensions list but not from the cipher suite list; the JA3 spec requires stripping GREASE (0x?A?A pattern) from both. Bug 2: in utils.py the extension type list is sorted with sorted(ext_types, key=str) instead of sorted(ext_types) (integer sort), which silently corrupts the JA3 sort order for extension IDs >= 100. The misleading symptom is that accuracy on the provided sample packets is 100% (all samples lack GREASE in cipher suites and happen to have only small extension IDs), so the solver's first check passes. The obvious symptom on live traffic (wrong browser/CDN classification) points at the classifier. A solver must: (1) run the generator and observe raw feature outputs, (2) compare against a JA3 reference implementation or the spec, (3) notice GREASE in cipher suites isn't filtered, (4) notice the sort key bug by examining feature vectors for packets with extension ID >= 100. Retraining the model is the trap \u2014 it makes things worse.",
+  "trap": "The solver instruments the pipeline, sees high error on 'browser' and 'cdn' packets, attributes it to the classifier, and either retrains the RandomForest on the (still-broken) extracted features or replaces it with a different model. This appears to improve sample accuracy (because the new model learns to compensate for the consistent-but-wrong features on easy inputs) but fails the verifier's fresh generated inputs which include diverse GREASE patterns and extension IDs above 100. A solver who doesn't generate and inspect the actual JA3 strings for packets with GREASE cipher suites and large extension IDs will miss both bugs.",
+  "tests": [
+   "Test generates 200 fresh synthetic TLS ClientHello packets per category (8 categories, 1600 total) using the packet generator's seeded random mode; runs the service against them; checks that per-category accuracy meets the targets in expected_results.json within tolerance",
+   "Test generates packets with GREASE values (0x0A0A, 0x1A1A, 0x2A2A, 0xAAAA, 0xBABA, 0xCACA, 0xDADA, 0xEAEA, 0xFAFA) specifically in the cipher suite list and verifies the extracted JA3 cipher suite field contains no GREASE values",
+   "Test generates packets with extension IDs >= 100 (specifically 0x0017=23, 0x0023=35, 0x0010=16, 0xff01=65281, 0x000f=15, 0x0021=33) and verifies the extension order in the JA3 string matches integer-sorted order, not string-sorted order",
+   "Test replays 50 known-correct JA3 fingerprints (computed by a reference implementation embedded in the test) and checks the service produces byte-for-byte identical JA3 strings",
+   "Test checks that the classifier model file has not been replaced (via stored hash of the original model), verifying the solution fixed the feature extractor rather than retraining the model"
+  ],
+  "verifier_knob": {
+   "name": "packet_diversity_factor",
+   "value": "200 packets per category with GREASE in both cipher suites and extensions, extension IDs uniformly sampled from 1-65535",
+   "effect": "Lowering to 20 packets per category with no GREASE makes the test passable with only the sort bug fixed; raising to 500 packets with adversarially chosen GREASE patterns and large extension IDs ensures both bugs must be fixed and the fix must be precise"
+  },
+  "expected_failure_modes": [
+   "Solver sees high error on 'browser'/'cdn' categories, concludes the classifier needs retraining, retrains on broken features \u2014 new model learns corrupted feature space, fails on fresh packets with different GREASE/extension patterns",
+   "Solver finds and fixes the GREASE filtering bug but misses the sort key bug because extension IDs in the sample packets are all below 100 and the symptom doesn't surface until fresh packets with large extension IDs are generated",
+   "Solver finds the sort key bug but misses the GREASE-in-cipher-suites bug because GREASE filtering exists in the code (for extensions) and the solver doesn't realize the cipher suite path skips it",
+   "Solver fixes both bugs but verifies only on the bundled sample packets, doesn't run against the generator's full traffic mix, and submits without noticing that accuracy on samples being 100% is misleading",
+   "Solver replaces feature_extractor.py with a correct JA3 implementation but introduces a subtle off-by-one in the length-prefixed frame protocol when reading from the generator port, causing parsing errors on some packet sizes"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "tls",
+   "fingerprinting",
+   "feature-extraction",
+   "misleading-symptom",
+   "edge-cases",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/classifier/feature_extractor.py  # look for GREASE filtering logic",
+   "cat /app/classifier/utils.py  # look for sort/normalization code",
+   "# Immediately visible: GREASE filter in feature_extractor.py only covers extensions list, not cipher suite list",
+   "# Immediately visible: sorted(ext_types, key=str) in utils.py should be sorted(ext_types) for integer sort",
+   "sed -i 's/is_grease(cs) for cs in extensions/is_grease(cs) for cs in cipher_suites/' /app/classifier/feature_extractor.py  # conceptual fix for GREASE in cipher suites",
+   "# Edit feature_extractor.py to apply GREASE filter to cipher suite list before JA3 construction",
+   "# Edit utils.py to change sorted(ext_types, key=str) to sorted(ext_types)",
+   "python /app/generator/server.py &",
+   "python /app/classifier/pipeline.py --source localhost:7654",
+   "# Verify accuracy matches expected_results.json",
+   "md5sum /app/classifier/models/fingerprint_clf.joblib  # confirm model unchanged"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The packet generator binding to localhost:7654 inside a container may have port/timing issues if the generator isn't started before the classifier connects, creating flaky test failures unrelated to correctness",
+   "The model hash check assumes the exact joblib serialization is stable across scikit-learn patch versions \u2014 if the pinned version produces a different serialization byte-for-byte on rebuild, valid solutions will fail the hash check",
+   "The 'tolerance 0.02' in expected_results.json combined with 200 packets per category means ~4 misclassifications allowed \u2014 statistical variance in seeded random generation could cause borderline categories to flip pass/fail",
+   "Building a RandomForestClassifier trained on correctly-extracted features that actually achieves the claimed accuracy targets across all 8 categories is complex; if the model file is not faithfully reproducible, accuracy targets may be unreachable even with correct bugs fixed"
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2/5 because both bugs are directly visible in the source code \u2014 'sorted(ext_types, key=str)' is an immediately obvious Python mistake and the GREASE filter placement gap is readable in ~10 lines of feature_extractor.py without running anything. The blueprint's own claim that bugs are 'invisible by reading only the relevant files' is false, which undermines the core difficulty design. A strong frontier agent will read the source files first, find and fix both bugs in under 15 commands, and never be misled by the classifier red herring.",
+  "fixes": [
+   "Make the GREASE bug invisible in source by spreading the cipher suite processing across multiple helper functions and a configuration dict so no single code reading reveals the gap \u2014 e.g., have a general filter_tls_list() function that takes a 'filter_grease' boolean parameter set to True for extensions and False for cipher suites, with the False case looking plausible as an optimization",
+   "Replace 'sorted(ext_types, key=str)' with something less obviously wrong \u2014 e.g., store extension types as hex strings in an intermediate data structure so that sorting them as strings looks intentional, and the bug only manifests when those hex strings are converted back to integers for the JA3 hash computation",
+   "Add a third runtime-only bug (e.g., an off-by-one in the length-prefixed frame reader that only triggers on packets > 255 bytes, causing silent truncation) to increase the number of things a solver must find, making the ~20-command threshold harder to hit"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/risk-scorer-replay",
+     "verdict": "distinct",
+     "reason": "That task is about repairing a model-risk parity evaluator to match production scorer behavior; the candidate is about fixing a TLS packet classifier's prediction accuracy."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a SQLite database with a compiled shared library; the candidate is about fixing a TLS fingerprint classifier."
+    },
+    {
+     "ref_id": "terminal-bench/heat-pump-warranty",
+     "verdict": "distinct",
+     "reason": "That task is about making warranty claim decisions from rules and submitting them through a portal; the candidate is about fixing a TLS traffic classification pipeline."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a regional sales aggregation bug with misconfigured weights; the candidate is about repairing a TLS fingerprint classifier."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet codec for correctness and performance; the candidate is about fixing a Python TLS fingerprint classifier's accuracy."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/risk-scorer-replay",
+     0.122
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.117
+    ],
+    [
+     "terminal-bench/heat-pump-warranty",
+     0.113
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.112
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.108
+    ]
+   ],
+   "cost_usd": 0.012273
+  },
+  "novel": true
+ },
+ "cost_usd": 0.049896
+}

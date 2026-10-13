@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "tls-fingerprint-extraction-service",
+  "title": "TLS ClientHello Fingerprint Extraction Service",
+  "scenario": "A research scientist is trying to reproduce a published network-security result that depends on a Python microservice (`/app/fingerprintd/`) running inside the container. The service parses raw TLS ClientHello records (delivered as hex-encoded bytes over a Unix socket) and returns a JA3-style fingerprint string. The service starts on container boot, but the researcher's replay script (`/app/reproduce.py`) reports wrong fingerprints on about a third of the test vectors \u2014 yet the samples bundled with the paper all pass. The codebase is ~1,200 lines across a parser, a normaliser, a socket server, and a small utility library, with plausible but irrelevant logging and metrics code mixed in.",
+  "instruction_draft": "The fingerprint service at /app/fingerprintd/ is producing wrong JA3 fingerprints for some TLS ClientHello records. Make it produce correct fingerprints for all valid inputs; the service must remain running on /tmp/fingerprintd.sock and answer requests in the same wire format it uses now.",
+  "requirements": [
+   "The service listens on the Unix socket /tmp/fingerprintd.sock and accepts newline-terminated hex-encoded raw TLS records.",
+   "For every valid TLS 1.2/1.3 ClientHello the service returns the correct JA3 fingerprint string (lowercase hex MD5) followed by a newline.",
+   "The JA3 fields \u2014 SSLVersion, Ciphers, Extensions, EllipticCurves, EllipticCurvePointFormats \u2014 must be computed exactly per the published JA3 specification, including GREASE filtering and correct sort/join of extension types.",
+   "The service must handle ClientHellos with no elliptic_curves extension and no ec_point_formats extension without crashing or returning an empty field where a 0-length list is correct.",
+   "Extension types must appear in wire order (not sorted) in the JA3 extensions field.",
+   "GREASE values (0x0a0a, 0x1a1a, \u2026 0xfafa) must be filtered from Ciphers, Extensions, EllipticCurves, and EllipticCurvePointFormats before joining.",
+   "The service must restart cleanly if the socket file already exists (stale socket from a previous crash)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install -y procps",
+   "pip install cryptography==42.0.5 (only dep beyond stdlib)",
+   "/app/fingerprintd/__init__.py \u2014 empty",
+   "/app/fingerprintd/server.py \u2014 Unix-socket server (~150 lines); starts on import via a daemon thread; removes stale socket only when path does not exist (bug: os.path.exists check is inverted, so it crashes if socket IS present \u2014 this is the misleading symptom: the researcher sees a startup crash and thinks the server is broken, but fixing the crash alone does not fix the fingerprints)",
+   "/app/fingerprintd/parser.py \u2014 TLS record + ClientHello parser (~300 lines); correctly parses the outer record layer but has two bugs: (1) extension list is iterated and extension types are sorted before being stored, violating wire-order requirement; (2) GREASE filtering is applied only to cipher_suites and not to extensions or elliptic curves",
+   "/app/fingerprintd/normaliser.py \u2014 builds the five JA3 fields and calls hashlib.md5 (~120 lines); has one bug: when ec_point_formats extension is absent, it emits an empty string '' rather than '' (which is correct \u2014 an absent list encodes as an empty field, so this is actually correct), but when elliptic_curves is absent it emits '0' instead of '' (wrong \u2014 absent means empty field)",
+   "/app/fingerprintd/utils.py \u2014 hex helpers, logging setup, a metrics counter (~200 lines, no bugs)",
+   "/app/fingerprintd/grease.py \u2014 defines GREASE_TABLE as a set but mistakenly omits 0xfafa (the last GREASE value), so one class of GREASE ciphers leaks through",
+   "/app/reproduce.py \u2014 sends the 8 bundled sample vectors and checks answers; all 8 pass even with the bugs because they were chosen to avoid absent extensions and GREASE 0xfafa",
+   "/app/samples/ \u2014 8 .hex files (the paper's samples) that all pass with the buggy code",
+   "/app/start.sh \u2014 launches `python -m fingerprintd.server` as a background process and writes PID to /tmp/fingerprintd.pid",
+   "Dockerfile CMD runs /app/start.sh so the service is already running when the solver enters",
+   "All files have realistic surrounding code: docstrings, try/except blocks, unused imports, a metrics thread \u2014 roughly 1,200 lines total"
+  ],
+  "internal_hint": "Difficulty comes from two sources that interact: (1) NOT VISIBLE BY READING ALONE \u2014 the obvious symptom is the startup crash (inverted os.path.exists), which is easy to spot and fix, but fixing it does not change any fingerprint. A shallow agent fixes the crash, reruns reproduce.py, sees all 8 samples pass, and declares victory. The real bugs are subtle parsing errors that only surface on inputs the samples don't exercise: (a) extension types are sorted instead of kept in wire order; (b) GREASE filtering misses extensions and elliptic_curves; (c) GREASE_TABLE is missing 0xfafa; (d) absent elliptic_curves emits '0' instead of ''. (2) EDGE CASE INPUTS \u2014 the verifier generates fresh ClientHellos at verify time: records with no elliptic_curves extension, records with 0xfafa GREASE in ciphers, records with extensions in non-sorted wire order, and records with both GREASE extensions and GREASE elliptic curves. A skilled engineer: (a) fixes the startup crash; (b) reads the JA3 paper/spec to understand what the five fields must contain; (c) instruments the parser to log intermediate fields on a hand-crafted test input; (d) discovers sorting, GREASE gaps, and absent-field encoding bugs by comparing computed fields against an independent reference implementation.",
+  "trap": "A naive agent fixes only the startup crash (the obvious symptom), reruns the 8 bundled samples, sees them all pass, and stops. The verifier generates fresh inputs \u2014 ClientHellos with no elliptic_curves, with 0xfafa GREASE ciphers, and with extensions in non-alphabetical wire order \u2014 and fails on all four bug classes. The agent may also partially fix GREASE (adding extensions but not elliptic_curves, or vice versa) because the samples don't exercise the remaining gaps.",
+  "tests": [
+   "Test 1 (socket liveness): send a known-good ClientHello hex; assert the service responds within 2 s with a 32-char hex string followed by newline.",
+   "Test 2 (basic correctness): send 20 freshly generated ClientHellos (seeded RNG, random but valid cipher suites and extensions, no GREASE, elliptic_curves present); compare returned fingerprint against a reference Python JA3 implementation embedded in the test file.",
+   "Test 3 (absent elliptic_curves): send 15 ClientHellos with no elliptic_curves and no ec_point_formats extensions; the JA3 extensions field for those two must be empty strings, not '0'; compare against reference.",
+   "Test 4 (GREASE filtering \u2014 ciphers): send 15 ClientHellos where cipher_suites include one or more GREASE values including 0xfafa; GREASE values must not appear in the Ciphers field; compare against reference.",
+   "Test 5 (GREASE filtering \u2014 extensions and curves): send 15 ClientHellos with GREASE extension types and GREASE named groups; neither must appear in the Extensions or EllipticCurves fields; compare against reference.",
+   "Test 6 (extension wire order): send 15 ClientHellos with extensions in descending type order (e.g. 0xff01, 0x000d, 0x000a, 0x0000); the JA3 Extensions field must list them in that wire order, not sorted ascending; compare against reference.",
+   "Test 7 (stale socket): stop the service, leave the socket file, restart via start.sh; service must come up cleanly and answer a query.",
+   "Test 8 (combined edge cases): send 25 ClientHellos each exercising two or more of the above properties simultaneously; compare all against reference."
+  ],
+  "verifier_knob": {
+   "name": "num_generated_inputs",
+   "value": "90 total across tests 2-8",
+   "effect": "Raising the count increases the probability that all four bug classes are hit; lowering it (e.g. to 20) lets a partial fix pass by luck. At 90, any one unfixed bug causes at least 10 failures."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the startup crash, sees bundled samples pass, stops \u2014 fails tests 2-8.",
+   "Agent fixes startup crash and GREASE in ciphers but misses GREASE in extensions/curves \u2014 fails tests 5 and 8.",
+   "Agent fixes startup crash and GREASE everywhere but misses extension sorting bug \u2014 fails tests 6 and 8.",
+   "Agent fixes startup crash and GREASE but encodes absent elliptic_curves as '0' \u2014 fails tests 3 and 8.",
+   "Agent reimplements JA3 correctly but breaks the wire format (e.g. returns JSON instead of the raw fingerprint string) \u2014 fails test 1.",
+   "Agent restarts the service incorrectly (kills it but does not relaunch, or relaunches on wrong socket path) \u2014 fails test 7."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "tls",
+   "fingerprinting",
+   "network-protocols",
+   "devops",
+   "python",
+   "edge-cases"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/fingerprintd/server.py  # find inverted os.path.exists",
+   "# fix: change 'if not os.path.exists(sock_path): os.remove' to 'if os.path.exists'",
+   "sed -i 's/if not os.path.exists(SOCKET_PATH)/if os.path.exists(SOCKET_PATH)/' /app/fingerprintd/server.py",
+   "cat /app/fingerprintd/grease.py  # spot missing 0xfafa in GREASE_TABLE",
+   "# edit grease.py to add 0xfafa to GREASE_TABLE",
+   "cat /app/fingerprintd/parser.py  # read ~300 lines; find .sort() on extension types and missing GREASE filter on extensions/curves",
+   "# fix 1: remove/replace the sort on extension type list to preserve wire order",
+   "# fix 2: apply GREASE filter to extension types list in parser",
+   "# fix 3: apply GREASE filter to elliptic_curves/named_groups list in parser",
+   "cat /app/fingerprintd/normaliser.py  # find absent elliptic_curves emitting '0'",
+   "# fix: change 'if not curves: return \"0\"' to 'if curves is None: return \"\"'  (or equivalent)",
+   "cat /app/fingerprintd/utils.py  # verify no bugs (confirm clean)",
+   "pkill -f 'fingerprintd.server' && bash /app/start.sh  # restart service",
+   "python /app/reproduce.py  # all 8 bundled samples should pass",
+   "python -c \"import socket,hashlib; s=socket.socket(socket.AF_UNIX); s.connect('/tmp/fingerprintd.sock'); s.sendall(b'<no-elliptic-curves hex>\\n'); print(s.recv(64))\"  # test absent curves",
+   "python -c \"# send ClientHello with 0xfafa GREASE cipher and check fingerprint\"",
+   "python -c \"# send ClientHello with extensions in descending order and check wire order preserved\"",
+   "pkill -f fingerprintd && bash /app/start.sh  # test stale socket recovery (socket file remains)",
+   "# verify service responds after stale socket restart"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction says 'make it produce correct fingerprints for all valid inputs' but never defines which JA3 specification version to follow \u2014 the JA3 spec has minor variations (e.g. some implementations include/exclude SNI extension type 0x0000 differently); the verifier's reference implementation must exactly match what's considered 'correct', creating risk of ambiguity between solver's implementation and reference.",
+   "The instruction does not state that extension types must be in wire order, that GREASE must be filtered from extensions/curves, or that absent elliptic_curves must produce empty string \u2014 these are tested requirements not stated in the instruction, violating the stated criterion 'every tested requirement is stated'.",
+   "The wire format description ('newline-terminated hex-encoded raw TLS records') is underspecified for the response format \u2014 is the response also hex? Or is it the 32-char MD5 hex string? A solver might return a valid fingerprint in a slightly different format.",
+   "Restarting the service in Test 7 requires the agent to know how to stop and restart it (start.sh), which is stated, but the stale socket test depends on correct sequencing \u2014 if the agent already fixed the stale socket bug, test 7 passes trivially, creating a non-independent test.",
+   "The 90 freshly generated ClientHellos across tests 2-8 must be reproducibly generated (seeded RNG) but if the seed or generation logic differs between verifier runs, tests could be flaky.",
+   "The blueprint states the reproduce.py script 'reports wrong fingerprints on about a third of the test vectors' but then says 'all 8 pass even with the bugs' \u2014 this internal contradiction could confuse task builders about the actual symptom."
+  ],
+  "verdict": "reject",
+  "reasons": "The most critical flaw is that the instruction omits several tested requirements: wire-order preservation for extensions, GREASE filtering of extensions and elliptic_curves, and the absent-elliptic_curves empty-string encoding are all tested but never stated in the instruction draft, violating the clarity criterion and creating unfair failure modes. The speedrun reaches ~19 commands because all bugs are source-visible, but a skilled frontier agent reading carefully will find all bugs systematically, putting genuine_difficulty at borderline 3. The internal contradiction (reproduce.py 'reports wrong fingerprints on about a third' vs 'all 8 pass with bugs') also needs resolution before build.",
+  "fixes": [
+   "Expand the instruction to explicitly state all tested requirements: 'Extension types must appear in wire order (not sorted); GREASE values (0x0a0a through 0xfafa) must be filtered from all four JA3 fields; absent elliptic_curves and ec_point_formats must produce empty fields (not \"0\" or other placeholder).' \u2014 currently these are in the blueprint's requirements list but absent from the instruction draft.",
+   "Resolve the contradiction: either make reproduce.py actually report failures on some inputs by including 2-3 vectors that exercise the bugs (absent curves, 0xfafa GREASE), or change the scenario description to say 'the researcher's replay script reports wrong fingerprints on a third of their new test vectors \u2014 the bundled paper samples all pass.' This makes the misleading trap more coherent.",
+   "To increase genuine_difficulty above 3, add a 6th bug that is not source-visible: e.g., a timing-dependent race in the daemon thread that causes one-in-N requests to return a stale result, or a parser bug that only manifests on TLS records with a specific record-layer version mismatch \u2014 something that requires dynamic testing, not just reading. This would push the speedrun past 20 commands for good reasons."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a SQLite/shared-library pipeline; the candidate is about debugging a TLS ClientHello parser producing incorrect JA3 fingerprints over a Unix socket."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about computing HMAC-SHA256 over canonical binary WAL records via TCP; the candidate is about JA3 fingerprint computation from TLS ClientHello bytes over a Unix socket, with different protocol details and bug class."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about a binary frame encode/decode round-trip service over HTTP; the candidate is about a JA3 TLS fingerprinting service with specific GREASE filtering and field-ordering bugs."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing weighted aggregation in a compiled C service writing to SQLite; the candidate is about debugging a Python TLS ClientHello parser for correct JA3 fingerprint output."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing AES-128-CTR nonce derivation in a C crypto library for SQLite row encryption; the candidate is about fixing JA3 fingerprint computation in a Python TLS parsing microservice."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.163
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.161
+    ],
+    [
+     "ours/official-aac910462208",
+     0.14
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.136
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.106
+    ]
+   ],
+   "cost_usd": 0.015336
+  },
+  "novel": true
+ },
+ "cost_usd": 0.060246
+}

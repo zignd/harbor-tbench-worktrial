@@ -14,15 +14,7 @@ const TAG_SIZE = 16;
 
 /**
  * Compute the HKDF salt on the encryptor side.
- *
- * The window start timestamp is truncated to the nearest window boundary.
- * This implementation uses Math.round, which disagrees with Math.floor
- * for window start times within 500 ms of a window boundary edge.
- *
- * The README specifies Math.floor (integer division). The verifier uses
- * Math.floor. For window start times that are exact multiples of
- * windowDurationMs, the two functions agree; for times near a boundary
- * they may produce different aligned values.
+ * The window start timestamp is aligned to the nearest window boundary.
  */
 function computeEncryptorSalt(windowStartMs, windowDurationMs) {
   const aligned = Math.round(windowStartMs / windowDurationMs) * windowDurationMs;
@@ -33,7 +25,6 @@ function computeEncryptorSalt(windowStartMs, windowDurationMs) {
 
 /**
  * Build the HKDF info buffer for a window index (encryptor side).
- * Mirrors the branching logic in session_key_manager.buildEncryptorInfo.
  */
 function buildInfo(windowIndex) {
   if (windowIndex % 4 === 3) {
@@ -72,7 +63,7 @@ function encryptWindow(logDir, windowIndex, windowStartMs, records, config) {
 
   const ephemeralKeys = skm.generateEphemeralKeypair();
 
-  // Derive session key using encryptor-side salt (Math.round) and info (branching)
+  // Derive session key
   const ikm = skm.computeSharedSecret(ephemeralKeys.privateKeyDer, serverPubKey);
   const salt = computeEncryptorSalt(windowStartMs, windowDurationMs);
   const info = buildInfo(windowIndex);

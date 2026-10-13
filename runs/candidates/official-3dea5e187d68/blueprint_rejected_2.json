@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "audit-binary-sql-aggregator-drift",
+  "title": "SQL Aggregation Engine Silent Corruption",
+  "scenario": "An analyst's monthly revenue roll-ups stopped matching the raw transaction ledger three weeks ago. The system uses a compiled C binary `/usr/local/bin/sqlagg` that reads a SQLite database, runs window-function aggregations, and writes a summary CSV. The binary has no source available in the container. The analyst has a reference implementation in Python that gives the correct numbers on small samples, and a growing divergence on production-scale data.",
+  "instruction_draft": "The aggregation binary at `/usr/local/bin/sqlagg` produces revenue summaries that no longer match the source ledger in `/app/data/ledger.db`. Fix the pipeline so that running `/app/run_pipeline.sh` produces a `/app/output/summary.csv` whose row totals, per-merchant subtotals, and grand total all match the values the reference script `/app/reference.py` computes from the same ledger for every merchant and month combination present in the ledger.",
+  "requirements": [
+   "Running `/app/run_pipeline.sh` must exit 0 and produce `/app/output/summary.csv`.",
+   "Every row in summary.csv must have the correct merchant_id, year_month, transaction_count, gross_revenue, net_revenue, and refund_total matching what `/app/reference.py` computes on the same ledger.",
+   "The grand total row (merchant_id='ALL') must equal the sum of all per-merchant rows for gross_revenue, net_revenue, refund_total, and transaction_count.",
+   "Each refund row must reduce net_revenue by the amount of the charge it references (by charge_id foreign key), not by an arbitrary amount matching its value.",
+   "The output must be correct for ledger data the verifier generates fresh at test time, not just the sample ledger shipped in the container."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base image.",
+   "Install sqlite3, gcc, python3-pip; pip install pandas.",
+   "Compile the C source (not left in the container) into `/usr/local/bin/sqlagg`; the binary accepts `--db <path> --out <path>` and reads the ledger, runs the aggregation, writes CSV.",
+   "The C binary has TWO planted bugs: (1) the GROUP BY clause for per-merchant monthly rollup aggregates refunds by matching on `amount` instead of `charge_id`, so a refund cancels a random same-amount charge rather than the referenced one \u2014 this causes net_revenue to be wrong on any ledger where two charges share an amount; (2) the grand-total row is computed BEFORE refund deduction is applied (it sums gross figures), so grand total net_revenue is always too high by the total refund amount. These two bugs interact: fixing only bug 1 makes grand total appear correct on symmetric test data, and fixing only bug 2 makes per-merchant rows appear correct when all amounts are unique.",
+   "The sample ledger `/app/data/ledger.db` is crafted so all charges have unique amounts AND refunds cancel out symmetrically across merchants, making both bugs invisible on the sample \u2014 the output looks correct.",
+   "Place `/app/reference.py`: a correct Python/pandas implementation that reads ledger.db and prints the right CSV to stdout.",
+   "Place `/app/run_pipeline.sh`: invokes `/usr/local/bin/sqlagg --db /app/data/ledger.db --out /app/output/summary.csv`.",
+   "Place `/app/schema.sql` describing the ledger schema: transactions(id, merchant_id, type TEXT CHECK(type IN ('charge','refund')), amount_cents INTEGER, charge_id INTEGER REFERENCES transactions(id), year_month TEXT).",
+   "Place `/app/logs/agg.log` with misleading 'ERROR: index out of range on merchant M-047' entries that appear during a previous run \u2014 this log points to the merchant list iteration logic, not the actual bugs, serving as the misleading symptom.",
+   "The binary is ~1200 lines of plausible C across aggregation, CSV writing, and DB connection modules \u2014 solver sees only the ELF.",
+   "Verifier generates a fresh ledger at test time with: multiple merchants sharing charge amounts, refunds that reference specific charge_ids (not just matching amounts), and an asymmetric refund distribution across months."
+  ],
+  "internal_hint": "Difficulty comes from a compiled opaque binary (no source visible by reading). The solver must: (1) probe the binary's behavior experimentally by crafting ledger inputs with known expected outputs, (2) discover bug 1 by inserting two charges with the same amount and one refund referencing the first \u2014 the binary will deduct from the wrong charge, (3) discover bug 2 by checking that the ALL row grand total equals sum of net rows (it won't because grand total is computed pre-refund). The misleading symptom is the 'M-047 index' log error which is a red herring from unrelated dead code. The fix requires replacing the binary: the solver must rewrite the aggregation logic (in Python, SQL, or recompiled C shim) and update run_pipeline.sh to call it instead. The two bugs interact: a ledger where all amounts are unique hides bug 1, and a ledger with symmetric refund distribution makes bug 2 cancel out in per-merchant totals \u2014 the sample ledger is designed to hide both simultaneously.",
+  "trap": "A solver who runs reference.py against the sample ledger, sees it matches sqlagg output, and concludes the pipeline is already correct will fail every verify-time test. A solver who only fixes the charge_id matching (bug 1) will pass per-merchant tests but fail the grand-total check. A solver who only fixes the grand total computation (bug 2) will pass grand-total tests on unique-amount data but fail per-merchant tests on shared-amount data. Only fixing both produces a correct solution.",
+  "tests": [
+   "Test 1 \u2014 shared-amount refund correctness: generate a ledger with merchant A having two charges of $100 and one refund referencing the first charge_id; verify that only the referenced charge is cancelled in net_revenue.",
+   "Test 2 \u2014 grand total integrity: sum all per-merchant net_revenue rows and compare to the ALL row; they must be equal.",
+   "Test 3 \u2014 asymmetric refund distribution: generate a ledger where merchant B has 3x more refunds than merchant C; verify per-merchant net_revenue and transaction_count are correct independently.",
+   "Test 4 \u2014 multi-month rollup: generate charges and refunds spanning 4 months; verify year_month bucketing is correct for both per-merchant and grand-total rows.",
+   "Test 5 \u2014 reference agreement: run reference.py and run_pipeline.sh on the same fresh ledger; diff the CSVs (after sorting); they must be identical.",
+   "Test 6 \u2014 zero-refund merchant: a merchant with no refunds must have gross_revenue == net_revenue and refund_total == 0.",
+   "Test 7 \u2014 refund exceeds charge in same month: a refund in month M for a charge in month M-1 must appear in the month of the original charge's row, not the refund's month."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size",
+   "value": "7 test ledgers with 50-500 rows each",
+   "effect": "Increasing corpus size and adding more edge cases (cross-month refunds, NULL charge_ids, merchants with only refunds) raises difficulty; reducing to 3 ledgers with unique amounts lowers it toward trivial."
+  },
+  "expected_failure_modes": [
+   "Agent probes binary with sample data, sees matching output, concludes no fix is needed, submits unchanged pipeline \u2014 fails all verify-time tests.",
+   "Agent rewrites only the refund-matching logic (bug 1) by inspecting binary behavior with shared-amount data, submits, passes per-merchant tests but fails grand-total test \u2014 partial credit trap.",
+   "Agent is distracted by the 'M-047 index' log error, spends time investigating merchant list parsing, never discovers the mathematical root causes.",
+   "Agent writes a replacement script that is correct for the sample ledger but uses a different bucketing convention for cross-month refunds, failing test 7.",
+   "Agent fixes both bugs but introduces a rounding error in integer cents arithmetic (e.g., dividing by 100 prematurely), failing tests on large amounts."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-engineering",
+  "tags": [
+   "sql",
+   "binary-reverse",
+   "debugging",
+   "data-integrity",
+   "system-administration",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/run_pipeline.sh",
+   "cat /app/reference.py",
+   "cat /app/schema.sql",
+   "cat /app/logs/agg.log",
+   "sqlite3 /app/data/ledger.db '.schema'",
+   "sqlite3 /app/data/ledger.db 'SELECT * FROM transactions LIMIT 20'",
+   "python3 /app/reference.py",
+   "/app/run_pipeline.sh && cat /app/output/summary.csv",
+   "diff <(python3 /app/reference.py | sort) <(sort /app/output/summary.csv)",
+   "# Sample ledger matches \u2014 must probe with adversarial data",
+   "sqlite3 /tmp/test.db < /app/schema.sql && sqlite3 /tmp/test.db \"INSERT INTO transactions VALUES (1,'A','charge',10000,NULL,'2024-01'),(2,'A','charge',10000,NULL,'2024-01'),(3,'A','refund',10000,1,'2024-01')\"",
+   "/usr/local/bin/sqlagg --db /tmp/test.db --out /tmp/test_out.csv && cat /tmp/test_out.csv",
+   "python3 /app/reference.py --db /tmp/test.db 2>/dev/null || python3 -c \"import sqlite3,csv,sys; ...\"",
+   "# Observe bug 1: binary deducts refund from wrong same-amount charge",
+   "# Check ALL row vs sum of merchant rows for net_revenue",
+   "python3 -c \"import csv; rows=list(csv.DictReader(open('/tmp/test_out.csv'))); merchants=[r for r in rows if r['merchant_id']!='ALL']; all_row=[r for r in rows if r['merchant_id']=='ALL'][0]; print(sum(int(r['net_revenue']) for r in merchants), all_row['net_revenue'])\"",
+   "# Observe bug 2: ALL row net_revenue doesn't match sum",
+   "# Write replacement aggregation script /app/agg_fixed.py using correct SQL with charge_id join",
+   "cat > /app/agg_fixed.py << 'EOF'\nimport sqlite3, csv, sys\ndb = sys.argv[sys.argv.index('--db')+1]\nout = sys.argv[sys.argv.index('--out')+1]\ncon = sqlite3.connect(db)\n# per-merchant monthly aggregation with correct charge_id matching\n...\nEOF",
+   "# Update /app/run_pipeline.sh to call python3 /app/agg_fixed.py --db ... --out ...",
+   "sed -i 's|/usr/local/bin/sqlagg|python3 /app/agg_fixed.py|' /app/run_pipeline.sh",
+   "/app/run_pipeline.sh && diff <(python3 /app/reference.py | sort) <(sort /app/output/summary.csv)"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Test 7 (cross-month refund bucketing) is not clearly specified in the instruction to the solver \u2014 the instruction says rows must match reference.py, but a solver who reads reference.py carefully may still implement bucketing differently if reference.py is ambiguous about which month a cross-month refund belongs to.",
+   "The reference.py script is available to the solver, so a trivially correct solution is to just shell out to reference.py in run_pipeline.sh \u2014 the verifier must check that /app/run_pipeline.sh doesn't simply call reference.py internally (otherwise the task collapses to a 1-command solution).",
+   "If the verifier generates fresh ledgers, the solver's replacement script must handle edge cases (merchants with no transactions in some months, NULL charge_id on charges, etc.) that may not be exercised by the sample \u2014 potential flakiness if schema constraints are underspecified.",
+   "The instruction does not state the CSV column order or header names precisely enough \u2014 a solution with correct data but different column ordering might be flagged as wrong depending on how the diff is done.",
+   "Depending on how /app/reference.py is invoked (with or without --db argument), a solver may need to reverse-engineer its calling convention, which is an unspecified friction point."
+  ],
+  "verdict": "accept",
+  "reasons": "The task is a well-constructed adversarial engineering problem with two genuinely interacting bugs hidden behind an opaque binary, a misleading log red herring, and a sample ledger that hides both bugs simultaneously \u2014 these compound traps make shallow verification fail and require systematic experimental probing. The verifier regenerates fresh ledgers at test time, preventing solutions that only match the sample. The scenario is realistic and the tests are deterministic and comprehensive. One significant loophole must be closed: a solver could trivially pass all tests by calling reference.py directly from run_pipeline.sh, which the verifier must explicitly guard against.",
+  "fixes": [
+   "Explicitly forbid calling /app/reference.py from run_pipeline.sh in the instruction and add a verifier check that run_pipeline.sh does not invoke reference.py (e.g., check that reference.py process is not spawned during pipeline execution).",
+   "Specify the exact CSV output format (column order, header names, sort order) in the instruction so that column-order mismatches are not a source of ambiguous failures.",
+   "Clarify the cross-month refund bucketing rule in the instruction (e.g., 'a refund is bucketed into the year_month of the charge it references, not the year_month of the refund transaction') so test 7 is unambiguous without reading reference.py source.",
+   "Add a verifier guard that confirms /usr/local/bin/sqlagg is either not called or that run_pipeline.sh has been meaningfully modified \u2014 preventing a partial-credit trap where the binary is called but its output is post-processed incorrectly."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a revenue/balance reconciliation pipeline where refunds must offset specific charges by foreign key rather than arbitrary matching, but the candidate uses a compiled C binary with no source (reverse-engineering angle) and CSV output rather than a Python tool printing to stdout."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "That task involves fixing Rust source code for a sensor statistics pipeline with fixed-point arithmetic, whereas the candidate involves a black-box C binary doing SQL window-function aggregations over financial ledger data."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task involves characterizing a black-box normalizer binary for sensor ADC readings and fixing SQL rollups, whereas the candidate involves a black-box SQL aggregation binary producing revenue summaries from a financial ledger."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about chunk-based CSV processing with deduplication and schema validation, whereas the candidate is about SQL window-function aggregation correctness for financial revenue roll-ups."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing SQL query logic (cumulative sums and RANK semantics) in a text file, whereas the candidate involves a black-box compiled binary that silently corrupts aggregation results."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.376
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.176
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.168
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.151
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.134
+    ]
+   ],
+   "cost_usd": 0.014034000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.046263
+}

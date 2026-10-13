@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "node-csp-middleware-throughput-audit",
+  "title": "CSP Middleware Throughput Audit",
+  "scenario": "A security engineer is auditing a Node.js HTTP gateway that enforces Content-Security-Policy headers before forwarding requests to a backend service. The gateway runs as a single container exposing port 3000, backed by an in-process mock backend. The service was recently refactored to add per-request nonce generation, directive merging from layered policy configs, and a request-signature validation path \u2014 and a performance regression was reported but never reproduced or filed as a bug.",
+  "instruction_draft": "You are auditing the security gateway at /app. The gateway must enforce CSP headers correctly on every response: nonces must be cryptographically random and unique per request, policy directives from all active policy layers must appear in the final header with no directive silently dropped, and the `report-uri` directive must point to the tenant-specific endpoint encoded in the request's `X-Tenant-ID` header.\n\nBeyond correctness, the gateway must sustain at least 400 requests per second on a single CPU when driven with 20 concurrent clients sending valid signed requests \u2014 a working-but-slow implementation is not acceptable for production. Measure throughput with `autocannon` or equivalent; the threshold applies to the `/check` endpoint with representative payloads. The gateway is already running; find and fix whatever prevents it from meeting both the correctness requirements and the 400 RPS bar.",
+  "requirements": [
+   "Each response must include a Content-Security-Policy header",
+   "The nonce value in the CSP header must be unique across every response (no repeated nonces across concurrent requests)",
+   "All directive keys from every active policy layer must appear in the final CSP header \u2014 no layer's directives are silently dropped",
+   "The report-uri directive must point to the tenant-specific endpoint derived from the X-Tenant-ID request header",
+   "The /check endpoint must sustain at least 400 requests per second under 20 concurrent clients with valid signed payloads"
+  ],
+  "environment": [
+   "Dockerfile FROM node:20-slim, installs autocannon globally, copies /app",
+   "/app/package.json with express, uuid, autocannon as dependencies",
+   "/app/server.js: main entry point, starts HTTP server on port 3000, already running via a start script",
+   "/app/middleware/csp.js: CSP header construction \u2014 contains a subtle directive-merge bug where Object.assign overwrites rather than merges duplicate directive arrays, silently dropping inner-layer script-src additions; also uses crypto.randomUUID() inside a synchronous forEach that serializes nonce generation, killing throughput",
+   "/app/middleware/policy-loader.js: loads 3 JSON policy layer files from /app/policies/, merges them \u2014 the merge logic has an off-by-one that drops the last policy layer entirely at runtime (visible only when 3+ layers are loaded, which only happens with the real config, not the unit test fixture that ships with the repo which only loads 2 layers)",
+   "/app/middleware/signature.js: verifies HMAC-SHA256 of the request body using a secret from /app/config/secret.key; uses a timing-safe comparison but iterates through a synchronous 50ms artificial delay (left from debugging) on every request",
+   "/app/policies/base.json, /app/policies/strict.json, /app/policies/tenant-overrides.json: three layered CSP policy files; tenant-overrides.json contains the report-uri template `https://reports.example.com/{tenant}/csp`",
+   "/app/config/secret.key: HMAC secret, static value",
+   "/app/config/tenants.json: maps tenant IDs to report endpoint slugs",
+   "/app/test/fixture-check.js: a unit-test style script that checks correctness against a 2-layer fixture \u2014 it passes even with the off-by-one bug because it only loads 2 policies",
+   "/app/scripts/bench.sh: autocannon invocation with correct flags and a pre-generated signed payload, 20 connections, 10 second run \u2014 solver can run this to measure",
+   "The service is pre-started by a supervisor script so it is already listening when the solver arrives"
+  ],
+  "internal_hint": "Difficulty comes from three interacting runtime problems that only manifest together under real load, none of which the provided test fixture exposes: (1) The policy-loader off-by-one (slice vs splice, or a loop ending at length-1) drops the third policy layer, which is the only layer containing the report-uri template \u2014 so report-uri is always absent. This is not visible in the unit fixture (2 layers). (2) The directive merge uses Object.assign on arrays, so script-src from layer 2 overwrites layer 1 rather than merging, dropping directives. This also only shows with \u22652 real layers. (3) The 50ms artificial delay in signature.js (a `await new Promise(r => setTimeout(r, 50))` left in) caps throughput at ~20 RPS regardless of other fixes. The solver must: run the service under autocannon to see the RPS failure, then inspect response headers to see correctness failures, then instrument/read each middleware to find the three causes. The fixture-check.js passing misleads the solver into thinking correctness is fine. The reference solution fixes all three and reaches ~600 RPS.",
+  "trap": "A solver that fixes only the 50ms delay reaches ~350 RPS (still below threshold) and may think the problem is solved. A solver that only fixes the merge and off-by-one passes the correctness checks but fails the throughput test. A solver that runs fixture-check.js and sees it pass stops investigating correctness entirely, never finding the missing third policy layer at runtime. All three issues must be fixed simultaneously for both the RPS threshold and correctness checks to pass.",
+  "tests": [
+   "Verifier sends 1000 requests to /check with valid signatures and collects all CSP header values; checks that zero nonce values repeat across the 1000 responses",
+   "Verifier sends requests with distinct X-Tenant-ID values (tenant-A, tenant-B, tenant-C generated at verify time from tenants.json) and checks that each response's report-uri contains the correct tenant-specific slug",
+   "Verifier sends a request and checks the CSP header contains directive keys from all three policy layers including script-src values that should appear only in layer 2",
+   "Verifier runs autocannon with 20 concurrent connections for 10 seconds against /check with a pre-signed payload and asserts requests/sec >= 400",
+   "Verifier sends 50 concurrent requests simultaneously and checks that all 50 nonces are distinct (concurrency correctness)"
+  ],
+  "verifier_knob": {
+   "name": "rps_threshold",
+   "value": "400",
+   "effect": "Lowering to 200 makes the task easier (fixing just the 50ms delay suffices); raising to 600 requires eliminating additional synchronous overhead in the merge pipeline and possibly switching to async nonce generation \u2014 very hard"
+  },
+  "expected_failure_modes": [
+   "Solver runs fixture-check.js, sees it pass, concludes correctness is fine and only investigates the RPS issue \u2014 misses both correctness bugs and ships an incomplete fix",
+   "Solver fixes the 50ms delay and sees RPS improve to ~350, declares success without re-running the full autocannon benchmark",
+   "Solver finds and fixes the directive merge bug but misses the off-by-one in policy-loader that drops the third layer, so report-uri remains absent in production",
+   "Solver rewrites nonce generation but uses Math.random() instead of crypto, failing the cryptographic randomness uniqueness check under concurrency",
+   "Solver fixes all three issues but introduces a regression in the HMAC verification path that causes valid requests to be rejected, failing the correctness tests"
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "security-engineering",
+  "tags": [
+   "nodejs",
+   "csp",
+   "throughput",
+   "middleware",
+   "security",
+   "configuration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/server.js",
+   "cat /app/middleware/csp.js",
+   "cat /app/middleware/policy-loader.js",
+   "cat /app/middleware/signature.js",
+   "bash /app/scripts/bench.sh  # observe ~20 RPS",
+   "curl with X-Tenant-ID header to /check, inspect CSP header",
+   "Remove 50ms setTimeout delay from signature.js",
+   "Fix off-by-one in policy-loader.js (slice/loop boundary)",
+   "Fix Object.assign array merge in csp.js (use concat instead)",
+   "bash /app/scripts/bench.sh  # verify >=400 RPS",
+   "curl again to verify report-uri and directive correctness",
+   "node /app/test/fixture-check.js  # confirm no regression"
+  ],
+  "speedrun_commands": 12,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 50ms artificial delay is an unconvincing artifact in production code \u2014 a real engineer would use a comment or environment flag, not a hardcoded delay, reducing realism but also making it extremely obvious to an agent reading the file",
+   "autocannon throughput results can vary on constrained CI hardware; a fix that yields 380-420 RPS on the solver's machine might flap across the 400 RPS threshold on the verifier's machine depending on available CPU, making the test non-deterministic",
+   "The fixture-check.js 'trap' is undermined by the instruction explicitly mentioning three correctness requirements including report-uri, which an agent will probe with curl before concluding correctness is fine",
+   "All three bugs are co-located in three short files with no obfuscation \u2014 a read-all-source-files approach surfaces them in one pass without needing any runtime exploration, reducing the no_repro_given difficulty lever's effect",
+   "If the pre-started service crashes or fails to start in the container, the solver has no way to restart it cleanly without knowing the supervisor mechanism, which is not documented in the instructions"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because all three bugs are directly visible by reading four short source files \u2014 no runtime exploration, log analysis, or subtle inference is required. The speedrun reaches a complete solution in ~12 commands, well under the 20-command threshold for a score above 2. Additionally, the 400 RPS threshold introduces flakiness risk on variable CI hardware, and the stated 'traps' (fixture-check passing, partial RPS fix) are unlikely to fool a frontier agent that reads source code before running tests.",
+  "fixes": [
+   "Obfuscate bugs so they require runtime observation rather than static reading: e.g., make the off-by-one conditional on an environment variable or a runtime config value loaded from a file, so the bug isn't visible from source alone",
+   "Replace the hardcoded 50ms setTimeout with a more realistic performance issue such as a synchronous crypto operation, bcrypt call, or DNS lookup that requires profiling to identify rather than grep",
+   "Add a fourth correctness dimension that requires cross-referencing runtime behavior (e.g., nonce appears in a downstream log the solver must fetch, not just the response header) to increase the exploration burden",
+   "Pin the RPS threshold to a range (e.g., 350-450 with a stated verifier-side warm-up run) or use a relative metric to avoid flakiness on constrained CI hardware",
+   "Introduce a red-herring file (e.g., a second csp.js variant or a commented-out middleware) that requires the solver to determine which code path is actually active, increasing the exploration depth"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/data-anonymization",
+     "verdict": "distinct",
+     "reason": "Data anonymization CLI tool problem bears no resemblance to a Node.js HTTP gateway CSP header enforcement and throughput optimization task."
+    },
+    {
+     "ref_id": "terminal-bench-pro/build-prime-factorization-http-api",
+     "verdict": "distinct",
+     "reason": "Building a prime factorization HTTP API is a completely different problem from auditing and fixing a security gateway for CSP correctness and performance."
+    },
+    {
+     "ref_id": "terminal-bench-pro/configure-apache-analytics-virtualhost",
+     "verdict": "distinct",
+     "reason": "Apache virtual host configuration is unrelated to Node.js CSP middleware throughput and correctness auditing."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Building an HTTP query service over a SQLite/shared-library pipeline is a different core problem from fixing CSP header generation and throughput in a Node.js gateway."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "WAF rule deployment consistency (compiler/deployer/filter pipeline) is a different domain and problem from CSP middleware nonce generation, directive merging, and RPS optimization."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/data-anonymization",
+     0.166
+    ],
+    [
+     "terminal-bench-pro/build-prime-factorization-http-api",
+     0.115
+    ],
+    [
+     "terminal-bench-pro/configure-apache-analytics-virtualhost",
+     0.114
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.086
+    ],
+    [
+     "ours/official-10912a593843",
+     0.079
+    ]
+   ],
+   "cost_usd": 0.013938
+  },
+  "novel": true
+ },
+ "cost_usd": 0.042114
+}

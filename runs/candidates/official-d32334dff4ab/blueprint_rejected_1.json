@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "container-bundle-policy-auditor",
+  "title": "Secure Build Policy Auditor for Node Service",
+  "scenario": "A security engineer is auditing a Node.js microservice that bundles itself into a single deployable artifact using a custom Rollup/esbuild pipeline before shipping inside a Docker container. The service is already running in the container at /app. The audit found that the build pipeline has undocumented behavior: it silently strips or mangles certain security-critical configuration keys depending on build flags, environment variable ordering, and plugin sequencing \u2014 bugs that only manifest at runtime on specific input shapes, not by reading the config files.",
+  "instruction_draft": "You are auditing the build and packaging pipeline for a Node.js service running in /app. The service exposes a POST /audit endpoint that accepts a JSON payload and returns a signed audit record. Security policy requires: (1) every audit record must carry an HMAC-SHA256 signature computed with the key named 'audit_signing_key' from the service's secrets config, (2) the signature field must use exactly the canonical key \u2014 not a fallback, stub, or zero key \u2014 verified by comparing to an independently derived HMAC using the same secret extracted directly from the raw config source, (3) the bundled production artifact (produced by running 'npm run build' in /app) must complete a full request-response cycle in under 80 ms at the 99th percentile under 50 concurrent clients for 10 seconds, measured by the verifier's wrk harness.\n\nThe service currently starts and responds, but the verifier will independently extract the true 'audit_signing_key' from the raw config source at /app/config/secrets.yaml, then send 200 POST requests with varied payloads and verify that each response's 'signature' field matches HMAC-SHA256(payload_canonical_json, true_key). It will also run a load test against the bundled artifact. Your job is to find the configuration and build defects \u2014 without being told where they are \u2014 fix them so both the correctness and performance requirements pass, then run 'npm run build' to produce the final artifact and start the service from the bundle.",
+  "requirements": [
+   "Every POST /audit response contains a 'signature' field that is HMAC-SHA256 of the canonical JSON of the request body, keyed with the value of 'audit_signing_key' from /app/config/secrets.yaml.",
+   "The signature must use the true key from the raw config, not a default, stub, env-override, or fallback value.",
+   "Running 'npm run build' in /app produces a bundled artifact that can serve the /audit endpoint.",
+   "The bundled artifact must handle 50 concurrent clients for 10 seconds with p99 latency under 80 ms."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install Node.js 20 LTS via nodesource, wrk via apt, and all npm deps offline from a local registry tarball.",
+   "The service is ~1400 lines across: src/server.js (Express app, /audit endpoint), src/config-loader.js (loads secrets.yaml, has a subtle key-name normalization bug that lowercases keys with hyphens into camelCase inconsistently), src/signer.js (HMAC logic, falls back to a hardcoded stub key 'INSECURE-FALLBACK' when config key is undefined), src/middleware/validator.js, src/plugins/rollup-secrets-strip.js (a custom Rollup plugin that strips any config property whose name matches /secret|key|token/i from the inlined bundle \u2014 removing the signing key at build time), rollup.config.js (references the strip plugin, has an env-conditional that activates the strip plugin when NODE_ENV=production, which npm run build sets), package.json with build script 'NODE_ENV=production rollup -c'.",
+   "/app/config/secrets.yaml contains 'audit_signing_key: \"s3cr3t-audit-k3y-xK9pLm2\"' plus other innocuous keys.",
+   "The service is pre-started from the source (not the bundle) using 'node src/server.js' so it appears to work; the verifier rebuilds from 'npm run build' and starts fresh from the bundle.",
+   "The config-loader normalization bug: it splits on '-' and camelCases, so 'audit_signing_key' (underscore) is loaded correctly from YAML, but the signer looks it up as 'auditSigningKey' (camelCase of hyphenated form) \u2014 meaning the signer always misses it and falls back to the stub. This bug is silent in dev because a .env file sets AUDIT_SIGNING_KEY to the stub value which masks the mismatch.",
+   "A second planted problem: the Rollup strip plugin uses a regex that also strips underscore-named keys, so even after fixing the lookup name mismatch, a naive fix that renames the key in code will still have the key stripped by the plugin at build time.",
+   "The performance problem: src/signer.js re-imports and re-parses the YAML file on every request (fs.readFileSync + yaml.parse in the hot path). Under 50 concurrent clients this adds ~15-25ms per request, pushing p99 over 80ms. The fix is to cache the parsed config at startup.",
+   "No reproduction is provided; the solver must discover that the running service (from source) works because of the .env stub, while the bundle will fail both correctness and performance.",
+   "The .env file contains AUDIT_SIGNING_KEY=INSECURE-FALLBACK, making the source-run service appear correct to a naive test."
+  ],
+  "internal_hint": "Difficulty comes from two interacting data-dependent runtime behaviors invisible by reading any single file: (1) the config-loader key normalization mismatch (underscore vs camelCase) is masked in the running source service by a .env override \u2014 so the service appears correct until the verifier independently derives the expected HMAC from the raw YAML. (2) Even after fixing the lookup, the Rollup strip plugin removes the key at build time, so the bundle still falls back to the stub. (3) The YAML re-parse on every request is a hot-path performance issue that only appears under load. The solver must: run 'npm run build', start the bundle, probe /audit, compare its HMAC to a manually derived one from secrets.yaml, discover the mismatch, trace back through signer.js -> config-loader.js -> the normalization logic, fix the lookup key, then discover the strip plugin strips it anyway (by testing again after the first fix), then fix the plugin regex to exclude underscore-named keys or add an allowlist, then fix the per-request YAML parse by caching. Each fix looks complete until the next layer fails.",
+  "trap": "A solver that fixes only the key name mismatch in signer.js will pass a quick manual test (because the source-run service with .env still works and the bundle test reveals progress) but the strip plugin will still remove the key from the bundle, so the verifier's 200 HMAC checks on the bundle artifact will all fail. A solver that also fixes the strip plugin but doesn't cache the config parse will fail the p99 latency threshold under 50 concurrent clients. A solver that only reads source files without running the bundle will miss all three issues.",
+  "tests": [
+   "Verifier runs 'npm run build' in /app, starts the bundle with 'node dist/server.js' (or equivalent output), and waits for the /audit endpoint to be healthy.",
+   "Verifier reads /app/config/secrets.yaml directly, extracts the raw value of 'audit_signing_key', and computes expected_sig = HMAC-SHA256(canonical_json(payload), raw_key) for 200 distinct randomly-generated payloads (generated at verify time with a fixed seed).",
+   "Verifier sends each of the 200 payloads to POST /audit on the running bundle and asserts response.signature === expected_sig; any mismatch or fallback-key match causes failure.",
+   "Verifier runs 'wrk -t4 -c50 -d10s --script post_audit.lua http://localhost:PORT/audit' and parses the latency histogram; asserts p99 < 80ms.",
+   "Verifier checks that the stub/fallback key 'INSECURE-FALLBACK' never appears as the HMAC key for any response (signatures must not match HMAC computed with the fallback key)."
+  ],
+  "verifier_knob": {
+   "name": "p99_latency_threshold_ms",
+   "value": "80",
+   "effect": "Lowering to 60ms makes the caching fix insufficient alone and requires additional optimization (e.g. pre-serializing canonical JSON or using a faster HMAC path); raising to 150ms makes the performance bar trivially met by caching alone, reducing difficulty to just the two correctness bugs."
+  },
+  "expected_failure_modes": [
+   "Solver fixes the key name mismatch but doesn't discover the Rollup strip plugin removes it at build time, so the bundle still uses the fallback key.",
+   "Solver finds and fixes both the name mismatch and the strip plugin, but doesn't notice the per-request YAML re-parse performance issue, and fails the p99 latency test.",
+   "Solver tests the source-run service (which passes due to .env) and concludes everything is working without ever running the bundle.",
+   "Solver fixes the strip plugin regex incorrectly (e.g. changes it to only strip 'token' but not 'key'), leaving the signing key still stripped.",
+   "Solver caches the config but uses module-level caching that doesn't survive the Rollup bundle's module scope behavior, not actually eliminating the re-parse."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "javascript",
+   "rollup",
+   "security",
+   "configuration",
+   "performance",
+   "node"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/signer.js",
+   "cat /app/src/config-loader.js",
+   "cat /app/config/secrets.yaml",
+   "cat /app/rollup.config.js",
+   "cat /app/src/plugins/rollup-secrets-strip.js",
+   "cat /app/package.json",
+   "cat /app/.env",
+   "Edit signer.js: change config key lookup from 'auditSigningKey' to 'audit_signing_key'",
+   "Edit signer.js: move YAML parse/readFileSync to module initialization (cache at startup)",
+   "Edit rollup-secrets-strip.js: narrow regex to exclude 'audit_signing_key' (e.g. add negative lookahead or allowlist)",
+   "cd /app && npm run build",
+   "node dist/server.js &",
+   "curl -X POST localhost:PORT/audit -d '{\"x\":1}' -H 'Content-Type: application/json'",
+   "python3 -c \"import hmac,hashlib; print(hmac.new(b's3cr3t-audit-k3y-xK9pLm2', b'{\"x\":1}', hashlib.sha256).hexdigest())\"",
+   "Compare curl response signature to manually derived HMAC",
+   "wrk -t4 -c50 -d10s --script post_audit.lua http://localhost:PORT/audit",
+   "Verify p99 < 80ms in wrk output"
+  ],
+  "speedrun_commands": 17,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 'canonical JSON' of the payload is underspecified \u2014 if the verifier and the service use different serialization (key ordering, whitespace, encoding) for HMAC computation, correct implementations could fail due to format mismatch rather than a real bug.",
+   "The bundle output path 'dist/server.js (or equivalent output)' is vague \u2014 if Rollup produces a differently named or structured output, the verifier's startup command may fail independent of solver correctness.",
+   "The p99 latency threshold of 80ms may be environment-sensitive: on a slow CI runner or under resource contention, even a correctly cached implementation could exceed 80ms, making the test flaky rather than deterministic.",
+   "The .env masking trick only works as a trap if the solver tests the running service rather than reading source \u2014 a source-reading agent bypasses the trap entirely, reducing difficulty to a straightforward multi-file edit problem.",
+   "The wrk lua script 'post_audit.lua' must be present in the container and correctly generate valid POST bodies; if it's missing or malformed, the load test fails for environmental reasons unrelated to the solver's fixes.",
+   "No specification of what 'canonical JSON' means (e.g. sorted keys, no extra whitespace) \u2014 ambiguity here can cause verifier/service disagreement that looks like a wrong key but is actually a serialization bug."
+  ],
+  "verdict": "reject",
+  "reasons": "All three bugs are directly visible by reading 6-7 source files, making this solvable in ~17 commands without any dynamic probing \u2014 the .env masking trap is bypassed by any agent that reads source before testing, which frontier agents always do. The genuine_difficulty score of 2 falls below the minimum threshold of 3, and the 'no_repro_given' and 'data-dependent runtime behavior' framing is misleading since the bugs are statically visible in source. Additionally, 'canonical JSON' is underspecified, creating invalid failure risk where correct implementations fail due to serialization disagreement rather than real defects.",
+  "fixes": [
+   "Obfuscate the bugs so they cannot be found by static reading alone: e.g. move the key normalization into a compiled binary helper or an npm package (not source), so the solver must actually run the bundle and observe the wrong HMAC to discover the mismatch.",
+   "Define 'canonical JSON' precisely in the instruction (e.g. 'JSON.stringify with keys sorted lexicographically, no extra whitespace') and ensure both verifier and service implement exactly the same serialization.",
+   "Replace the .env masking trick with a runtime-only bug (e.g. the normalization only triggers for keys that contain both underscores and are longer than N chars, or a conditional that depends on Node.js process.env.npm_lifecycle_event being 'build') so source-reading alone cannot reveal the bug \u2014 requiring the solver to actually run the bundle and probe it.",
+   "Pin the p99 threshold to a value validated on the target hardware (e.g. run the baseline in CI and set threshold at 2x the observed median) and document the expected hardware profile to reduce flakiness.",
+   "Specify the exact output artifact path that 'npm run build' produces (e.g. 'dist/bundle.cjs') so the verifier's startup command is unambiguous.",
+   "Add a runtime canary: have the service log which key it actually used for signing (masked), so the solver can confirm their fix worked without needing to manually derive HMACs."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task focuses on fixing an HMAC chain verification protocol for audit log files, while the candidate involves diagnosing silent build pipeline key mangling bugs and fixing bundling/performance in a Node.js service."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "That task is about a TCP service computing HMAC over binary WAL records with a refund resolver lookup, not about build pipeline defects, bundler key stripping, or load performance requirements."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "That task involves fixing session key derivation agreement between an encryptor and verifier for encrypted log windows, whereas the candidate centers on build pipeline configuration bugs silently mangling signing keys and a p99 load test requirement."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a compiled shared library with windowed aggregations, entirely unrelated to HMAC signing key integrity through a bundler or load performance auditing."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about restoring a frame codec service with a specific binary wire format regression, not about build pipeline key mangling, HMAC audit signatures, or bundler performance."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-cff69805912b",
+     0.229
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.203
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.171
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.164
+    ],
+    [
+     "ours/official-aac910462208",
+     0.148
+    ]
+   ],
+   "cost_usd": 0.015306
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05337600000000001
+}

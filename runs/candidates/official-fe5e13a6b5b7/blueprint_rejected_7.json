@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "cost-basis-lot-tracker-repair",
+  "title": "Capital Gains Cost-Basis Lot Tracker Repair",
+  "scenario": "A finance-ops team runs a small in-house Rust codebase (~1,400 lines across several modules) that ingests trade CSV files and produces a SQLite database of realized capital-gains lots for quarterly tax reporting. The pipeline has been quietly producing wrong per-lot gain/loss figures since a refactoring several months ago, but the nightly health-check passes because it only validates row counts and total proceeds. The team noticed the quarterly report disagreed with the brokerage statement by thousands of dollars and has asked you to find and fix the issue.",
+  "instruction_draft": "Hey, our lot-tracker pipeline is busted \u2014 the realized gains in `/app/data/lots.db` are wrong compared to what the brokerage shows. The pipeline lives in `/app/tracker/`, you build it with `cargo build --release` and run it with `./target/release/lot-tracker /app/data/trades.csv /app/data/lots.db`. The nightly check script at `/app/check.sh` claims everything is fine, which is obviously not true. The `/app/data/` dir also has a reference binary `lot-ref` that we know produces correct output for any input CSV \u2014 use it however you like. Fix the Rust source so that running the pipeline produces a `lots.db` where every row's `cost_basis`, `proceeds`, and `realized_gain` columns exactly match what `lot-ref` outputs (to the nearest cent, i.e. rounded to 2 decimal places and stored as REAL). The `lot_method` column must also be correct. Don't change the schema.",
+  "requirements": [
+   "Running `./target/release/lot-tracker /app/data/trades.csv /app/data/lots.db` produces a SQLite database at `/app/data/lots.db`.",
+   "Every row's `cost_basis` column matches the reference binary's output to the nearest cent (\u00b10.005).",
+   "Every row's `proceeds` column matches the reference binary's output to the nearest cent (\u00b10.005).",
+   "Every row's `realized_gain` column equals `proceeds - cost_basis` rounded to 2 decimal places.",
+   "Every row's `lot_method` column is correct (the reference binary uses HIFO \u2014 highest-in, first-out \u2014 not FIFO).",
+   "The `lots.db` schema is unchanged from the original.",
+   "The fix works on fresh trade CSV files generated at verify time, not just the provided sample."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs rustup/cargo (stable), sqlite3, and python3.",
+   "The tracker codebase at /app/tracker/ contains: src/main.rs (CLI entry, ~80 lines), src/ingestion.rs (CSV parsing, ~200 lines), src/matching.rs (lot-matching engine, ~350 lines, contains the bug), src/reporting.rs (SQLite writer, ~250 lines), src/portfolio.rs (position tracking, ~200 lines), src/utils.rs (helpers, ~120 lines), Cargo.toml.",
+   "The bug in matching.rs: the lot-matching loop iterates open lots in FIFO order (BTreeMap keyed by acquisition date ascending) but the system is supposed to use HIFO (highest cost basis first). The key in the BTreeMap is (NaiveDate, OrderedFloat<f64>) but insertion ordering was changed during refactoring to ascending cost, not descending. Fixing this requires changing the sort key to descending cost so the highest-cost lot is matched first.",
+   "A second subtle bug: when a sell partially fills a lot, the remaining fractional shares are reinserted into the open-lot map with the wrong key (uses the sale date instead of the original acquisition date), causing subsequent sells on the same symbol to mis-sequence the remaining lot and compute wrong cost basis for later sells in the same session.",
+   "The misleading symptom: check.sh validates total proceeds summed across all rows (which is order-independent) and row count, so it passes despite the per-lot cost_basis being wrong. Agents looking at the health check first will think proceeds are fine and focus on the gain column.",
+   "The opaque component: /app/data/lot-ref is a compiled binary (no source) that accepts the same CSV and a SQLite output path and produces correct HIFO lots. Agents must probe it experimentally to determine the lot-selection method (HIFO vs FIFO vs LIFO) and the partial-fill reinsertion behavior.",
+   "Plausible non-bug code: ingestion.rs has a commission-fee adjuster, portfolio.rs has a wash-sale stub (not activated), reporting.rs has a currency-rounding note comment \u2014 all realistic distractors.",
+   "Sample /app/data/trades.csv: ~40 rows covering 5 symbols with multiple buys at different prices followed by partial and full sells, designed so FIFO and HIFO give visibly different results.",
+   "The reference binary lot-ref is built from a correct implementation (compiled and stripped) and installed at /app/data/lot-ref with execute permission.",
+   "At verify time, the verifier generates a fresh trades.csv with ~60 rows (different symbols and quantities), runs both lot-ref and the fixed lot-tracker, and compares the lots.db tables row by row."
+  ],
+  "internal_hint": "Difficulty comes from two sources that only manifest on real data, not by reading: (1) the opaque binary must be probed to determine it uses HIFO \u2014 the source says 'HIFO' in a comment but the BTreeMap key order implements FIFO, so an agent who trusts the comment without running data through both binaries will miss the effective behavior; (2) the partial-fill key reinsertion bug is silent on inputs where each lot is fully consumed but produces wrong basis when a later sell hits a partially-filled lot. The health check actively misleads by passing on the broken output. Resolution path: probe lot-ref on a crafted CSV with two buys at different prices then one sell \u2014 compare output to lot-tracker to discover HIFO vs FIFO discrepancy; then craft a CSV with a partial sell followed by a second sell of the remainder to expose the key reinsertion bug; then fix both in matching.rs.",
+  "trap": "An agent that only fixes the BTreeMap sort order (FIFO\u2192HIFO) will pass on inputs where every sell fully exhausts a lot, but fail on any input with a partial sell followed by a second sell of the same symbol. The verifier's fresh CSV always contains at least one such partial-fill chain. Agents who verify only against the sample trades.csv (which can be constructed to all be full-lot sells by the naive agent) will be caught.",
+  "tests": [
+   "Test 1 (schema): lots.db has the original schema columns: lot_id, symbol, acquisition_date, sale_date, quantity, cost_basis, proceeds, realized_gain, lot_method \u2014 no additions or removals.",
+   "Test 2 (HIFO method column): Every row in lots.db has lot_method = 'HIFO'.",
+   "Test 3 (sample data cost_basis): For each row in lots.db produced from the provided trades.csv, cost_basis matches lot-ref output within \u00b10.005.",
+   "Test 4 (sample data realized_gain): For each row, realized_gain = round(proceeds - cost_basis, 2) within \u00b10.005.",
+   "Test 5 (fresh data full-lot sells): Verifier generates a fresh CSV with only full-lot sells at varying prices; checks all cost_basis and realized_gain values against lot-ref.",
+   "Test 6 (fresh data partial-lot sells): Verifier generates a CSV with at least 3 symbols each having a buy, partial sell, then sell of remainder; checks cost_basis for the second sell of each symbol against lot-ref.",
+   "Test 7 (multi-lot partial chain): Verifier generates a CSV with two buys of the same symbol at different prices followed by a sell that spans both lots (partial on the cheaper, full on the more expensive under HIFO); checks both output rows against lot-ref.",
+   "Test 8 (pipeline idempotence): Running lot-tracker twice on the same CSV produces identical lots.db content (no duplicate rows)."
+  ],
+  "verifier_knob": {
+   "name": "number_of_partial_fill_chains",
+   "value": "3 symbols with partial fills in fresh CSV",
+   "effect": "Increasing the number of partial-fill chains in the verify-time CSV raises the probability that an agent who fixed only the HIFO ordering bug (but not the reinsertion bug) is caught; decreasing to 0 partial fills makes the task easier by allowing a single-bug fix to pass."
+  },
+  "expected_failure_modes": [
+   "Agent reads the 'HIFO' comment in matching.rs, trusts it, and only investigates reporting.rs or utils.rs \u2014 never discovers the BTreeMap key is ascending instead of descending.",
+   "Agent fixes the HIFO sort order but misses the partial-fill key reinsertion bug because the sample CSV happens to have only full-lot sells against the naively fixed code.",
+   "Agent probes lot-ref only with the provided sample CSV and concludes output matches after fixing HIFO, but doesn't test a partial-sell scenario, so the reinsertion bug survives to the verifier.",
+   "Agent is misled by the passing health check and spends effort on reporting.rs rounding instead of lot-selection order.",
+   "Agent characterizes lot-ref as FIFO because the sample CSV has buys at nearly equal prices where FIFO and HIFO produce similar results, then builds a wrong fix."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "finance",
+   "sqlite",
+   "opaque-binary",
+   "lot-matching",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/tracker/src/matching.rs  # identify BTreeMap key order and partial-fill reinsertion",
+   "# See ascending cost key (FIFO) despite HIFO comment; see sale_date used in partial-fill reinsertion",
+   "cargo build --release  # baseline",
+   "./target/release/lot-tracker /app/data/trades.csv /app/data/lots.db",
+   "/app/data/lot-ref /app/data/trades.csv /tmp/ref.db",
+   "sqlite3 /app/data/lots.db 'SELECT * FROM lots LIMIT 5;'  # compare cost_basis",
+   "sqlite3 /tmp/ref.db 'SELECT * FROM lots LIMIT 5;'",
+   "# Edit matching.rs: change BTreeMap key from (NaiveDate, OrderedFloat<f64>) ascending to (NaiveDate, Reverse(OrderedFloat<f64>)) so highest cost is first",
+   "# Edit matching.rs: fix partial-fill lot reinsertion to use original acquisition_date instead of sale_date",
+   "cargo build --release",
+   "./target/release/lot-tracker /app/data/trades.csv /app/data/lots.db",
+   "sqlite3 /app/data/lots.db 'SELECT * FROM lots;' > /tmp/fixed.txt",
+   "sqlite3 /tmp/ref.db 'SELECT * FROM lots;' > /tmp/ref.txt",
+   "diff /tmp/fixed.txt /tmp/ref.txt  # confirm match"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Fresh CSV generation at verify time is underspecified: if verifier generates sells before corresponding buys or other edge cases, lot-ref may behave differently from the fixed tracker, causing spurious mismatches unrelated to the bugs being tested.",
+   "Tolerance specification conflict: instruction says 'rounded to 2 decimal places and stored as REAL' but tolerance is \u00b10.005; if lot-ref uses banker's rounding or truncation instead of round-half-up, correct implementations could fail Test 3/4.",
+   "Test 8 (idempotence) requires the pipeline to handle an already-existing lots.db without duplicating rows, but the instruction to the solver never mentions this requirement, making it a hidden constraint.",
+   "Both bugs are fully visible by reading matching.rs source \u2014 the HIFO comment vs ascending BTreeMap key, and the wrong date in partial-fill reinsertion \u2014 so the opaque binary difficulty lever is effectively nullified, and the task is easier than designed.",
+   "The lot_method column value ('HIFO') must be written by the Rust code, but if the bug is only in the sort key, the string 'HIFO' may already be hardcoded in reporting.rs, making Test 2 trivially pass even on broken implementations."
+  ],
+  "verdict": "reject",
+  "reasons": "The task's primary difficulty levers (opaque binary characterization, subtle partial-fill bug) are neutralized because both bugs are directly readable in matching.rs source \u2014 a 14-command speedrun suffices, placing genuine_difficulty at 2, below the minimum threshold of 3. The average score (4+4+4+2+5)/5 = 3.8 meets the average threshold, but the mandatory per-criterion minimum of 3 is violated by genuine_difficulty. Additionally, Test 8 (idempotence) introduces an untold requirement, and the fresh-CSV generation is underspecified, creating invalid failure risks.",
+  "fixes": [
+   "Make the bugs source-invisible: obfuscate matching.rs (e.g., compile matching.rs into a separate .so shared library with only the buggy behavior exposed, or replace the Rust source with a version that looks correct syntactically \u2014 e.g., sort key reads `(Reverse(date), cost)` which looks like HIFO but is actually LIFO). This forces agents to probe lot-ref experimentally rather than reading the fix.",
+   "Introduce a third subtle bug in a different file (e.g., a rounding error in reporting.rs that only manifests on specific quantity*price products) to raise the exploration cost and prevent a pure source-read solve.",
+   "Specify the fresh CSV generation algorithm precisely in the verifier section (e.g., 'generated by /app/verifier/gen_trades.py with seed $RANDOM') and document idempotence as an explicit solver requirement in the instruction to eliminate invalid failure risks.",
+   "Add a source-level misdirection: make the BTreeMap key appear to be descending (e.g., use Reverse on date but not on cost) so reading the code suggests HIFO but running it shows FIFO behavior, forcing experimental verification of the opaque binary."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a Rust pipeline that writes wrong numeric values to SQLite, with a reference binary to compare against and a health check that passes despite incorrect output \u2014 the core debugging pattern is identical, differing mainly in domain (capital gains vs. sensor aggregation) and the specific bug category (lot-matching algorithm vs. fixed-point arithmetic)."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing CSV chunking/deduplication logic in a Python pipeline, not debugging numeric calculation errors in a Rust financial computation pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering a black-box binary's transformation to fix SQL rollup queries, whereas the candidate task involves fixing a known Rust source implementing a specific lot-matching algorithm (HIFO vs FIFO)."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bash script that translates JSON filter specs into SQLite queries, a completely different problem from debugging a Rust capital-gains lot-tracking algorithm."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a SQL query's window functions (cumulative sum and ranking), not debugging a Rust source implementing a financial lot-matching algorithm."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-c396920d769d",
+     0.254
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.155
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.148
+    ],
+    [
+     "ours/official-18899524e171",
+     0.12
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.112
+    ]
+   ],
+   "cost_usd": 0.014988000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.059007000000000004
+}

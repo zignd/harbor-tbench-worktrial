@@ -19,6 +19,9 @@ BLUEPRINT = Blueprint(**json.loads((FIX / "blueprint_ledger.json").read_text()))
 @pytest.fixture
 def env(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "CANDIDATES_DIR", tmp_path / "candidates")
+    # Gate slots are machine-wide locks under JOBS_DIR: a test must never wait on (or hold)
+    # the live pipeline's slots.
+    monkeypatch.setattr(pipeline, "JOBS_DIR", str(tmp_path / "jobs"))
     calls = {"author": [], "gates": 0}
 
     def fake_blueprint(cand, ledger):

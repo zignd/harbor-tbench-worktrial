@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "npm-audit-throughput-profiler",
+  "title": "Dependency Audit Throughput Profiler",
+  "scenario": "A security engineer is auditing a Node.js microservice that performs dependency vulnerability scanning at request time. The service runs inside a single container, scanning npm package manifests submitted via HTTP and returning CVSS scores aggregated by severity. It was recently reported that the service hangs under real load and produces incorrect aggregations when manifests contain transitive dependency cycles. The engineer has a running service on port 4321 and source code under /app/scanner, but no reproduction case \u2014 the bug only surfaces on specific real-world manifest shapes.",
+  "instruction_draft": "You are a security engineer auditing a vulnerability aggregation service running on port 4321 inside this container. The service accepts POST requests to /scan with a JSON body containing a `manifest` field (an npm package-lock.json v2 object) and returns a JSON object with fields `critical`, `high`, `medium`, `low` \u2014 counts of advisories at each CVSS severity tier for all packages in the manifest including transitive dependencies.\n\nThe service currently produces wrong aggregation counts on real manifests and falls below the required throughput of 80 requests per second when tested with a batch of 200 concurrent scan requests against manifests drawn from a hidden test corpus. A working but slow solution also fails: the 80 req/s bar is measured end-to-end by the verifier.\n\nFind the failing case yourself \u2014 no reproduction is provided. Fix the service so that: (1) every advisory is counted exactly once per unique package version even when the dependency graph contains cycles, (2) the severity bucketing follows CVSS v3 numeric ranges (critical \u2265 9.0, high 7.0\u20138.9, medium 4.0\u20136.9, low < 4.0), and (3) the fixed service sustains at least 80 requests per second measured over a 200-request burst from the verifier's hidden corpus. Do not restart or replace the process manager \u2014 patch the source and reload the service in place.",
+  "requirements": [
+   "Each advisory is counted exactly once per unique (package-name, version) pair even when the dependency graph contains transitive cycles",
+   "CVSS v3 numeric bucketing: critical \u2265 9.0, high 7.0\u20138.9, medium 4.0\u20136.9, low < 4.0",
+   "Service sustains \u2265 80 requests/second over a 200-request burst on the verifier's hidden manifest corpus",
+   "Service remains accessible on port 4321 throughout (process manager must not be restarted)",
+   "Response JSON contains exactly the keys: critical, high, medium, low (integer counts)"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with nodejs 20, npm, and pm2 installed via apt/npm",
+   "/app/scanner/index.js \u2014 Express HTTP server, ~120 lines, handles POST /scan",
+   "/app/scanner/graph.js \u2014 dependency graph walker, ~90 lines, contains the cycle bug: it uses a visited set keyed only on package name (not name+version), causing early termination and wrong deduplication",
+   "/app/scanner/advisor.js \u2014 advisory lookup against an in-process JSON database, ~80 lines, uses wrong CVSS bucketing thresholds (treats \u2265 8.0 as critical instead of \u2265 9.0, collapses medium and low into one bucket), only visible through wrong numeric outputs not through reading the threshold constants which are computed indirectly from a config object",
+   "/app/scanner/config.json \u2014 contains severity thresholds as base+delta offsets that compose to wrong final values, e.g. {base: 7, criticalDelta: 1} yields 8 instead of 9; this is the only place thresholds are defined and the arithmetic is non-obvious",
+   "/app/scanner/advisories.json \u2014 ~2000 synthetic advisory records with package name, version range, cvssScore fields; covers 400 unique packages",
+   "/app/scanner/package.json and node_modules/ \u2014 express, semver pre-installed",
+   "pm2 process manager running the service, pm2 ecosystem.config.js with cluster_mode instances=1",
+   "/app/scanner/samples/ \u2014 3 small non-cyclic test manifests that happen to pass even with the bugs (the cycle bug only fires on graphs with \u2265 2 hops of transitive deps forming a cycle; the bucketing bug only shows when packages with cvssScore between 8.0\u20138.9 are present, which the samples avoid)",
+   "Performance bottleneck: graph.js does synchronous recursive DFS with no memoization of advisory lookups, causing O(n\u00b2) advisory scans on large manifests; fixing the cycle bug alone does not clear the throughput bar \u2014 advisory lookup must also be indexed",
+   "Verifier generates 200 manifests at test time: 50 with cycles, 50 with packages scoring 8.x CVSS, 50 large (80+ packages), 50 mixed; measures req/s with autocannon or similar"
+  ],
+  "internal_hint": "Difficulty comes from two interacting runtime-only bugs plus a performance bar that requires both bugs fixed AND an algorithmic change: (1) The cycle bug is data-dependent \u2014 visited set uses name only, so two packages with the same name but different versions collapse, and cycles in real manifests cause premature termination. Only manifests with actual dep cycles reveal this. (2) The bucketing bug hides in config.json arithmetic: criticalDelta+base = 7+1 = 8, so cvssScore \u2265 8.0 becomes critical instead of \u2265 9.0. A solver reading advisor.js sees `score >= config.thresholds.critical` and the threshold value looks like a variable \u2014 they must trace it back through config.json math to see the off-by-one. (3) Even after fixing both bugs, a naive DFS rescans advisories.json for every package visit. With a 80-package cyclic manifest this is ~6400 sequential JSON filter operations per request. The solver must index advisories.json by package name at startup and key the visited set on `name@version` strings. A solver who fixes the cycle bug alone passes correctness but fails throughput. A solver who indexes without fixing bucketing passes throughput but fails correctness on 8.x CVSS scores.",
+  "trap": "A solver who finds and fixes the cycle bug (the most obvious runtime failure) and verifies against the provided sample manifests sees all four severity counts pass \u2014 the samples contain no 8.x CVSS packages. They reload pm2 and the correctness tests for the samples pass. But the verifier's hidden corpus includes manifests with cvssScore 8.0\u20138.9 packages, which get miscounted as critical instead of high. Separately, a solver who fixes both correctness bugs but does not add advisory indexing will pass correctness checks but fail the 80 req/s throughput threshold on the large and mixed manifest sets.",
+  "tests": [
+   "POST /scan with a freshly generated cyclic manifest (A\u2192B\u2192C\u2192A, each with known advisories) returns exactly the advisory count for each unique package, not inflated by repeated visits",
+   "POST /scan with a manifest containing packages whose advisories have cvssScore 8.5 returns that count in `high`, not `critical`",
+   "POST /scan with a manifest containing packages whose advisories have cvssScore 9.1 returns that count in `critical`",
+   "POST /scan with a manifest containing packages whose advisories have cvssScore 3.9 returns that count in `low`",
+   "autocannon or equivalent fires 200 requests with manifests from the hidden corpus concurrently (concurrency=20) and measured req/s \u2265 80",
+   "Service is still reachable on port 4321 after the fix (pm2 list shows the process running)",
+   "Response JSON has exactly the keys critical, high, medium, low with integer values (no extra keys, no floats)"
+  ],
+  "verifier_knob": {
+   "name": "throughput_threshold",
+   "value": "80 req/s",
+   "effect": "Lowering to 40 req/s makes a naive fix without indexing pass; raising to 120 req/s requires also enabling pm2 cluster mode with multiple instances, adding a third dimension of difficulty"
+  },
+  "expected_failure_modes": [
+   "Fixes the cycle bug only, verifies against samples, misses the CVSS bucketing defect because no sample triggers the 8.x range",
+   "Fixes the bucketing defect by hardcoding thresholds without tracing config.json arithmetic, gets the thresholds wrong (e.g. sets critical \u2265 8.5 instead of \u2265 9.0)",
+   "Fixes both correctness bugs but does not add advisory indexing, fails the 80 req/s bar on large manifests",
+   "Restarts pm2 with cluster mode without patching source, passes throughput but both correctness bugs remain",
+   "Fixes the visited-set key to name+version but also accidentally deduplicates across different packages that share an advisory ID, producing undercounts"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "security-engineering",
+  "tags": [
+   "nodejs",
+   "npm",
+   "security-audit",
+   "graph-algorithms",
+   "performance",
+   "configuration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/scanner/graph.js",
+   "cat /app/scanner/advisor.js",
+   "cat /app/scanner/config.json",
+   "cat /app/scanner/index.js",
+   "ls /app/scanner/samples/ && cat /app/scanner/samples/*.json",
+   "cat /app/scanner/advisories.json | head -20",
+   "Identify cycle bug: visited set keyed on name only in graph.js",
+   "Identify bucketing bug: config base=7 + criticalDelta=1 = 8, should be 9",
+   "Identify perf bug: no advisory index, O(n^2) per request",
+   "curl -X POST http://localhost:4321/scan -H 'Content-Type: application/json' -d '{\"manifest\":{...cyclic...}}' to confirm",
+   "Edit graph.js: change visited set key from name to name@version, add advisory index at startup",
+   "Edit config.json: set criticalDelta to 2 (so base+delta=9) OR edit advisor.js to hardcode correct thresholds",
+   "pm2 reload ecosystem.config.js",
+   "curl -X POST http://localhost:4321/scan -d '{\"manifest\":{...cyclic...}}' to verify dedup",
+   "curl -X POST http://localhost:4321/scan -d '{\"manifest\":{...8.5 cvss pkg...}}' to verify high not critical",
+   "curl -X POST http://localhost:4321/scan -d '{\"manifest\":{...9.1 cvss pkg...}}' to verify critical",
+   "npx autocannon -c 20 -a 200 -m POST -b '{...}' http://localhost:4321/scan to verify throughput",
+   "pm2 list to verify process still running"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The config.json arithmetic (7+1=8) is described as 'non-obvious' but is trivial once visible \u2014 the indirection may not meaningfully delay a careful reader",
+   "pm2 reload vs pm2 restart distinction is load-bearing for the 'do not restart the process manager' constraint but the instruction does not define what counts as a restart, creating potential ambiguity",
+   "Throughput threshold of 80 req/s measured over a 200-request burst is sensitive to container CPU allocation and concurrency settings \u2014 could produce flaky pass/fail near the threshold",
+   "The hidden corpus generates manifests at test time with specific CVSS score ranges; if advisory lookup for those packages is not deterministic (e.g., version range matching edge cases in semver), correctness tests could be flaky",
+   "A solver who correctly fixes config.json arithmetic by changing criticalDelta from 1 to 2 gets the right answer, but a solver who instead hardcodes thresholds in advisor.js also gets the right answer \u2014 the test cannot distinguish these approaches, which is fine, but the 'only place thresholds are defined' claim in the blueprint would be violated by the second approach without the test catching it"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 falls below the minimum threshold of 3 required for acceptance. All three bugs are directly visible by reading source files in a single pass, placing this squarely in the category the rubric explicitly caps at 2. The speedrun reaches a likely-correct solution in ~18 commands, consistent with the Opus benchmark cited in the rubric. Additionally, the average score is (4+3+4+2+4)/5 = 3.4, below the required 3.6 minimum.",
+  "fixes": [
+   "Replace the config.json indirection with a runtime bug that requires dynamic analysis to discover \u2014 for example, the bucketing threshold could be computed from a hash of advisory IDs loaded at startup, so the wrong value only appears at runtime and cannot be found by reading config files",
+   "Add a second correctness dimension that requires behavioral probing: for instance, make the cycle bug conditional on manifest schema version (v2 vs v3 lockfile format) so the solver must test multiple manifest shapes rather than finding it in one code read",
+   "Increase the performance bar difficulty by adding a realistic distractor: include a cache layer in the code that appears to solve the O(n^2) problem but has a key collision bug that causes incorrect results under load, forcing the solver to debug both correctness and performance simultaneously rather than independently"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building a new HTTP query service over a SQLite metrics database with a compiled engine, not about fixing cycle detection and throughput in a vulnerability aggregation scanner."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-depgraph-dependency-resolver",
+     "verdict": "distinct",
+     "reason": "That task is about implementing a dependency resolver with topological sort and conflict detection from scratch, not about fixing an existing HTTP service's cycle handling, CVSS bucketing, and throughput."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted aggregation in a sales reporting service, not about graph cycle handling and HTTP throughput in a vulnerability scanner."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a binary frame codec's encode/decode correctness, not about dependency graph cycle detection, CVSS scoring, or request throughput."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about schema validation correctness and throughput for a log ingestion pipeline processing NDJSON files, not about dependency graph cycles and CVSS aggregation in a vulnerability scanner."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.211
+    ],
+    [
+     "terminal-bench-pro/implement-depgraph-dependency-resolver",
+     0.194
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.147
+    ],
+    [
+     "ours/official-aac910462208",
+     0.143
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.097
+    ]
+   ],
+   "cost_usd": 0.014199
+  },
+  "novel": true
+ },
+ "cost_usd": 0.057596999999999995
+}

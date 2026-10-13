@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "csp-header-budget-auditor",
+  "title": "Content-Security-Policy Header Budget Auditor",
+  "scenario": "A security engineer is auditing a Node.js API gateway service that constructs and emits Content-Security-Policy headers dynamically from a YAML policy file. The service runs in a single container alongside a lightweight HTTP probe client. The engineer has discovered that in production, some responses are missing directives or exceed the 4096-byte hard limit enforced by a downstream CDN, but no reproduction case is documented. The codebase is ~1200 lines across a policy compiler, a header builder, an express middleware stack, and test fixtures.",
+  "instruction_draft": "You are auditing a Node.js API gateway at /app. The gateway reads /app/config/policy.yaml, compiles a Content-Security-Policy header, and attaches it to every response via an Express middleware. A CDN in front of this service silently drops CSP headers that exceed 4096 bytes; the gateway must therefore keep every emitted CSP header at or below 4096 bytes for all request paths. Additionally, the compiled header must include at least the directives default-src, script-src, style-src, img-src, and frame-ancestors on every response, and no directive value may contain a bare wildcard ('*') unless the directive is explicitly whitelisted in the policy file under the allow_wildcard key.\n\nThe service is already running on port 3000. A probe at /app/probe/run.js exercises the service and reports per-path CSP lengths and directive coverage. The current configuration and code together cause at least one path to emit an over-budget or non-compliant header, but no test case is provided that demonstrates the failure\u2014you must find it by running the probe or instrumenting the service yourself.\n\nFix the policy compiler and/or the header builder so that all paths satisfy the three constraints simultaneously: (1) CSP header byte length \u2264 4096, (2) the five mandatory directives are always present, (3) no unwhitelisted wildcard values. The probe must exit 0 and report all-pass when you are done. Do not weaken the policy by removing legitimate source entries\u2014the fix must preserve all explicitly listed origins.",
+  "requirements": [
+   "Every HTTP response from the gateway includes a Content-Security-Policy header of 4096 bytes or fewer",
+   "Every CSP header contains at a minimum the directives: default-src, script-src, style-src, img-src, and frame-ancestors",
+   "No directive value contains a bare wildcard ('*') unless that directive is listed under allow_wildcard in policy.yaml",
+   "All explicitly listed source origins in policy.yaml are preserved in the emitted header (the fix must not simply delete sources to shrink the header)",
+   "The probe script /app/probe/run.js exits with code 0 after the fix"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install Node.js 20 via apt (nodejs, npm pinned), plus curl",
+   "/app/package.json with dependencies: express@4.18.2, js-yaml@4.1.0, express-rate-limit@7.1.5",
+   "/app/src/server.js: Express app, imports middleware/csp.js, listens on 3000, registers several routes including /api/v1/data, /api/v1/upload, /health, /docs, /embed (embed route adds extra frame-ancestors from route config)",
+   "/app/src/middleware/csp.js: reads compiled policy from src/compiler/policy-compiler.js, builds CSP string, attaches as header. Bug 1: when the compiled policy object has a long-form 'sources' array, the builder joins ALL source arrays across ALL directives into each directive value instead of only that directive's sources (copy-paste loop variable collision: uses outer loop variable 'dir' where it should use 'directive'), causing the /embed and /docs paths\u2014which trigger a route-level policy merge\u2014to emit a header of ~4800 bytes",
+   "/app/src/compiler/policy-compiler.js: reads /app/config/policy.yaml, expands macros (e.g., @cdn expands to 5 separate CDN hostnames), merges route-specific overrides. Bug 2: when a route override sets a directive to a bare '*', the compiler does not check the allow_wildcard whitelist, so /api/v1/upload route override injects 'img-src *' even though img-src is not in allow_wildcard",
+   "/app/config/policy.yaml: valid YAML with default-src, script-src, style-src, img-src, frame-ancestors, plus @cdn macro expanding to 5 hosts, allow_wildcard: [default-src], route_overrides for /embed (adds 20 extra frame-ancestors origins), /docs (adds 15 extra script-src origins), /api/v1/upload (img-src: '*')",
+   "/app/probe/run.js: fires requests to all registered routes, parses CSP header on each, checks (a) length \u2264 4096, (b) five mandatory directives present, (c) no unwhitelisted wildcard; prints PASS/FAIL per path and per constraint; exits 1 on any failure, 0 on all-pass",
+   "Dockerfile CMD: node /app/src/server.js & sleep 2 && echo 'ready' (so service is running when solver starts)",
+   "~300 lines of plausible but uninvolved middleware: rate limiter, request-id injector, JSON body parser, error handler",
+   "At verify time the verifier fires its own HTTP client against port 3000 on a fresh container and independently checks all three constraints on 8 paths (the 5 app routes plus 3 additional paths injected into policy.yaml by the verifier's own Dockerfile layer)"
+  ],
+  "internal_hint": "Difficulty source: 'not visible by reading' + 'a stated quantitative bar'. Bug 1 is a classic loop-variable shadowing error in csp.js\u2014the inner forEach uses `dir` but the outer loop's accumulator variable is also named `dir`, so every directive gets the concatenation of all sources. This only manifests at runtime on the /embed and /docs paths because only those routes trigger the policy merge that produces a long enough combined source list. Bug 2 is a missing guard in policy-compiler.js: route overrides bypass the allow_wildcard check. A skilled engineer: (1) runs the probe, sees /embed FAIL on length and /api/v1/upload FAIL on wildcard; (2) reads csp.js and spots the shadowed `dir` variable; (3) reads policy-compiler.js and finds the route_override merge that skips the wildcard check; (4) patches both; (5) re-runs probe to confirm exit 0.",
+  "trap": "A naive agent reads csp.js, sees the forEach loops look plausible, and only notices the wildcard bug. They fix the wildcard check and test against /api/v1/upload, see it pass, and stop. The hidden verifier also tests /embed and /docs (and three verifier-injected paths with large source lists), which still emit 4800-byte headers due to the unfixed loop variable collision. Alternatively, an agent might 'fix' the length problem by capping the source list length, deleting legitimate origins\u2014failing the preservation requirement.",
+  "tests": [
+   "Verifier starts the container, waits for port 3000, then issues GET requests to /api/v1/data, /api/v1/upload, /health, /docs, /embed, and 3 verifier-injected paths with route overrides that add 10 extra script-src origins each",
+   "For each response: assert Content-Security-Policy header exists and len(header_value) <= 4096",
+   "For each response: assert all five directives (default-src, script-src, style-src, img-src, frame-ancestors) appear in the CSP string",
+   "For each response: parse each directive's value; assert no bare '*' appears unless the directive name is in the allow_wildcard list from policy.yaml",
+   "Verifier reads the final policy.yaml and the compiled output for the base policy and asserts that every hostname listed under each directive in policy.yaml also appears in the corresponding directive of at least one response (origin preservation check)",
+   "Verifier runs /app/probe/run.js and asserts exit code 0"
+  ],
+  "verifier_knob": {
+   "name": "extra_origins_per_injected_route",
+   "value": "10",
+   "effect": "Raising this to 25 makes the length budget tighter and requires the solver to also deduplicate or alias origins correctly; lowering to 3 makes the budget easier to hit with a partial fix"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the wildcard bug (visible by reading policy-compiler.js after finding /api/v1/upload failure) and misses the loop-variable collision in csp.js that causes /embed and /docs to exceed 4096 bytes",
+   "Agent fixes the length problem by truncating the source list, silently dropping legitimate origins and failing the preservation check",
+   "Agent reads csp.js, sees the forEach and assumes it is correct because it looks structurally plausible, never runs the probe to observe the length failure",
+   "Agent fixes csp.js but introduces a new bug: deduplication across merged directives that also removes legitimate distinct-directive sources",
+   "Agent correctly identifies both bugs but the fix to the loop variable accidentally breaks the /health route (which uses a different code path) leaving it without mandatory directives"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "javascript",
+   "node",
+   "security",
+   "csp",
+   "configuration",
+   "systems"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "node /app/probe/run.js  # observe /embed FAIL length, /docs FAIL length, /api/v1/upload FAIL wildcard",
+   "cat /app/src/middleware/csp.js  # spot: inner forEach uses variable 'dir' shadowing outer loop 'dir'",
+   "cat /app/src/compiler/policy-compiler.js  # spot: route_override merge skips allow_wildcard check",
+   "cat /app/config/policy.yaml  # confirm allow_wildcard: [default-src], img-src not listed",
+   "sed -i 's/forEach(dir =>/forEach(directive =>/g; s/use dir/use directive/g' /app/src/middleware/csp.js  # fix loop variable collision (conceptual)",
+   "# Edit /app/src/middleware/csp.js: rename inner forEach param from 'dir' to 'directive'",
+   "# Edit /app/src/compiler/policy-compiler.js: add guard - if value === '*' && !allowWildcard.includes(directiveName), skip or throw",
+   "node /app/probe/run.js  # verify exit 0, all PASS"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The loop variable collision in csp.js IS visible by reading source (it's a textual 'dir'/'dir' shadowing), contradicting the blueprint's claim of 'not visible by reading' as a difficulty source \u2014 a careful agent reading csp.js would spot it without running the probe",
+   "The probe immediately and clearly reports all three failing paths and which constraint each violates, eliminating the 'must find it yourself' challenge \u2014 there is effectively a reproduction case provided",
+   "Verifier injects 3 extra routes with route overrides, but if the injected YAML format differs subtly from what policy-compiler.js expects, the origin preservation check could produce a false failure on a correct solution",
+   "The 'preserve all explicitly listed origins' check requires the verifier to read policy.yaml and compare against live responses \u2014 if the verifier's YAML parsing differs from js-yaml's behavior (e.g., anchor/alias handling), a valid solution could spuriously fail",
+   "If the agent renames the inner variable correctly but the outer loop also iterates something sensitive, the fix could subtly break the /health or /api/v1/data path, which is a valid failure mode but depends on exact code structure not fully specified in the blueprint"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 is disqualifying per the rubric (minimum 3 required, average must be \u22653.6). Both bugs are directly visible by reading source files in a straightforward sequential read, the probe immediately surfaces all failing paths with clear per-constraint reporting eliminating the exploration challenge, and the speedrun reaches a correct solution in ~8 commands \u2014 well within the \u226420 threshold that caps genuine_difficulty at 2. The task has strong verifiability and realistic scenario framing, but the puzzle is too shallow for a 'hard' difficulty rating.",
+  "fixes": [
+   "Obfuscate the loop variable collision: instead of a simple variable shadowing (dir/dir), bury the bug in a utility function called from csp.js that accumulates sources incorrectly \u2014 making it non-visible by reading csp.js alone and requiring runtime observation + cross-file tracing",
+   "Remove or hobble the probe script so the solver must write their own test client to reproduce the failures, restoring the 'no reproduction given' difficulty lever that is currently negated by the comprehensive probe",
+   "Add a third bug that only manifests under the verifier's injected routes (e.g., a deduplication step that incorrectly merges sources across directives when directive names share a prefix), ensuring agents who only test against the known 5 routes miss a failure that appears on the injected paths",
+   "Replace the byte-limit bug with a performance/caching bug: the compiler re-parses policy.yaml synchronously on every request, and with the verifier's injected routes the overhead causes response times to exceed a stated 200ms SLA \u2014 making it a hidden-input performance failure rather than a readable code defect",
+   "Increase the code surface area meaningfully: if both bugs require tracing through 3+ files with non-obvious data flow (e.g., the source accumulation happens in a third shared utility, not directly in csp.js), the 'visible by reading' property is eliminated and genuine difficulty rises"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/data-anonymization",
+     "verdict": "distinct",
+     "reason": "This task is about building a CSV anonymization CLI with cross-file entity consistency, not about auditing and fixing HTTP security headers."
+    },
+    {
+     "ref_id": "terminal-bench-science/microarch-modeling",
+     "verdict": "distinct",
+     "reason": "This task is about building an IPC surrogate model for CPU design-space exploration, entirely unrelated to HTTP security headers or Node.js middleware."
+    },
+    {
+     "ref_id": "terminal-bench/bun-sourcemap-leak",
+     "verdict": "distinct",
+     "reason": "This task is about fixing source map leakage in a Bun/TypeScript build pipeline, not about Content-Security-Policy header compliance."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "This task is about computing HMAC-SHA256 tags over WAL records in a TCP audit service, unrelated to CSP headers or HTTP middleware."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "This task is about fixing schema validation and performance in an NDJSON log ingestion pipeline, not about CSP header compliance or HTTP security policy enforcement."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/data-anonymization",
+     0.214
+    ],
+    [
+     "terminal-bench-science/microarch-modeling",
+     0.147
+    ],
+    [
+     "terminal-bench/bun-sourcemap-leak",
+     0.133
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.1
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.097
+    ]
+   ],
+   "cost_usd": 0.013569000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05295
+}

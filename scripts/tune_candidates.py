@@ -16,15 +16,16 @@ from generator.pipeline import CANDIDATES_DIR
 from scripts.calibrate_candidates import ship
 
 
-def tune_one(cand_dir: Path, ledger, rounds: int = 2) -> dict | None:
+def tune_one(cand_dir: Path, ledger, rounds: int = 2, again: bool = False) -> dict | None:
     """Tune one calibrated near-miss (too easy / too hard) and ship it if it lands in band."""
     cal_file = cand_dir / "calibration.json"
-    if not cal_file.exists() or (cand_dir / "tuning.json").exists():
+    done = cand_dir / ("tuning_again.json" if again else "tuning.json")
+    if not cal_file.exists() or done.exists():
         return None
     # too easy/hard -> difficulty mutation; invalid -> spec fix from the judged failures
     if json.loads(cal_file.read_text())["verdict"] not in ("too_easy", "too_hard", "invalid"):
         return None
-    record = tune_candidate(cand_dir, ledger, max_rounds=rounds)
+    record = tune_candidate(cand_dir, ledger, max_rounds=rounds, again=again)
     shipped = None
     if record["final"] == "learnable":
         shipped = ship(cand_dir, json.loads(cal_file.read_text()))
@@ -37,12 +38,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--only", nargs="*")
     parser.add_argument("--rounds", type=int, default=2)
+    parser.add_argument("--again", action="store_true", help="a second tuning generation")
     args = parser.parse_args()
     ledger = Ledger()
     for cand_dir in sorted(CANDIDATES_DIR.iterdir()):
         if args.only and cand_dir.name not in args.only:
             continue
-        tune_one(cand_dir, ledger, rounds=args.rounds)  # skips what doesn't need tuning
+        tune_one(cand_dir, ledger, rounds=args.rounds, again=args.again)
     return 0
 
 

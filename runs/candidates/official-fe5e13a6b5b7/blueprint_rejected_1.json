@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "ledger-rounding-reconciler-rust",
+  "title": "Finance Ledger Rounding Reconciler",
+  "scenario": "A small finance-ops team has an in-house Rust codebase (~1,200 lines) that reconciles daily transaction exports: a CSV ingestor, an aggregation engine, and a pre-compiled `libsettler.so` that applies currency rounding before writing final balances to a SQLite ledger. After a recent 'minor refactor' the daily reconciliation job has been silently producing balance mismatches \u2014 the totals look plausible but internal cross-checks fail. The compiled shared library has no source in the repo.",
+  "instruction_draft": "Hey, the reconciler job is broken again \u2014 balances in `ledger.db` don't match what they should after running `cargo run -- reconcile data/transactions.csv`. The symptom is that the `daily_totals` table shows the right grand total but individual account rows are off. Can you fix whatever's wrong so that: (1) every account's `settled_balance` in `daily_totals` equals the sum of its transaction amounts rounded to 2 decimal places using banker's rounding (round-half-to-even), (2) the `reconcile_log` table has one row per account with `status = 'OK'` and a correct `checksum` (SHA-256 of the account_id concatenated with the settled_balance formatted to exactly 8 decimal places), and (3) `cargo test` passes. The library `libsettler.so` is the canonical rounding authority \u2014 you need to figure out what rounding rule it actually applies and make the Rust aggregation layer agree with it before results are written.",
+  "requirements": [
+   "Every account's `settled_balance` in `daily_totals` uses banker's rounding (round-half-to-even) to 2 decimal places",
+   "The `reconcile_log` table has exactly one row per account with `status = 'OK'`",
+   "Each `reconcile_log.checksum` is SHA-256 of account_id + settled_balance formatted to exactly 8 decimal places",
+   "The Rust aggregation layer and libsettler.so agree on the rounding result for every account",
+   "`cargo test` passes"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: rustup (stable), libsqlite3-dev, sqlite3 CLI, python3 (for generating test fixtures)",
+   "Codebase at /app/reconciler/ (~1,200 lines across src/main.rs, src/ingest.rs, src/aggregate.rs, src/ledger.rs, src/checksum.rs, Cargo.toml)",
+   "Pre-compiled /app/reconciler/lib/libsettler.so (x86-64, no source): exports `settle_amount(f64, i32 decimals) -> f64`; internally uses round-half-to-even (banker's rounding), BUT the Rust FFI call site in aggregate.rs passes `decimals=3` instead of `decimals=2` due to a copy-paste error introduced in the refactor",
+   "The Rust aggregation code in aggregate.rs does its own rounding BEFORE calling libsettler, using std f64::round() (round-half-away-from-zero), then passes the pre-rounded value to libsettler \u2014 so libsettler's banker's rounding never has a chance to fix half-values, producing wrong results only on .5-cent boundary amounts",
+   "src/checksum.rs formats settled_balance with 6 decimal places instead of 8 before hashing, making checksums wrong",
+   "data/transactions.csv: ~400 rows, ~30 accounts, generated deterministically with Python; includes several accounts whose net sum lands exactly on a .5-cent boundary to expose the rounding divergence",
+   "ledger.db is a SQLite file created fresh on each reconcile run",
+   "reconcile_log table schema: (account_id TEXT, settled_balance REAL, checksum TEXT, status TEXT)",
+   "daily_totals table schema: (account_id TEXT, settled_balance REAL, run_date TEXT)",
+   "cargo test has 3 unit tests: one for rounding, one for checksum format, one integration test that runs reconcile on a fixture and checks ledger state \u2014 tests currently fail",
+   "A Makefile target `make probe` compiles and runs a small C probe against libsettler.so to print its output on boundary values, intended as a debugging aid (solver must discover it or write their own probe)"
+  ],
+  "internal_hint": "Difficulty from two interacting sources: (1) opaque_component \u2014 libsettler.so must be characterised by experiment; the solver needs to call it with boundary values like 1.235, 2.245 etc. to discover it uses banker's rounding, not standard rounding. (2) misleading_symptom \u2014 the grand total in daily_totals looks correct (because non-boundary amounts dominate and random errors cancel), so the obvious symptom points at the checksum logic, but the root causes are actually: (a) aggregate.rs rounds with f64::round() before passing to libsettler, nullifying the library's banker's rounding \u2014 fix: remove pre-rounding, pass raw sum to libsettler with decimals=2 (fix the off-by-one decimals argument too), and (b) checksum.rs formats to 6 decimal places instead of 8. A solver who only fixes the checksum will still fail because account balances on .5-cent boundaries are wrong. A solver who calls libsettler with the right decimals but keeps pre-rounding will also fail. Both bugs must be fixed together.",
+  "trap": "Shallow verifiers run `cargo run -- reconcile` on the provided sample data, see that grand totals match, and declare success \u2014 but the hidden verifier generates fresh transaction CSVs at test time with more .5-cent boundary cases per account. A solver who fixes only the checksum format passes the sample but fails hidden tests. A solver who reverses the library correctly but forgets the off-by-one `decimals` argument produces wrong rounding scale. Both bugs must be fixed for all generated inputs.",
+  "tests": [
+   "Run `cargo run -- reconcile data/transactions.csv`; query `SELECT COUNT(*) FROM reconcile_log WHERE status = 'OK'` \u2014 must equal the number of distinct accounts in the CSV",
+   "At verify time, generate a fresh transactions.csv with Python (seeded RNG) containing \u226510 accounts whose net sum lands on exact .5-cent boundaries; run reconcile; check every `settled_balance` in `daily_totals` matches Python's `decimal.Decimal` banker's rounding to 2 places",
+   "For each account in `reconcile_log`, verify `checksum = sha256(account_id + format(settled_balance, '.8f')).hexdigest()`",
+   "Run `cargo test` \u2014 all 3 tests must pass (rounding unit test uses a .5-boundary fixture, checksum test checks 8-decimal format, integration test checks ledger state)",
+   "Verify `settled_balance` values in `daily_totals` and `reconcile_log` agree for every account_id",
+   "Probe libsettler.so directly via a small C program: call `settle_amount(1.235, 2)` \u2014 must return 1.24 (banker's rounds .5 to even, 3 is odd so rounds up); `settle_amount(1.245, 2)` must return 1.24 (4 is even so rounds down) \u2014 this confirms the library semantics and validates the solver's characterisation"
+  ],
+  "verifier_knob": {
+   "name": "boundary_account_count",
+   "value": "10 accounts with .5-cent net sums in hidden test CSV",
+   "effect": "Raising to 20+ accounts makes it nearly impossible for a partially-fixed solution to accidentally pass; lowering to 2-3 makes it easier for a lucky partial fix to squeak by"
+  },
+  "expected_failure_modes": [
+   "Agent reads aggregate.rs, sees f64::round() and changes it to banker's rounding in pure Rust \u2014 but doesn't realise libsettler.so uses banker's rounding too and the two now disagree on the call convention, causing the library output to be ignored or double-rounded",
+   "Agent fixes the checksum decimal format from 6 to 8 places and `cargo test` checksum test passes, declares done \u2014 but rounding of boundary accounts is still wrong",
+   "Agent correctly identifies libsettler's banker's rounding by experiment but passes pre-rounded values to it, so the library always receives .00 or non-boundary input and appears to work on the sample",
+   "Agent fixes the decimals argument from 3 to 2 but keeps the pre-rounding, so libsettler receives already-rounded values and the .5-boundary cases are determined by f64::round() (wrong rule)",
+   "Agent fixes both rounding issues but misses the 8-decimal checksum format requirement, failing the checksum tests on hidden inputs"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "finance",
+   "rounding",
+   "opaque-binary",
+   "sqlite",
+   "ffi"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat src/aggregate.rs  # immediately see f64::round() pre-rounding and decimals=3",
+   "cat src/checksum.rs  # immediately see 6 decimal format",
+   "make probe  # confirm libsettler banker's rounding (optional, bugs already visible)",
+   "sed -i aggregate.rs: remove pre-rounding call, change decimals arg from 3 to 2, pass raw sum to settle_amount",
+   "sed -i checksum.rs: change format string from '.6f' to '.8f'",
+   "cargo test  # verify all 3 unit/integration tests pass",
+   "cargo run -- reconcile data/transactions.csv",
+   "sqlite3 ledger.db \"SELECT COUNT(*) FROM reconcile_log WHERE status='OK'\""
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "libsettler.so is compiled for x86-64 but if the Docker host is ARM (e.g., Apple Silicon), the .so won't load, breaking the entire task environment",
+   "SQLite REAL columns store IEEE 754 f64 \u2014 after writing settled_balance as REAL and reading it back, the value may not round-trip perfectly to 8 decimal places, causing checksum failures that are not the solver's fault",
+   "f64 floating-point arithmetic can produce values like 1.2349999999... instead of 1.235 for some sums, meaning 'exactly on a .5-cent boundary' is fragile unless the Python fixture generator uses decimal.Decimal throughout and outputs values that are exactly representable in f64",
+   "The instruction says 'libsettler.so is the canonical rounding authority' but also says the correct fix is to pass raw sums to it \u2014 if a solver implements pure-Rust banker's rounding and bypasses libsettler entirely, they may pass all tests (since results agree), making the 'characterize the opaque binary' requirement hollow",
+   "make probe is mentioned in the blueprint internals but it's unclear if its existence is hinted in the instruction \u2014 if the solver must discover it independently, the difficulty is higher; if it's visible in the Makefile, it's nearly free information"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies acceptance per the rubric: all three bugs are directly visible by reading source code (aggregate.rs shows f64::round() and decimals=3; checksum.rs shows 6 decimal format), and `make probe` removes the need to experimentally characterize the opaque binary. A frontier agent will solve this in ~8 commands without needing to treat libsettler.so as truly opaque. Additionally, the f64/SQLite REAL round-trip risk and the possibility of bypassing libsettler entirely with pure-Rust banker's rounding create invalid failure and invalid-pass risks.",
+  "fixes": [
+   "Make the bug truly opaque: move the rounding logic into libsettler.so entirely (no f64::round() visible in source) and have aggregate.rs call it with a plausible-looking but wrong function signature or ABI mismatch \u2014 the solver must reverse-engineer the library's calling convention, not just fix a readable off-by-one",
+   "Remove make probe or any debugging aid from the repo so the solver must write their own C/Rust probe to characterize libsettler behavior, adding meaningful exploration commands",
+   "Fix the SQLite REAL precision issue: store settled_balance as TEXT or INTEGER (cents * 10^8) to avoid f64 round-trip loss, or explicitly document that the checksum must be computed before writing to DB using the in-memory f64 value",
+   "Add a fourth bug that is NOT visible in source \u2014 e.g., libsettler.so has a subtle behavior difference for negative amounts (rounds toward zero instead of to-even), and some accounts have negative net balances; this forces actual binary characterization rather than source reading",
+   "To prevent the bypass-libsettler failure mode, add a cargo test that calls the FFI function directly and asserts its output matches a known banker's rounding result, making the library's use mandatory"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both involve fixing a broken reconciliation tool that writes incorrect per-account/merchant balances to a SQLite ledger from CSV imports, though the candidate adds a reverse-engineering twist (binary .so with unknown rounding) and Rust/cargo context."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust codec for correctness and performance benchmarks, not ledger reconciliation or rounding semantics."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task involves reverse-engineering AES-CTR encryption behavior from a reference binary to fix a cryptographic library, not financial rounding or ledger reconciliation."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a weighted aggregation service using config-file weights, not currency rounding rules or ledger reconciliation with a precompiled binary."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a CSV chunking pipeline with deduplication and row-count correctness issues, unrelated to financial rounding or ledger reconciliation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.186
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.096
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.096
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.087
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.085
+    ]
+   ],
+   "cost_usd": 0.013521000000000002
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05218500000000001
+}

@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "container-sbom-policy-enforcer",
+  "title": "Container SBOM Policy Enforcer",
+  "scenario": "A security engineer is auditing a Node.js microservice that bundles and runs inside a single Docker container. The container ships a custom JavaScript build pipeline (`/opt/builder/`) that transpiles, bundles, and signs releases, plus a small Express API that serves audit reports. The build pipeline has a policy-enforcement hook (`/opt/builder/policy/enforce.js`) that is supposed to reject any dependency whose resolved version violates a declared constraint set (`/opt/builder/policy/constraints.json`) before the bundle is written to disk. The hook is wired into the pipeline but silently passes builds it should reject \u2014 and the failure is data-dependent: it only manifests for certain constraint patterns and dependency graphs that don't appear in the provided sample inputs.",
+  "instruction_draft": "You are a security engineer auditing the Node.js build pipeline at `/opt/builder/`. The pipeline reads a project manifest, resolves dependencies, enforces a policy defined in `/opt/builder/policy/constraints.json`, and writes a signed bundle to `/opt/output/`. The policy enforcer must reject any build whose resolved dependency tree contains a package whose version falls outside its declared constraint range, whose declared license is not in the approved list, or whose transitive depth exceeds the configured maximum. Currently the enforcer exits 0 and produces output even for builds it must reject.\n\nYour deliverable: a corrected `/opt/builder/policy/enforce.js` (and any other files in `/opt/builder/` you need to change) such that `node /opt/builder/build.js <manifest>` exits non-zero and writes nothing to `/opt/output/` whenever any policy constraint is violated, and exits 0 and produces a valid bundle whenever all constraints are satisfied. The enforcer must complete policy evaluation in under 80 ms wall-clock time for any manifest with up to 200 direct dependencies (each with up to 5 transitive levels), measured by the verifier on hidden manifests using `--policy-timing` mode. A correct but slow implementation fails.",
+  "requirements": [
+   "The build pipeline exits non-zero and produces no output in /opt/output/ when any resolved dependency version is outside its declared semver constraint range.",
+   "The build pipeline exits non-zero and produces no output in /opt/output/ when any resolved dependency has a license not in the approved list in constraints.json.",
+   "The build pipeline exits non-zero and produces no output in /opt/output/ when any dependency's transitive depth exceeds the configured maximum depth in constraints.json.",
+   "The build pipeline exits 0 and produces a valid bundle in /opt/output/ when all policy constraints are satisfied.",
+   "Policy evaluation completes in under 80 ms wall-clock time for any manifest with up to 200 direct dependencies at up to 5 transitive levels deep.",
+   "No bundle file is written to /opt/output/ on a rejected build (partial writes must be cleaned up)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base, with Node.js 20 (pinned) installed via apt/nvm.",
+   "/opt/builder/ contains the full build pipeline: build.js (entry point, ~300 lines), resolver.js (dependency graph builder, ~250 lines), bundler.js (webpack-like concatenator, ~200 lines), signer.js (HMAC bundle signer, ~150 lines), and policy/enforce.js (the broken enforcer, ~150 lines).",
+   "policy/constraints.json defines: approved_licenses (list), max_transitive_depth (integer, e.g. 3), and per-package version ranges (semver strings).",
+   "The enforcer bug is NOT visible by reading: enforce.js correctly checks version ranges for direct dependencies but calls the wrong traversal function for transitive deps, so transitive violations are silently skipped. License checking uses a case-sensitive string comparison but the resolver normalizes license names to lowercase, so all license checks pass regardless of constraint.",
+   "A second latent bug: the enforcer short-circuits on the first satisfied constraint rather than requiring ALL constraints to pass (logical OR instead of AND for multi-constraint packages), only exposed when a package has two or more declared constraints.",
+   "The timing bug: the default traversal performs redundant re-resolution of already-visited nodes (exponential in depth for diamond dependencies), causing >80ms on large graphs. The solver must implement memoization or iterative traversal.",
+   "/opt/builder/samples/ contains 3 sample manifests that all pass policy (so running samples does not reveal the bugs).",
+   "/opt/builder/test-fixtures/ contains 2 fixtures: one with a license violation (uses wrong case), one with a shallow transitive violation \u2014 these are provided as hints that something is wrong, but the solver must find what.",
+   "/opt/output/ is writable; the pipeline writes bundle.js and bundle.sig here.",
+   "A running Express service at port 3001 serves GET /audit-log which reads /opt/output/ \u2014 this is plausible environment noise, not directly relevant.",
+   "~1800 total lines across all JS files, with realistic-looking but non-involved code in bundler.js and signer.js.",
+   "node_modules for semver and fast-json-stable-stringify are pre-installed under /opt/builder/node_modules/."
+  ],
+  "internal_hint": "Difficulty comes from three interacting bugs that are NOT visible by reading enforce.js alone \u2014 they only manifest when the system runs on specific data patterns not present in the samples: (1) transitive traversal calls resolver.getDirectDeps() instead of resolver.getAllDeps(), so only depth-1 violations are caught; (2) license comparison is case-sensitive (`=== `) while resolved licenses are lowercased by the resolver, making every license check vacuously pass; (3) multi-constraint packages use Array.some() instead of Array.every(), so a package satisfying one of two version constraints passes even if it violates the other. The performance issue (exponential re-traversal without memoization) is separate and only shows on large generated inputs. The solver must: (a) discover failing cases by constructing manifests that exercise each bug path, (b) trace through the resolver/enforcer interaction to find the data normalization mismatch, (c) fix all three logical bugs, and (d) add memoized traversal. A solver that only fixes the obvious traversal bug and tests on samples will appear to succeed but fail hidden tests.",
+  "trap": "A naive solver reads enforce.js, sees the traversal function name, maybe fixes the direct/transitive call, runs the provided samples (which all pass), and declares victory. The hidden tests include: manifests with transitive-only violations (catches bug 1 if unfixed), manifests with lowercase license names that should be rejected (catches bug 2), manifests with packages having two version constraints where one is satisfied (catches bug 3), and large diamond-dependency manifests that timeout without memoization (catches the performance issue). All four must be fixed for the verifier to pass.",
+  "tests": [
+   "Verifier generates a manifest where a transitive dep (depth 2) violates its version constraint but the direct dep does not \u2014 asserts exit code non-zero and /opt/output/ empty.",
+   "Verifier generates a manifest where a dep has license 'mit' (lowercase, as resolver produces) but constraints.json lists 'MIT' (uppercase) as approved \u2014 asserts exit code non-zero and /opt/output/ empty after fix; before fix this passes incorrectly.",
+   "Verifier generates a manifest where a package has two version constraints ['>=1.0.0', '<1.5.0'] and the resolved version is 1.7.0 (satisfies first, violates second) \u2014 asserts exit code non-zero.",
+   "Verifier generates a valid manifest where all constraints are satisfied \u2014 asserts exit code 0 and /opt/output/bundle.js and /opt/output/bundle.sig both exist and are non-empty.",
+   "Verifier generates a manifest with 200 direct deps each with 5 transitive levels (diamond pattern) and runs with --policy-timing flag \u2014 asserts wall-clock policy evaluation < 80ms.",
+   "Verifier checks that on a rejected build, /opt/output/ contains no new files (partial write cleanup works).",
+   "Verifier generates a manifest where transitive depth is exactly max_transitive_depth+1 \u2014 asserts rejection.",
+   "Verifier generates a manifest where transitive depth is exactly max_transitive_depth \u2014 asserts acceptance."
+  ],
+  "verifier_knob": {
+   "name": "performance_threshold_ms",
+   "value": "80",
+   "effect": "Lowering to 50ms makes the task significantly harder as naive memoization may not suffice and the solver must use iterative BFS; raising to 200ms makes the performance requirement trivially satisfiable with simple fixes, removing that difficulty lever."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the transitive traversal bug, tests on samples, sees all pass, and submits \u2014 fails the license-case and multi-constraint hidden tests.",
+   "Solver fixes all three logical bugs but misses the memoization requirement \u2014 passes correctness tests but fails the 80ms timing test on large generated inputs.",
+   "Solver rewrites enforce.js from scratch correctly but introduces a subtle off-by-one on max_transitive_depth (treating it as exclusive instead of inclusive) \u2014 fails the boundary depth tests.",
+   "Solver notices the license bug but applies the fix in the wrong direction (uppercases the resolved value instead of lowercasing the constraint list) \u2014 breaks on mixed-case approved licenses in hidden tests.",
+   "Solver adds memoization but keys on package name only, not name+version, causing cache collisions for packages appearing at multiple versions in diamond deps \u2014 correctness failures on diamond manifests."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "javascript",
+   "security",
+   "configuration",
+   "systems-programming",
+   "performance",
+   "dependency-management"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/builder/policy/enforce.js",
+   "cat /opt/builder/resolver.js",
+   "cat /opt/builder/build.js",
+   "cat /opt/builder/policy/constraints.json",
+   "cat /opt/builder/test-fixtures/fixture1.json",
+   "cat /opt/builder/test-fixtures/fixture2.json",
+   "node /opt/builder/build.js /opt/builder/test-fixtures/fixture1.json  # exits 0, confirms bug",
+   "node /opt/builder/build.js /opt/builder/test-fixtures/fixture2.json  # exits 0, confirms bug",
+   "grep -n 'getDirectDeps\\|getAllDeps\\|some\\|every\\|license' /opt/builder/policy/enforce.js",
+   "grep -n 'toLowerCase\\|normalize\\|license' /opt/builder/resolver.js",
+   "# Spots all three bugs: wrong traversal fn, case mismatch, some vs every",
+   "# Fix 1: replace getDirectDeps() with getAllDeps() in enforce.js traversal",
+   "# Fix 2: lowercase constraint license strings before === comparison",
+   "# Fix 3: replace Array.some with Array.every for multi-constraint check",
+   "# Fix 4: add visited Set for memoization in traversal loop",
+   "node /opt/builder/build.js /opt/builder/test-fixtures/fixture1.json  # now exits non-zero",
+   "node /opt/builder/build.js /opt/builder/test-fixtures/fixture2.json  # now exits non-zero",
+   "node /opt/builder/build.js /opt/builder/samples/sample1.json  # exits 0, bundle present",
+   "ls /opt/output/  # verify bundle.js and bundle.sig exist"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "max_transitive_depth boundary (inclusive vs exclusive) is described as a solver trap but is never clarified in the instruction \u2014 a solver could implement it correctly per natural reading and still fail hidden boundary tests, making the failure ambiguous rather than earned.",
+   "The instruction claims bugs are 'NOT visible by reading enforce.js alone' but all three bugs are immediately visible by reading enforce.js alongside resolver.js (two files, one grep session) \u2014 the difficulty claim is overstated and the task may be easier than intended for any agent that reads both files.",
+   "Memoization keyed on name+version vs name-only is listed as a failure mode, but the instruction never specifies how diamond deps are represented in the manifest schema, so a solver might implement correct memoization that differs from the verifier's expectation.",
+   "The Express service at port 3001 is described as 'plausible environment noise, not directly relevant' \u2014 if it holds a file lock on /opt/output/ or interferes with writes, timing tests could be flaky.",
+   "Performance threshold of 80ms is tight and machine-dependent; verifier hardware is unspecified, so a correct memoized solution could flake near the boundary on slower CI runners."
+  ],
+  "verdict": "reject",
+  "reasons": "genuine_difficulty scores 2 because all three bugs are directly visible by reading enforce.js and resolver.js together in under 20 commands \u2014 the blueprint's own claim that bugs are not visible by reading is false. The test-fixtures further hint directly at each bug class, reducing discovery work to a grep session. The task has excellent verifiability and realism but fails the minimum score threshold for genuine_difficulty (requires \u22653), and the average of 3.8 is borderline but cannot compensate for a dimension at 2.",
+  "fixes": [
+   "Remove the test-fixtures that directly demonstrate each bug class \u2014 the solver should have to construct failing manifests from scratch by understanding the code, not be handed repro cases.",
+   "Hide the resolver's toLowerCase normalization behind an opaque compiled module or indirect call chain so the case-sensitivity bug requires dynamic testing (run with a lowercase license and observe) rather than a single grep.",
+   "Replace the named-function bug (getDirectDeps vs getAllDeps) with a subtler algorithmic mistake \u2014 e.g., the traversal correctly calls the right function but resets the visited set on each top-level package, causing transitive deps shared across packages to be re-evaluated and a specific ordering-dependent bug to manifest only for certain graph topologies.",
+   "Clarify the max_transitive_depth boundary semantics explicitly in constraints.json schema docs or in the instruction (e.g., 'depth 3 means packages at levels 1, 2, and 3 are allowed; level 4 is rejected') to eliminate the off-by-one ambiguity from being an invalid failure.",
+   "Specify verifier hardware or normalize the timing test (e.g., measure CPU instructions or enforce a multiplier on baseline) to avoid flakiness on slower CI machines near the 80ms threshold."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/data-anonymization",
+     "verdict": "distinct",
+     "reason": "Data anonymization CLI with cross-file entity linking and memory constraints is a fundamentally different problem from a build pipeline policy enforcer."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "WAF rule deployment and request classification is a different domain and problem from SBOM policy enforcement in a build pipeline, despite both involving policy/rule evaluation."
+    },
+    {
+     "ref_id": "ours/official-b540d2ce9b80",
+     "verdict": "distinct",
+     "reason": "Webpack addon configuration and build output verification is a different problem from dependency policy enforcement and version/license constraint checking."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "SQL filter validation against a reference binary is a different problem from SBOM policy enforcement with semver, license, and transitive depth constraints."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "CSV chunked pipeline correctness (deduplication, row counts, header handling) is a different problem from build-time dependency policy enforcement."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/data-anonymization",
+     0.204
+    ],
+    [
+     "ours/official-10912a593843",
+     0.181
+    ],
+    [
+     "ours/official-b540d2ce9b80",
+     0.177
+    ],
+    [
+     "ours/official-18899524e171",
+     0.172
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.102
+    ]
+   ],
+   "cost_usd": 0.013815000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058248
+}

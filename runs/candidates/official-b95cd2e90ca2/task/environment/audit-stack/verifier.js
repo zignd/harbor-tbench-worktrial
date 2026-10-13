@@ -52,7 +52,7 @@ function parseHeader(buf) {
 
 /**
  * Compute the HKDF salt for the verifier.
- * Uses Math.floor for the epoch truncation (canonical per README).
+ * Truncates the window start timestamp to the nearest window boundary.
  */
 function computeVerifierSalt(windowStartMs, windowDurationMs) {
   const truncated = Math.floor(windowStartMs / windowDurationMs) * windowDurationMs;
@@ -63,8 +63,7 @@ function computeVerifierSalt(windowStartMs, windowDurationMs) {
 
 /**
  * Build HKDF info for the verifier.
- * Uses string encoding for all window indices (canonical per internal convention).
- * Note: does not use the branching path from session_key_manager.
+ * Encodes the window index for use as HKDF info.
  */
 function buildVerifierInfo(windowIndex) {
   // Always use string representation

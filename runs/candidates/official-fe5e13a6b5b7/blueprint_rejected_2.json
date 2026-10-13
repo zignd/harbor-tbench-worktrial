@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "fx-settlement-aggregator-rust",
+  "title": "FX Settlement Amount Aggregator Repair",
+  "scenario": "A small finance-ops team has an in-house Rust codebase (~1,400 lines) that aggregates daily FX trade settlements from a SQLite ledger, applies currency-pair netting rules via a pre-compiled 'netter' binary (no source shipped), and writes reconciled totals to a results table. Since last month's release the daily close amounts are wrong \u2014 downstream reports show settlement figures that don't match the raw trades. The pipeline has a Rust aggregator crate, a shell driver, config YAML, and the opaque netter binary.",
+  "instruction_draft": "Hey \u2014 our end-of-day FX settlement numbers have been off since the v1.4 release and finance is on my case. The pipeline lives in /app/settle. Running `./run_close.sh` should populate the `settlement_summary` table in /app/data/ledger.db with one row per currency-pair per settlement date, where each row's `net_usd` is the correct net USD value of all trades for that pair on that date, and `trade_count` is the exact count of contributing trades. Right now the numbers are wrong. Find out why, fix it, and make sure `./run_close.sh` completes without error. The ledger already has trade data loaded \u2014 don't touch the `trades` table.",
+  "requirements": [
+   "Running `./run_close.sh` completes without non-zero exit code",
+   "The `settlement_summary` table in /app/data/ledger.db contains exactly one row per (currency_pair, settlement_date) combination present in the trades table",
+   "Each row's `net_usd` equals the sum of (quantity * rate_usd * direction_sign) for all trades in that group, where direction_sign is +1 for BUY and -1 for SELL",
+   "Each row's `trade_count` equals the count of trades in that group",
+   "The netter binary's grouping key output must be used correctly \u2014 the binary encodes the grouping key in a specific byte order that the Rust aggregator must parse accurately",
+   "Results are stable: re-running `./run_close.sh` produces identical `settlement_summary` rows (idempotent upsert)"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base with rustc/cargo (via apt), sqlite3, and python3 pre-installed",
+   "Pre-compiled opaque binary at /app/settle/bin/netter (ELF x86-64, stripped, no source) \u2014 accepts JSON lines of {pair, date, amounts:[...]} on stdin, emits JSON lines of {key: <16-byte hex>, net: <float>} on stdout; the key is pair+date concatenated as UTF-8 then hex-encoded in big-endian field order, but the Rust aggregator incorrectly treats it as little-endian, causing key mismatches and wrong grouping",
+   "Rust crate at /app/settle/src/ (~900 lines across main.rs, aggregator.rs, db.rs, config.rs, schema.rs) \u2014 the aggregator calls the netter binary but parses the returned hex key bytes in the wrong endian order, silently mis-groups trades",
+   "A second bug: in aggregator.rs the direction_sign for SELL trades is applied as +1 instead of -1 (copy-paste error introduced in v1.4), so SELL amounts are added instead of subtracted",
+   "Shell driver /app/settle/run_close.sh that builds the crate with `cargo build --release` and runs it",
+   "Config at /app/settle/config.yaml specifying DB path and netter binary path",
+   "SQLite DB at /app/data/ledger.db with a `trades` table containing ~200 rows across 6 currency pairs and 3 settlement dates, and an empty `settlement_summary` table",
+   "Schema file creating settlement_summary(currency_pair TEXT, settlement_date TEXT, net_usd REAL, trade_count INTEGER, PRIMARY KEY(currency_pair, settlement_date))",
+   "A /app/settle/README.md describing the pipeline at a high level but not the netter's byte format",
+   "Plausible but uninvolved code: a reporter.rs module (~300 lines) that formats output to CSV \u2014 not relevant to the bug",
+   "The netter binary's exact protocol: it must be characterized by experiment (probe stdin/stdout with crafted inputs) to understand the key format"
+  ],
+  "internal_hint": "Two interacting bugs: (1) in aggregator.rs, SELL direction_sign is +1 not -1 \u2014 visible by reading, but the symptom (wrong net_usd) points equally at the netter; (2) the netter key is parsed with wrong endianness in aggregator.rs, causing trades to land in wrong groups \u2014 this is NOT visible by reading alone because the key format is defined by the opaque netter binary. The solver must probe the netter binary with test inputs (e.g., echo '{\"pair\":\"EURUSD\",\"date\":\"2025-01-01\",\"amounts\":[1.0]}' | ./netter) to learn that the key is big-endian UTF-8 concatenation, then discover the Rust code does from_le_bytes instead of from_be_bytes. The misleading symptom is that the most obvious error is 'wrong totals' which naive agents attribute entirely to the direction_sign bug \u2014 they fix that alone and the numbers improve but still fail hidden test cases with multi-trade pairs where mis-grouping matters. Both must be fixed.",
+  "trap": "Fixing only the direction_sign bug (SELL -1 vs +1) makes the sample data look plausible because the provided ledger has mostly single-trade groups where key mis-parsing doesn't change grouping. Hidden tests inject multi-trade groups for the same pair+date, where endianness mis-parsing causes two groups to merge or split incorrectly, producing wrong trade_count and net_usd. An agent that only reads the source, spots the direction sign, fixes it, runs on the sample DB, sees 'reasonable' numbers, and stops will fail.",
+  "tests": [
+   "After `./run_close.sh`, query settlement_summary: assert exactly len(distinct currency_pair \u00d7 settlement_date) rows exist matching the trades table",
+   "For each (pair, date) group, compute expected net_usd = SUM(quantity * rate_usd * IF(side='BUY',1,-1)) and trade_count = COUNT(*) from trades; assert settlement_summary matches within 1e-6",
+   "Verify-time: insert 20 additional synthetic trades (10 BUY + 10 SELL, same pair+date, with known net) into trades table, re-run ./run_close.sh, assert the new group's net_usd and trade_count are exact",
+   "Verify-time: insert trades for a new currency pair with ONLY SELL trades; assert net_usd is negative (catches direction_sign-only fixes that missed endian bug when grouping is trivial)",
+   "Verify-time: insert two currency pairs whose names differ only in byte order (e.g., 'ABCDEF' and 'FEDCBA') with distinct totals; assert they produce two separate rows with correct individual totals (catches endian bug)",
+   "Assert run_close.sh exits 0 and settlement_summary has no NULL values in any column",
+   "Assert idempotency: run ./run_close.sh twice, assert settlement_summary row count is unchanged and values are identical"
+  ],
+  "verifier_knob": {
+   "name": "number_of_synthetic_groups_injected",
+   "value": "5 groups (3 pairs \u00d7 dates + 2 edge-case pairs)",
+   "effect": "Raising to 10+ groups with more varied pair names and mixed BUY/SELL ratios makes it harder to accidentally pass by numeric coincidence; lowering to 1 makes it easier for a partial fix to squeak through"
+  },
+  "expected_failure_modes": [
+   "Agent reads aggregator.rs, finds the direction_sign bug, fixes only that, runs on sample DB, sees 'better' numbers, declares success without probing the netter binary's key format",
+   "Agent probes the netter binary but misinterprets the hex output endianness from a single-byte test and concludes endian is irrelevant",
+   "Agent correctly identifies both bugs but introduces a new off-by-one in the netter invocation parsing (e.g., trimming too many bytes from the hex key)",
+   "Agent fixes the endian bug but applies it to the wrong field (e.g., fixes the date portion but not the pair portion of the concatenated key)",
+   "Agent rewrites the aggregator to bypass the netter entirely using pure SQL grouping, which works for net_usd but ignores that the netter is supposed to gate which trades are 'settled' vs 'pending' (a subtle contract implied in the README)"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "finance-ops",
+   "opaque-binary",
+   "sqlite",
+   "reconciliation",
+   "endianness"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/settle/README.md",
+   "cat /app/settle/run_close.sh",
+   "cat /app/settle/src/aggregator.rs",
+   "cat /app/settle/src/main.rs",
+   "cat /app/settle/src/db.rs",
+   "# Spot direction_sign bug: SELL uses +1 instead of -1",
+   "echo '{\"pair\":\"EURUSD\",\"date\":\"2025-01-01\",\"amounts\":[1.0]}' | /app/settle/bin/netter",
+   "echo '{\"pair\":\"ABCDEF\",\"date\":\"2025-01-01\",\"amounts\":[1.0]}' | /app/settle/bin/netter",
+   "# Compare hex keys: determine key = UTF-8(pair+date) hex-encoded big-endian",
+   "grep -n 'from_le_bytes\\|endian\\|key' /app/settle/src/aggregator.rs",
+   "# Confirm from_le_bytes used where from_be_bytes required",
+   "sed -i 's/direction_sign = 1.0/direction_sign = -1.0/' /app/settle/src/aggregator.rs  # fix SELL sign",
+   "sed -i 's/from_le_bytes/from_be_bytes/' /app/settle/src/aggregator.rs  # fix endian",
+   "cd /app/settle && ./run_close.sh",
+   "sqlite3 /app/data/ledger.db 'SELECT * FROM settlement_summary;'",
+   "# Manually compute expected net_usd for one pair+date to verify",
+   "./run_close.sh  # idempotency check",
+   "sqlite3 /app/data/ledger.db 'SELECT COUNT(*) FROM settlement_summary;'"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The netter binary's hex key format description says 'pair+date concatenated as UTF-8 then hex-encoded in big-endian field order' \u2014 but 'big-endian field order' for a UTF-8 string is ambiguous (strings don't have endianness in the traditional sense); the actual endianness difference must be observable only by probing, which is fine, but if the binary behaves inconsistently across inputs the test becomes flaky",
+   "If cargo build times exceed reasonable limits in the 1 CPU / 2 GB container, the build step in run_close.sh could timeout or OOM \u2014 Rust compilation of ~1400 lines plus dependencies may be slow without caching",
+   "The instruction says 'don't touch the trades table' but doesn't clarify whether the solver may add test trades during debugging \u2014 verify-time tests inject synthetic trades, which could interfere if the solver's run_close.sh accidentally deletes/modifies them",
+   "The netter binary being ELF x86-64 requires the container to be x86-64; if run on ARM (e.g., Apple Silicon CI), it won't execute, making the task unsolvable in that environment",
+   "The description of the netter key as '16-byte hex' is slightly ambiguous \u2014 a 16-byte hex string would be 32 hex characters representing 16 bytes, but pair+date as UTF-8 could be longer than 16 bytes (e.g., 'EURUSD' + '2025-01-01' = 16 chars = 16 bytes UTF-8, exactly 16 \u2014 but this only works for pairs of exactly 6 chars and dates of exactly 10 chars; other pair lengths would break this)",
+   "The 'rewrites aggregator to bypass netter' failure mode notes the netter 'gates settled vs pending trades' \u2014 but if this gating behavior isn't explicitly stated in the instruction or README, agents who bypass the netter won't know this contract exists, making it an ambiguous failure mode potentially attributable to instruction incompleteness"
+  ],
+  "verdict": "accept",
+  "reasons": "The task has two well-designed interacting bugs with a realistic misleading symptom that requires active experimentation with the opaque binary, not just code reading. The verifier correctly uses synthetic inject tests to catch partial fixes, and the trap (sample DB masking the endian bug) is mechanically sound. The main risks are the netter binary architecture dependency (must be x86-64) and potentially slow Rust compilation in a constrained container, both of which should be addressed before deployment.",
+  "fixes": [
+   "Clarify in the environment spec that the container must be x86-64/amd64 explicitly, since the netter binary is ELF x86-64 and the task is unsolvable on ARM without emulation",
+   "Add a pre-compiled release binary or a cargo build cache layer to the Docker image to prevent OOM/timeout during `cargo build --release` on 1 CPU / 2 GB \u2014 alternatively pre-build and have run_close.sh skip rebuild if binary is fresh",
+   "Tighten the netter key format description in README.md to hint that the key length is always 32 hex chars (16 bytes), and ensure all test currency pairs are exactly 6 ASCII chars so the 'pair+date = 16 bytes' invariant always holds \u2014 otherwise add length validation to prevent test flakiness with non-standard pair names",
+   "Explicitly state in the README (not the instruction) that the netter binary filters trades by settlement status, so the 'bypass netter' failure mode is a valid but incorrect approach \u2014 this makes that failure mode fair rather than an ambiguity-caused false failure",
+   "Consider adding a small pre-built cargo registry cache in the Docker image for common Rust crates to keep build time under 2 minutes in constrained environments"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "Both involve fixing an aggregation pipeline with wrong totals, but the NetFlow task deals with binary protocol parsing and template state across files, while the candidate involves FX trade netting with a Rust crate, opaque binary grouping-key parsing, and SQLite upsert idempotency."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "Both use SQLite ledgers and fix wrong financial totals, but the ledger-reconcile task is a Python CSV import with refund-charge matching logic, while the candidate is a Rust aggregator with an opaque netter binary whose byte-order grouping key must be reverse-engineered."
+    },
+    {
+     "ref_id": "terminal-bench/fin-saccr-rwa",
+     "verdict": "distinct",
+     "reason": "Both are finance domain tasks but SA-CCR RWA is a regulatory capital calculation exercise with no coding/debugging component, whereas the candidate is a software debugging task fixing a Rust pipeline."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "variant",
+     "reason": "Both tasks require fixing a Rust pipeline that writes to SQLite by reverse-engineering an opaque reference binary's output format/encoding, with correctness verified against exact column values \u2014 the core skill (black-box binary reverse engineering + Rust fix) is essentially the same even though the domain (sensor stats vs. FX netting) differs."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The sensor-normalizer task centers on characterizing an opaque binary's numeric transformation via experiment and fixing SQL rollups, whereas the candidate centers on correctly parsing a binary's byte-order grouping key in Rust and fixing netting aggregation logic."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e5238fcac164",
+     0.22
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.165
+    ],
+    [
+     "terminal-bench/fin-saccr-rwa",
+     0.15
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.145
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.015678
+  },
+  "novel": false
+ },
+ "cost_usd": 0.058314000000000005
+}

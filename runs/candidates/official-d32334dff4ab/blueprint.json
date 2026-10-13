@@ -1,0 +1,57 @@
+{
+ "slug": "node-sandbox-escape-policy",
+ "title": "Node.js Sandbox Policy Rate Limiter",
+ "scenario": "A security engineer is auditing a microservice that evaluates untrusted JavaScript snippets submitted by external API users. The service runs in a single Docker container and exposes an HTTP API. The container ships a Node.js evaluation sandbox with a configurable policy engine that enforces per-user rate limits and CPU-time quotas. Recent penetration tests flagged that some policy rules are silently bypassed under specific request sequences, but no reproduction case was filed.",
+ "instruction_draft": "You are a security engineer auditing the snippet-evaluation service running at http://localhost:4000. The service accepts POST /eval requests with a JSON body containing `user_id` and `code` fields. A policy engine at /app/policy enforces two invariants that must hold under any request sequence:\n\n1. No single user may accumulate more than 500 CPU-milliseconds of evaluation time within any rolling 60-second window. Any request that would push the user over the budget must be rejected with HTTP 429 before evaluation begins.\n2. The per-user CPU-time ledger must be consistent: the sum of CPU times recorded for accepted requests in any window must never exceed 500 ms, and the running total exposed at GET /stats/:user_id must equal the sum of the individual accepted-request records stored in /app/data/records.db.\n\nBoth invariants are checked at verify time by replaying request sequences generated at verification time against the live service. The service must process at least 80 accepted requests per second under a 10-concurrent-user load (measured with the requests that stay within budget). Fix whatever is necessary so both invariants hold and the throughput target is met.",
+ "requirements": [
+  "Any request that would cause a user's rolling-60-second CPU-time total to exceed 500 ms is rejected with HTTP 429 before the code runs",
+  "The cumulative CPU time in GET /stats/:user_id matches the sum of accepted-request records in records.db for that user",
+  "The ledger is consistent even when concurrent requests for the same user arrive simultaneously",
+  "The service processes at least 80 accepted requests per second under 10-concurrent-user load without violating the budget invariant"
+ ],
+ "environment": [
+  "Dockerfile FROM python:3.13-slim-bookworm installs Node.js 20 via nodesource, sqlite3, and hyperfine",
+  "/app/service/ contains the HTTP service (server.js ~200 lines, routes.js ~150 lines) that starts on port 4000 via `node server.js`",
+  "/app/policy/ contains policy.js (~180 lines) with the rate-limit check and ledger update logic; it uses a per-user in-memory Map to track rolling windows",
+  "/app/policy/db.js (~120 lines) handles SQLite writes to /app/data/records.db using better-sqlite3",
+  "/app/data/records.db is created at startup if absent; schema: table `eval_records(user_id TEXT, ts INTEGER, cpu_ms REAL, accepted INTEGER)`",
+  "The rolling-window check in policy.js has a race condition: it reads the window total, then evaluates the code, then writes \u2014 so concurrent requests for the same user can both pass the budget check and both get accepted even if together they exceed 500 ms",
+  "The stats endpoint aggregates from the in-memory Map, not from the DB, so after a restart the in-memory totals reset to zero while the DB retains old records, causing the consistency invariant to fail silently",
+  "The CPU measurement uses process.hrtime() subtracted around vm.runInNewContext() but the timeout is set to 2000 ms; typical snippets run 10-150 ms so under concurrent load some legitimately rejected requests slip through the race before the write completes",
+  "A startup script /app/start.sh launches the service and pre-populates the DB with 48 hours of historical records for 20 users so the DB is non-empty on first run",
+  "hyperfine is available for benchmarking; wrk or autocannon is NOT available but Node.js is, so the solver must write their own load test or use node fetch in a script",
+  "/app/README.md describes the API endpoints and the two invariants in the same language as the instruction"
+ ],
+ "internal_hint": "Difficulty comes from two interacting runtime bugs that are invisible by reading source alone: (1) a classic TOCTOU race in the rate-limit check \u2014 the window total is read, code runs (takes real time), then the write happens, so concurrent same-user requests both pass \u2014 only visible by actually running concurrent load and observing /stats or the DB; (2) the stats endpoint reads from the in-memory Map which resets on restart while the DB persists, causing ledger inconsistency only observable after a restart. Fixing (1) requires wrapping the read-check-execute-write in a per-user async mutex (e.g. async-mutex or a promise-chain queue); simply moving the write before execution does not help because execution duration is unknown upfront. Fixing (2) requires the stats endpoint to aggregate from the DB, not the Map. The throughput bar (80 req/s) ensures that a naive fix using a single global lock or a synchronous SQLite write in the hot path fails the performance threshold \u2014 the agent must use WAL mode for SQLite and per-user locking, not a global lock.",
+ "trap": "A naive agent reads policy.js, spots the write-after-execute ordering, moves the write before execute using an estimated cpu_ms, and re-runs the sample. This passes a single-user sequential test but fails concurrent tests because there is still no mutual exclusion \u2014 two concurrent requests read the same window total simultaneously. The stats-DB inconsistency is only caught after a service restart, which the agent may not think to test. The throughput bar catches any solution that uses a single global async lock (serializing all requests) instead of per-user locks.",
+ "tests": [
+  "Replay a generated sequence of 200 requests for 5 users with randomized code snippets (10-120 ms CPU each) sent concurrently (20 goroutine-equivalent async fetches); verify that no user's accepted-request sum in records.db ever exceeds 510 ms in any 60-second window",
+  "After replaying the concurrent sequence, restart the service and immediately call GET /stats/:user_id for each user; verify the returned total matches the DB sum within 1 ms",
+  "Run a throughput test: 10 users each sending requests that cost exactly 10 ms CPU, pipelining until the 500 ms budget is reached per window; measure accepted-request throughput and assert >= 80/s",
+  "Send 50 concurrent requests for the same user all at once when their budget is at 490 ms; verify that exactly 1 is accepted (not 0, not 2+) and 49 get 429",
+  "Verify that GET /stats/:user_id returns the correct sum even when the service has been restarted mid-window (DB has records from before restart)"
+ ],
+ "verifier_knob": {
+  "name": "concurrency_level",
+  "value": "20 concurrent requests per user burst",
+  "effect": "Lowering to 2 concurrent makes the race hard to trigger and the task easier; raising to 50 makes even slightly-imperfect locking fail, and the throughput bar becomes harder to clear without per-user locks"
+ },
+ "expected_failure_modes": [
+  "Agent fixes the write ordering but not the race condition \u2014 concurrent test still shows over-budget accepts",
+  "Agent adds a global async lock eliminating the race but throughput drops below 80 req/s under 10-user load",
+  "Agent fixes concurrency but leaves stats reading from in-memory Map \u2014 post-restart consistency test fails",
+  "Agent writes a correct per-user lock but uses synchronous SQLite writes without WAL mode \u2014 throughput test fails",
+  "Agent only tests sequential single-user flows and declares the fix done without running concurrent load"
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "security",
+ "tags": [
+  "javascript",
+  "concurrency",
+  "sqlite",
+  "rate-limiting",
+  "systems-programming",
+  "security-audit"
+ ]
+}

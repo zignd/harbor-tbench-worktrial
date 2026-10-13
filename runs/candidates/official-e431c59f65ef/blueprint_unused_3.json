@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "connection-pool-ghost-leak",
+  "title": "Connection Pool Ghost Leak Repair",
+  "scenario": "A database administrator is investigating a production incident: the in-house Python application server began exhausting its PostgreSQL connection pool during peak hours, causing cascading timeouts. The codebase is a ~1,200-line internal service with a custom async connection-pool manager, a query router, a retry layer, and a health-check daemon. The admin has pasted a truncated error log and needs the service to handle arbitrary connection patterns without leaking.",
+  "instruction_draft": "```\n[2026-10-13 03:17:42] CRITICAL pool.py: acquire() timeout after 30s (pool_size=20, checked_out=20, idle=0)\n[2026-10-13 03:17:43] ERROR  router.py: query failed: connection pool exhausted\n[2026-10-13 03:17:43] ERROR  router.py: query failed: connection pool exhausted\n[2026-10-13 03:17:44] CRITICAL pool.py: acquire() timeout after 30s (pool_size=20, checked_out=20, idle=0)\n...(repeated 847 times over 4 minutes)...\n[2026-10-13 03:21:51] INFO   healthcheck.py: pool status: checked_out=20, idle=0, waiters=143\n```\n\nThe service is at `/app/`. After the incident the on-call engineer restarted the process and the leak stopped \u2014 until the next spike.\n\nYour job: identify what causes connections to be permanently checked out and never returned, then fix it so the pool never leaks connections regardless of query success, failure, retry, or cancellation paths. The pool must also correctly report its live metrics (checked_out, idle, total) at all times.\n\nVerification: the test suite at `/app/tests/test_pool.py` will replay a variety of workloads \u2014 including exception injection, concurrent cancellation, and retry storms \u2014 and assert that after every workload the pool returns to a fully-idle state and its reported metrics match reality.",
+  "requirements": [
+   "After any query workload (successful, failing, retried, or cancelled), all acquired connections are returned to the pool and the pool reaches a fully-idle state.",
+   "pool.status() returns metrics (checked_out, idle, total) that exactly match the true internal state at all times, including mid-workload.",
+   "The fix must not change the external API of the pool (acquire/release/status/close signatures must remain identical).",
+   "The pool must handle concurrent acquisition and release from multiple async tasks without deadlock or metric drift.",
+   "Connections are not double-released (the pool must detect and raise on duplicate release of the same connection handle)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt: none needed beyond base",
+   "pip: asyncio (stdlib), pytest==8.3.3, pytest-asyncio==0.24.0, anyio==4.6.2",
+   "/app/pool.py: ~280 lines \u2014 async connection pool with acquire()/release()/status()/close(); the bug: in the retry wrapper inside acquire(), a failed first-attempt connection is checked out into _checked_out but then re-raised without releasing, leaving the slot permanently occupied; additionally status() reads _checked_out and _idle as simple ints that are incremented/decremented without a lock, causing metric drift under concurrency",
+   "/app/router.py: ~220 lines \u2014 query router that calls pool.acquire(), wraps in a context, executes a mock query, and calls pool.release(); the router has its OWN retry loop that calls acquire() again on failure WITHOUT releasing the previous handle first (a second leak vector only visible when both retries and exceptions coincide)",
+   "/app/retry.py: ~150 lines \u2014 exponential backoff decorator used by router; injects configurable exceptions; not itself buggy but interacts with router's leak",
+   "/app/healthcheck.py: ~180 lines \u2014 background task that polls pool.status() and logs; not buggy",
+   "/app/mock_db.py: ~120 lines \u2014 a mock 'database' that accepts connections, tracks open handles, and can be configured to fail on the N-th query; used by tests",
+   "/app/server.py: ~200 lines \u2014 thin async HTTP server wiring together router and healthcheck; not involved in the bug but makes the codebase realistically sized",
+   "/app/tests/test_pool.py: the verifier; generates fresh workloads at test time using seeded randomness (seed from pytest fixture parametrize); tests: (1) clean workload \u2014 all queries succeed, pool fully idle after; (2) exception injection at random query indices \u2014 pool fully idle after; (3) concurrent cancellation \u2014 pool fully idle after; (4) retry storm \u2014 router retries 3x on injected failures, pool fully idle after; (5) metric consistency \u2014 status() checked_out + idle == total throughout; (6) double-release detection \u2014 releasing the same handle twice raises ValueError; number and variety of workload seeds is the difficulty knob",
+   "The two bug sites (pool.py retry path and router.py retry-without-release) only manifest together when the mock_db is configured to fail; a workload of only successful queries passes even with the bugs present"
+  ],
+  "internal_hint": "Root cause 1 (observe_not_read): pool.py's acquire() has a fast-path retry: if the first mock connection attempt raises, it increments _checked_out, appends to _in_use, then re-raises \u2014 but never calls _release_internal(). This only fires on the data-dependent exception path, so reading the happy-path code misses it. Root cause 2 (build_component): router.py's retry loop calls pool.acquire() \u2192 gets exception \u2192 loops back and calls pool.acquire() AGAIN, holding the first (leaked) handle. The fix requires: (a) wrapping acquire()'s internal connection attempt in try/except and releasing on failure before re-raising, (b) rewriting router.py's retry loop to release before re-acquiring, (c) replacing the bare int counters in pool.py with asyncio.Lock-guarded updates so status() is consistent. A solver who only fixes root cause 1 will pass clean-workload tests but fail the retry-storm tests. A solver who only fixes root cause 2 will pass most tests but fail the concurrent-cancellation tests where the pool's internal path fires. The metric drift (root cause 3) only shows up in the parametrized metric-consistency test with high concurrency seeds.",
+  "trap": "A solver who reads pool.py, spots the obvious missing release in the exception branch, patches it, runs the provided sample test (clean workload), and submits will pass tests 1 and 6 but fail tests 3 and 4. The retry-without-release bug in router.py is only visible by running the retry-storm workload \u2014 it requires actually executing the failure path. Metric drift under concurrency (test 5 with high-seed parametrize) is a third failure that requires instrumenting status() under concurrent load to observe.",
+  "tests": [
+   "test_clean_workload(seed): generate N random queries (N drawn from seed), all succeed; assert pool.status().idle == pool_size and pool.status().checked_out == 0 after workload completes",
+   "test_exception_injection(seed, fail_indices): mark random query indices to raise; run workload; assert pool fully idle after regardless of which queries failed",
+   "test_concurrent_cancellation(seed): launch M concurrent tasks each acquiring a connection; cancel a random subset mid-flight using asyncio.Task.cancel(); assert pool fully idle after cleanup",
+   "test_retry_storm(seed): configure router to retry 3x on failure; inject failures at router level; assert pool fully idle after all retries exhaust",
+   "test_metric_consistency(seed, concurrency): run concurrent workload; at random checkpoints assert pool.status().checked_out + pool.status().idle == pool.status().total; drift > 0 at any checkpoint fails",
+   "test_double_release_raises: acquire a handle, release it, release it again; assert ValueError is raised on second release"
+  ],
+  "verifier_knob": {
+   "name": "workload_seeds",
+   "value": "12 distinct seeds covering clean, failure-injection, cancellation, retry-storm, and metric-consistency scenarios",
+   "effect": "Fewer seeds (e.g., 3, only clean + one failure) let a partial fix pass; more seeds (20+) expose all three bug paths and require the full fix; the current value of 12 is calibrated to require both root causes and the metric fix"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the pool.py exception path, passes clean and exception-injection tests, but fails retry-storm because router.py's leak is not found without running the retry path",
+   "Agent fixes both pool.py and router.py leaks but leaves the int counters unguarded; metric-consistency test with high-concurrency seed catches drift",
+   "Agent rewrites pool.py with a context-manager approach that works for the happy path but introduces a new race in close() that the cancellation test catches",
+   "Agent instruments and observes the exception path but misreads the retry loop in router.py as correct (it looks like it reacquires legitimately), missing the held-handle leak"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "connection-pool",
+   "async-python",
+   "concurrency",
+   "bug-hunt",
+   "database",
+   "systems-programming"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cat /app/pool.py",
+   "cat /app/router.py",
+   "cat /app/retry.py",
+   "cat /app/tests/test_pool.py",
+   "cat /app/mock_db.py",
+   "Identify bug 1: pool.py acquire() increments _checked_out then re-raises on failed connection attempt without releasing",
+   "Edit pool.py: wrap internal connection attempt in try/except; call _release_internal() before re-raising",
+   "Identify bug 3 (visible in code): _checked_out and _idle are bare ints, no asyncio.Lock",
+   "Edit pool.py: add asyncio.Lock; guard all increments/decrements; update status() to read under lock",
+   "python -m pytest /app/tests/test_pool.py::test_clean_workload -v",
+   "python -m pytest /app/tests/test_pool.py::test_exception_injection -v",
+   "python -m pytest /app/tests/test_pool.py::test_concurrent_cancellation -v",
+   "python -m pytest /app/tests/test_pool.py::test_retry_storm -v",
+   "Observe retry_storm failure: router.py re-acquires without releasing previous handle on retry",
+   "Edit router.py: in retry loop, release held handle before re-acquiring (add try/finally or explicit release)",
+   "python -m pytest /app/tests/test_pool.py::test_retry_storm -v",
+   "python -m pytest /app/tests/test_pool.py::test_metric_consistency -v",
+   "python -m pytest /app/tests/test_pool.py::test_double_release_raises -v",
+   "python -m pytest /app/tests/test_pool.py -v"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "test_metric_consistency asserts checked_out + idle == total via three separate pool.status() calls in sequence \u2014 even a correct implementation could see a task switch between calls, making the assertion racy and potentially flaky under high-concurrency seeds",
+   "asyncio.Task.cancel() in test_concurrent_cancellation may not fire at a cancellation checkpoint if mock_db.connect() is synchronous and has no await; the test could pass trivially or fail unpredictably depending on whether the mock has cooperative await points",
+   "pytest-asyncio 0.24.0 compatibility with Python 3.13 and anyio 4.6.2 is not guaranteed \u2014 this combination may require asyncio_mode='auto' config that isn't mentioned, causing all async tests to fail with collection errors unrelated to the bugs",
+   "The asyncio.Lock fix in pool.py could itself introduce a deadlock if _release_internal() is called while the lock is held by acquire() \u2014 the fix requires careful lock scoping that is easy to get wrong, potentially making a correct-intent solution fail the cancellation test",
+   "If 'seeded randomness' uses random.seed() globally rather than a local Random instance, parallel pytest execution could cause seeds to interfere across tests, making results non-deterministic"
+  ],
+  "verdict": "accept",
+  "reasons": "The task has three layered bugs across two files that require iterative run-and-observe debugging rather than pure code reading, placing it beyond the ~20-command threshold for genuine difficulty. The scenario is highly realistic and the test suite is well-designed to catch partial fixes. The main risk is the metric-consistency test's TOCTOU pattern in assertions, which should be addressed by having status() return an atomic snapshot struct rather than being called three times separately.",
+  "fixes": [
+   "Change test_metric_consistency to call pool.status() once per checkpoint and assert on the returned snapshot object (e.g., s = pool.status(); assert s.checked_out + s.idle == s.total) to eliminate the TOCTOU race in the test assertion itself",
+   "Ensure mock_db.connect() and mock_db.execute() include at least one 'await asyncio.sleep(0)' so that asyncio.Task.cancel() has a valid cancellation point; without this, test_concurrent_cancellation may be trivially passing or failing due to lack of cooperative cancellation",
+   "Add a note in the environment spec about pytest-asyncio configuration (asyncio_mode='auto' in pytest.ini or pyproject.toml) to prevent collection errors with Python 3.13, which changed default event loop scope handling",
+   "Clarify in the instruction that the solver should not change the external API but MAY add internal synchronization primitives, to prevent confusion about whether asyncio.Lock counts as an 'API change'"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/analyze-arm-shellcode-network-connections",
+     "verdict": "distinct",
+     "reason": "That task is about QEMU ARM emulation and network monitoring of shellcode, completely unrelated to async Python connection pool leak repair."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service over a compiled shared library with a custom protocol, not about diagnosing and fixing connection pool leaks."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-engineer-kvstore-binary-protocol",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering a binary protocol for a key-value store, not about async connection pool resource management."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a canary deployment orchestrator's rollback logic, not about async database connection pool leak repair."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bash filter validator for a CI pipeline with SQLite queries, not about async Python connection pool lifecycle management."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/analyze-arm-shellcode-network-connections",
+     0.114
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.093
+    ],
+    [
+     "terminal-bench-pro/reverse-engineer-kvstore-binary-protocol",
+     0.073
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.056
+    ],
+    [
+     "ours/official-18899524e171",
+     0.055
+    ]
+   ],
+   "cost_usd": 0.014577
+  },
+  "novel": true
+ },
+ "cost_usd": 0.058065
+}

@@ -1,0 +1,163 @@
+{
+ "blueprint": {
+  "slug": "node-service-bundle-size-audit",
+  "title": "Node.js Service Bundle Security Audit",
+  "scenario": "A security engineer is auditing a Node.js microservice that runs in a single container. The service handles sensitive request routing and is built with a custom webpack configuration. During a routine audit, the engineer flagged that the production bundle is bloated\u2014it ships development-only modules and ignored the dependency allow-list policy the team adopted six months ago. The codebase lives at /app and includes the service source, webpack config, package.json, an allow-list manifest, and a running Express server.",
+  "instruction_draft": "You are auditing the production build of the Node.js service at /app. The service is supposed to ship a single minified bundle at /app/dist/service.bundle.js built by `npm run build`. Two requirements were agreed upon at the last security review: (1) the production bundle must contain no module whose package name appears in /app/security/deny-list.json\u2014this file lists modules forbidden in production artifacts because they expose internals or add attack surface; and (2) the gzipped size of /app/dist/service.bundle.js must not exceed 180 KB. The current build passes CI but violates both constraints. Investigate and fix the build configuration so that `npm run build` produces a bundle that satisfies both constraints simultaneously. Do not alter the runtime behaviour of the service: all endpoints must still respond correctly when the server is started with `node /app/dist/service.bundle.js`.",
+  "requirements": [
+   "Running `npm run build` at /app must complete without error.",
+   "No string matching any package name in /app/security/deny-list.json may appear as a resolvable module identifier in /app/dist/service.bundle.js after build.",
+   "The gzipped byte size of /app/dist/service.bundle.js must be \u2264 180 KB (184320 bytes).",
+   "The service started with `node /app/dist/service.bundle.js` must respond correctly on all four HTTP endpoints checked by the verifier."
+  ],
+  "environment": [
+   "Dockerfile FROM node:20-slim. Install: webpack 5, webpack-cli, babel-loader, @babel/core, @babel/preset-env, terser-webpack-plugin, compression-webpack-plugin, express, lodash, moment, uuid, axios, debug, chalk, dotenv, and several others.",
+   "The service is a realistic Express app (~900 LOC across 6 files) with four endpoints: GET /health, POST /route, GET /metrics, POST /audit. Each uses a subset of the installed packages.",
+   "webpack.config.js is intentionally broken in three interacting ways: (a) mode is 'development' so minification is off; (b) a custom BannerPlugin injects a large license block (~40 KB of text) into every chunk; (c) a misused ProvidePlugin pulls in the full `lodash` global instead of the specific methods actually imported, bloating the bundle.",
+   "/app/security/deny-list.json lists: ['debug', 'chalk', 'dotenv'] \u2014 these are dev/config-exposure modules. The current webpack config does NOT externalize or tree-shake them; they are fully inlined.",
+   "package.json scripts: { 'build': 'webpack --config webpack.config.js', 'start': 'node dist/service.bundle.js' }.",
+   "The service source correctly uses only named lodash imports (e.g., `import { pick, omit } from 'lodash'`), so switching to lodash-es or babel-plugin-lodash can eliminate most of the lodash bloat without breaking behaviour.",
+   "A /app/test/smoke.sh script pings all four endpoints and exits 0 if they respond correctly \u2014 solver can use this to verify runtime behaviour is preserved.",
+   "The deny-list check is: for each name in deny-list.json, grep the bundle for the literal string require('${name}') or the module's internal __webpack_require__ registration key.",
+   "Planted numbers: unpatched bundle gzipped \u2248 420 KB; with only minification fixed \u2248 260 KB; with banner removed \u2248 210 KB; with lodash tree-shaking \u2248 155 KB but deny-list modules still present; all three fixes together \u2248 148 KB and clean deny-list."
+  ],
+  "internal_hint": "Difficulty comes from three interacting misconfiguration knobs that each independently fail one or both constraints, and a partial fix leaves the solution looking done. Root causes: (1) webpack mode='development' disables Terser \u2014 fix: set mode='production' or add TerserPlugin explicitly. (2) BannerPlugin adds ~40 KB of literal text to the bundle \u2014 fix: remove or shrink the plugin. (3) ProvidePlugin with lodash pulls the entire 70 KB lodash build into the bundle \u2014 fix: remove ProvidePlugin for lodash and either add babel-plugin-lodash or switch import to lodash-es so webpack tree-shakes. (4) debug, chalk, dotenv are bundled because they are not externalized \u2014 fix: add them to webpack externals (and ensure the runtime either doesn't need them in production or stubs them). The solver must discover the deny-list rule by reading /app/security/deny-list.json (not stated in the instruction in prescriptive detail), then find that those modules appear in the bundle, then trace back why. Because three independent fixes are required and each alone leaves the bundle too large OR still contains deny-list modules, a shallow solver who fixes one or two will fail the metric or the deny-list check. The key insight about ProvidePlugin vs named imports is only visible when running the build and inspecting the bundle \u2014 not by reading one file.",
+  "trap": "A solver who only sets mode='production' gets minification but the banner and lodash bloat keep the gzip over 180 KB. A solver who externalizes the deny-list modules but doesn't fix lodash/banner stays over the size limit. A solver who fixes size but forgets to externalize one deny-list module (e.g., removes debug and chalk but misses dotenv which is required in a deeply imported config helper) passes the size check but fails the deny-list test on hidden inputs that grep for all three. The verifier generates the deny-list check at verify-time by re-reading /app/security/deny-list.json and grepping the fresh bundle, so any module left in triggers failure.",
+  "tests": [
+   "Run `npm run build` at /app; assert exit code 0.",
+   "Gzip /app/dist/service.bundle.js and assert compressed size \u2264 184320 bytes.",
+   "For each name in /app/security/deny-list.json, scan /app/dist/service.bundle.js for the module's webpack registration token (the literal package name as a module key); assert none found.",
+   "Start `node /app/dist/service.bundle.js &` and wait for listen; send GET /health, assert 200 with JSON body containing 'status'.",
+   "POST /route with a valid JSON body per the service's schema; assert 200 and correct routing response.",
+   "GET /metrics; assert 200 and a numeric field in the response.",
+   "POST /audit with a sample payload; assert 200 and an audit record in the response."
+  ],
+  "verifier_knob": {
+   "name": "gzip_size_limit_bytes",
+   "value": "184320",
+   "effect": "Lowering to 163840 (160 KB) requires additionally switching from axios to a lighter HTTP client or removing moment in favour of date-fns with tree-shaking. Raising to 204800 (200 KB) lets a solver skip the lodash ProvidePlugin fix and still pass on size, making the task purely a deny-list problem."
+  },
+  "expected_failure_modes": [
+   "Solver sets mode='production' and externalizes deny-list modules, passes deny-list check, but bundle is still 210 KB gzipped due to banner and lodash; fails size test.",
+   "Solver removes BannerPlugin and sets production mode, gets bundle to 185 KB, but forgets dotenv is also in deny-list (finds debug and chalk by inspection, misses dotenv); fails deny-list test.",
+   "Solver switches all lodash imports to individual packages (lodash.pick etc.) to tree-shake, but this changes the require tokens in the bundle from 'lodash' to 'lodash.pick' \u2014 the deny-list only bans 'lodash' root so this actually passes, but solver breaks the endpoint behaviour by missing one usage.",
+   "Solver externalizes deny-list modules via webpack externals but doesn't provide stubs, so the server crashes on startup when one module is required at init time; smoke test fails.",
+   "Solver verifies only GET /health after build and doesn't test POST /audit which hits the chalk-dependent code path; deploys a broken bundle."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "webpack",
+   "nodejs",
+   "security-audit",
+   "bundle-size",
+   "configuration",
+   "systems-programming"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/security/deny-list.json",
+   "cat /app/webpack.config.js",
+   "cat /app/package.json",
+   "npm run build (observe initial failure/size)",
+   "gzip -c /app/dist/service.bundle.js | wc -c  # confirm ~420KB",
+   "grep -l 'debug\\|chalk\\|dotenv' /app/dist/service.bundle.js  # confirm deny-list violations",
+   "# Identify from webpack.config.js: mode='development', large BannerPlugin, ProvidePlugin(lodash)",
+   "# Edit webpack.config.js: set mode='production'",
+   "# Edit webpack.config.js: remove BannerPlugin or replace with tiny one",
+   "# Edit webpack.config.js: remove ProvidePlugin for lodash",
+   "# Edit webpack.config.js: add externals for debug, chalk, dotenv; provide empty stubs or confirm unused at runtime",
+   "npm run build  # rebuild",
+   "gzip -c /app/dist/service.bundle.js | wc -c  # confirm <=184320",
+   "grep 'debug\\|chalk\\|dotenv' /app/dist/service.bundle.js  # confirm clean",
+   "node /app/dist/service.bundle.js &",
+   "bash /app/test/smoke.sh  # verify all four endpoints"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Externalizing debug/chalk/dotenv via webpack externals leaves the bundle referencing them as globals or CommonJS requires \u2014 if the service calls them at init time, node crashes; the instruction says 'do not alter runtime behaviour' but doesn't specify how to stub them, creating an ambiguous constraint.",
+   "The deny-list grep check on 'webpack registration token' may false-positive on externalized modules because the module name still appears as a string literal in the require() call emitted for externals, potentially failing a test even when the module code is not bundled.",
+   "If babel-plugin-lodash or lodash-es is not pre-installed in the container with no internet, solvers who choose that approach for tree-shaking will fail; the blueprint mentions them but doesn't confirm they are installed.",
+   "The 180 KB threshold is very tight (planted numbers show ~148 KB with all fixes); any variation in webpack version behavior or chunk splitting across environments could cause flakiness near the boundary.",
+   "The smoke.sh correctness depends on chalk/debug/dotenv code paths \u2014 if chalk is used in a response formatter rather than just dev logging, externalizing without stubbing breaks POST /audit specifically, making the fix non-obvious and potentially environment-dependent."
+  ],
+  "verdict": "reject",
+  "reasons": "Genuine difficulty scores 2 because all three root causes are directly visible by reading webpack.config.js in a single pass \u2014 a skilled agent identifies and fixes all issues in ~16 commands without iterative discovery, which is below the threshold for 'hard' difficulty. Additionally, the externals-vs-stubs ambiguity and the deny-list grep behavior on externalized modules create invalid failure risks that could cause a correct solution to be marked wrong. The solvability concern around pre-installed packages (babel-plugin-lodash, lodash-es) needs confirmation.",
+  "fixes": [
+   "Hide one of the three misconfiguration bugs outside webpack.config.js \u2014 e.g., put the BannerPlugin injection in a separate webpack plugin file that is imported, or bury the lodash ProvidePlugin in a webpack.common.js that is merged; this forces the solver to discover it rather than reading one file.",
+   "Clarify the deny-list test methodology precisely: specify whether externalized modules (referenced by name in require() calls) count as violations, and whether stubs are permitted \u2014 this removes the ambiguous failure risk around externalizing vs removing.",
+   "Confirm in the environment spec that lodash-es and babel-plugin-lodash are pre-installed in the Docker image, or remove them from the hint and require a different tree-shaking approach using only what is installed.",
+   "Raise the gzip threshold slightly (e.g., to 160 KB / 163840 bytes) to reduce flakiness risk at the boundary while keeping the challenge meaningful.",
+   "Add a 'red herring' fix path \u2014 e.g., make one deny-list module (dotenv) conditionally required based on NODE_ENV so it only appears in the bundle under development mode, requiring the solver to both set production mode AND externalize it, creating genuine interdependence between the two constraint types."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-b540d2ce9b80",
+     "verdict": "distinct",
+     "reason": "That task is about wiring a native addon into webpack for optimization pass assignments; the candidate is about fixing webpack config to exclude denied modules and reduce bundle size."
+    },
+    {
+     "ref_id": "terminal-bench-pro/merge-parser-branches",
+     "verdict": "distinct",
+     "reason": "That task involves git bundle imports and merge conflict resolution for a parser; the candidate is a webpack security audit focused on deny-listed modules and bundle size."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service using a compiled shared library; the candidate is about auditing and fixing a webpack build configuration for security compliance."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task involves fixing a Node.js log ingestion pipeline for correctness and performance; the candidate is about webpack bundle security auditing and size constraints."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect regional sales aggregation in a compiled service; the candidate is about webpack configuration to exclude denied modules and meet bundle size limits."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-b540d2ce9b80",
+     0.263
+    ],
+    [
+     "terminal-bench-pro/merge-parser-branches",
+     0.201
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.196
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.177
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.167
+    ]
+   ],
+   "cost_usd": 0.013239
+  },
+  "novel": true
+ },
+ "cost_usd": 0.051453
+}

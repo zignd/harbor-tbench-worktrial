@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "metrics-pipeline-ghost-aggregation",
+  "title": "Production Metrics Ghost Aggregation Bug",
+  "scenario": "A backend developer is investigating why the production alerting system fires spurious high-latency alerts every few hours, then clears itself, despite the service appearing healthy. The environment contains a running metrics collection daemon (~1,200 lines across 6 modules) that reads structured JSON log lines from a FIFO pipe, computes rolling percentile aggregations, and writes summary metrics to a SQLite database consumed by the alerting engine. The system has been running for several hours of simulated history already loaded into the database.",
+  "instruction_draft": "```\n$ tail -100 /var/log/alertmanager/alerts.log\n2026-10-13T04:17:33Z ALERT p99_latency_ms=2847.3 threshold=2000 service=api-gateway\n2026-10-13T04:17:34Z RESOLVE p99_latency_ms=143.2 threshold=2000 service=api-gateway\n2026-10-13T07:44:11Z ALERT p99_latency_ms=3102.8 threshold=2000 service=api-gateway\n2026-10-13T07:44:12Z RESOLVE p99_latency_ms=98.7 threshold=2000 service=api-gateway\n2026-10-13T11:22:09Z ALERT p99_latency_ms=2991.1 threshold=2000 service=api-gateway\n2026-10-13T11:22:10Z RESOLVE p99_latency_ms=112.4 threshold=2000 service=api-gateway\n$\n```\n\nThese alerts have been firing several times per day for two weeks. The on-call team has confirmed that actual service latency never exceeds 300ms; every alert is a false positive. The metrics collection daemon is at `/opt/metricsd/` and the alerting engine reads from the SQLite database at `/var/lib/metricsd/metrics.db`.\n\nFix the metrics pipeline so that:\n1. The p99 latency reported to the database accurately reflects the distribution of latency values in the incoming log stream, within 5% of the true p99 for any window.\n2. The pipeline correctly separates metrics by the `service` field in log lines; a spike in one service's latency must not affect another service's reported percentiles.\n3. The aggregation window boundaries are respected: a metric value written for window `[T, T+60s)` must only include log lines whose timestamps fall within that window.\n4. The fix must work correctly when log lines arrive out of chronological order by up to 30 seconds (a known property of the log source).\n5. Leave the daemon running and processing live data; do not replace it with a polling script.",
+  "requirements": [
+   "p99 latency reported to the database is within 5% of the true p99 for any 60-second aggregation window",
+   "Metrics are correctly partitioned by service field; one service's latency distribution does not contaminate another's",
+   "Aggregation window boundaries are strict: only log lines with timestamps inside [T, T+60s) contribute to that window's metric",
+   "Out-of-order log lines arriving up to 30 seconds late are correctly attributed to their proper window",
+   "The daemon process continues running and processing the live FIFO pipe after the fix is applied"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, numpy, scipy packages",
+   "/opt/metricsd/ contains 6 Python modules: main.py (daemon entrypoint, ~200 lines), collector.py (FIFO reader and line parser, ~180 lines), aggregator.py (sliding window and percentile computation, ~300 lines), store.py (SQLite writer, ~150 lines), config.py (loads /etc/metricsd/config.yaml, ~100 lines), util.py (time helpers, ~120 lines)",
+   "/etc/metricsd/config.yaml configures window_seconds=60, late_arrival_tolerance=30, services=[api-gateway,auth-service,data-processor], percentiles=[p50,p90,p99]",
+   "Bug 1 (observe_not_read): aggregator.py maintains a single shared reservoir per percentile tier instead of per-service reservoirs; the reservoir is a fixed-size random sample that silently evicts values when full, but the eviction uses a global counter reset that fires on window boundaries shared across all services \u2014 meaning only when multiple services are active simultaneously (which only happens in real traffic patterns, not in the unit tests that ship with the daemon) does cross-service contamination appear. The reservoir size is read from config at startup but the config key name mismatches between config.yaml ('reservoir_size') and aggregator.py which reads 'sample_size', defaulting to 128 \u2014 far too small for realistic traffic, causing systematic high-bias in p99.",
+   "Bug 2 (interacts with Bug 1): util.py contains a window boundary function that truncates timestamps to the nearest window boundary using integer division of Unix timestamps, but it reads timezone offset from an environment variable METRICSD_TZ_OFFSET (defaulting to 0) and applies it before truncation but not after, causing windows to be offset by up to tz_offset seconds. The container has METRICSD_TZ_OFFSET=3600 set in /etc/environment (loaded by the init script but not by direct Python execution). Late-arriving lines land in the wrong window because the boundary check in collector.py calls util.window_for(ts) without the offset correction, while the storage path in store.py calls it with the correction applied \u2014 so late lines are rejected as 'too old' when they are actually in the current window, then the window closes early, cutting off the tail of the distribution and making p99 appear lower until the next window's contaminated sample fires an alert.",
+   "/var/lib/metricsd/metrics.db is pre-populated with 8 hours of history showing the spurious alert pattern visible in the database",
+   "/var/log/metricsd/daemon.log shows the daemon has been running and processing lines with no Python exceptions",
+   "/opt/metricsd/tests/ contains unit tests that pass on clean synthetic single-service data with no out-of-order delivery and small traffic volume \u2014 they do not expose either bug",
+   "A script /opt/metricsd/tools/inject_traffic.py generates realistic multi-service log traffic to the FIFO for testing; it includes configurable out-of-order delivery and realistic latency distributions",
+   "The daemon is started by /etc/init.d/metricsd and is already running when the solver enters the container",
+   "Approximately 1,800 lines total across all files including tests and tooling"
+  ],
+  "internal_hint": "Two interacting bugs: (1) aggregator.py uses a single shared T-Digest/reservoir per percentile level rather than per (service, window) key \u2014 the reservoir_size config key mismatch causes it to default to 128 samples instead of the intended 10,000, making high-percentile estimates systematically unreliable, and cross-service mixing only manifests when multiple services are simultaneously active (observable_not_read: unit tests use single-service synthetic data). (2) util.py applies METRICSD_TZ_OFFSET before integer truncation in window_for() but collector.py's late-arrival check calls the function in a context where the env var is unset (direct import), while store.py's write path gets it correctly from the init environment. This causes late arrivals to be misclassified as expired and dropped, truncating the tail of each window's distribution. Bug 2 alone makes the p99 look artificially low most of the time (because tail values are dropped), but when enough late arrivals accumulate in a reservoir flush, the contaminated cross-service values from Bug 1 dominate for exactly one reporting cycle, causing the alert-then-immediate-resolve pattern. Fixing only Bug 1 (per-service reservoirs, correct config key) stops cross-service contamination but the p99 is still wrong due to dropped late arrivals from Bug 2. Fixing only Bug 2 stops the late-arrival dropping but the reservoir is still 128 samples and cross-service contaminated, so p99 is still wildly off. Both must be fixed together. Discovery path: inject_traffic.py reveals the pattern; querying metrics.db across services reveals cross-contamination; adding logging around util.window_for() with and without the env var reveals the offset mismatch; the config key mismatch is found by grepping the mismatch between config.yaml and aggregator.py's config reads.",
+  "trap": "A solver who fixes only the per-service reservoir partitioning (Bug 1) will find that their p99 estimates improve significantly on the provided inject_traffic.py test, but the hidden corpus tests use multi-service traffic with 25-30 second late arrivals at high load \u2014 late arrivals still get dropped due to Bug 2, cutting the tail distribution and causing p99 to read 15-40% low on windows with heavy out-of-order delivery. The solver's local test may show 'correct' results because inject_traffic.py's default settings use only 5-second out-of-order jitter, which falls within the timezone offset tolerance by accident. The verifier generates fresh traffic with 28-second jitter across multiple services and checks that p99 values land within 5% of ground truth computed from the raw log lines.",
+  "tests": [
+   "Inject 10,000 log lines across 3 services with known latency distributions (lognormal, ground truth p99 computed offline) and verify reported p99 values in metrics.db are within 5% of ground truth for each service independently",
+   "Inject concurrent multi-service traffic where service A has p99=200ms and service B has p99=2500ms; verify service A's reported p99 remains below 500ms (cross-contamination test)",
+   "Inject traffic with 28-second out-of-order delivery (lines timestamped 28s before arrival); verify these lines appear in their correct windows (not dropped or misattributed to the next window)",
+   "Verify the daemon process is still running (PID check, FIFO still open) after all fixes are applied",
+   "Check metrics.db for a 30-minute post-fix window injected by the verifier: no p99 value for any single service should exceed 3x the injected 95th percentile of that service's latency distribution",
+   "Verify that window boundaries in metrics.db are aligned to 60-second UTC epoch multiples (confirming the timezone offset bug is fixed)",
+   "Run the existing /opt/metricsd/tests/ suite; it must still pass (solver must not break the unit-test-passing behavior)"
+  ],
+  "verifier_knob": {
+   "name": "out_of_order_jitter_seconds",
+   "value": "28",
+   "effect": "Lowering to 5 makes Bug 2 nearly invisible because accidental tolerance absorbs it; raising to 30 makes both bugs independently detectable; the value of 28 is chosen to sit in the range where Bug 2 causes definite window misattribution but only manifests clearly under multi-service load (requiring both bugs to be fixed to pass)"
+  },
+  "expected_failure_modes": [
+   "Solver fixes per-service reservoir partitioning but misses the config key mismatch (reservoir still defaults to 128 samples), causing p99 to remain inaccurate on the hidden corpus high-volume tests",
+   "Solver fixes the config key mismatch and per-service partitioning but does not find the timezone offset bug in util.py because unit tests and low-jitter inject_traffic.py runs pass",
+   "Solver replaces the daemon with a polling script that reads the SQLite database periodically, violating requirement 5 (daemon must keep running on the live FIFO)",
+   "Solver fixes the timezone offset handling in util.py but only in one call site (store.py), not in collector.py's late-arrival gate, so late arrivals are still dropped at the entry point",
+   "Solver uses the p99 estimate from the pre-fix metrics.db history to validate their fix (the history was generated by the buggy system), missing that the ground truth is in the raw injected log lines"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "log-processing",
+   "metrics",
+   "configuration",
+   "observe-not-read",
+   "two-interacting-causes",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /etc/metricsd/config.yaml",
+   "grep -n 'sample_size\\|reservoir_size' /opt/metricsd/aggregator.py",
+   "grep -n 'window_for\\|TZ_OFFSET\\|offset' /opt/metricsd/util.py",
+   "grep -n 'window_for' /opt/metricsd/collector.py",
+   "grep -n 'window_for' /opt/metricsd/store.py",
+   "cat /etc/environment | grep METRICSD",
+   "# Bug 1 identified: aggregator.py reads 'sample_size' but config uses 'reservoir_size', defaults to 128; also uses shared reservoir not per-service",
+   "# Bug 2 identified: util.window_for() applies TZ offset before truncation but env var unset in collector.py context vs set in init context for store.py",
+   "vi /opt/metricsd/aggregator.py  # fix: change 'sample_size' to 'reservoir_size'; change shared dict key from percentile-only to (service, window, percentile)",
+   "vi /opt/metricsd/util.py  # fix: apply TZ offset symmetrically after truncation, or remove env-var dependency and always use UTC",
+   "vi /opt/metricsd/collector.py  # verify window_for call matches fixed util.py behavior",
+   "/etc/init.d/metricsd restart",
+   "python3 /opt/metricsd/tools/inject_traffic.py --jitter 28 --services 3",
+   "sleep 120",
+   "sqlite3 /var/lib/metricsd/metrics.db 'SELECT service, p99 FROM metrics ORDER BY window_start DESC LIMIT 20'",
+   "python3 -m pytest /opt/metricsd/tests/ -v"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "FIFO pipe timing in verifier tests may be flaky: injected lines may not be processed within the test's polling window, causing intermittent failures unrelated to correctness",
+   "The env-var-loaded-by-init-but-not-direct-Python behavior is OS/init-system-specific; if the verifier runs the daemon differently than the init.d script, the bug may not reproduce consistently",
+   "Daemon restart during testing changes the PID, so a naive 'PID still running' check may fail even when the daemon is correctly running post-fix",
+   "The 8-hour pre-populated SQLite database generation at build time adds significant Docker build complexity and could fail or produce incorrect history if the buggy code changes during iteration",
+   "inject_traffic.py's default 5-second jitter accidentally masking Bug 2 is noted as a trap, but the verifier using 28-second jitter should catch it \u2014 however if the verifier injects traffic too quickly for the daemon's window to close, timing dependencies could cause false failures"
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 disqualifies this task: both bugs are fully visible by static source reading (grep + cat), and the speedrun reaches a correct solution in ~16 commands without needing runtime observation, contradicting the 'observe_not_read' difficulty tag. The average score of 3.4 falls below the required 3.6 threshold. The task has excellent realism and clear verifiability, but needs the bugs to be made less statically discoverable \u2014 for example by having the reservoir size computed dynamically at runtime from an expression, or the timezone offset loaded from a database rather than a readable env var \u2014 to force agents to actually run the system and observe emergent behavior.",
+  "fixes": [
+   "Make Bug 1 runtime-observable rather than statically readable: instead of a simple config key mismatch, have the reservoir size computed from a formula in config.yaml that evaluates correctly in unit tests (small traffic) but pathologically at scale \u2014 e.g., reservoir_size: 'traffic_rate * 0.001' where traffic_rate defaults to 128000 in prod config but the formula parser has an off-by-three-orders-of-magnitude unit conversion bug",
+   "Make Bug 2 require runtime observation: instead of a readable env var in /etc/environment, have the timezone offset come from a running sidecar service or a database table that the init script populates \u2014 so the bug only manifests when the solver observes actual window boundary timestamps in metrics.db and correlates them with log line timestamps",
+   "Add a third, subtler bug that only manifests after both primary bugs are fixed, to push the solve time past one hour and raise genuine_difficulty \u2014 for example, a race condition in store.py's window-close logic when two services' windows close within the same second"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service implementing a specific protocol on top of an existing pipeline; this task is about debugging and fixing a ghost aggregation bug in a running metrics daemon involving percentile calculation, service partitioning, and out-of-order event handling."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a log enrichment pipeline where geo-enrichment produces wrong country counts and adding a missing API endpoint; this task is about debugging spurious percentile spikes in a metrics aggregation daemon."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task is about fixing incorrect weighted regional sales aggregations in a compiled service; this task is about debugging a rolling percentile bug causing false alerting in a metrics daemon."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "That task is about fixing ECDH session key derivation inconsistency between an encryptor and verifier for audit log rotation windows; this task is about fixing percentile aggregation and windowing bugs in a metrics collection daemon."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing schema validation correctness and performance in a Node.js NDJSON ingestion service; this task is about debugging ghost percentile spikes, service-level partitioning errors, and out-of-order event attribution in a Python metrics daemon."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.214
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.172
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.162
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.132
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.115
+    ]
+   ],
+   "cost_usd": 0.015741
+  },
+  "novel": true
+ },
+ "cost_usd": 0.063447
+}

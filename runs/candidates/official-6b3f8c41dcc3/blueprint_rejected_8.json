@@ -1,0 +1,162 @@
+{
+ "blueprint": {
+  "slug": "spectral-hmac-oracle-break",
+  "title": "Spectral Analysis HMAC Oracle Repair",
+  "scenario": "A small scientific computing team built an in-house spectral analysis pipeline that processes encrypted instrument telemetry from field sensors. The pipeline decrypts sensor packets, runs FFT-based anomaly detection, and stores HMAC-verified results in a SQLite archive. A refactor three weeks ago changed how the HMAC oracle validates cached computations \u2014 the CI suite still passes (all green), but the nightly batch job that processes real multi-channel sensor archives is silently producing wrong anomaly scores, causing the release to be blocked.",
+  "instruction_draft": "```\n$ python /opt/pipeline/run_batch.py --archive /data/sensors/nightly.sdb\nBatch complete: 1247 packets processed, 0 errors\nAnomalies detected: 14\n\n$ python /opt/pipeline/verify_results.py /data/sensors/nightly.sdb\nHMAC chain: OK\nSpectral drift check: FAIL \u2014 9 of 14 flagged anomalies are false positives\nExpected anomaly rate for this archive: 4-6 events\n\n$ python /opt/pipeline/run_tests.py\nAll 23 tests passed.\n```\n\nThe nightly batch completed without errors and the HMAC chain passes, but the anomaly detector is producing too many false positives on real sensor archives. Fix the pipeline so that when `verify_results.py` is run against any archive in `/data/sensors/`, the spectral drift check passes (false-positive rate \u2264 15% of flagged anomalies across 500+ packet archives). The HMAC chain must still verify correctly. Do not modify `/opt/pipeline/verify_results.py` or `/opt/pipeline/run_tests.py`.",
+  "requirements": [
+   "The spectral drift check in verify_results.py must pass: false-positive anomaly rate \u2264 15% of flagged anomalies across all archives in /data/sensors/",
+   "The HMAC chain verification must still pass for all processed archives",
+   "run_tests.py must still report all 23 tests passing",
+   "Do not modify verify_results.py or run_tests.py"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y sqlite3; pip install numpy scipy pycryptodome",
+   "/opt/pipeline/ contains ~1400 lines across 8 Python modules: run_batch.py, run_tests.py, verify_results.py, lib/hmac_oracle.py, lib/spectral.py, lib/packet_codec.py, lib/archive.py, lib/key_schedule.py",
+   "lib/spectral.py: FFT-based anomaly detector that computes power spectral density; the bug is that after the refactor, the Hann window is applied AFTER the FFT instead of before, causing spectral leakage that inflates high-frequency power estimates; this is not visible by reading the file alone \u2014 the function signature is correct and the comment says 'apply windowing', but the actual call order in the processing pipeline is only wrong when the cache-bypass path is taken (which only happens for multi-channel packets with >64 samples, which the unit tests never send)",
+   "lib/hmac_oracle.py: validates computation results against HMAC; the refactor introduced a second code path for 'cache hits' vs 'cache misses'; the cache-miss path (used by CI tests, single-channel short packets) calls spectral.compute() correctly; the cache-bypass path (triggered when HMAC oracle detects a cache key collision, which only happens for multi-channel packets sharing a sensor ID prefix) calls spectral.compute_windowed() with window=None, silently disabling windowing",
+   "The cache key collision condition: HMAC oracle uses a truncated 8-byte key derived from sensor_id[:4] + channel_count; for multi-channel sensors (channel_count >= 4), multiple sensors share the same truncated key, triggering the bypass path",
+   "lib/key_schedule.py: generates per-packet decryption keys; contains plausible-looking code with a comment about 'IV rotation' that draws attention away from the real bug; the decryption itself is fine",
+   "run_tests.py: 23 tests, all single-channel with \u226464 samples, never trigger the cache-bypass path",
+   "/data/sensors/: SQLite archives; nightly.sdb has 1247 packets, mix of single and multi-channel; 6 small test archives (test_01.sdb through test_06.sdb) used by run_tests.py, all single-channel; verify_results.py has ground-truth anomaly windows for each archive baked in and checks false-positive rate",
+   "verify_results.py ships a compiled .pyc reference of the correct spectral computation (Python 3.13 bytecode) and compares results against it on 50 randomly sampled multi-channel packets from each archive; it is not editable",
+   "The pipeline is realistically sized: packet_codec.py ~320 lines, spectral.py ~280 lines, hmac_oracle.py ~240 lines, archive.py ~180 lines, key_schedule.py ~220 lines, run_batch.py ~160 lines, plus __init__ and helpers"
+  ],
+  "internal_hint": "Difficulty source: NOT VISIBLE BY READING. The bug only manifests on multi-channel packets with >64 samples because (1) the Hann window is applied in the wrong place only in the cache-bypass code path, and (2) the cache-bypass is only triggered by an 8-byte HMAC key collision that occurs when sensor_id[:4] + str(channel_count) produces duplicate truncated keys \u2014 a data-dependent condition invisible from source alone. The misleading symptom is the 'IV rotation' comment in key_schedule.py, which looks suspicious and draws investigation away from the real issue in hmac_oracle.py's bypass path. Resolution: (1) run the batch on a multi-channel archive and observe the discrepancy, (2) add debug logging to hmac_oracle.py to discover which code path is taken, (3) discover the cache key collision by printing keys for multi-channel packets, (4) find that the bypass path calls spectral.compute_windowed(window=None) instead of compute_windowed(window='hann'), (5) fix the bypass path to pass window='hann'. The HMAC chain still passes because it validates the stored result, not the computation method.",
+  "trap": "A naive agent reads spectral.py, sees the Hann window applied correctly in the main path, and concludes the spectral computation is fine. They then investigate key_schedule.py (drawn by the IV comment), find nothing wrong with decryption, and may incorrectly patch key_schedule.py. The hidden tests run verify_results.py against archives with 4+ channel sensors \u2014 specifically generated at verify time with known ground-truth anomaly windows \u2014 and the false-positive rate will still be >15% unless the bypass path in hmac_oracle.py is fixed. A partial fix that only touches spectral.py's main path leaves the bypass path broken and fails all multi-channel test archives.",
+  "tests": [
+   "verify_results.py run against nightly.sdb: spectral drift check must pass (false-positive rate \u2264 15%)",
+   "verify_results.py run against 3 hidden archives generated at verify time: each contains 500-800 packets, mix of single-channel and 4-8 channel sensors; false-positive rate \u2264 15% in each",
+   "run_tests.py must still report 23/23 tests passing",
+   "HMAC chain verification must pass on all archives (no HMAC errors introduced by the fix)",
+   "Hidden archive generator: creates sensors with shared sensor_id prefixes (to guarantee cache key collisions), injects exactly 5 real anomalies (known frequency + amplitude spikes), verifies that flagged anomaly count is 4-8 (not 10+)",
+   "Verify that fix does not modify verify_results.py or run_tests.py (checked by SHA-256 of those files)"
+  ],
+  "verifier_knob": {
+   "name": "false_positive_threshold",
+   "value": "0.15",
+   "effect": "Raising the threshold (e.g., 0.30) makes it easier \u2014 even a partially fixed pipeline passes. Lowering it (e.g., 0.05) requires also catching edge cases where channel_count=3 sensors occasionally collide. Current value of 0.15 requires fixing the main bypass path but not every edge case."
+  },
+  "expected_failure_modes": [
+   "Agent reads spectral.py, sees windowing looks correct in main path, and concludes the spectral module is fine; investigates key_schedule.py instead and wastes time on the IV red herring",
+   "Agent fixes the window order in spectral.py's main compute() function (which is actually correct) but never discovers the cache-bypass path in hmac_oracle.py that calls compute_windowed(window=None)",
+   "Agent discovers the bypass path exists but misdiagnoses it as an HMAC key length issue rather than a windowing parameter issue",
+   "Agent verifies fix only against the provided test archives (all single-channel) and misses that multi-channel archives still fail",
+   "Agent modifies verify_results.py to change the threshold, which is disallowed and caught by SHA-256 check"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "scientific-computing",
+   "cryptography",
+   "reverse-engineering",
+   "data-dependent-bug",
+   "hmac",
+   "spectral-analysis"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/pipeline/lib/hmac_oracle.py  # read the HMAC oracle - find two code paths, cache-hit vs cache-miss",
+   "cat /opt/pipeline/lib/spectral.py  # read spectral module - main path looks correct",
+   "cat /opt/pipeline/lib/key_schedule.py  # drawn by IV comment - red herring, waste 2-3 commands",
+   "python /opt/pipeline/run_batch.py --archive /data/sensors/nightly.sdb  # reproduce",
+   "python /opt/pipeline/verify_results.py /data/sensors/nightly.sdb  # confirm FAIL",
+   "grep -n 'compute_windowed\\|window' /opt/pipeline/lib/hmac_oracle.py  # spot window=None in bypass path",
+   "grep -n 'channel_count\\|cache_key\\|bypass' /opt/pipeline/lib/hmac_oracle.py  # understand collision condition",
+   "python3 -c \"import sqlite3; c=sqlite3.connect('/data/sensors/nightly.sdb'); print(c.execute('SELECT channel_count, COUNT(*) FROM packets GROUP BY channel_count').fetchall())\"  # confirm multi-channel packets exist",
+   "sed -n '1,240p' /opt/pipeline/lib/hmac_oracle.py  # read full file to find exact line with window=None",
+   "# Fix: change compute_windowed(window=None) to compute_windowed(window='hann') in bypass path",
+   "sed -i \"s/compute_windowed(window=None)/compute_windowed(window='hann')/g\" /opt/pipeline/lib/hmac_oracle.py",
+   "python /opt/pipeline/run_batch.py --archive /data/sensors/nightly.sdb",
+   "python /opt/pipeline/verify_results.py /data/sensors/nightly.sdb  # verify PASS",
+   "python /opt/pipeline/run_tests.py  # confirm 23/23 still pass"
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 'compiled .pyc reference' in verify_results.py for Python 3.13 bytecode is a significant build risk - .pyc files are version and platform-sensitive; if the container's Python 3.13 minor version differs from what generated the .pyc, verify_results.py may fail to import it, causing all tests to error rather than fail, producing an unrunnable environment.",
+   "Hidden archives generated 'at verify time' with known ground-truth anomaly windows must perfectly match the pipeline's internal archive format and schema; schema mismatches between generator and pipeline could cause spurious errors unrelated to the fix.",
+   "The false-positive threshold (\u226415%) applied to verify-time hidden archives depends on the hidden archive generator producing exactly 5 real anomalies with sufficient SNR to be detected; if the generator's injected anomaly strength is near the detector threshold, flakiness in detection (4-8 expected range is wide but real anomalies might be missed too) could cause borderline pass/fail.",
+   "The instruction says 'do not modify verify_results.py or run_tests.py' but verify_results.py contains a compiled .pyc reference - if the solver's fix accidentally changes Python's module cache or bytecode, the SHA-256 check on verify_results.py passes but the .pyc comparison logic might behave unexpectedly.",
+   "The cache key collision condition (sensor_id[:4] + str(channel_count)) must be guaranteed in hidden archives; if the generator doesn't enforce shared prefixes correctly, multi-channel packets might not trigger the bypass path, making the test non-discriminating (a broken pipeline would accidentally pass).",
+   "The bug description says it's 'NOT VISIBLE BY READING' but window=None vs window='hann' in hmac_oracle.py IS visible by reading - a careful agent reading ~240 lines of hmac_oracle.py will find it without needing runtime observation. This undermines the genuine_difficulty claim.",
+   "verify_results.py uses 'ground-truth anomaly windows baked in' - if baked-in windows don't match the archives exactly (e.g., timestamp drift, packet ordering), the spectral drift check could fail even with a correct fix, producing invalid failures."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has a critical buildability risk: shipping a Python 3.13 .pyc file as a ground-truth oracle inside verify_results.py is fragile and version-sensitive, likely to cause environment failures rather than clean pass/fail. The genuine_difficulty claim that the bug is 'NOT VISIBLE BY READING' is partially false - window=None in the bypass path of a 240-line hmac_oracle.py is directly visible to a careful reader, and the speedrun reaches a likely fix in ~14 commands without requiring runtime discovery. Additionally, verify-time hidden archive generation that must match the pipeline's internal format creates a complex dependency that risks flaky or invalid failures.",
+  "fixes": [
+   "Replace the compiled .pyc oracle in verify_results.py with a pure-Python reference implementation that's explicitly locked to a stable interface, avoiding Python version/platform bytecode fragility.",
+   "To raise genuine difficulty, move the windowing bug to be truly invisible in source: instead of window=None (obviously wrong), use a subtly wrong window (e.g., applying a Hamming window when Hann is required, or using wrong normalization), so reading the code alone shows 'windowing applied' without revealing the error.",
+   "Pre-generate the hidden test archives at build time and bake them into the Docker image rather than generating at verify time, eliminating the archive-format mismatch risk and making verification deterministic.",
+   "Add explicit documentation in the blueprint about how the .pyc file is generated and tested to ensure buildability, or replace it with a checksum-based comparison of computed spectral values against pre-stored numpy arrays."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "That task is about fixing an HMAC chain verification service with a specific line protocol, while the candidate is about fixing false-positive anomaly detection in an FFT-based spectral analysis pipeline where HMAC is only a secondary constraint."
+    },
+    {
+     "ref_id": "ours/official-e7c8c1f5f126",
+     "verdict": "variant",
+     "reason": "Both tasks involve debugging a regression in an FFT/spectral analysis pipeline that produces false anomaly results on healthy input, with a verification script that must pass \u2014 the core problem and approach are essentially the same despite different surface framing."
+    },
+    {
+     "ref_id": "terminal-bench-pro/bash-ddos-traffic-analyzer",
+     "verdict": "distinct",
+     "reason": "That task is about writing a shell script to detect network attack patterns from traffic logs, which is entirely unrelated to spectral analysis or HMAC validation."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "That task is about fixing fixed-point arithmetic in a Rust sensor aggregation pipeline to match a reference binary's output, not about spectral anomaly detection or HMAC oracles."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about making a bash filter validator produce byte-identical SQL query output to a reference binary, entirely unrelated to spectral analysis or HMAC oracles."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-cff69805912b",
+     0.202
+    ],
+    [
+     "ours/official-e7c8c1f5f126",
+     0.157
+    ],
+    [
+     "terminal-bench-pro/bash-ddos-traffic-analyzer",
+     0.15
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.138
+    ],
+    [
+     "ours/official-18899524e171",
+     0.099
+    ]
+   ],
+   "cost_usd": 0.015321
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05730300000000001
+}

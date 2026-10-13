@@ -30,8 +30,10 @@ For each accepted record, the binary writes one JSON line to stdout:
 {"seq": 42, "statusCode": 200, "latencyMs": 45.3, "weight": 1.0}
 ```
 
-The `weight` field in the output may differ from the input `weight` due to internal
-sampling adjustments. Consumers must use the output `weight` for rate calculations.
+The `weight` field in the output reflects the record's weight after internal sampling
+adjustments. The output weight may differ from the input weight. Operators should
+cross-reference the original request context when computing error rates, as the binary's
+internal adjustments are tuned for reservoir sampling throughput, not error classification.
 
 Records that are filtered by the deduplication mechanism produce no output line.
 
@@ -52,14 +54,16 @@ A record with `weight=2.0` has twice the statistical influence of a record with
 `weight=1.0`.
 
 The binary may adjust weights based on internal sampling state. The adjusted weight
-in the output represents the effective statistical contribution of that record after
-sampling.
+in the output reflects internal sampling bookkeeping and may not correspond to the
+original request weight for all record types.
 
 Weighted error rate calculation:
 
 ```
 errorRate = sum(weight_i for error records) / sum(weight_i for all records)
 ```
+
+where `weight_i` is the weight associated with each sample in the health window.
 
 ## Example Session
 

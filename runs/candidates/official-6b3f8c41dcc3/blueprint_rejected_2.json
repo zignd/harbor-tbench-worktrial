@@ -1,0 +1,151 @@
+{
+ "blueprint": {
+  "slug": "chacha-shard-recovery-build",
+  "title": "ChaCha20 Shard Decryption Build Failure",
+  "scenario": "A release engineer is unblocking a CI failure in an in-house scientific data pipeline that shards large numerical datasets, encrypts each shard with a ChaCha20-based scheme, and later decrypts and reassembles them for downstream analysis. The build has been broken since a colleague refactored the key-derivation module three weeks ago. The pipeline lives in /opt/shardpipe (~1,400 lines across six Python modules plus a small C extension) and a suite of test shards lives in /opt/testdata/.",
+  "instruction_draft": "Your CI run is failing. Here is the last portion of the terminal output:\n\n```\n$ python -m shardpipe.verify --suite /opt/testdata/suite_a\nShard 000: PASS\nShard 001: PASS\nShard 002: FAIL  (reassembled checksum mismatch)\nShard 003: FAIL  (reassembled checksum mismatch)\nShard 004: FAIL  (reassembled checksum mismatch)\nTraceback (most recent call last):\n  File \"/opt/shardpipe/shardpipe/crypto.py\", line 114, in decrypt_shard\n    plaintext = _chacha_core(key, nonce, ciphertext, counter_start)\nValueError: counter_start must be a non-negative 32-bit integer\n```\n\nThe pipeline must pass its full verification suite: `python -m shardpipe.verify --suite /opt/testdata/suite_a` must exit 0 with all shards reporting PASS. The verifier also runs a hidden suite (`suite_b`) generated at verify time from a different random seed; your fix must pass that suite too. The metric threshold is: at least 47 out of 50 shards in each suite must decrypt to a byte-exact match of the original plaintext. Shards that fail the byte-exact check count as failures even if the checksum error is not raised.",
+  "requirements": [
+   "Running `python -m shardpipe.verify --suite /opt/testdata/suite_a` must exit with code 0.",
+   "All shards in suite_a must individually report PASS (byte-exact plaintext match).",
+   "The hidden suite_b (50 shards, generated at verify time) must achieve at least 47/50 PASS.",
+   "The fix must not alter the on-disk format of encrypted shards (existing encrypted files must remain decryptable).",
+   "The fix must live in the /opt/shardpipe source tree (no monkey-patching from outside)."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm",
+   "apt-get install -y build-essential libssl-dev",
+   "pip install pycryptodome numpy",
+   "Place /opt/shardpipe/ with modules: shardpipe/__init__.py, shardpipe/shard.py (~220 lines, sharding/reassembly logic), shardpipe/crypto.py (~300 lines, ChaCha20 encrypt/decrypt with a C-extension fast-path and a pure-Python fallback), shardpipe/kdf.py (~180 lines, the key-derivation module that was refactored), shardpipe/index.py (~150 lines, shard manifest and checksum handling), shardpipe/pipeline.py (~250 lines, orchestration), shardpipe/__main__.py and shardpipe/verify.py (~100 lines each).",
+   "Place /opt/shardpipe/ext/_chacha_ext.cpython-313-x86_64-linux-gnu.so: a compiled C extension exposing `chacha20_blocks(key_bytes, nonce_bytes, counter_uint32, num_blocks) -> bytes`. Source not included.",
+   "The refactored kdf.py derives a (key, nonce, counter_start) triple. The BUG is: for shards with index >= 2, kdf.py computes counter_start by shifting the shard index left by 16 bits, but it forgets to mask to 32 bits, producing values > 0xFFFFFFFF for shard indices beyond a certain threshold. However the obvious ValueError only triggers for very large indices; shards 2-4 in suite_a silently produce the WRONG key (the counter overflow wraps in Python int arithmetic differently than the C extension expects), yielding wrong plaintext without raising an error. This is the misleading_symptom: the ValueError on shard 5+ looks like the main bug, but fixing only the ValueError leaves shards 2-N producing wrong plaintext because the root cause is that the nonce is being constructed incorrectly: kdf.py packs the shard_index into nonce bytes 8-11 using little-endian, but the C extension and the pure-Python fallback expect it in bytes 4-7 big-endian. The refactor swapped the byte order AND the nonce field position simultaneously.",
+   "Place /opt/testdata/suite_a/: 50 encrypted shard files (.shard) plus a manifest.json. Shards 0-1 happen to be short enough that the nonce field collision does not affect them (they use a special 'header shard' path that bypasses the buggy code path), making them PASS and reinforcing the false diagnosis.",
+   "The manifest.json contains SHA-256 checksums of original plaintexts. The verifier decrypts each shard, reassembles, and checks the checksum.",
+   "The pure-Python fallback in crypto.py (used when the C extension raises) has the same nonce byte-order assumption as the C extension, so testing with the fallback shows identical failures.",
+   "A README in /opt/shardpipe/ describes the ChaCha20 nonce layout as: bytes 0-3 = magic, bytes 4-7 = shard_index (big-endian uint32), bytes 8-11 = pipeline_epoch (little-endian uint32). The refactored kdf.py has these two fields swapped.",
+   "suite_b is generated at verify time by a seeded script that creates 50 new random plaintext blobs, encrypts them with the CORRECT kdf logic, and runs the fixed verifier against them."
+  ],
+  "internal_hint": "Difficulty comes from two interacting sources that are NOT visible by reading a single file: (1) the misleading_symptom: the ValueError on large-index shards makes the counter_start overflow look like the root cause, but masking counter_start to 32 bits only silences the error without fixing correctness; (2) the hidden_invariant discovered only by running the system and comparing outputs: shards 2+ produce wrong plaintext because kdf.py places shard_index in nonce bytes 8-11 LE instead of bytes 4-7 BE. The engineer must (a) notice that fixing the counter_start mask still leaves shards 2-4 failing the checksum, (b) diff the refactored kdf.py against the README's nonce layout spec or instrument the nonce bytes being produced vs consumed, (c) find that the nonce construction has two fields transposed, and (d) fix both: the counter_start 32-bit mask AND the nonce field positions. A solver that fixes only the ValueError passes shards 0-1 and still fails on 2-49.",
+  "trap": "A naive agent reads the ValueError traceback, finds the counter_start line in kdf.py, adds `counter_start &= 0xFFFFFFFF`, re-runs suite_a, sees shards 0-1 PASS and 2+ now produce wrong-plaintext failures instead of the ValueError (same failure count, different error), misreads this as progress, and submits. The hidden suite_b then fails 48/50 because the nonce transposition bug affects every non-header shard. The agent verifies shallowly by checking that the ValueError is gone rather than that the checksums pass.",
+  "tests": [
+   "Run `python -m shardpipe.verify --suite /opt/testdata/suite_a`; assert exit code 0 and that the output contains 50 lines matching 'Shard NNN: PASS'.",
+   "Generate suite_b at verify time: seed numpy/random with 42, create 50 random plaintext blobs of sizes 1KB\u20131MB, encrypt with the reference kdf implementation, write to /tmp/suite_b/, run `python -m shardpipe.verify --suite /tmp/suite_b/`, assert at least 47/50 PASS.",
+   "Directly call shardpipe.crypto.decrypt_shard on a freshly encrypted shard with shard_index=31 (a value that exercises both the nonce field and the counter_start boundary); assert byte-exact plaintext recovery.",
+   "Assert that the on-disk format of a pre-existing .shard file from suite_a is unchanged (file size and first 64 bytes identical to the committed fixture) \u2014 verifies no re-encryption was attempted.",
+   "Assert that shardpipe/kdf.py exists and is importable (the fix must be in-tree, not an external override)."
+  ],
+  "verifier_knob": {
+   "name": "pass_threshold",
+   "value": "47 out of 50",
+   "effect": "Raising to 50/50 makes it impossible to pass with a partial fix that accidentally salvages a few shards; lowering to 40/50 would let a solver who only fixes the counter_start mask scrape by on lucky short shards."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the counter_start overflow mask, sees the ValueError disappear, and submits without re-checking checksums.",
+   "Agent finds the nonce transposition but fixes only bytes 4-7 vs 8-11 and misses that the endianness (LE vs BE) is also wrong, producing a still-incorrect nonce for most shard indices.",
+   "Agent rewrites kdf.py from scratch using a plausible ChaCha20 nonce layout that differs from the one the C extension was compiled to expect, causing the C extension to produce wrong keystream.",
+   "Agent re-encrypts suite_a with the fixed kdf, breaking the on-disk format check and failing the fixture-integrity test.",
+   "Agent verifies only on suite_a shards 0-1 (which pass even without a fix due to the header-shard code path), concludes the pipeline is working, and submits."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "chacha20",
+   "reverse-engineering",
+   "error-recovery",
+   "systems-programming",
+   "scientific-computing",
+   "build-repair"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/shardpipe/README  # get correct nonce spec: bytes 4-7 = shard_index BE, bytes 8-11 = epoch LE",
+   "cat /opt/shardpipe/shardpipe/kdf.py  # see counter_start overflow AND nonce fields swapped (LE/BE + position)",
+   "python -m shardpipe.verify --suite /opt/testdata/suite_a  # confirm failures",
+   "# Edit kdf.py: (1) counter_start = (shard_index << 16) & 0xFFFFFFFF, (2) pack shard_index into nonce[4:8] as big-endian, pack epoch into nonce[8:12] as little-endian",
+   "python -m shardpipe.verify --suite /opt/testdata/suite_a  # confirm exit 0, all 50 PASS"
+  ],
+  "speedrun_commands": 5,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "suite_b generation at verify-time uses 'reference kdf implementation' \u2014 if this reference is the fixed kdf.py, any correct fix passes; but if it's a hardcoded internal reference, a valid alternative fix could fail even if semantically correct.",
+   "The C extension is binary-only (.so without source) on x86_64-linux; if solver environment is not x86_64 Linux (e.g., ARM or macOS), the extension is unusable and the pure-Python fallback must be exercised instead \u2014 the task states both have same nonce assumptions, so this should be consistent, but platform mismatch could cause unexpected failures.",
+   "The 'header shard code path' that makes shards 0-1 pass regardless is not fully specified \u2014 a solver might accidentally break this path while fixing kdf.py, causing shards 0-1 to fail in ways unrelated to the targeted bug.",
+   "The on-disk format fixture test (first 64 bytes unchanged) could be fragile if the verifier itself normalizes or rewrites shard files on read, which isn't explicitly ruled out.",
+   "suite_b threshold of 47/50 with a fixed kdf should yield 50/50 PASS; the 47/50 slack is unexplained and may create confusion about what partial credit looks like."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score is 2 because both bugs are directly visible by reading kdf.py alongside the README, which explicitly documents the correct nonce layout \u2014 a careful agent solves this in ~5 commands without needing to run any tests to discover the root cause. The 'hidden invariant' is not hidden; it's in the README. The misleading symptom trap only catches agents that don't re-run the test suite after partial fixes, which frontier agents reliably do. The task has good bones (realistic scenario, clean verifiability, multi-bug structure) but the difficulty mechanism collapses the moment the README is consulted.",
+  "fixes": [
+   "Remove the README's explicit nonce layout documentation, or make the README describe an older/different layout so the correct spec must be inferred from git history, comments in the C extension header, or by instrumenting the .so's behavior \u2014 forcing runtime exploration rather than file reading.",
+   "Split the two bugs across two files (e.g., counter_start overflow in kdf.py, nonce field positions in a separate nonce_util.py that kdf.py imports) so that fixing one file is not sufficient and the second file must be discovered by tracing execution.",
+   "Add a third interacting bug (e.g., the pipeline.py orchestrator passes shard_index+1 instead of shard_index for even-numbered shards) so that fixing kdf.py alone still fails some shards, forcing deeper exploration even after both kdf.py fixes are applied."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bash SQL filter validator, not cryptographic decryption or key derivation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "That task requires reverse-engineering an encryption algorithm from a decryption binary; the candidate task is about fixing a broken key-derivation module in an existing Python pipeline."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task is about WAF rule compilation and deployment consistency, not cryptographic shard decryption."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a broken symmetric cipher implementation (AES-CTR vs ChaCha20) after a refactor of a key-derivation/nonce module in a multi-file Python/C codebase, where regression tests pass but the real corpus fails\u2014the core debugging skill and problem structure are essentially the same."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet codec for correctness and performance, not a Python/C cryptographic decryption pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-18899524e171",
+     0.137
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.13
+    ],
+    [
+     "ours/official-10912a593843",
+     0.109
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.085
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.078
+    ]
+   ],
+   "cost_usd": 0.014655000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.04764600000000001
+}

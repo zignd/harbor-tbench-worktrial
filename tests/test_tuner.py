@@ -134,3 +134,50 @@ def test_an_infra_failed_authoring_is_not_a_tuning_round(tmp_path):
                                       "result": "gates_failed"}))  # fmt: skip
     rounds, cal = tuner._resume_rounds("c", ledger)
     assert [r["round"] for r in rounds] == [1] and cal["verdict"] == "gates_failed"
+
+
+def test_breadth_plan_asks_for_many_independent_hidden_input_requirements():
+    first, second = tuner.breadth_plan(1), tuner.breadth_plan(2)
+    assert (first["n"], second["n"]) == (8, 14) and first["kind"] == "breadth"
+    text = " ".join(tuner.directive(first).split())
+    assert "BREADTH" in text and "8 INDEPENDENT" in text and "fresh inputs" in text
+    assert "nothing the tests check may be unstated" in text  # fairness is part of the ask
+
+
+def _tunable(tmp_path, monkeypatch, verdict):
+    import shutil
+
+    from generator import pipeline
+
+    fixture = Path(__file__).parent / "fixtures" / "harbor_jobs" / "p0-metatask-sonnet"
+    shutil.copytree(next(fixture.glob("*/artifacts/app/output")), tmp_path / "official-y" / "task")
+    d = tmp_path / "official-y"
+    spec = {"domain": "d", "skill_type": "s", "capabilities": ["a", "b"], "pillar": "p",
+            "persona": "x", "language": "any", "fixture": "f", "verifier": "service_probe",
+            "levers": ["hidden_invariant", "edge_case_inputs"], "style": "minimal"}  # fmt: skip
+    (d / "spec.json").write_text(json.dumps(spec))
+    (d / "blueprint.json").write_text(
+        (Path(__file__).parent / "fixtures" / "blueprint_ledger.json").read_text()
+    )
+    (d / "calibration.json").write_text(
+        json.dumps({"verdict": verdict, "outcomes": ["pass"] * 4, "trials": []})
+    )
+    monkeypatch.setattr(pipeline, "CANDIDATES_DIR", tmp_path)
+    return d
+
+
+def test_too_easy_gets_breadth_and_a_second_generation_uses_separate_names(tmp_path, monkeypatch):
+    from analysis.ledger import Ledger
+
+    d = _tunable(tmp_path, monkeypatch, "too_easy")
+    seen = []
+    monkeypatch.setattr(tuner, "_retune", lambda cand, ledger, rid, plan, previous:
+                        (seen.append((rid, plan["kind"], previous.name)), ["stop"])[1])  # fmt: skip
+    ledger = Ledger(tmp_path / "l.jsonl")
+    tuner.tune_candidate(d, ledger, max_rounds=1)
+    tuner.tune_candidate(d, ledger, max_rounds=1, again=True)
+    assert seen == [(1, "breadth", "before_tune_r1"), (21, "breadth", "before_tune_r21")]
+    assert (d / "tuning.json").exists() and (d / "tuning_again.json").exists()
+    assert (d / "tune_plan_r21.json").exists()
+    offsets = [e.result["offset"] for e in ledger.events(stage="tune")]
+    assert offsets == [0, 20]  # a resume of one generation never sees the other's rounds

@@ -1,0 +1,158 @@
+{
+ "blueprint": {
+  "slug": "sql-aggregation-binary-rollup-repair",
+  "title": "Billing Rollup Aggregator Silent Corruption",
+  "scenario": "A usage-billing platform summarises per-tenant meter readings into monthly invoices through a two-stage pipeline: a compiled C binary (`/usr/local/bin/meter_rollup`) pre-aggregates raw event rows into hourly buckets and writes them to a SQLite staging table, then a SQL view (`invoice_summary`) reads those buckets and computes each tenant's monthly charge. An analyst noticed that totals for high-volume tenants occasionally exceed the raw event sum, while low-volume tenants sometimes under-bill \u2014 but only in months with specific day-of-month patterns. The environment ships roughly 1,400 lines across the pipeline, supporting scripts, and sample data.",
+  "instruction_draft": "The billing pipeline at /app produces wrong monthly totals. Fix it so every tenant's monthly invoice_summary charge exactly equals the sum of that tenant's raw event amounts for the same calendar month.",
+  "requirements": [
+   "For every tenant and every calendar month present in the raw events table, invoice_summary.charge must equal the exact sum of raw_events.amount for that tenant-month.",
+   "The fix must be persistent: re-running the pipeline end-to-end on fresh raw data must continue to produce correct results.",
+   "No raw event rows may be dropped, duplicated, or modified."
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm. Install: sqlite3, gcc, build-essential (for compiling the binary), python3-pip (for test harness).",
+   "Compile and install /usr/local/bin/meter_rollup from C source that is present only as the compiled binary \u2014 source is deleted after the Dockerfile build step. The binary reads raw_events from a SQLite DB path (arg 1), aggregates into hourly buckets in the staging table hourly_buckets, and exits.",
+   "The binary has TWO interacting bugs: (1) it uses a signed 32-bit accumulator for the per-hour sum, overflowing for tenants whose hourly event amounts exceed ~2.1 billion (high-volume tenants); (2) its GROUP BY clause groups by strftime('%H', event_ts) but omits the date component, so events from the same clock-hour on different days are merged into a single bucket, collapsing multi-day data into 24 rows per tenant per month instead of 24*days rows.",
+   "The SQL view invoice_summary has a bug independent from the binary: it divides the hourly bucket sum by 100 (a unit-conversion remnant) but raw amounts are already in base units, so it under-reports by 100x for all tenants \u2014 this is the MISLEADING symptom the analyst sees first because it is large and obvious.",
+   "The SQL view bug is visible in the schema file /app/schema.sql and looks intentional (there is a comment 'convert cents to dollars'). Fixing only this bug makes high-volume tenant totals look plausible but still wrong due to the binary's overflow and date-collapsing bugs.",
+   "Fixing only the binary overflow (by casting to int64) without fixing date-collapsing leaves totals wrong for any month with more than one day of data.",
+   "Fixing both binary bugs but not the SQL view leaves all totals off by 100x.",
+   "All three fixes must be present for correctness.",
+   "The binary must be replaced via re-compilation (solver finds the source template in /app/src/meter_rollup.c.template which has placeholder comments marking the two bug sites but no values filled in) OR by writing a replacement binary/script at the same path.",
+   "Populate raw_events with ~50,000 rows across 8 tenants and 3 calendar months, with deliberate high-volume tenants (hourly sums > 2^31) and months spanning multiple days.",
+   "Provide /app/pipeline.sh that runs meter_rollup then queries invoice_summary.",
+   "Provide /app/verify_sample.py that checks the sample dataset and prints PASS/FAIL \u2014 solver can use this to self-check.",
+   "The hidden verifier regenerates raw_events with fresh tenant IDs, amounts, and date ranges, runs the pipeline, and checks invoice_summary against independently computed correct sums."
+  ],
+  "internal_hint": "Three bugs, two in the opaque binary and one in SQL, all interact: (1) The SQL view divides by 100 \u2014 the big, obvious symptom that the analyst sees. (2) The binary's GROUP BY omits the date, collapsing all same-hour events across different days into one bucket, silently discarding data. (3) The binary uses int32 accumulation, overflowing for large hourly sums. Fixing only the SQL view reveals that high-volume tenants are still wrong (binary bugs). Fixing the SQL + the overflow but not the date collapse still fails for multi-day months. The solver must: (a) probe the binary black-box by running it on crafted data; (b) recognise the date-strip collapse by observing that hourly_buckets has exactly 24 rows per tenant per month regardless of how many days the month has; (c) notice the overflow by checking tenants with large amounts; (d) fix or replace the binary; (e) fix the SQL view. The source template at /app/src/meter_rollup.c.template gives the full code structure with clearly marked TODO sites \u2014 the solver must fill in the correct GROUP BY expression and use int64 accumulation, then compile and install.",
+  "trap": "A naive solver fixes only the obvious /100 bug in the SQL view, runs verify_sample.py (which only checks a low-volume tenant over a single day in the sample), sees PASS, and submits. The hidden verifier uses a high-volume tenant (overflow trigger) and a multi-day month (date-collapse trigger), both of which still produce wrong totals.",
+  "tests": [
+   "Correctness on sample data: pipeline.sh runs cleanly; invoice_summary totals match raw event sums for all 8 sample tenants across all 3 sample months.",
+   "Overflow test: hidden verifier inserts a tenant with hourly event amounts summing to 3.5 billion (> INT32_MAX) in a single hour; invoice_summary must report the correct sum.",
+   "Date-collapse test: hidden verifier inserts a tenant with events spread across 15 days of a month, each day having the same clock-hour; hourly_buckets must have 15 rows (not 1) for that hour, and the monthly total must be correct.",
+   "Combined stress test: fresh corpus with 6 tenants, 4 calendar months, mixed high/low volume, random amounts; all invoice_summary rows must match independently computed SUM(amount) per tenant-month within 1 unit.",
+   "No data loss: COUNT of raw_events before and after pipeline run must be identical.",
+   "Idempotency: running pipeline.sh twice must not duplicate bucket rows or change totals."
+  ],
+  "verifier_knob": {
+   "name": "corpus_tenants_x_months",
+   "value": "6 tenants \u00d7 4 months with varied overflow/no-overflow, multi-day/single-day combinations",
+   "effect": "Raising to 20 tenants \u00d7 6 months with more tricky amount distributions (e.g., amounts that are near but below INT32_MAX individually but overflow when summed) increases difficulty; lowering to 2 tenants \u00d7 1 month makes it too easy to pass by coincidence."
+  },
+  "expected_failure_modes": [
+   "Solver fixes only the SQL /100 bug, verify_sample.py passes on the low-volume sample, solver stops and submits \u2014 fails hidden overflow and date-collapse tests.",
+   "Solver fixes SQL and the overflow but misses the date-collapse bug \u2014 multi-day month tests fail.",
+   "Solver replaces the binary with a Python script that correctly groups by date+hour and uses 64-bit math, but forgets to fix the SQL view \u2014 all totals off by 100x.",
+   "Solver identifies the SQL bug and the overflow, writes a new binary with int64, but copy-pastes the same broken GROUP BY strftime('%H', ...) from the template without noticing the missing date component \u2014 date-collapse tests fail.",
+   "Solver does not realise the binary can be replaced and wastes time trying to patch the compiled ELF directly, exhausting the time budget."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "debugging",
+   "integer-overflow",
+   "aggregation",
+   "billing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/schema.sql  \u2192 spot /100 division and 'convert cents to dollars' comment",
+   "cat /app/src/meter_rollup.c.template  \u2192 see both TODO markers: GROUP BY missing date, int32 accumulator",
+   "cat /app/pipeline.sh  \u2192 understand flow",
+   "cp /app/src/meter_rollup.c.template /app/src/meter_rollup.c",
+   "edit meter_rollup.c: fix GROUP BY to strftime('%Y-%m-%d %H', event_ts), change int32_t to int64_t",
+   "gcc -O2 -o /usr/local/bin/meter_rollup /app/src/meter_rollup.c",
+   "edit /app/schema.sql: remove /100 from invoice_summary view",
+   "sqlite3 /app/billing.db < /app/schema.sql  (recreate view)",
+   "bash /app/pipeline.sh",
+   "python3 -I /app/verify_sample.py  \u2192 PASS"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 1,
+   "realism": 3
+  },
+  "invalid_failure_risks": [
+   "The template file exposes both bug sites with explicit TODO comments, making the 'opaque binary' premise false \u2014 a strong agent reads the template and fixes all three bugs in ~10 commands without any black-box probing.",
+   "verify_sample.py is documented to only check a low-volume single-day tenant, so it can return PASS with only the SQL fix \u2014 but this is described as an intentional trap, not an invalid failure.",
+   "Idempotency requirement (running pipeline.sh twice must not duplicate bucket rows) is not clearly described in the instruction text; a solver might not know to test for it, and the verifier could flag a valid fix as wrong if the schema doesn't use INSERT OR REPLACE / DELETE-before-insert.",
+   "The hidden verifier regenerates raw_events with fresh tenant IDs \u2014 if the schema file recreating the view also truncates or reinitializes raw_events, the no-data-loss check could fail depending on setup order.",
+   "gcc compilation of the template requires it to be a valid .c file, but it is named .c.template \u2014 if the solver passes the template path directly to gcc without renaming it, behavior is implementation-defined; the blueprint should clarify."
+  ],
+  "verdict": "reject",
+  "reasons": "The central difficulty lever (opaque binary requiring black-box probing) is undermined by the template file that explicitly marks both bug sites with TODO comments, reducing the task to a read-and-fix exercise solvable in ~10 commands; genuine_difficulty scores 1. The task is otherwise well-structured with clear requirements and strong verifier design, but the misleading-symptom and two-interacting-causes levers only work if the solver cannot trivially read the bug locations from source. The realism is slightly strained by the contrivance of three simultaneous production bugs that all interact perfectly.",
+  "fixes": [
+   "Remove /app/src/meter_rollup.c.template entirely \u2014 ship only the compiled binary with no source artifacts; force the solver to discover the date-collapse bug by observing that hourly_buckets has exactly 24 rows per tenant-month, and the overflow by crafting test inputs, as the internal hint originally intends.",
+   "If a template must exist to allow recompilation, provide the full correct C source but with the bugs present (not marked with TODOs) \u2014 the solver must identify the bugs from behavior, not from code comments.",
+   "Add an explicit idempotency requirement to the instruction text (e.g., 'Running the pipeline twice on the same database must produce identical results') so solvers know to handle duplicate-bucket accumulation.",
+   "Strengthen verify_sample.py to cover at least one high-volume tenant and one multi-day month so the easy-fix trap requires more than a single-symptom fix to pass self-check, raising the bar for premature submission."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "That task centers on reverse-engineering a black-box binary normalizer to characterize its transformation, whereas the candidate task is about finding and fixing a silent numerical/logic corruption bug in a known billing aggregation pipeline."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "That task requires fixing a Rust pipeline to match a reference binary's exact fixed-point arithmetic output; the candidate task involves debugging silent over/under-billing corruption in a C+SQLite pipeline with no reference binary to match."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "That task is purely about correcting a SQL query's window-function logic (running totals and ranking); the candidate task involves a multi-stage C binary + SQL view pipeline with a corruption bug tied to day-of-month patterns."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both tasks require fixing an ETL/aggregation pipeline so that per-key totals in a summary table exactly match the sum of raw source records, with idempotent re-run correctness \u2014 the candidate adds a C binary pre-aggregation stage and a calendar-pattern corruption angle, but the core problem and success criterion are essentially the same."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing row deduplication, chunk-boundary handling, and header-stripping in a CSV chunking pipeline; the candidate task is about numerical corruption in a billing rollup aggregator."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.161
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.117
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.111
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.097
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.095
+    ]
+   ],
+   "cost_usd": 0.014553
+  },
+  "novel": false
+ },
+ "cost_usd": 0.046701000000000006
+}

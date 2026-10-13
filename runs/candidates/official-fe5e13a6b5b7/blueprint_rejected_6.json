@@ -1,0 +1,159 @@
+{
+ "blueprint": {
+  "slug": "fx-rate-cascade-reconciler",
+  "title": "FX Rate Cascade Reconciler",
+  "scenario": "A finance-ops team runs a small in-house Rust service called `fxrecon` that ingests daily CSV files of multi-currency transactions, applies interbank FX rates through a chain of intermediate currencies, and writes reconciled position snapshots to a SQLite database. The service ships with a pre-compiled `libfxchain.so` that implements the rate-chaining math. After a currency-config update last week, nightly reconciliation started writing position totals that are off by amounts that seem random but are reproducible. The symptom surfaced first as a mismatch on EUR positions, but the EUR handler reads correctly.",
+  "instruction_draft": "Hey \u2014 our fxrecon service is writing wrong position totals to the SQLite `positions` table after last week's config change. The discrepancy showed up on EUR first, but the EUR code looks fine to me. Something upstream is feeding it bad numbers. The final positions need to match what you get when you multiply each transaction amount by the correct end-to-end exchange rate for that currency pair on that trade date. Can you get `cargo run -- reconcile` producing correct rows? The `positions` table should have one row per (currency, date) with `net_position` correct to 6 decimal places and `checksum` equal to the SHA-256 (hex, lowercase) of `currency|date|net_position` where net_position is formatted to exactly 8 decimal places. Don't change the CSV files or the SQLite schema.",
+  "requirements": [
+   "Running `cargo run -- reconcile` completes without error",
+   "The `positions` table contains one row per (currency, date) pair present in the input CSVs",
+   "Each row's `net_position` is correct to 6 decimal places: the sum of each transaction amount multiplied by the fully-chained exchange rate converting it to USD on its trade date",
+   "Each row's `checksum` equals the SHA-256 hex digest (lowercase) of the string `{currency}|{date}|{net_position}` where net_position is formatted with exactly 8 decimal places",
+   "The fix must not modify the input CSV files or the SQLite schema"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs: rustc/cargo (stable via rustup), sqlite3, libssl-dev, build-essential",
+   "Project at /app/fxrecon/ with Cargo.toml and ~1600 lines across: src/main.rs, src/loader.rs, src/reconcile.rs, src/checksum.rs, src/config.rs, src/db.rs",
+   "Pre-compiled binary /app/fxrecon/lib/libfxchain.so (no source): exports `fxchain_rate(from_currency: *const c_char, to_currency: *const c_char, date: *const c_char, rates_json: *const c_char) -> f64`; takes a JSON blob of daily rates and chains through intermediate currency; the function internally normalizes currency codes to uppercase but silently returns 0.0 for unknown pairs instead of an error",
+   "src/config.rs contains a `CURRENCY_BASES` map updated last week: one entry has a key with a lowercase currency code 'jpy' instead of 'JPY', causing the rate lookup to pass the wrong key to libfxchain and get 0.0 back; all other entries are uppercase",
+   "src/reconcile.rs calls libfxchain correctly but passes `currency_base` from the config map directly without normalization, so the mismatch is in config.rs not reconcile.rs",
+   "src/checksum.rs formats net_position with 6 decimal places (%.6f) instead of 8, producing wrong checksums for every row",
+   "The misleading symptom: EUR positions are wrong because JPY is an intermediate currency in the EUR->USD chain; EUR source code is correct but gets 0.0 from the chain because JPY lookup fails upstream",
+   "Input data: /app/fxrecon/data/trades_2024_11.csv (~400 rows), /app/fxrecon/data/trades_2024_12.csv (~400 rows), /app/fxrecon/data/fx_rates_2024_11.json, /app/fxrecon/data/fx_rates_2024_12.json \u2014 rates JSON has entries for USD, EUR, GBP, JPY, CHF, AUD, CAD with date-keyed daily rates",
+   "The JPY->USD chain is used as intermediate for EUR, GBP, CHF; so six currencies are affected, not just JPY",
+   "A plausible-looking `validate` subcommand in main.rs runs checksums only on a hardcoded sample of 3 rows (all USD rows which happen to be correct), so `cargo run -- validate` prints OK even when most rows are wrong",
+   "SQLite DB at /app/fxrecon/recon.db is created fresh on each `cargo run -- reconcile`",
+   "Additional plausible files: src/audit.rs (unused audit log writer), src/report.rs (CSV exporter, not involved in the bug), tests/ directory with unit tests that all pass because they mock libfxchain"
+  ],
+  "internal_hint": "Two independent bugs interact to make the symptom misleading. Bug 1 (opaque component interaction): config.rs has 'jpy' (lowercase) in CURRENCY_BASES; the Rust code passes this directly to libfxchain_rate which normalizes internally but the rates_json key lookup happens before normalization, so the function returns 0.0 for any pair involving JPY. This must be found by running the binary on real data and observing 0.0 outputs, then experimenting with the libfxchain API to discover it normalizes the currency param but not the rates_json keys. Bug 2 (spec adherence): checksum.rs uses %.6f formatting but the spec (and verifier) requires %.8f. The misleading symptom is EUR appearing wrong, which causes agents to look at EUR-handling code; the actual cause is JPY config key, discoverable only by instrumenting the libfxchain calls at runtime. The validate subcommand gives false confidence. Resolution: fix 'jpy' -> 'JPY' in config.rs, fix '%.6f' -> '%.8f' in checksum.rs.",
+  "trap": "An agent that finds and fixes only the config.rs typo will get correct net_position values but wrong checksums on every row, failing the checksum verification tests. An agent that finds and fixes only checksum.rs will get correct checksum format but net_position = 0.0 for all JPY-intermediate pairs (EUR, GBP, CHF, AUD, CAD), failing position tests. An agent that runs `cargo run -- validate` and sees OK will think the system is fixed and stop. The hidden tests generate fresh (currency, date) pairs including JPY-intermediate currencies not in the provided sample.",
+  "tests": [
+   "Run `cargo run -- reconcile` and check exit code is 0",
+   "Query `SELECT COUNT(*) FROM positions` and verify it equals the number of distinct (currency, date) pairs in both CSV files",
+   "For each of 12 spot-checked (currency, date) pairs including JPY, EUR, GBP, CHF rows: verify |db.net_position - expected_net_position| < 1e-5 where expected is computed by the verifier using the correct rate chain",
+   "For each of 12 spot-checked rows: compute SHA-256('{currency}|{date}|{net_position_8dec}') and verify it equals db.checksum (lowercase hex)",
+   "Inject a fresh mini-CSV at verify time with new trade dates and currencies (including JPY and EUR) not present in the original data, re-run reconcile, and verify the same position and checksum correctness conditions hold on the new rows",
+   "Verify the input CSV files are byte-for-byte identical to their original state (no modification)",
+   "Verify the SQLite schema is unchanged from original DDL"
+  ],
+  "verifier_knob": {
+   "name": "number_of_spot_checked_currency_date_pairs",
+   "value": "12",
+   "effect": "Increasing checks more (currency, date) combinations including rarer intermediate chains; decreasing to 4-6 might let a partial fix pass if it only covers direct USD pairs"
+  },
+  "expected_failure_modes": [
+   "Agent reads reconcile.rs and config.rs, spots 'jpy' typo, fixes it, runs validate which prints OK, stops \u2014 misses the checksum %.6f bug",
+   "Agent fixes checksum formatting first, runs against sample, positions look wrong (because JPY still broken), concludes checksum was not the real issue and reverts it",
+   "Agent proxies libfxchain calls and sees 0.0 for JPY, concludes the .so is broken and tries to replace it entirely rather than investigating why 0.0 is returned",
+   "Agent instruments libfxchain, finds the lowercase key issue, fixes config.rs, but then trusts `cargo run -- validate` showing OK and submits without fixing checksum.rs",
+   "Agent never discovers that EUR is affected via JPY intermediate, only fixes JPY rows directly, fails on EUR/GBP/CHF checksum or position tests"
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "sqlite",
+   "opaque-binary",
+   "finance",
+   "fx-rates",
+   "reconciliation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/fxrecon/src/config.rs  # look for CURRENCY_BASES map, spot 'jpy' lowercase",
+   "cat /app/fxrecon/src/checksum.rs  # spot %.6f format string",
+   "cat /app/fxrecon/src/reconcile.rs  # confirm currency_base passed directly, no normalization",
+   "cat /app/fxrecon/src/main.rs  # understand validate subcommand trap",
+   "sed -i 's/\"jpy\"/\"JPY\"/' /app/fxrecon/src/config.rs",
+   "sed -i 's/%.6f/%.8f/' /app/fxrecon/src/checksum.rs",
+   "cd /app/fxrecon && cargo run -- reconcile",
+   "sqlite3 recon.db \"SELECT currency, date, net_position, checksum FROM positions LIMIT 10\"",
+   "sqlite3 recon.db \"SELECT COUNT(*) FROM positions\""
+  ],
+  "speedrun_commands": 9,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "libfxchain.so compiled for linux/amd64 (Docker container) but the blueprint says platform is darwin \u2014 if the .so is not correctly built for the container architecture, cargo run will fail with a linker/loader error unrelated to the bugs, making the task unsolvable",
+   "The claim that libfxchain normalizes the currency param but NOT the rates_json keys is an internal implementation detail of an opaque binary \u2014 if this behavior is not precisely implemented in the .so, the bug mechanism described doesn't hold and the task becomes invalid",
+   "The fresh CSV injection at verify time requires the verifier to independently compute expected net_positions using its own rate-chaining logic; if that logic disagrees with libfxchain's actual behavior for edge cases, correct solutions could be marked wrong",
+   "The validate subcommand printing OK for correct USD rows is a good trap for agents, but if an agent happens to spot-check JPY rows manually after fixing config.rs only, they would still catch the checksum bug \u2014 the trap is not as reliable as described",
+   "~1600 lines of Rust that must compile cleanly in the container; if any dependency version pins are missing or crates.io is unreachable (offline container), the build fails"
+  ],
+  "verdict": "reject",
+  "reasons": "Both bugs are directly visible by reading the source files \u2014 'jpy' in config.rs and '%.6f' in checksum.rs \u2014 making this a ~9-command speedrun for any agent that reads source before running code. Per the stated calibration rule, source-visible bugs score at most 2 on genuine_difficulty, which is below the 3-minimum threshold. The opaque-binary and misleading-symptom difficulty levers are real design features but are entirely bypassed by reading source, so they don't raise the actual difficulty for capable agents. Additionally, the libfxchain.so must be pre-compiled for linux/amd64 in the Docker container, but the platform is listed as darwin, creating a potential invalid failure risk if the binary is not correctly cross-compiled.",
+  "fixes": [
+   "Remove the bugs from readable source files: move the lowercase 'jpy' issue entirely into the opaque libfxchain.so behavior (e.g., the .so silently drops pairs where the intermediate rate key doesn't match a specific internal format), so the bug cannot be found by reading Rust source \u2014 the agent must instrument or probe the .so at runtime to discover it",
+   "Move the checksum format error into a compiled helper library or make it a runtime parameter read from a config file that has a misleading comment, so it cannot be trivially spotted with grep",
+   "Add a plausible-but-wrong rates_json structure that the agent must discover by running the binary and comparing outputs, not by reading config \u2014 for example, the JSON has correctly-cased keys but the .so expects a specific nested structure that changed after the config update",
+   "Ensure the Dockerfile and .so are built and tested for linux/amd64 specifically, and explicitly state the container architecture to avoid the darwin/linux mismatch risk"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/fin-saccr-rwa",
+     "verdict": "distinct",
+     "reason": "SA-CCR/RWA capital calculation under CRR3 is a completely different financial domain and computational problem from FX rate chaining and position reconciliation."
+    },
+    {
+     "ref_id": "terminal-bench-pro/implement-sales-processor-engine",
+     "verdict": "distinct",
+     "reason": "Implements a sales processor class with taxation, discounts, and inventory management, not debugging a Rust service with FX rate chain errors and SHA-256 checksums."
+    },
+    {
+     "ref_id": "ours/official-93f5bab9f568",
+     "verdict": "variant",
+     "reason": "Both involve fixing a broken pipeline that writes incorrect aggregated totals to SQLite, with idempotency and correctness constraints, differing mainly in domain (ETL revenue aggregation vs. FX rate-chained position reconciliation) and language (Python vs. Rust)."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "variant",
+     "reason": "Both involve debugging a compiled service (Rust/C) that writes wrong aggregated numeric totals to SQLite due to a configuration change, requiring source-level fixes and a rebuild."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "Focuses on chunk-splitting pipeline correctness (duplicate rows, dropped rows, schema validation) rather than FX rate math errors or checksum generation in a financial reconciliation context."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/fin-saccr-rwa",
+     0.186
+    ],
+    [
+     "terminal-bench-pro/implement-sales-processor-engine",
+     0.176
+    ],
+    [
+     "ours/official-93f5bab9f568",
+     0.151
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.126
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.123
+    ]
+   ],
+   "cost_usd": 0.014847
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05136
+}

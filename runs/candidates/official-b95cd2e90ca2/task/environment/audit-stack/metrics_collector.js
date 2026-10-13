@@ -58,7 +58,7 @@ function sampleMetric(seqNum, baseLatencyMs, timestamp) {
   // Simulate latency with occasional spikes
   const base = baseLatencyMs + rng.next() * baseLatencyMs * 2;
   const spike = rng.next() < 0.05 ? rng.next() * 500 : 0;
-  const latencyMs = Math.round(base + spike);
+  const latencyMs = Math.trunc(base + spike) + 1;
 
   const rowsAffected = queryType === 'SELECT'
     ? rng.nextInt(0, 1000)

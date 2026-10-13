@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "bloom-filter-hash-drift-repair",
+  "title": "Distributed Bloom Filter Hash Drift",
+  "scenario": "A Go microservice uses a shared bloom filter for deduplication across two cooperating components: a writer daemon that hashes and inserts event IDs, and a reader/query library that checks membership. The components were developed in separate sprints and each hashes the same logical key differently under specific conditions involving multi-byte unicode and keys that cross a 64-byte length boundary. A compiled black-box 'libbloom.so' (no source available in the repo) implements the actual bit-array logic and exposes a C ABI; both components link against it and must agree on which bits to set. The repo has 18 months of git history including the sprint where the divergence was introduced.",
+  "instruction_draft": "Hey, we're seeing phantom duplicates in production \u2014 events that were definitely inserted are coming back as 'not found' from the membership check, but only for certain event IDs. The writer and reader are both in `/app/svc/`, the shared bloom bit-array lives in `/app/libbloom.so` (no source, sorry), and there's a Redis instance on localhost:6379 that the two sides use for the shared bit array. Can you figure out what's wrong and fix it so the writer and reader agree on every event ID? The fix has to live in the Go source \u2014 don't patch the .so or the Redis config. After your fix, `go test ./...` in `/app/svc/` must pass, and the integration smoke test at `/app/verify/check.sh` must exit 0. The writer must correctly reject re-inserted IDs and the reader must find every ID that was inserted, for both short keys (under 64 bytes) and long keys (64 bytes and over), including keys containing multi-byte UTF-8 characters.",
+  "requirements": [
+   "The writer daemon and reader library must produce identical hash inputs to libbloom.so for every event ID",
+   "Short keys (under 64 bytes) must be handled correctly",
+   "Long keys (64 bytes and over) must be handled correctly",
+   "Keys containing multi-byte UTF-8 characters must produce consistent hash values in both components",
+   "Inserted event IDs must be found by the reader (no false negatives for inserted keys)",
+   "Re-inserted IDs must be correctly identified as duplicates by the writer",
+   "go test ./... must pass in /app/svc/",
+   "/app/verify/check.sh must exit 0",
+   "The fix must be in Go source only \u2014 libbloom.so and Redis config must not be modified"
+  ],
+  "environment": [
+   "FROM python:3.13-slim-bookworm base; install Go 1.22, Redis server, gcc, libc-dev",
+   "Redis started as a background service on localhost:6379",
+   "A compiled shared library /app/libbloom.so (C, no source) with C ABI: `void bloom_set_bits(uint64_t* bitarray, uint64_t arraylen_bits, const uint8_t* key, size_t keylen, uint32_t num_hashes)` and `int bloom_check_bits(const uint64_t* bitarray, uint64_t arraylen_bits, const uint8_t* key, size_t keylen, uint32_t num_hashes)`. Internally uses xxHash64 seeded with three different seeds per hash slot.",
+   "/app/svc/ is a Go module (~1200 lines total across 6 files) with: cmd/writer/main.go (inserts events), cmd/reader/main.go (checks membership), internal/bloom/bloom.go (wraps libbloom.so via cgo), internal/hash/keygen.go (prepares the key bytes sent to libbloom), internal/store/redis.go (Redis bit-array persistence), internal/config/config.go (config loading)",
+   "internal/hash/keygen.go in the writer: for keys >= 64 bytes, truncates to 64 bytes BEFORE utf8-encoding (operates on rune slice, then converts), producing a different byte slice than the reader",
+   "internal/hash/keygen.go in the reader: for keys >= 64 bytes, utf8-encodes first then truncates to 64 bytes (operates on the []byte), correct behavior",
+   "For keys with multi-byte UTF-8 chars under 64 bytes: the writer incorrectly appends a zero byte as a 'namespace separator' while the reader does not, causing bit mismatch",
+   "Git history has 18 months of commits; the divergence was introduced in two separate commits 6 months apart (one for the length boundary bug, one for the namespace separator bug), each touching only keygen.go",
+   "/app/svc/internal/bloom/bloom_test.go has unit tests for the cgo wrapper but not for the key preparation logic",
+   "/app/svc/internal/hash/keygen_test.go has tests only for ASCII short keys (the sample cases all pass)",
+   "/app/verify/check.sh: a shell script that starts writer and reader, inserts 200 event IDs including unicode-heavy long keys, then queries all of them expecting 0 false negatives and correct duplicate detection",
+   "The libbloom.so behavior must be characterized by experiment: the solver needs to probe which seed values are used and how bit positions are computed to understand whether the key bytes or the hash function itself is the issue",
+   "Plausible unrelated code: internal/store/redis.go handles TTL and serialization (correct, not involved), internal/config/config.go (correct), a metrics middleware (correct, ~150 lines), a rate-limiter stub (correct, ~100 lines)"
+  ],
+  "internal_hint": "The difficulty comes from two sources: (1) the opaque component \u2014 libbloom.so exposes no source, so the solver must probe it (insert known keys, read bit positions from Redis, vary key bytes) to establish whether the library itself is correct or whether the key preparation is wrong; this experimentation is essential before any fix is possible; (2) two independent bugs in the same function that interact \u2014 a naive fix of one leaves the other, and the sample tests only cover ASCII short keys so both bugs are hidden from the unit tests. Root causes: in keygen.go Writer path for long keys, rune-slice truncation before encoding changes byte boundaries for multibyte chars. For short keys with multibyte chars, Writer appends \\x00 (a leftover 'namespace' byte) while Reader does not. The solver must (a) probe libbloom.so by writing a tiny C or Go harness to confirm the library is consistent, (b) instrument both code paths with identical inputs to find the byte-level divergence, (c) check git log to see when each divergence was introduced (the commits are clearly labeled), (d) unify the keygen logic so both sides run: utf8-encode, then truncate to 64 bytes if needed, no trailing zero.",
+  "trap": "A solver who fixes only the long-key truncation order (the more obvious bug found by reading the git diff) will pass the sample ASCII tests and the short-key unit tests, but the integration check inserts unicode-heavy keys under 64 bytes that trigger the trailing-zero bug. Conversely, fixing only the trailing-zero bug passes the unicode short-key cases but fails the long unicode key cases. Both bugs must be found and fixed; the unit tests don't cover either case. A solver who doesn't probe libbloom.so might incorrectly blame the library and waste time, or assume the hash function is the issue.",
+  "tests": [
+   "Insert 50 pure-ASCII keys under 64 bytes; reader must find all 50 (baseline sanity)",
+   "Insert 50 pure-ASCII keys exactly 64-80 bytes; reader must find all 50 (long-key path, ASCII)",
+   "Insert 50 keys under 64 bytes containing 2-4 byte UTF-8 chars (Japanese, emoji); reader must find all 50 (short-key unicode path \u2014 catches trailing-zero bug)",
+   "Insert 50 keys 64-90 bytes containing multi-byte UTF-8 chars; reader must find all 50 (long-key unicode path \u2014 catches truncation-order bug)",
+   "Re-insert all 200 keys; writer must report all 200 as duplicates (false-negative rate = 0 for dedup)",
+   "go test ./... in /app/svc/ exits 0",
+   "/app/verify/check.sh exits 0",
+   "libbloom.so is byte-for-byte identical to the original (not patched)"
+  ],
+  "verifier_knob": {
+   "name": "number_of_unicode_key_variants",
+   "value": "50 per category (short unicode, long unicode)",
+   "effect": "Raising to 200 per category makes statistical false-negative noise impossible to hide; lowering to 5 makes it easier to accidentally pass with a partial fix that gets lucky on boundary cases"
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the long-key truncation bug (git-visible from one commit) and misses the trailing-zero bug; passes unit tests and ASCII integration cases but fails unicode short-key verification",
+   "Agent fixes only the trailing-zero bug and misses the truncation order; opposite failure pattern",
+   "Agent spends most of the time probing libbloom.so trying to reverse-engineer its hash seeds, concludes the library is correct but runs out of time before fixing both keygen bugs",
+   "Agent patches both bugs but introduces a new off-by-one in the UTF-8 byte-length calculation, causing failures on exactly-64-byte multibyte keys that straddle the truncation boundary",
+   "Agent modifies redis.go to canonicalize keys at the persistence layer rather than fixing keygen.go, which the verifier rejects since the fix must be in Go source (redis.go is Go source, but the fix doesn't make keygen agree \u2014 the libbloom calls still get different bytes)"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "go",
+   "systems",
+   "opaque-component",
+   "bloom-filter",
+   "unicode",
+   "git-history"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/svc/internal/hash/keygen.go  # read the single divergent file, immediately see both bugs: rune-truncation before encode, trailing \\x00",
+   "git -C /app/svc log --oneline internal/hash/keygen.go  # confirm two bad commits for documentation",
+   "# Fix 1: change writer long-key path from rune-truncate-then-encode to encode-then-byte-truncate",
+   "# Fix 2: remove trailing \\x00 append in short-key path",
+   "# Edit keygen.go with both fixes (single file, ~5 line change)",
+   "cd /app/svc && go build ./...  # confirm compilation",
+   "cd /app/svc && go test ./...  # unit tests pass",
+   "bash /app/verify/check.sh  # integration check exits 0"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Both bugs are in a single readable Go source file; a skilled agent needs no libbloom.so probing to find them, making the 'opaque component' difficulty lever largely decorative",
+   "The 'fix must be in Go source' constraint is ambiguous \u2014 redis.go is also Go source, but the verifier must distinguish structural fix location from canonical fix location",
+   "CGo build failures due to missing libbloom.so linkage flags or ABI mismatch in the container environment could cause spurious failures unrelated to the bugs",
+   "The byte-for-byte libbloom.so integrity check requires storing a reference hash at build time; if the container build is non-reproducible, honest solutions could be wrongly rejected",
+   "The existing keygen_test.go tests for ASCII short keys all pass before any fix \u2014 an agent could mistake 'tests pass' for 'bugs are fixed' and exit early, but this is a valid failure mode, not an invalid one"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: both bugs reside in a single Go source file (keygen.go) and are syntactically obvious upon reading \u2014 rune-slice truncation before encoding and a trailing \\x00 append \u2014 making the speedrun approximately 8 commands with no need to probe the opaque libbloom.so at all. The 'opaque component' difficulty lever is largely inert because the library is documented as correct and the bugs are entirely in the Go layer. With a speedrun well under 20 commands and both bugs visible by straightforward source reading, genuine_difficulty scores 2, which is below the required threshold of 3.",
+  "fixes": [
+   "Move the bugs out of the readable Go source into the libbloom.so behavior itself \u2014 e.g., the library applies different key normalization depending on an undocumented flag byte, forcing real probing; this makes the opaque component lever actually load-bearing",
+   "Introduce a third component (e.g., a separate Go plugin or a Lua Redis script) that also hashes keys, creating a three-way consistency requirement where bugs interact non-obviously across components rather than sitting in one file",
+   "Make keygen.go syntactically correct but semantically wrong in a non-obvious way \u2014 e.g., using a length check against the rune count of an already-encoded string (which equals byte count for ASCII, hiding the bug) \u2014 so the bug requires understanding Go string/rune semantics deeply rather than visual inspection",
+   "Ensure the existing unit tests provide false confidence by actually passing with the bugs present for a wider range of inputs, then fail deterministically only in the integration test, to prevent early exit after 'go test ./...' passes"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-pro/recover-encrypted-db-credentials",
+     "verdict": "distinct",
+     "reason": "That task is about reassembling raw disk blocks and decrypting XOR-encoded credentials; the candidate is about hash function divergence between two Go components sharing a bloom filter."
+    },
+    {
+     "ref_id": "terminal-bench-pro/polyglot-bash-python-config-parser",
+     "verdict": "distinct",
+     "reason": "That task is about creating a polyglot script to parse config files; the candidate is about diagnosing and fixing a hash consistency bug between two Go microservice components."
+    },
+    {
+     "ref_id": "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     "verdict": "distinct",
+     "reason": "That task is about reverse-engineering an encryption algorithm from its decryption source; the candidate is about identifying hash divergence between two cooperating Go components using a shared bloom filter."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a Rust packet codec for correctness and performance; the candidate is about diagnosing Unicode/length-boundary hash divergence in Go microservices sharing a bloom filter."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a C library AES-CTR nonce derivation bug introduced during refactoring; the candidate is about fixing hash input divergence between two Go components for a shared bloom filter."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-pro/recover-encrypted-db-credentials",
+     0.128
+    ],
+    [
+     "terminal-bench-pro/polyglot-bash-python-config-parser",
+     0.127
+    ],
+    [
+     "terminal-bench-pro/reverse-go-stream-cipher-encryption",
+     0.125
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.096
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.091
+    ]
+   ],
+   "cost_usd": 0.015156
+  },
+  "novel": true
+ },
+ "cost_usd": 0.05368200000000001
+}

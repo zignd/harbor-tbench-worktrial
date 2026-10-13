@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "capacity-forecast-binary-drift",
+  "title": "Capacity Forecast Validator Drift",
+  "scenario": "A sysadmin team runs a capacity planning system that ingests hourly server metrics, runs them through a compiled forecasting binary (`/opt/capplan/forecast`), and stores the results in a SQLite database. An analyst has noticed that monthly headroom forecasts have been systematically wrong for multi-rack groups \u2014 the numbers fail an internal audit that cross-checks forecast error against actual peak loads. The binary takes a SQLite database path and a config file as arguments, populates a `forecasts` table, and the analyst suspects the config or the SQL post-processing layer, not the binary itself.",
+  "instruction_draft": "The capacity planning system at `/opt/capplan/` is producing incorrect monthly headroom forecasts for multi-rack server groups: each group's forecasted peak must be within 5% of the actual 90th-percentile peak load computed directly from the raw `hourly_metrics` table, and the `utilization_headroom_pct` column must equal `(capacity_watts - forecasted_peak_watts) / capacity_watts * 100` rounded to two decimal places. Fix the system so that `/opt/capplan/run.sh` produces a correct `forecasts` table.",
+  "requirements": [
+   "Each rack group's `forecasted_peak_watts` in the `forecasts` table must be within 5% of the actual 90th-percentile of `load_watts` from `hourly_metrics` for that group in the forecast window.",
+   "The `utilization_headroom_pct` column must equal `(capacity_watts - forecasted_peak_watts) / capacity_watts * 100` rounded to two decimal places using the corrected `forecasted_peak_watts`.",
+   "The `forecasts` table must contain exactly one row per rack group present in `hourly_metrics`.",
+   "Running `/opt/capplan/run.sh` must be idempotent: running it twice must produce the same result.",
+   "No rack group that appears in `hourly_metrics` may be missing from `forecasts`."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, gcc, and python3 packages (numpy, scipy).",
+   "A compiled binary `/opt/capplan/forecast` (built from C source in the Dockerfile, source deleted after build) reads a SQLite db path and a config JSON path as positional args; it computes a smoothed peak per rack group and writes rows to the `forecasts` table.",
+   "The binary applies a configurable `smoothing_percentile` (default 75 in the shipped config) instead of the 90th percentile. The config file `/opt/capplan/config.json` has `smoothing_percentile: 75` \u2014 this is bug #1 (wrong percentile, causes underestimation).",
+   "A Python post-processing script `/opt/capplan/postprocess.py` runs after the binary and updates `utilization_headroom_pct`. It contains bug #2: it computes headroom as `(capacity_watts - forecasted_peak_watts) / forecasted_peak_watts * 100` (divides by peak, not capacity).",
+   "Bug interaction: fixing only the percentile makes the headroom formula error look proportionally smaller (forecasted_peak closer to capacity), causing a naive solver to miss the formula bug because headroom values stay in a plausible range. Fixing only the formula leaves peak values too low, causing the 5% accuracy test to fail.",
+   "A shell script `/opt/capplan/run.sh` calls the binary then the postprocessor.",
+   "The SQLite database `/opt/capplan/capplan.db` contains: `hourly_metrics(ts INTEGER, rack_group TEXT, load_watts REAL)` with ~30 days of hourly data for 8 rack groups, and `rack_inventory(rack_group TEXT, capacity_watts REAL)`.",
+   "The `forecasts` table schema: `(rack_group TEXT PRIMARY KEY, forecasted_peak_watts REAL, capacity_watts REAL, utilization_headroom_pct REAL, generated_at INTEGER)`.",
+   "Data is seeded deterministically with numpy seed 42; each rack group has realistic load patterns with distinct peaks so the 75th vs 90th percentile difference is clearly visible (~10-18% difference per group).",
+   "A plausible but irrelevant `scheduler.py` (~200 lines) and `metrics_collector.py` (~300 lines) are present to add realistic environment noise.",
+   "Log file `/var/log/capplan/forecast.log` mentions 'config loaded: smoothing_percentile=75' \u2014 a misleading symptom that makes the config look intentional, not buggy.",
+   "Binary is ~400 lines of C covering smoothed-peak logic, argument parsing, SQLite writes, and config parsing; compiled and source deleted in Dockerfile."
+  ],
+  "internal_hint": "Two interacting bugs: (1) config.json sets smoothing_percentile=75 but the spec requires 90th-percentile peak \u2014 the binary reads this config and applies it faithfully, so changing config to 90 fixes the peak values; (2) postprocess.py divides by forecasted_peak_watts instead of capacity_watts in the headroom formula. The misleading symptom is that the log output and config both look intentional (75th percentile for 'smoothing' sounds reasonable), so agents inspect postprocess.py first and fix the formula, then test \u2014 but headroom values now pass a casual sanity check while peak values still fail the 5% accuracy criterion. A solver who fixes only the formula sees plausible-looking numbers and may stop. Only running a SQL cross-check comparing forecasted_peak_watts against the actual 90th percentile from hourly_metrics reveals bug #1. The binary is opaque; the solver must probe it by changing the config and observing output changes to understand it reads smoothing_percentile from config.json.",
+  "trap": "A solver who fixes only the postprocess.py formula bug (the obvious code-readable bug) gets plausible-looking headroom numbers but still fails the forecasted_peak accuracy tests because the binary is still using the 75th percentile. A solver who only changes the config to 90 fixes the peak values but leaves the headroom formula wrong, failing the utilization_headroom_pct tests. Only fixing both causes all tests to pass. The hidden corpus tests multiple rack groups with varied load distributions where the 75th-vs-90th percentile gap and the formula error compound differently.",
+  "tests": [
+   "Run /opt/capplan/run.sh, then for each rack_group in forecasts, query SELECT percentile_disc(0.9) WITHIN GROUP (ORDER BY load_watts) FROM hourly_metrics WHERE rack_group=? to get actual_p90, and assert abs(forecasted_peak_watts - actual_p90) / actual_p90 < 0.05.",
+   "For each row in forecasts, compute expected_headroom = round((capacity_watts - forecasted_peak_watts) / capacity_watts * 100, 2) and assert it equals utilization_headroom_pct within 0.01.",
+   "Assert COUNT(*) in forecasts equals COUNT(DISTINCT rack_group) in hourly_metrics (no missing groups).",
+   "Run /opt/capplan/run.sh a second time and assert the forecasts table contents are identical to the first run (idempotency).",
+   "Adversarial corpus: inject 3 new rack groups with synthetic load data into hourly_metrics and rack_inventory, re-run run.sh, and verify all five tests pass for the new groups too \u2014 this catches hardcoded group lists.",
+   "Adversarial corpus: test a rack group whose load distribution has a large gap between P75 and P90 (bimodal with rare spikes), ensuring the 5% accuracy test catches any residual percentile misconfiguration.",
+   "Adversarial corpus: test a rack group with capacity_watts close to forecasted_peak_watts (low headroom ~5%), ensuring the formula denominator error is detectable at small headroom values."
+  ],
+  "verifier_knob": {
+   "name": "corpus_rack_groups",
+   "value": "8 base + 5 adversarial injected at verify time",
+   "effect": "Increasing the number of adversarial groups with more varied load distributions (multimodal, bursty, flat) raises the chance of catching a partial fix; decreasing makes it easier to pass with a wrong-percentile or wrong-formula solution that happens to be close for simple distributions."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only postprocess.py formula, sees plausible headroom numbers, and declares success without cross-checking forecasted_peak_watts against actual P90 from raw data.",
+   "Agent correctly identifies the formula bug but treats config.json as intentional (smoothing sounds deliberate), never realizing the binary respects the percentile config.",
+   "Agent probes the binary, discovers the config parameter, sets it to 90, and stops \u2014 not noticing the postprocess.py formula is also wrong, because after the peak fix, headroom values fall in a plausible range.",
+   "Agent tries to replace the binary entirely with a Python script but gets the percentile computation subtly wrong (e.g., linear interpolation vs. nearest-rank) causing borderline accuracy failures on the adversarial corpus.",
+   "Agent verifies only on the base 8 rack groups (which happen to have simpler distributions) and misses the adversarial bimodal group injected at verify time."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "sysadmin",
+  "tags": [
+   "sql",
+   "compiled-binary",
+   "debugging",
+   "two-interacting-bugs",
+   "data-processing",
+   "capacity-planning"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/capplan/run.sh",
+   "cat /opt/capplan/postprocess.py",
+   "cat /opt/capplan/config.json",
+   "cat /var/log/capplan/forecast.log",
+   "sqlite3 /opt/capplan/capplan.db '.tables'",
+   "sqlite3 /opt/capplan/capplan.db 'SELECT * FROM forecasts LIMIT 3'",
+   "# Spot formula bug in postprocess.py (divides by forecasted_peak_watts)",
+   "sed -i 's|/ forecasted_peak_watts|/ capacity_watts|g' /opt/capplan/postprocess.py",
+   "/opt/capplan/run.sh",
+   "sqlite3 /opt/capplan/capplan.db 'SELECT * FROM forecasts'",
+   "# Headroom numbers look plausible \u2014 many agents stop here (trap activated)",
+   "# Strong agent: compute actual P90 from raw data to cross-check forecasted_peak",
+   "python3 -I -c \"import sqlite3, numpy as np; con=sqlite3.connect('/opt/capplan/capplan.db'); rows=con.execute('SELECT rack_group, load_watts FROM hourly_metrics').fetchall(); import collections; d=collections.defaultdict(list); [d[r].append(w) for r,w in rows]; p90={k: np.percentile(v,90) for k,v in d.items()}; f=con.execute('SELECT rack_group, forecasted_peak_watts FROM forecasts').fetchall(); [print(rg, pw, p90[rg], abs(pw-p90[rg])/p90[rg]) for rg,pw in f]\"",
+   "# Observes ~12-15% error in forecasted_peak vs actual P90 \u2014 bug #1 confirmed",
+   "# Probe binary config parameter",
+   "sed -i 's/\"smoothing_percentile\": 75/\"smoothing_percentile\": 90/' /opt/capplan/config.json",
+   "/opt/capplan/run.sh",
+   "python3 -I -c \"... same cross-check ...\"",
+   "# Verify both peak accuracy and headroom formula",
+   "/opt/capplan/run.sh && /opt/capplan/run.sh",
+   "# Check idempotency by comparing before/after second run"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 2,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "SQLite does not natively support percentile_disc() WITHIN GROUP syntax \u2014 this is a PostgreSQL function. The test description specifies this exact query but it would throw an error on SQLite, making the verifier non-functional as written. The Dockerfile must load a SQLite extension (e.g., sqlite-percentile) or rewrite the test using Python/numpy, but this is not mentioned.",
+   "The binary uses the C standard library's SQLite and the forecast binary writes to the forecasts table \u2014 if the binary schema for forecasts differs subtly (e.g., column order, NULL handling) from what postprocess.py expects, the post-processor could silently produce wrong results in edge cases.",
+   "The idempotency test requires the binary to DELETE/REPLACE existing forecasts rows before writing \u2014 if the binary uses INSERT without conflict handling, running twice could duplicate rows or fail with UNIQUE constraint error. The blueprint doesn't specify the binary's upsert behavior, risking flaky idempotency test failures.",
+   "The adversarial corpus injects 3 new rack groups at verify time but the blueprint doesn't specify whether rack_inventory rows are also injected, which is required for capacity_watts lookups \u2014 if the verifier only inserts into hourly_metrics but not rack_inventory, the binary may skip those groups or crash, causing invalid failures.",
+   "numpy/scipy percentile computation (nearest-rank vs. linear interpolation) differs from what the binary computes in C, potentially causing borderline 5% failures for agents who correctly understand the intent but implement P90 slightly differently in their cross-check scripts.",
+   "The 5% tolerance is applied to forecasted_peak_watts vs actual P90 \u2014 but the binary at smoothing_percentile=90 may use a different interpolation method than numpy's default, causing values just outside 5% for certain distributions even when correctly configured."
+  ],
+  "verdict": "reject",
+  "reasons": "The verifiability score is 2 because the test specification uses `percentile_disc()` which is not available in SQLite \u2014 this makes the verifier non-functional as written and must be redesigned before the task is buildable. The idempotency behavior of the binary (INSERT vs UPSERT) and the adversarial corpus injection (missing rack_inventory rows) are underspecified, creating invalid failure risks. The two-bug interaction design is otherwise excellent and the genuine difficulty and realism are strong, but the verifier must be concretely fixed before acceptance.",
+  "fixes": [
+   "Replace all `percentile_disc(0.9) WITHIN GROUP (ORDER BY load_watts)` test queries with Python-based P90 computation using numpy (which is already installed in the container), or explicitly install and load a SQLite percentile extension (e.g., the nalgeon/sqlean stats module) in the Dockerfile and document it in the blueprint.",
+   "Specify the binary's conflict resolution behavior on re-run: document that it uses INSERT OR REPLACE (or DELETE + INSERT) so the idempotency test is guaranteed to work, and verify the binary source (before deletion) implements this before building the image.",
+   "Ensure the adversarial corpus injection adds rows to both `hourly_metrics` AND `rack_inventory` for injected rack groups, and document this explicitly in the environment spec so the verifier script is complete.",
+   "Clarify the exact percentile interpolation method the C binary uses (e.g., nearest-rank, linear) and use the same method in all test computations to prevent borderline accuracy failures from interpolation disagreement."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a bash script that translates JSON filter specs into SQLite queries, not about capacity forecasting or fixing metric aggregation pipelines."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a metrics pipeline that computes 90th-percentile aggregations into a SQLite database and require the pipeline script to be idempotent and correct on hidden inputs, making them structurally very similar despite different domain framing."
+    },
+    {
+     "ref_id": "terminal-bench/gsea-proteomics",
+     "verdict": "distinct",
+     "reason": "That task is about bioinformatics gene set enrichment analysis, entirely different domain and methodology."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "That task is about fixing a WAF rule compiler and classifier, a completely different problem domain."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "That task involves fixing weighted aggregation in a sales service with a compiled binary and config file, a different core problem despite superficial similarities like SQLite and config-driven computation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-18899524e171",
+     0.11
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.088
+    ],
+    [
+     "terminal-bench/gsea-proteomics",
+     0.082
+    ],
+    [
+     "ours/official-10912a593843",
+     0.078
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.075
+    ]
+   ],
+   "cost_usd": 0.01386
+  },
+  "novel": false
+ },
+ "cost_usd": 0.056412000000000004
+}

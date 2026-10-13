@@ -48,38 +48,42 @@ BAND_HIGH = int(os.environ.get("BAND_HIGH", "3"))
 # 80 authoring turns ran out mid-build (pilot: 80 turns, broken Dockerfile, $3.86); a repair
 # round costs ~$0.9 and 30 min, so finishing the first build is cheaper.
 MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
-METATASK_MAX_TURNS = int(os.environ.get("METATASK_MAX_TURNS", "140"))
+METATASK_MAX_TURNS = int(os.environ.get("METATASK_MAX_TURNS", "100"))
 # A repair or tuning round patches /app/previous instead of building from scratch.
 METATASK_REPAIR_MAX_TURNS = int(os.environ.get("METATASK_REPAIR_MAX_TURNS", "70"))
-# Authoring only (the Opus calibration agent keeps terminus-2's defaults): terminus-2
+# Cost lever again (it was raised to 20k while credits were ignored; those runs cost $150-200/h):
+# authoring only (the Opus calibration agent keeps terminus-2's defaults): terminus-2
 # summarizes its history once free context drops below this. It was a cost lever at 140k
 # (summarize once history passed ~60k; Phase 0 authoring history reached 104k and cost $2.75),
 # but each summarization is a multi-minute pause that drops detail mid-build. Throughput now
 # matters more than cost, so it only fires near the real 200k limit.
-METATASK_SUMMARIZE_THRESHOLD = int(os.environ.get("METATASK_SUMMARIZE_THRESHOLD", "20000"))
-OPUS_CONCURRENCY = int(os.environ.get("OPUS_CONCURRENCY", "5"))
+METATASK_SUMMARIZE_THRESHOLD = int(os.environ.get("METATASK_SUMMARIZE_THRESHOLD", "140000"))
+OPUS_CONCURRENCY = int(os.environ.get("OPUS_CONCURRENCY", "3"))
 # Every Harbor run creates a Docker network, and Docker's default address pools allow ~31 in
 # total, shared with every other project on this machine (all pools exhausted at ~20 of ours:
 # authoring runs, gates and Opus trials at once). Authoring, gates, quality checks and the
 # red-team share ENV_SLOTS concurrent environments; Opus trials have their own OPUS_CONCURRENCY.
-ENV_SLOTS = int(os.environ.get("ENV_SLOTS", "14"))
+ENV_SLOTS = int(os.environ.get("ENV_SLOTS", "12"))
 # Machine-wide cap on functional gates (docker build + oracle x3 + nop): CPU-heavy, and a
 # CPU-starved oracle looks flaky. Authoring is API-bound and isn't capped this way.
 GATE_CONCURRENCY = int(os.environ.get("GATE_CONCURRENCY", "3"))
 # Eager calibration runs every remaining trial in one wave (fastest wall clock); exact
 # curtailment waves (CALIBRATION_EAGER=0) never pay for a trial that can't change the
 # verdict. Same verdict either way; the report still computes what curtailment saves.
-CALIBRATION_EAGER = os.environ.get("CALIBRATION_EAGER", "1") == "1"
+CALIBRATION_EAGER = os.environ.get("CALIBRATION_EAGER", "0") == "1"
 # Calibrate a candidate as soon as its build and oracle/nop pass, alongside the remaining
 # gates: Opus calibration is the only real signal for "learnable" and takes minutes, while
 # each lint/quality finding costs a 20-40 min repair round. A too-easy/too-hard candidate
 # then ends there; only a learnable one is repaired for its other findings.
-CALIBRATE_FIRST = os.environ.get("CALIBRATE_FIRST", "1") == "1"
+CALIBRATE_FIRST = os.environ.get("CALIBRATE_FIRST", "0") == "1"
 # The built-package difficulty review rejected every package we had calibrated, and calibration
 # is the ground truth: it is logged as advice and blocks only when this is on.
 DIFFICULTY_GATE_BLOCKS = os.environ.get("DIFFICULTY_GATE_BLOCKS", "0") == "1"
+# Tuning a too-easy task: many independent hidden-input requirements (analysis/tuner.py
+# breadth_plan) instead of one more readable bug, which never moved a pass rate.
+TUNE_BREADTH = os.environ.get("TUNE_BREADTH", "1") == "1"
 # Blueprint drafts generated and reviewed at once per round (the review rejects most).
-BLUEPRINT_DRAFTS = int(os.environ.get("BLUEPRINT_DRAFTS", "4"))
+BLUEPRINT_DRAFTS = int(os.environ.get("BLUEPRINT_DRAFTS", "2"))
 
 # --- Budget (docs/plan.md, "Spend discipline") -----------------------------
 # BUDGET_AUTHORIZED_USD caps total key spend; the reserve is never touched.

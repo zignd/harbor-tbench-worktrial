@@ -1,0 +1,65 @@
+{
+ "slug": "go-rate-limiter-clock-skew",
+ "title": "Token Bucket Rate Limiter with Opaque Time Source",
+ "scenario": "A backend Go service ships a token-bucket rate limiter as a compiled plugin (`ratelimit.so`) loaded at runtime, plus a thin wrapper package and an HTTP middleware layer. The plugin is the authoritative source of 'current time' \u2014 it exports a single C-ABI symbol `rl_now_ns()` whose semantics must be discovered by experiment. A bug introduced three commits ago makes the limiter silently allow bursts that exceed the configured cap under certain inter-request timing patterns, causing prod alerts. The repo is about 1,400 lines across the plugin loader, middleware, config parser, a metrics collector, and unrelated CRUD handlers.",
+ "instruction_draft": "Hey, we're getting prod alerts that our API is letting through way more requests than the rate limit config says it should \u2014 clients are hitting like 3x the burst cap on some endpoints. The rate limiter is in this repo; there's a compiled plugin at `plugin/ratelimit.so` that we can't rebuild right now. I need you to:\n\n1. Figure out what's actually broken and fix it so the token bucket enforces the configured `burst_cap` and `refill_rate_per_sec` exactly \u2014 no more, no less \u2014 across any call pattern.\n2. Add a new `/metrics/ratelimit` HTTP endpoint (GET) to the server that returns a JSON object with these fields: `window_start_unix` (int64, unix seconds of current token window start), `tokens_available` (float64, current token count), `requests_accepted` (int64, total since server start), `requests_dropped` (int64, total since server start). The values must be consistent with each other \u2014 i.e. `requests_accepted + requests_dropped` must equal total requests seen, and `tokens_available` must never exceed `burst_cap` from config.\n3. Make sure the fix works under concurrent load, not just sequential requests.",
+ "requirements": [
+  "Token bucket enforces burst_cap: no more than burst_cap requests are accepted in any window that the plugin's time source defines as a single window",
+  "Token refill follows refill_rate_per_sec from config with no drift or double-counting",
+  "GET /metrics/ratelimit returns valid JSON with fields: window_start_unix (int64), tokens_available (float64), requests_accepted (int64), requests_dropped (int64)",
+  "requests_accepted + requests_dropped equals total HTTP requests seen by the middleware (excluding /metrics/ratelimit itself)",
+  "tokens_available never exceeds burst_cap from config at any observable point",
+  "The fix is concurrency-safe: correct under parallel goroutines",
+  "window_start_unix reflects the plugin's time source, not the system clock"
+ ],
+ "environment": [
+  "Git repo with ~1,400 lines of Go across: cmd/server/main.go, internal/middleware/ratelimit.go, internal/config/config.go, internal/metrics/collector.go, internal/handlers/crud.go (not involved), plugin/loader.go",
+  "plugin/ratelimit.so: pre-compiled shared library exporting rl_now_ns() via C ABI \u2014 returns a monotonic nanosecond counter that advances at a rate determined by experiment (it runs at 10x wall-clock speed, simulating a fast test clock); source NOT present",
+  "plugin/loader.go: uses cgo to call rl_now_ns(); the bug is here \u2014 it divides rl_now_ns() by 1e9 to get seconds but the plugin returns deciseconds*1e7, so the effective time unit is wrong by a factor of 10, making token refill happen 10x faster than configured",
+  "internal/middleware/ratelimit.go: reads tokens, applies bucket logic; has a secondary bug: token refill calculation uses float32 instead of float64, causing precision loss that compounds over long-running servers, allowing extra fractional tokens to accumulate past burst_cap",
+  "internal/config/config.go: parses config.yaml with burst_cap and refill_rate_per_sec",
+  "config.yaml: burst_cap: 10, refill_rate_per_sec: 2.0",
+  "No /metrics/ratelimit endpoint exists; solver must add it",
+  "The metrics collector exists but only tracks HTTP 2xx/4xx/5xx counts, not rate limiter accept/drop",
+  "Git history: 8 commits; commit 3 ago changed loader.go divisor from 1e10 to 1e9 (introduced time-scale bug); commit 5 ago introduced float32 precision bug in refill calculation",
+  "A test harness script test_harness.sh that fires 50 concurrent requests in two bursts and prints accept/drop counts for manual inspection",
+  "Dockerfile installs go 1.22, gcc (for cgo), and builds the server"
+ ],
+ "internal_hint": "Difficulty comes from two interacting opaque-component bugs. (1) The compiled plugin rl_now_ns() must be characterized by experiment: the solver must call it repeatedly and measure how fast it advances relative to wall clock. Discovery: it advances at 10x wall-clock speed. This is not in any source file. The loader.go then divides by 1e9 (seconds), but the plugin actually returns units where 1e8 = 1 wall-second, so the computed 'elapsed seconds' is 10x too large, making refill appear to happen 10x faster \u2014 tokens replenish in 0.1 real seconds instead of 1. Fix: divide by 1e8 instead of 1e9. (2) The float32 bug in refill: `tokens = min(burst_cap, tokens + float32(elapsed)*float32(refill_rate))` \u2014 float32 has ~7 digits of precision; after many additions the accumulated fractional error pushes tokens above burst_cap. Fix: use float64 throughout. (3) The new /metrics/ratelimit endpoint requires thread-safe reads of the bucket state and counters, so the solver must add a mutex-protected snapshot method and wire up accept/drop counters in the middleware that currently don't exist. Cross-component consistency: window_start_unix must come from the plugin's time source (rl_now_ns()/1e8 converted to unix by adding server start offset), not time.Now(). A solution that fixes the plugin time scale but misses the float32 bug will still fail on long-running or high-precision tests. A solution that adds the metrics endpoint without wiring accept/drop to the middleware will fail the consistency check.",
+ "trap": "A naive solver reads the middleware source, spots the float32, fixes it, adds a metrics endpoint reading time.Now() for window_start_unix, and calls it done. The hidden tests fire requests in patterns that exploit the plugin time scale mismatch (10x speed) \u2014 at wall-clock t=0.5s the plugin thinks 5 real seconds have passed, so 10 tokens have refilled into a cap-10 bucket that just emptied, admitting 10 more requests. The verifier generates fresh timing patterns at verify time using the plugin's actual speed. The window_start_unix check also fails because it differs from what the plugin reports. The consistency check (accepted+dropped=total) fails if the solver forgets to exclude /metrics/ratelimit itself from counting.",
+ "tests": [
+  "Characterization test: call rl_now_ns() twice 100ms apart via a small Go probe; assert the delta is ~1e9 (10x wall speed * 100ms * 1e8 units/wall-sec = 1e9 units); verifies solver discovered the correct divisor",
+  "Burst enforcement test (generated at verify time): send burst_cap+5 requests simultaneously; assert exactly burst_cap are accepted and 5 are dropped; repeat for 3 randomly chosen burst sizes between burst_cap+1 and burst_cap+20",
+  "Refill precision test: empty the bucket, wait exactly 1 real second (plugin advances 10 fake seconds = 2*10=20 tokens, capped at 10), send burst_cap+5 requests; assert exactly burst_cap accepted",
+  "Long-run float precision test: run 10,000 sequential requests spaced 10ms apart (plugin sees 100ms each = 0.2 tokens refilled per step); assert tokens_available never exceeds burst_cap from the metrics endpoint at any sampled point",
+  "Metrics endpoint structure test: GET /metrics/ratelimit returns HTTP 200 with Content-Type application/json and all four required fields with correct types",
+  "Metrics consistency test: after N requests where M are accepted, assert requests_accepted=M, requests_dropped=N-M, requests_accepted+requests_dropped=N",
+  "tokens_available cap test: assert tokens_available <= burst_cap at all times sampled during a concurrent load burst",
+  "window_start_unix source test: assert window_start_unix changes by ~10 plugin-seconds per real second (not 1:1 with wall clock), confirming it uses the plugin time source",
+  "Concurrency safety test: run 100 goroutines each making 20 requests concurrently; assert no data race (run with -race) and total accepted+dropped equals 2000"
+ ],
+ "verifier_knob": {
+  "name": "number_of_independent_state_properties_checked",
+  "value": "7",
+  "effect": "Lowering to 3 (just burst enforcement, metrics structure, consistency count) makes it medium difficulty solvable if the agent finds the time scale bug. Raising to 9 (adding float drift over 100k requests and a second endpoint for per-IP bucket state) forces the agent to also handle long-term numerical stability and a second data-consistency surface."
+ },
+ "expected_failure_modes": [
+  "Agent fixes float32 but never discovers the plugin time scale is 10x \u2014 fixes look correct on immediate tests but fail timed refill checks",
+  "Agent discovers time scale by reading loader.go commit diff and guessing the fix without experimentally verifying \u2014 guesses wrong multiplier (e.g. 1e8 vs 1e7) and passes some tests but fails precision tests",
+  "Agent adds /metrics/ratelimit but uses time.Now() for window_start_unix instead of the plugin clock, failing the window source test",
+  "Agent wires accept/drop counters but also counts requests to /metrics/ratelimit itself, failing the N=accepted+dropped consistency test",
+  "Agent uses a mutex for the metrics snapshot but still reads tokens_available outside the lock in the limiter hot path, causing a data race caught by -race test",
+  "Agent fixes both bugs but misses that tokens_available must be atomically snapshotted with requests_accepted/dropped \u2014 they read at different times and the consistency check races"
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "debugging",
+ "tags": [
+  "go",
+  "systems",
+  "opaque-component",
+  "concurrency",
+  "cross-component-consistency",
+  "rate-limiting"
+ ]
+}

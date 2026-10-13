@@ -1,65 +1,57 @@
 # Log Ingestion Pipeline
 
-A Node.js service that reads newline-delimited JSON (NDJSON) log files, validates
-each record against a JSON Schema, and writes accepted records to a clean output file.
+This service reads newline-delimited JSON (NDJSON) log files, validates each
+record against a JSON Schema, and writes accepted records to a clean output
+file. Records that fail validation are silently discarded.
 
-## Structure
+## Directory layout
 
-```
-/app/
-  src/
-    index.js          - Entry point and orchestration
-    pipeline.js       - Streaming pipeline and file I/O
-    validator.js      - JSON Schema validation (Ajv)
-    schema_loader.js  - Schema file loading and introspection
-    config.js         - Configuration and CLI argument parsing
-    utils.js          - Utility functions
-    metrics.js        - Internal metrics collection
-    logger.js         - Structured logging
-  tools/
-    gen_corpus.js     - Deterministic NDJSON corpus generator
-  logs/
-    sample.ndjson     - Sample log corpus from incident window
-  schema.json         - JSON Schema for log record validation
-  output/             - Default output directory (writable)
-  package.json
-```
-
-## Usage
-
-```bash
-node /app/src/index.js --input <input.ndjson> --output /app/output/clean.ndjson
-```
-
-### Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--input <file>` | `/app/logs/sample.ndjson` | Input NDJSON file |
-| `--output <file>` | `/app/output/clean.ndjson` | Output NDJSON file |
-| `--schema <file>` | `/app/schema.json` | JSON Schema path |
-| `--log-level <level>` | `info` | Logging level (debug/info/warn/error) |
-| `--batch-size <n>` | `500` | Internal batch size hint |
-| `--no-metrics` | off | Disable periodic metrics reporting |
+    /app/
+      src/           Node.js source modules
+        index.js     Entry point
+        pipeline.js  Streaming orchestration
+        validator.js Schema validation logic
+        schema_loader.js  Schema file loading
+        config.js    CLI argument parsing
+        logger.js    Structured logging
+        metrics.js   Throughput and error counters
+        utils.js     Shared helpers
+      schema.json    JSON Schema (draft-7) for log records
+      logs/          Input NDJSON log files
+      output/        Accepted records written here
+      tools/
+        gen_corpus.js  Corpus generator (for testing)
 
 ## Schema
 
-The schema at `/app/schema.json` is JSON Schema draft-7. Required fields:
+Each log record must be a JSON object with the following fields:
 
-- `timestamp` (string): ISO 8601 datetime
-- `level` (string): one of `debug`, `info`, `warn`, `error`
-- `severity` (string): severity label, must be a string
-- `service` (string): originating service name
-- `message` (string): human-readable event description
+| Field      | Type                              | Required |
+|------------|-----------------------------------|----------|
+| timestamp  | string, ISO 8601                  | yes      |
+| level      | string, one of debug/info/warn/error | yes   |
+| severity   | string (non-empty)                | yes      |
+| service    | string                            | yes      |
+| message    | string                            | yes      |
+| metadata   | object                            | no       |
 
-Optional fields:
-- `metadata` (object): arbitrary key-value pairs
+## Running
 
-## Corpus Generator
+    node /app/src/index.js --input <file> --output /app/output/clean.ndjson
 
-```bash
-node /app/tools/gen_corpus.js --seed 1 --count 1000 --mode mixed --output /tmp/corpus.ndjson
-```
+Options:
 
-Modes: `benign` (all valid), `malicious` (all invalid), `mixed` (interleaved, default 20% invalid).
-All output is deterministic for a given seed.
+    --input,  -i   Path to NDJSON input file (required)
+    --output, -o   Path for accepted records output (default: /app/output/clean.ndjson)
+    --schema, -s   Path to JSON Schema file (default: /app/schema.json)
+    --batch-size   Records per write batch (default: 500)
+    --log-level    Logging verbosity: debug|info|warn|error (default: info)
+    --dry-run      Validate without writing output
+    --verbose, -v  Print top validation error reasons after completion
+
+## Corpus generator
+
+    node /app/tools/gen_corpus.js --size <n> --seed <s> --output <file>
+
+Generates a deterministic NDJSON corpus of `n` records using the given seed.
+Useful for performance and regression testing.

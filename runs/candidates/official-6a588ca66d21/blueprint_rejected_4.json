@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "log-filter-dual-config-bug",
+  "title": "Production Log Filter Silent Misconfiguration",
+  "scenario": "A backend developer is chasing a production incident where the alerting pipeline is silently dropping malicious request patterns and also passing through some benign traffic as false positives. The system is a Python log-processing daemon (~1,400 lines across several modules) that reads structured JSON access logs, applies a configurable multi-stage filter chain, and emits filtered events to a downstream sink. The filter chain is driven by two interacting config files: a regex rule set and a severity-scoring YAML. The bug only manifests when the daemon processes real log history\u2014specific sequences of log entries cause stateful filter state to corrupt later decisions.",
+  "instruction_draft": "```\n$ sudo systemctl status log-filter\n\u25cf log-filter.service - Production Log Filter Daemon\n   Active: active (running)\n$ python /opt/log-filter/run_check.py --mode=replay --input=/var/log/access/sample.jsonl 2>&1 | tail -20\nWARNING: 3 events emitted with severity=BENIGN that match known attack signatures\nWARNING: 7 events dropped with severity=MALICIOUS that appear to be normal traffic\nFilter chain completed: 1000 events processed, 247 passed, 753 dropped\n$ cat /etc/log-filter/rules.yaml | head -5\n# Log filter rule configuration - DO NOT EDIT IN PRODUCTION\nversion: 2\nrules: [...]\n```\n\nThe log-filter daemon at `/opt/log-filter/` is misclassifying requests in production. Events that should be flagged as MALICIOUS are being dropped silently, and some BENIGN events are being incorrectly flagged.\n\nFix the filter chain so that:\n1. Every event whose decoded request path matches any pattern in the `malicious_patterns` rule set is emitted with severity=MALICIOUS, regardless of the order in which prior events arrived.\n2. Every event that does not match any `malicious_patterns` rule and whose computed severity score is below the configured `alert_threshold` is emitted with severity=BENIGN.\n3. The severity score for each event must be computed solely from the fields of that event and the static configuration\u2014it must not carry over state from previous events in a replay session.\n4. The filter must correctly handle URL-encoded and doubly-encoded request paths (e.g., `%2F`, `%252F`) by normalizing them before pattern matching.\n5. After your fix, running `python /opt/log-filter/run_check.py --mode=replay --input=/var/log/access/sample.jsonl` must print zero WARNING lines and the summary line must show counts consistent with the rule set.\n\nDo not change the rule configuration files or the downstream sink interface. The fix must be entirely within the daemon source code.",
+  "requirements": [
+   "Every event whose normalized request path matches any malicious_patterns entry is emitted as MALICIOUS",
+   "Every event that matches no malicious_patterns and has severity score below alert_threshold is emitted as BENIGN",
+   "Severity score is computed per-event from static config only\u2014no inter-event state leakage",
+   "Request paths are fully normalized before matching: URL-decode applied recursively until stable",
+   "run_check.py --mode=replay on the sample input prints zero WARNING lines",
+   "The fix is entirely in daemon source code, not in YAML/config files"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; apt-get install -y python3-yaml; pip install pyyaml",
+   "/opt/log-filter/ contains ~1,400 lines across: main.py, filter_chain.py, rule_engine.py, scorer.py, normalizer.py, sink.py, utils.py (plausible non-buggy code in sink.py and utils.py)",
+   "Bug 1 (stateful score accumulation): scorer.py accumulates a running_severity instance variable that is never reset between events in a replay session; high-severity legit events inflate scores for subsequent benign events, causing false MALICIOUS flags",
+   "Bug 2 (single-decode normalization): normalizer.py calls urllib.parse.unquote() exactly once, so doubly-encoded paths like %252F are decoded to %2F but not further to /, evading pattern matching for known path-traversal attacks",
+   "The two bugs interact: fixing only scorer.py leaves doubly-encoded attacks undetected (false negatives); fixing only normalizer.py still produces false positives for benign events that follow a burst of high-severity events",
+   "/etc/log-filter/rules.yaml: contains malicious_patterns (list of regexes for attack paths), alert_threshold (float), and scoring weights per field",
+   "/etc/log-filter/scoring.yaml: per-field score multipliers referenced by scorer.py",
+   "/var/log/access/sample.jsonl: 1,000 synthetic access log events; mix of benign and malicious; includes doubly-encoded attack paths and a burst pattern that triggers score accumulation bug",
+   "/opt/log-filter/run_check.py: replay harness that processes the JSONL, calls filter chain, checks each output event against ground-truth labels embedded in the JSONL, prints WARNING for each mismatch",
+   "Ground-truth labels in sample.jsonl: each event has a _expected_severity field used only by run_check.py, not by the daemon itself",
+   "The daemon code is realistic: ~200 lines of plausible HTTP log parsing, sink batching, metrics counters, retry logic unrelated to the bugs"
+  ],
+  "internal_hint": "Two interacting bugs: (1) scorer.py initializes `self.running_severity = 0.0` at class instantiation and adds each event's raw score to it without reset, so a burst of legitimate high-UA-score requests inflates the running total and causes subsequent benign events to cross alert_threshold\u2014only visible when replaying a realistic log sequence with bursts; (2) normalizer.py calls `urllib.parse.unquote(path)` once, leaving %252F as %2F, so doubly-encoded path-traversal patterns bypass regex matching\u2014only detectable by running the daemon against logs that contain such encodings. Fix 1: reset `self.running_severity = 0.0` at the start of `score_event()` (or make it a local variable). Fix 2: replace single unquote with a loop `while (decoded := unquote(path)) != path: path = decoded`. A solver who fixes only one bug will see the WARNING count drop but not reach zero, because the two causes produce different symptom classes (false positives vs false negatives) that are both checked.",
+  "trap": "A solver who fixes only the scorer reset sees false-positive WARNINGs drop to zero but still gets false-negative WARNINGs for doubly-encoded attacks (or vice versa). The hidden test corpus includes: (a) log sequences with no bursts\u2014exposes the encoding bug in isolation; (b) sequences with only doubly-encoded attacks and no score accumulation\u2014exposes the scorer bug in isolation; (c) sequences where both interact; (d) triply-encoded paths (%25252F) that require the loop fix, not just two calls to unquote. A solver who hardcodes two unquote calls passes the sample but fails (d).",
+  "tests": [
+   "Replay sample.jsonl: assert zero WARNING lines printed by run_check.py",
+   "Hidden corpus batch A (50 events, no bursts, doubly-encoded traversal attacks): assert all doubly-encoded attack events emitted as MALICIOUS",
+   "Hidden corpus batch B (200 events, burst of 20 high-score legit events followed by 30 benign events): assert none of the 30 benign events are emitted as MALICIOUS",
+   "Hidden corpus batch C (triply-encoded %25252F paths): assert all traversal attacks detected",
+   "Hidden corpus batch D (mixed: bursts + single-encode + double-encode + triple-encode + clean benign): assert overall precision >= 1.0 and recall >= 1.0 (zero misclassifications)",
+   "Hidden corpus batch E (adversarial: benign paths that partially match attack patterns only before full normalization): assert no false positives",
+   "Structural check: run_check.py exits 0 and summary line shows exactly the ground-truth MALICIOUS count as passed events"
+  ],
+  "verifier_knob": {
+   "name": "corpus_size_and_encoding_depth",
+   "value": "50 events per batch, max triple-encoding",
+   "effect": "Raising corpus size increases the chance a shallow fix is exposed; adding quadruple-encoding or mixed-scheme encoding (e.g., %2525xx) further tests the loop fix; lowering to single-encode only would let a two-call hardcode pass"
+  },
+  "expected_failure_modes": [
+   "Solver fixes scorer reset but misses the normalization bug entirely\u2014WARNING count drops but doesn't reach zero",
+   "Solver fixes normalization with two sequential unquote calls\u2014passes sample and double-encode batches but fails triple-encode batch",
+   "Solver reads config files looking for the bug and never instruments the daemon to observe the score accumulation across a realistic event sequence",
+   "Solver resets the running_severity at class `__init__` by moving it into `score_event` as a local but accidentally removes a legitimate per-session metric that causes run_check.py to crash on the hidden corpus",
+   "Solver patches normalizer.py correctly but introduces a regression by normalizing paths before the sink receives them, breaking downstream consumers that expect raw paths (sink interface contract violation caught by a separate test)"
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "log-processing",
+   "configuration",
+   "stateful-bug",
+   "url-encoding",
+   "adversarial-corpus",
+   "two-interacting-causes"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/log-filter/scorer.py",
+   "cat /opt/log-filter/normalizer.py",
+   "cat /opt/log-filter/filter_chain.py",
+   "cat /opt/log-filter/rule_engine.py",
+   "cat /opt/log-filter/run_check.py",
+   "cat /etc/log-filter/rules.yaml",
+   "cat /etc/log-filter/scoring.yaml",
+   "head -20 /var/log/access/sample.jsonl",
+   "python /opt/log-filter/run_check.py --mode=replay --input=/var/log/access/sample.jsonl 2>&1 | tail -20",
+   "# Identify: self.running_severity in scorer.py accumulates across events",
+   "# Edit scorer.py: make running_severity a local variable in score_event()",
+   "python /opt/log-filter/run_check.py --mode=replay --input=/var/log/access/sample.jsonl 2>&1 | tail -20",
+   "# Observe: false positives gone, 7 false negatives remain",
+   "# Identify: normalizer.py calls unquote() once, misses double/triple encoding",
+   "# Edit normalizer.py: replace single unquote() with loop until path stabilizes",
+   "python /opt/log-filter/run_check.py --mode=replay --input=/var/log/access/sample.jsonl 2>&1 | tail -20"
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Triple-encoding requirement not stated in instruction text but tested in hidden corpus batch C; a solver implementing exactly two unquote calls passes the stated requirement but fails a hidden test, which is a test-overreach risk",
+   "Sink interface regression test (no raw-path normalization before sink) is not mentioned in the instruction's requirements list, making it a hidden constraint that could cause invalid failures",
+   "The 'legitimate per-session metric' trap (removing running_severity from __init__ crashes run_check.py on hidden corpus) is not hinted at in the instruction, creating an invisible tripwire unrelated to the stated bugs",
+   "Both bugs are directly readable from source code without needing to observe runtime behavior; the observe_not_read difficulty lever does not actually apply, so genuine difficulty is lower than intended"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: both bugs are structurally visible by reading scorer.py and normalizer.py without any runtime observation, making the speedrun ~16 commands and yielding a high expected solve rate for frontier agents. The average score is (4+4+4+2+4)/5 = 3.6, which meets the average threshold, but genuine_difficulty at 2 is below the minimum of 3. Additionally, the hidden corpus tests for triple-encoding and the sink interface constraint introduce requirements not stated in the instruction, creating invalid failure risks.",
+  "fixes": [
+   "Obscure the scorer bug: instead of a bare self.running_severity accumulation, hide it as a decorator or middleware pattern, or make it a class-level variable shared across instances, so the bug is not apparent from reading a single method",
+   "Make normalization bug harder to spot: use a more complex normalization pipeline where the single-decode is buried in a chain of transformations, requiring runtime observation to see that doubly-encoded paths slip through pattern matching",
+   "State the recursive normalization requirement explicitly in the instruction (e.g., 'normalize by repeatedly URL-decoding until the path is stable') to avoid ambiguity between loop and two-sequential-calls solutions, and ensure hidden tests align with stated requirements",
+   "Either document the sink interface constraint in the instruction's requirements list or remove the test that checks for it, to eliminate invalid failure risk from unstated requirements",
+   "Add an observe_not_read mechanism that forces runtime discovery: for example, the scorer bug could only manifest via a state machine transition that's not visible statically, requiring the solver to add logging or run the replay to see the accumulation in action"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "variant",
+     "reason": "Both involve fixing a misclassifying security filter (WAF vs log-filter) that incorrectly passes malicious and blocks benign traffic, with ~1400 lines of Python and labeled samples, but differ in architecture (compiler/deployer/runtime vs daemon with filter chain) and specific bugs (rule version consistency vs stateful inter-event corruption and URL encoding)."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "This task is about fixing a log enrichment pipeline's GeoIP tagging, database insertion, and Flask API endpoints\u2014not about security classification or filter chain logic."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/log-summary-date-ranges",
+     "verdict": "distinct",
+     "reason": "This task is purely about counting log severity levels across date ranges and writing a CSV\u2014no filter chain, no classification logic, no security patterns."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "This task is about fixing a bash script that translates JSON filter specs into SQLite queries\u2014no security classification, no daemon, no URL normalization or stateful corruption."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "This task is about fixing HMAC chain verification in an audit-log service\u2014no filter chain, no malicious pattern matching, no URL encoding or inter-event state corruption."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-10912a593843",
+     0.291
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.241
+    ],
+    [
+     "terminal-bench-2-1/log-summary-date-ranges",
+     0.2
+    ],
+    [
+     "ours/official-18899524e171",
+     0.111
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.102
+    ]
+   ],
+   "cost_usd": 0.016242
+  },
+  "novel": false
+ },
+ "cost_usd": 0.061137000000000004
+}

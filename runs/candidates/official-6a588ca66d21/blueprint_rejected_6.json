@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "metrics-pipeline-silent-aggregation-drift",
+  "title": "Production Metrics Aggregation Silent Drift",
+  "scenario": "A backend developer is chasing a production alert: the per-service error-rate dashboard shows numbers that disagree with raw log counts by 15-40% depending on the time window queried. The system is a Python metrics pipeline (~1400 lines across several modules) that reads structured JSON log lines from rotating log files, aggregates them into 1-minute and 5-minute buckets, and writes summary records to a SQLite metrics store. A Prometheus-style scrape endpoint exposes the stored metrics. The mismatch only manifests on real historical data because it depends on how the pipeline handles log lines that arrive out-of-order (due to multi-process log writers) and on a subtle interaction between the bucket boundary logic and a timezone-offset configuration that shifts which bucket a log line falls into.",
+  "instruction_draft": "```\n$ python /opt/metrics/check_integrity.py --window 60m\nERROR: integrity check failed\n  service=auth  raw_errors=1847  reported_errors=1203  delta=35%\n  service=api   raw_errors=3201  reported_errors=2890  delta=10%\n  service=worker raw_errors=512  reported_errors=341   delta=33%\nWindow: 2024-01-15T08:00:00Z to 2024-01-15T09:00:00Z\n\n$ python /opt/metrics/check_integrity.py --window 5m\nERROR: integrity check failed  \n  service=auth  raw_errors=31   reported_errors=31    delta=0%\n  service=api   raw_errors=52   reported_errors=52    delta=0%\n  service=worker raw_errors=9   reported_errors=9     delta=0%\nWindow: 2024-01-15T08:55:00Z to 2024-01-15T09:00:00Z\n```\n\nThe metrics pipeline at `/opt/metrics/` is miscounting errors in its aggregated summaries for windows longer than a few minutes, but the most-recent 5-minute window is always accurate. The discrepancy grows with window length and varies by service.\n\nFix the pipeline so that:\n1. Every log event in `/var/log/services/*.log` is counted in exactly one bucket \u2014 the bucket whose interval contains the event's own `timestamp` field, in UTC.\n2. Late-arriving log lines (lines appended to a log file with a `timestamp` earlier than lines already processed) are correctly attributed to their own bucket, not dropped and not double-counted.\n3. The 1-minute and 5-minute aggregated bucket counts in the SQLite database at `/var/lib/metrics/metrics.db` must match the raw log counts when verified by running `/opt/metrics/check_integrity.py --window 60m` with exit code 0.\n4. The pipeline must remain a streaming processor: it reads new log lines incrementally using the tail-follow mechanism already in place; do not replace it with a full-file reprocessing batch job.\n5. After your fix, run `/opt/metrics/replay_and_verify.sh` which replays a 2-hour historical log corpus and checks that the final database counts match ground-truth counts for all services and all bucket sizes. It must exit 0.",
+  "requirements": [
+   "Every log event is counted in exactly one bucket determined by the event's own UTC timestamp field",
+   "Late-arriving log lines (out-of-order by timestamp) are correctly attributed to their own bucket and never dropped or double-counted",
+   "The 1-minute and 5-minute aggregated bucket counts in the SQLite database match raw log counts for the 60-minute window verified by check_integrity.py",
+   "The pipeline remains a streaming/tail-follow processor \u2014 no replacement with full-file batch reprocessing",
+   "replay_and_verify.sh exits 0 after replaying a 2-hour historical log corpus against all services and all bucket sizes"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs sqlite3, pytz, python-dateutil, watchdog",
+   "/opt/metrics/ contains: pipeline.py (main loop, ~350 lines), aggregator.py (~280 lines with the two bugs), bucket_store.py (~200 lines, SQLite writer), config.yaml (timezone set to 'America/New_York', flush_interval=30s, late_window=0), log_reader.py (~150 lines, inotify-based tail follower), check_integrity.py (~200 lines, compares DB vs raw logs), replay_and_verify.sh (replays historical corpus and checks counts)",
+   "Bug 1 (observe_not_read, data-dependent): aggregator.py computes bucket boundaries using local time from config timezone then converts to UTC for storage, but the floor() operation is applied BEFORE the timezone conversion, so events near bucket boundaries get assigned to the wrong bucket. This only manifests when log timestamps are in a different offset than the pipeline's configured timezone \u2014 visible only when running against real multi-hour data where events span DST boundary or bucket edges",
+   "Bug 2 (interacts with Bug 1): aggregator.py has late_window=0 from config, so any log line whose timestamp is earlier than the last-flushed bucket start is silently dropped (treated as 'too late to reopen bucket'). The config.yaml has late_window=0 but the correct value is 120 (seconds). Fixing Bug 1 alone makes more events fall into 'late' category (because the correct bucket is now earlier than the wrong one was), making the drop rate worse. Fixing only Bug 2 without Bug 1 makes all events count but into wrong buckets. Both must be fixed together.",
+   "/var/log/services/ contains auth.log, api.log, worker.log with pre-generated JSON log lines including intentional out-of-order sequences (simulating multi-process writers) and events near minute boundaries",
+   "A historical corpus of 2 hours of log data with ground truth counts is embedded in /opt/metrics/corpus/ and used by replay_and_verify.sh",
+   "The pipeline runs as a systemd-like daemon started by /opt/metrics/start_pipeline.sh; solver must restart it after fixing",
+   "check_integrity.py accepts --window parameter and exits nonzero with delta >1% for any service",
+   "replay_and_verify.sh: stops the daemon, resets the DB, feeds corpus logs in replay order (including intentional late arrivals), restarts daemon, waits for processing, runs check_integrity.py against ground truth CSV"
+  ],
+  "internal_hint": "Root cause 1: in aggregator.py, the bucket_floor() function calls datetime.fromtimestamp() with the configured local timezone (America/New_York, UTC-5), then does floor-to-minute on the local time, then converts back to UTC. This means events at e.g. 14:00:59 UTC (09:00:59 local) and 14:01:00 UTC (09:01:00 local) round correctly in isolation, but events at e.g. 13:59:30 UTC (08:59:30 local) whose local floor is 08:59:00 local = 13:59:00 UTC are sometimes assigned to the 14:00:00 UTC bucket due to a DST-era offset artifact in the floor arithmetic. The correct fix is to floor in UTC directly: bucket = ts.replace(second=0, microsecond=0) for 1-min buckets. Root cause 2: config.yaml has late_window: 0 which means bucket_store.py drops any event whose bucket has already been flushed (flushed after flush_interval=30s). Correct value is late_window: 120. Fixing only Bug 2 causes events to be counted but in wrong buckets (Bug 1). Fixing only Bug 1 causes more events to land in already-flushed buckets and get dropped (Bug 2 worsens). A skilled engineer discovers this by: (1) noticing the 5-minute window is accurate but 60-minute is not \u2014 suggesting time-accumulation issue; (2) adding debug logging or running the pipeline on a short controlled replay corpus and seeing dropped-event log messages; (3) reading aggregator.py to understand the timezone conversion sequence; (4) checking config.yaml and finding late_window=0.",
+  "trap": "A naive agent reads aggregator.py, spots the timezone conversion and fixes the bucket_floor() function (Bug 1), then re-runs check_integrity.py on the live 5-minute window (which was already correct) and sees exit 0. The hidden replay_and_verify.sh corpus includes dense out-of-order sequences where 20-30% of events arrive late after their bucket is flushed \u2014 these are silently dropped due to Bug 2 (late_window=0 not fixed). The error rate discrepancy in the corpus grows to 25%+ for services with high out-of-order rates, causing replay_and_verify.sh to fail even after Bug 1 is fixed. The solver must also discover and fix the late_window config value, which requires observing the 'event dropped: bucket already closed' log messages that only appear when replaying the corpus.",
+  "tests": [
+   "Run replay_and_verify.sh after solver's fix; it resets DB, replays 2-hour corpus with intentional late arrivals, and checks that each (service, bucket_size, minute) count matches ground truth CSV within 1%; exit code must be 0",
+   "Verify that the pipeline is still running in tail-follow mode (not replaced with batch reprocessing): check that /opt/metrics/pipeline.py is invoked and the process is live, and that log_reader.py inotify watches are active",
+   "Inject 100 synthetic log lines with timestamps 90 seconds in the past into a live log file and verify they appear in the correct historical bucket in the DB (not dropped, not in current bucket)",
+   "Inject 50 log lines with timestamps exactly on minute boundaries (HH:MM:00.000) and verify each lands in the correct bucket (the minute starting at that second, not the previous minute)",
+   "Run check_integrity.py --window 60m and verify exit code 0 with delta <1% for all three services on the historical window",
+   "Adversarial corpus test: replay a corpus with events clustered at UTC midnight (where America/New_York offset causes maximum bucket-boundary confusion) and verify counts match ground truth"
+  ],
+  "verifier_knob": {
+   "name": "corpus_out_of_order_fraction",
+   "value": "0.28",
+   "effect": "Raising this fraction increases the percentage of log events that arrive late (out of order), making Bug 2 (late_window) more impactful and harder to ignore. Lowering it makes Bug 2 barely visible and the task easier (Bug 1 alone causes most failures). At 0.0, only Bug 1 matters. At 0.5, both bugs must be fixed to get within 1% on any service."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only Bug 1 (timezone/bucket-floor arithmetic), verifies the 5-minute window (always accurate), sees exit 0, and submits without running replay_and_verify.sh or noticing the dropped-event log messages from late arrivals",
+   "Agent finds late_window=0 in config.yaml but interprets it as intentional (zero grace period for late events is a plausible business policy) and only fixes Bug 1",
+   "Agent replaces the tail-follow pipeline with a batch reprocessor that re-reads all log files from disk, which passes replay_and_verify.sh but fails the 'must remain streaming' requirement check",
+   "Agent fixes both bugs but restarts the pipeline incorrectly (e.g., starts a second instance alongside the old one), causing double-counting in the DB which fails the ground-truth comparison",
+   "Agent correctly identifies the bucket_floor timezone bug but re-implements it with a different but still-wrong conversion (e.g., uses utcoffset() which fails during DST transitions in the corpus)"
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "log-processing",
+   "metrics-pipeline",
+   "configuration",
+   "timezone-bugs",
+   "streaming",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/metrics/config.yaml  # spot late_window=0",
+   "cat /opt/metrics/aggregator.py  # spot bucket_floor() timezone bug",
+   "cat /opt/metrics/bucket_store.py  # understand flush/drop logic",
+   "python /opt/metrics/check_integrity.py --window 60m  # confirm 35% delta",
+   "python /opt/metrics/check_integrity.py --window 5m  # confirm 0% delta",
+   "# Edit aggregator.py: replace bucket_floor() to floor in UTC: ts.replace(second=0, microsecond=0)",
+   "# Edit config.yaml: change late_window: 0 to late_window: 120",
+   "bash /opt/metrics/start_pipeline.sh restart",
+   "python /opt/metrics/check_integrity.py --window 60m  # verify exit 0",
+   "bash /opt/metrics/replay_and_verify.sh  # final verification"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "replay_and_verify.sh 'waits for processing' with no specified timeout \u2014 on 1 CPU / 2 GB hardware, daemon processing may not complete in time, causing flaky false failures",
+   "DST corpus relies on tzdata version consistency; pytz behavior for ambiguous/wall-clock times can differ across tzdata releases, potentially causing non-deterministic bucket assignment in edge cases",
+   "The 'inotify watches are active' streaming check may not work reliably on macOS (task says darwin platform) since inotify is Linux-only; the environment says python:3.13-slim-bookworm (Linux) but environment detection could confuse reviewers",
+   "late_window=0 is a plausible intentional policy \u2014 the instruction gives no signal that it is a bug, only replay_and_verify.sh failure reveals it; agents that fix Bug 1 only and skip replay_and_verify.sh fail validly but the instruction doesn't mandate running that script first",
+   "Pipeline restart double-counting risk is an undisclosed environmental hazard: the instruction says 'restart the pipeline after your fix' but doesn't warn that starting a second instance causes double-counting, which is an implicit constraint not stated in requirements"
+  ],
+  "verdict": "reject",
+  "reasons": "The task fails the genuine_difficulty threshold: both bugs are directly visible by reading source files (config.yaml and aggregator.py), and a strong agent reading exhaustively will find both in ~10 commands without needing to observe runtime behavior. The observe_not_read lever is undermined because the bugs are literally readable from static files. Additionally, the task average score is (4+4+4+2+5)/5 = 3.8 which meets the average threshold, but genuine_difficulty scores 2 which is below the minimum-3 requirement per criterion.",
+  "fixes": [
+   "Make late_window bug non-obvious from static analysis: instead of a config value of 0, use a plausible-looking value like 30 (seconds) that is just barely too small to catch the out-of-order sequences in the corpus \u2014 agents would need to observe dropped-event log messages to find the right value, not just read the config",
+   "Obfuscate the bucket_floor bug: instead of a clear timezone conversion sequence, embed the bug in a utility function imported from a utility module that's less obviously wrong on inspection \u2014 e.g., a cached offset calculation that fails to refresh across DST transitions",
+   "Add a third subtle interaction: make the pipeline's flush_interval (30s) interact with late_window in a way that requires understanding all three values together, increasing the search space and making partial fixes less obvious",
+   "Strengthen the streaming-mode verification to not rely on inotify-specific checks: instead verify that the pipeline's SQLite writes occur incrementally (new rows appear within N seconds of log injection) rather than all at once after a batch run"
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Both involve log pipelines and SQLite, but the reference task is about fixing a GeoIP enrichment pipeline with wrong country counts and adding a missing API endpoint, while the candidate is about fixing out-of-order log handling and timezone-bucket boundary bugs in a metrics aggregation system."
+    },
+    {
+     "ref_id": "terminal-bench-pro/configure-apache-logging-and-rate-limit",
+     "verdict": "distinct",
+     "reason": "The reference is an Apache configuration task involving virtual hosts, rate limiting, and log format setup, completely unrelated to the candidate's metrics aggregation drift and out-of-order log attribution problem."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "The reference involves fixing ECDH session key derivation consistency between an encryptor and verifier for encrypted audit logs, which is a cryptographic protocol bug, not a metrics bucketing or log ordering problem."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference is about building an HTTP query service that wraps a compiled shared library for windowed aggregations, whereas the candidate is about fixing silent data drift caused by out-of-order log lines and timezone-offset bucket boundary bugs in an existing pipeline."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference involves reverse-engineering a binary normalizer's transformation and fixing SQL rollup queries for sensor data, a completely different problem domain and core challenge from the candidate's out-of-order log bucketing and timezone offset bug."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-8a6ed366c8a0",
+     0.208
+    ],
+    [
+     "terminal-bench-pro/configure-apache-logging-and-rate-limit",
+     0.149
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.145
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.142
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.116
+    ]
+   ],
+   "cost_usd": 0.017034
+  },
+  "novel": true
+ },
+ "cost_usd": 0.060498
+}

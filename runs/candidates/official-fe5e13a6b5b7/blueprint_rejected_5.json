@@ -1,0 +1,166 @@
+{
+ "blueprint": {
+  "slug": "fx-exposure-roll-aggregator",
+  "title": "FX Exposure Roll Aggregator",
+  "scenario": "A finance-ops team runs a small Rust service that reads daily trade blotters (CSV), computes per-currency net open exposure buckets, and writes summary rows to a SQLite database that the risk dashboard reads. A compiled shared library (`libexposure.so`, no source) handles the bucketing thresholds; the Rust codebase wires inputs to it and accumulates results. After a blotter format change three weeks ago, the daily numbers 'look roughly right' but the FX desk noticed that multi-leg trades with mixed buy/sell directions are sometimes mis-netted, and the 30-day roll always lands slightly off. The environment is ~1,400 lines across 6 Rust source files, a Python blotter generator, config files, and the opaque `.so`.",
+  "instruction_draft": "Hey \u2014 the exposure aggregator in `/app/aggregator` is producing wrong numbers for the risk dashboard. Run `cargo run -- --blotter /app/data/today.csv` and compare the `fx_exposure` table against the expected totals in `/app/data/expected.json`. Two things are broken: first, net exposure per currency is wrong for portfolios that have both buys and sells on the same currency pair in the same session; second, the '30d_roll_usd' column is always off by a systematic amount. Figure out what the service is actually supposed to compute (there's a reference binary at `/app/bin/refcalc` you can probe), fix the Rust source so all currency/bucket combinations match expected.json, and make sure a fresh run with any blotter the generator can produce also passes. Leave the database at `/app/data/exposure.db` in correct final state.",
+  "requirements": [
+   "Per-currency net open exposure is correctly computed for portfolios containing both buy and sell legs on the same currency pair in the same session (buys and sells must offset, not accumulate).",
+   "The '30d_roll_usd' column in the fx_exposure table matches the value produced by the reference binary /app/bin/refcalc for every currency bucket row.",
+   "The fx_exposure SQLite table at /app/data/exposure.db contains one row per (currency, bucket) pair matching expected.json after a fresh run.",
+   "A fresh run with a newly generated blotter (different random seed) also produces a passing fx_exposure table checked against refcalc output.",
+   "The Rust service exits 0 and writes all rows without silent truncation or missing currencies."
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm; installs rustup+cargo (stable), sqlite3, gcc, python3 packages (faker, pandas).",
+   "/app/aggregator/ \u2014 Rust workspace (~1400 lines, 6 files): main.rs, blotter.rs, accumulator.rs, reporter.rs, roll.rs, db.rs. The accumulator.rs has the netting bug: it sums abs(qty) instead of signed qty before taking net, so buy+sell inflates instead of cancels. The roll.rs applies a hardcoded USD/BPS conversion factor of 10000 instead of using the bucket midpoint the .so returns.",
+   "/app/bin/refcalc \u2014 compiled x86-64 ELF binary (no source). Accepts: `refcalc <currency> <bucket_label> <gross_notional> <buy_qty> <sell_qty>` and prints the correct net_exposure and 30d_roll_usd for that combination. The bucket threshold logic inside is non-trivial (tiered percentage bands, not visible in any source).",
+   "/app/lib/libexposure.so \u2014 compiled shared library used by the Rust code via FFI. Exports `bucket_label(currency: *const c_char, notional: f64) -> *const c_char` and `bucket_midpoint(label: *const c_char) -> f64`. The roll.rs file calls bucket_midpoint but then ignores its return value and uses a hardcoded constant \u2014 this is the second bug.",
+   "/app/data/today.csv \u2014 sample blotter with 80 trades across 6 currencies, including mixed buy/sell on EUR, JPY, GBP.",
+   "/app/data/expected.json \u2014 correct per-(currency,bucket) net_exposure and 30d_roll_usd values computed by running refcalc over the aggregated blotter.",
+   "/app/scripts/gen_blotter.py \u2014 deterministic blotter generator seeded by $SEED env var; verifier uses it with a fresh seed.",
+   "/app/aggregator/Cargo.toml pins specific versions; build is offline (vendored deps in /app/vendor/).",
+   "Misleading symptom: the service logs 'netting complete, 0 errors' even when the accumulator bug is active \u2014 the log message in accumulator.rs fires on row count, not value correctness.",
+   "Plausible noise: blotter.rs has a comment about a 'sign convention flip applied in v2 format' that was reverted but the comment was not removed \u2014 it suggests looking there first, but the actual bug is in accumulator.rs."
+  ],
+  "internal_hint": "Two independent bugs, both requiring runtime investigation to locate: (1) accumulator.rs sums abs(qty) before netting \u2014 visible only when a blotter has both buys and sells on the same pair (not obvious from reading alone because the abs() is inside a helper called 'normalise_leg' that sounds correct). Finding it requires running the aggregator on a mixed blotter and seeing that exposure grows instead of shrinks. (2) roll.rs calls bucket_midpoint() from the .so but discards the return value (assigned to an unused '_' binding in older Rust idiom) and uses a literal 10000.0 \u2014 the solver must probe refcalc with known inputs to discover the real formula, then find where roll.rs diverges. The opaque .so is the oracle; the solver must experiment with refcalc CLI to understand the relationship: 30d_roll_usd = net_exposure * bucket_midpoint / 365. The misleading symptom is that the per-currency totals look 'roughly right' for single-direction books (they are exact) \u2014 so shallow testing on a buy-only blotter would miss bug 1 entirely.",
+  "trap": "An agent that tests only on today.csv (which has currencies with predominantly one direction) will see nearly correct numbers and conclude bug 2 (roll formula) is the only issue. After fixing roll.rs, the hidden verifier runs a fresh mixed blotter with equal buy and sell volumes; exposure rows are then doubly inflated (bug 1 untouched) and 30d_roll_usd is also wrong. The agent must discover and fix both bugs independently. Additionally, agents that hardcode the roll formula from refcalc probes on a single bucket will fail on other buckets with different midpoints.",
+  "tests": [
+   "State check: /app/data/exposure.db fx_exposure table has exactly N rows (N = number of unique (currency, bucket) pairs in today.csv), each with net_exposure and 30d_roll_usd matching expected.json to within 0.01 USD.",
+   "Fresh-blotter check: verifier runs `SEED=<random_int> python3 /app/scripts/gen_blotter.py > /tmp/fresh.csv`, then `cargo run -- --blotter /tmp/fresh.csv`, then re-runs refcalc on every (currency, bucket) in the fresh blotter and asserts each db row matches refcalc output to within 0.01.",
+   "Netting correctness: verifier generates a blotter with exactly 100 buy lots and 100 sell lots on EUR/USD at the same notional; asserts net_exposure in db for EUR is ~0 (within 1 USD), not 200\u00d7 the single-leg value.",
+   "Roll formula correctness: verifier probes refcalc with three different bucket labels (small/mid/large) and verifies the db rows for those buckets use the correct midpoint-based formula, not the hardcoded 10000.",
+   "Exit code: `cargo run -- --blotter /app/data/today.csv` exits 0 with no panics in stderr."
+  ],
+  "verifier_knob": {
+   "name": "number_of_currency_bucket_pairs_checked",
+   "value": "6 currencies \u00d7 3 buckets = 18 pairs",
+   "effect": "Raising to more currencies/buckets forces the agent to discover the general roll formula (not just one midpoint value) and handle more mixed-direction edge cases; lowering to 2 currencies makes a partial fix passable."
+  },
+  "expected_failure_modes": [
+   "Agent fixes only the roll formula (bug 2) after probing refcalc, never discovers the accumulator netting bug (bug 1) because today.csv has mostly single-direction currencies.",
+   "Agent discovers both bugs conceptually but hardcodes the roll formula for only the bucket sizes in today.csv; fresh blotter with a different bucket distribution fails.",
+   "Agent notices the 'sign convention' comment in blotter.rs and spends effort there, never reaching accumulator.rs.",
+   "Agent fixes accumulator.rs correctly but introduces a rounding error in the fixed-point arithmetic when summing signed quantities, causing off-by-one cent errors on large positions.",
+   "Agent probes refcalc only once per currency, misses that bucket_midpoint varies by bucket tier, and applies a single averaged factor."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "sqlite",
+   "finance",
+   "opaque-binary",
+   "netting",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cargo run -- --blotter /app/data/today.csv (baseline run)",
+   "sqlite3 /app/data/exposure.db 'SELECT * FROM fx_exposure'",
+   "cat /app/data/expected.json (compare actual vs expected)",
+   "/app/bin/refcalc EUR bucket_small 1000000 100 0 (probe refcalc, single direction)",
+   "/app/bin/refcalc EUR bucket_small 1000000 50 50 (probe refcalc, mixed - should net to ~0)",
+   "Observe: refcalc returns net\u22480 for equal buy/sell \u2192 confirms netting bug exists",
+   "cat /app/aggregator/src/accumulator.rs (find abs(qty) in normalise_leg)",
+   "cat /app/aggregator/src/blotter.rs (check misleading sign-convention comment, rule out)",
+   "cat /app/aggregator/src/roll.rs (find hardcoded 10000.0 and unused _ binding from bucket_midpoint)",
+   "/app/bin/refcalc EUR bucket_mid 5000000 200 0 (probe second bucket tier for roll formula)",
+   "/app/bin/refcalc EUR bucket_large 50000000 200 0 (probe third bucket tier)",
+   "Derive formula: 30d_roll_usd = net_exposure * bucket_midpoint / 365",
+   "Edit accumulator.rs: change abs(qty) to signed qty in normalise_leg",
+   "Edit roll.rs: replace hardcoded 10000.0 with bucket_midpoint() return value, apply /365 factor",
+   "cargo build (verify compiles)",
+   "cargo run -- --blotter /app/data/today.csv",
+   "sqlite3 /app/data/exposure.db 'SELECT * FROM fx_exposure' (compare against expected.json)",
+   "SEED=999 python3 /app/scripts/gen_blotter.py > /tmp/fresh.csv",
+   "cargo run -- --blotter /tmp/fresh.csv",
+   "sqlite3 /app/data/exposure.db 'SELECT * FROM fx_exposure' (verify fresh blotter rows)"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "refcalc is x86-64 ELF only - fails silently or with exec error on ARM-based CI runners (M1/M2 Mac, ARM Linux)",
+   "Rust first-time compilation of 1400 lines + vendored deps on 1 CPU/2GB RAM may take 8-15 minutes, exceeding the implied time budget",
+   "0.01 USD tolerance may be violated by floating-point accumulation differences between refcalc (likely C double) and Rust f64 on large positions with many legs",
+   "libexposure.so built for a specific glibc version may fail to load in python:3.13-slim-bookworm if symbol versions mismatch",
+   "refcalc CLI argument format is specified in the blueprint but not in the solver-visible environment - if actual binary differs (e.g., uses flags instead of positional args), all probing commands fail"
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a well-designed dual-bug structure where the trap (single-direction blotter masking bug 1) and opaque oracle requirement genuinely challenge frontier agents, the verifier suite is deterministic and cheat-resistant (fresh-blotter check defeats DB-stuffing), and the scenario is coherent finance-ops engineering. The speedrun lands at ~20 commands but requires experimental characterization of both bugs making shallow solutions fail the fresh-blotter and netting-correctness checks. The main risks are the x86-64-only refcalc binary (ARM runner incompatibility) and Rust build time on constrained hardware, which should be explicitly addressed in the build spec.",
+  "fixes": [
+   "Explicitly specify that the CI/verify environment is x86-64 Linux, or provide an ARM-compatible refcalc build, since the task's oracle binary is the single hardest dependency to substitute",
+   "Add a pre-built Rust artifact cache or split the Cargo.lock + vendor setup to guarantee sub-2-minute build times on 1 CPU/2GB RAM, or increase the time budget to 90 minutes",
+   "Tighten the refcalc CLI invocation format in the environment spec (show exact argument order and output format) so agents don't waste commands reverse-engineering the binary interface",
+   "Increase the tolerance to 0.10 USD or document the expected floating-point arithmetic model to prevent spurious failures on large-notional positions near bucket boundaries"
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/fin-saccr-rwa",
+     "verdict": "distinct",
+     "reason": "SA-CCR/RWA capital calculation under CRR3 is a completely different financial computation from FX net exposure aggregation and 30-day roll bucketing."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a Rust pipeline that reads input data, computes statistics via an opaque reference binary/library, and writes results to SQLite \u2014 the core debugging approach (probe reference binary, fix source to match) is essentially identical, differing only in domain (sensor vs. FX trade data)."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "Regional sales weighted aggregation with a config-driven weight cache is a simpler, different bug pattern from multi-leg FX netting and 30-day roll computation against an opaque shared library."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "NetFlow v9 binary parsing with dynamic template state and CIDR ASN lookup is a different problem domain and debugging challenge from FX trade netting and roll bucketing."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Building an HTTP query service with windowed log aggregations over a shared library is a different task from fixing FX exposure netting and roll computation in a batch Rust pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/fin-saccr-rwa",
+     0.164
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.161
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.144
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.129
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.123
+    ]
+   ],
+   "cost_usd": 0.015210000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.062457000000000006
+}

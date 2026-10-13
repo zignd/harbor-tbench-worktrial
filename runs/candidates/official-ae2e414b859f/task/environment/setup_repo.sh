@@ -141,6 +141,6 @@ git tag v0.3.0
 echo "Repository setup complete."
 git --no-pager log --oneline --all
 
-# Pin dependencies for Rust 1.82 compatibility
-cd /app/repo
-cargo update clap --precise 4.5.0
+
+# Pin textwrap to version compatible with Rust 1.82
+cd /app/repo && cargo update textwrap --precise 0.16.0

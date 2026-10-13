@@ -1,0 +1,164 @@
+{
+ "blueprint": {
+  "slug": "fx-settlement-accumulator-repair",
+  "title": "FX Settlement Accumulator Repair",
+  "scenario": "A small finance-ops team runs a Rust service called `ledger-reconciler` that ingests daily FX trade files and produces a per-currency net settlement position. The service ships as a pre-compiled binary (`reconciler`) alongside ~1,400 lines of Rust source covering ingestion, aggregation, and reporting. A silent regression means the netting figures have been wrong for two weeks, but the daily health-check passes because it only validates row counts, not numeric totals. A colleague has noticed the EUR/USD cross-rate positions are suspiciously small.",
+  "instruction_draft": "Hey \u2014 I need you to fix the ledger-reconciler service in /app. The daily file processor runs fine and says it reconciled everything, but finance keeps finding that the net settlement positions written to /app/output/positions.csv are wrong. The EUR and USD columns in particular look off. The binary at /app/bin/reconciler is what actually does the heavy lifting (the Rust source in /app/src/ is the rest of the pipeline around it), so you'll need to figure out what it does by running it. Once you know what it's computing, fix the pipeline so that /app/output/positions.csv has the correct net position per currency: each position must equal the sum of all BUY notionals minus the sum of all SELL notionals for that currency across all trades in /app/data/trades.csv, with values rounded to 2 decimal places. The pipeline is triggered by running `make reconcile` from /app.",
+  "requirements": [
+   "Running `make reconcile` from /app completes without error.",
+   "The file /app/output/positions.csv exists after running `make reconcile`.",
+   "Each row in positions.csv represents one currency and contains the correct net position: sum(BUY notionals) - sum(SELL notionals) for that currency, rounded to 2 decimal places.",
+   "No currency present in trades.csv is missing from positions.csv.",
+   "The reconciler binary at /app/bin/reconciler must still be invoked as part of the pipeline (it performs a required transformation step \u2014 its output must be consumed).",
+   "positions.csv must use the column header format: currency,net_position"
+  ],
+  "environment": [
+   "Dockerfile FROM python:3.13-slim-bookworm installs rustc, cargo, make, and Python 3.",
+   "/app/bin/reconciler is a pre-compiled Rust binary (compiled from hidden source, not included in /app/src/). It reads a CSV of trades from stdin or a file argument, applies an intermediate transformation, and writes intermediate results. The binary applies a non-obvious scaling: it converts notional amounts by dividing by a currency-specific lot size before summing \u2014 the lot sizes are embedded in the binary (EUR=100000, USD=100000, GBP=100000, JPY=1000000, CHF=100000). Its output is per-currency raw_sum values (already divided by lot size), NOT the final net positions.",
+   "/app/src/ contains ~1,400 lines of Rust: an ingestion layer (parse trades.csv, validate fields), a reporting layer (read reconciler output, write positions.csv), and a thin orchestration main.rs. The reporting layer currently writes the reconciler's raw_sum values directly to positions.csv as if they were net positions \u2014 it does NOT multiply back by lot size.",
+   "/app/data/trades.csv contains ~800 rows: trade_id, currency, side (BUY/SELL), notional (a decimal number representing full currency units). The file includes trades in EUR, USD, GBP, JPY, CHF.",
+   "/app/Makefile has a `reconcile` target that: (1) runs the Rust ingestion/reporting pipeline via `cargo run`, which internally calls /app/bin/reconciler as a subprocess, (2) writes output to /app/output/positions.csv.",
+   "A /app/bin/reconciler.md file says 'reconciler: intermediate aggregation tool, outputs per-currency sums' \u2014 deliberately vague about the lot-size division.",
+   "The misleading symptom: the daily health-check script /app/scripts/health_check.py validates that the number of currencies in positions.csv matches trades.csv \u2014 this passes \u2014 so the symptom appears to be 'missing currencies' when in fact the values are wrong by a factor of 100000.",
+   "A /app/logs/reconciler_2024-01-15.log shows 'Reconciliation complete: 5 currencies, 800 trades processed' \u2014 no mention of lot sizes.",
+   "The /app/src/reporting.rs contains a TODO comment: 'TODO: verify units match expectations' \u2014 a planted breadcrumb that the unit conversion is the issue area.",
+   "/app/output/ directory exists but positions.csv may be stale or absent initially.",
+   "trades.csv is generated deterministically from a seed so verify-time inputs can be regenerated."
+  ],
+  "internal_hint": "Difficulty comes from two interacting levers: (1) opaque_component \u2014 the binary does a lot-size division that is not documented and must be discovered by experiment (feed known inputs, observe outputs, compute the ratio). (2) misleading_symptom \u2014 the health check reports 'row count OK' so the naive reading is 'currencies are missing', but the real bug is that reporting.rs uses the reconciler's already-divided raw_sum values as final positions without multiplying back by lot size. The fix is in /app/src/reporting.rs: after reading the reconciler's output, multiply each raw_sum by the currency's lot size (EUR/USD/GBP/CHF: 100000, JPY: 1000000) to recover the true notional net position, then round to 2dp. The solver must: (a) run the binary on known synthetic data to characterise the lot-size division, (b) identify that the reporting layer is the broken component (not the binary, not the ingestion), (c) implement the correct inverse scaling in reporting.rs. A solver who fixes the ingestion layer or tries to replace the binary will pass the row-count check but fail numeric verification.",
+  "trap": "The health-check passes on row counts, so a solver who probes shallowly (checks that 5 currencies appear in output) concludes the fix worked. The verifier generates fresh trade data with known BUY/SELL totals per currency and checks that positions.csv numeric values match the correct net (full notional units, 2dp). A solver who discovers the lot-size issue but applies a single uniform multiplier of 100000 will be wrong for JPY (needs 1000000). A solver who patches the binary invocation flags rather than the reporting layer will also fail because the binary's division is always applied \u2014 it cannot be bypassed.",
+  "tests": [
+   "Run `make reconcile` and assert exit code 0.",
+   "Assert /app/output/positions.csv exists and has header row 'currency,net_position'.",
+   "For each currency in the verifier-generated trades.csv, compute expected_net = sum(BUY notionals) - sum(SELL notionals) rounded to 2dp. Assert the value in positions.csv matches within 0.01.",
+   "Assert all 5 currencies (EUR, USD, GBP, JPY, CHF) appear in positions.csv.",
+   "Feed a synthetic probe input with exactly 2 EUR BUY trades of 100000 each and 1 EUR SELL trade of 50000 \u2014 expected EUR net_position is 150000.00. Assert positions.csv contains this value (not 1.50, which would indicate the lot-size division was not reversed).",
+   "Assert that /app/bin/reconciler is still invoked during `make reconcile` (check that reporting.rs still calls it as a subprocess, not that the binary is replaced \u2014 verified by confirming reconciler process appears in strace or by checking that removing the binary causes make to fail)."
+  ],
+  "verifier_knob": {
+   "name": "number_of_currencies_with_hidden_lot_sizes",
+   "value": "5 currencies, 2 distinct lot sizes (100000 and 1000000)",
+   "effect": "Adding more currencies with distinct lot sizes (e.g., KRW at 10000000) increases the number of independent numeric properties checked and the cost of getting the scaling wrong for any one currency; reducing to 2 currencies with identical lot sizes makes the task easier because a uniform multiplier works"
+  },
+  "expected_failure_modes": [
+   "Agent characterises the binary correctly (discovers lot-size division) but applies a uniform 100000 multiplier and gets JPY wrong by a factor of 10.",
+   "Agent focuses on the misleading symptom (health-check says row count OK) and patches the ingestion layer without investigating the binary's output format, leaving positions.csv values wrong by ~100000x.",
+   "Agent replaces or bypasses the binary rather than correcting the reporting layer, then discovers the binary is still required, loses time rebuilding.",
+   "Agent correctly identifies the lot-size issue and fixes reporting.rs but rounds intermediate values (before summing) rather than the final sum, causing off-by-one errors on large JPY positions.",
+   "Agent patches reporting.rs but hard-codes only EUR and USD lot sizes (the two currencies mentioned in the scenario), failing for GBP, JPY, CHF in the hidden verifier test."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "rust",
+   "finance",
+   "opaque-binary",
+   "unit-conversion",
+   "reconciliation",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /app/src/reporting.rs  # find TODO, see raw_sum written directly to positions.csv",
+   "cat /app/data/trades.csv | head -5  # understand CSV format",
+   "printf 'trade_id,currency,side,notional\\n1,EUR,BUY,100000\\n2,EUR,BUY,100000\\n3,EUR,SELL,50000\\n' > /tmp/probe.csv",
+   "/app/bin/reconciler /tmp/probe.csv  # observe EUR raw_sum ~= 1.5 \u2192 lot_size = 100000",
+   "printf 'trade_id,currency,side,notional\\n1,JPY,BUY,1000000\\n2,JPY,SELL,500000\\n' > /tmp/probe_jpy.csv",
+   "/app/bin/reconciler /tmp/probe_jpy.csv  # observe JPY raw_sum ~= 0.5 \u2192 lot_size = 1000000",
+   "cat /app/Cargo.toml  # confirm project structure",
+   "cat /app/src/main.rs  # confirm orchestration calls reporting",
+   "# Edit reporting.rs: add lot_size map {EUR:100000, USD:100000, GBP:100000, CHF:100000, JPY:1000000}",
+   "# In reporting.rs: net_position = raw_sum * lot_size, rounded to 2dp",
+   "sed -i or $EDITOR /app/src/reporting.rs  # apply fix",
+   "make -C /app reconcile  # triggers cargo run which calls reconciler binary",
+   "cat /app/output/positions.csv  # verify all 5 currencies, spot-check EUR value",
+   "python3 -c \"import csv; ...  # manually verify EUR net from trades.csv matches positions.csv\"",
+   "# Done"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The strace-based binary-invocation check may fail if strace is not installed in python:3.13-slim-bookworm; the fallback (removing binary causes failure) is more reliable but could have timing/path issues.",
+   "Cargo compilation of ~1400 lines with potential dependencies may be slow or exceed memory on 1 CPU/2GB, causing intermittent timeout failures unrelated to solver correctness.",
+   "The reconciler binary's input interface ('stdin or a file argument') is underspecified in the instruction; if the binary requires a specific flag format, probe attempts could silently fail or produce confusing output.",
+   "If reporting.rs imports or re-exports types from a shared crate alongside the binary, changes to reporting.rs might require touching other source files, making the fix scope unclear.",
+   "The TODO comment ('TODO: verify units match expectations') is a planted breadcrumb that makes the task significantly easier for a careful source-reader, reducing discriminative power between shallow and deep agents."
+  ],
+  "verdict": "reject",
+  "reasons": "The genuine_difficulty score of 2 falls below the required minimum of 3, and the average across all scores is (4+4+5+2+5)/5 = 4.0 which meets the average threshold, but the per-criterion floor of 3 is violated. The core bug is directly telegraphed by a TODO comment in reporting.rs and a 15-command speedrun suffices for a strong agent reading source first; the JPY trap adds one probe step but does not substantially raise difficulty. To be accepted, the task needs to obscure the bug location more effectively\u2014removing the TODO breadcrumb, splitting the bug across multiple files, or making the source less obviously incriminating.",
+  "fixes": [
+   "Remove or neutralize the TODO comment in reporting.rs ('TODO: verify units match expectations') \u2014 it directly points at the bug and makes source-reading sufficient to identify the fix without probing the binary.",
+   "Add a second misleading layer: make reporting.rs appear to do a unit conversion (e.g., multiply by a wrong constant like 1000 instead of 100000/1000000), so an agent reading the source sees an attempt at conversion but still needs to probe the binary to find the correct lot sizes.",
+   "Increase the number of interacting components: e.g., the ingestion layer performs a partial normalization that partially cancels the binary's division for some currencies but not others, making a single multiplier fix insufficient and forcing deeper cross-component tracing.",
+   "Replace the strace-based binary invocation check with a more reliable mechanism, such as the binary writing a sentinel file or log entry that the verifier checks, to eliminate environmental flakiness."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench/fin-saccr-rwa",
+     "verdict": "distinct",
+     "reason": "SA-CCR/RWA capital calculation under CRR3 is a completely different financial computation from FX trade netting/settlement position aggregation."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "That task is about fixing chunked CSV pipeline row deduplication and chunk-boundary bugs; this task is about diagnosing a silent numeric regression in FX settlement netting logic with a black-box binary involved."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "variant",
+     "reason": "Both tasks involve fixing a silent numeric aggregation bug in a financial/network settlement pipeline where per-entity totals are wrong and the health check passes, requiring the agent to understand the existing computation and correct the output CSV."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "That task requires fixing Rust source to match a reference binary's fixed-point statistics; this task involves a black-box binary whose output must be consumed while fixing surrounding pipeline logic to produce correct FX net positions."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "That task is about building an HTTP query service integrating a compiled shared library; this task is about debugging a silent numeric regression in an FX settlement aggregation pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench/fin-saccr-rwa",
+     0.216
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.165
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.145
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.129
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.122
+    ]
+   ],
+   "cost_usd": 0.014934000000000001
+  },
+  "novel": false
+ },
+ "cost_usd": 0.05991300000000001
+}

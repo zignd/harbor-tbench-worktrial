@@ -9,7 +9,7 @@
 // Options:
 //   --count N          Total metric records to generate (default: 200)
 //   --start-index I    First window index (default: 0)
-//   --start-ts T       Window 0 start timestamp in ms (default: 1700000010000)
+//   --start-ts T       Window 0 start timestamp in ms (default: 1699900000000)
 //   --log-dir DIR      Output directory for log files
 //   --verify           Verify logs after generation; exit 1 if any fail
 //   --dashboard FILE   Write JSON verification dashboard to FILE
@@ -27,7 +27,7 @@ function parseArgs(argv) {
   const args = {
     count: 200,
     startIndex: 0,
-    startTs: 1700000010000,
+    startTs: 1699900000000,
     logDir: null,
     verify: false,
     dashboardOut: null,

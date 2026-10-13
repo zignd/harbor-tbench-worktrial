@@ -122,9 +122,28 @@ Two audit candidates were brought to full quality approval; approval also requir
 | `optimize-policy-decision-audit` | pass (1 advice) | pass | 4 passes / 5 | no (too easy) | no |
 | `repair-attributed-funnel-service` | pass (0 findings) | pass | 4 real + 1 turn-cap invalid | incomplete | no |
 
-`output/` is therefore **empty**, and `docs/result/verification.json` records `overall_status: "failed"` rather than `"passed"`. Three quality-clean, functionally-correct packages exist, and each fails the *learnable band* on honest measurement. Two candidate explanations, both supported by the evidence: (a) the difficulty levers that produced in-band results — chiefly a stated wall-clock budget — are exactly the ones the rubric forbids, so the pipeline currently has no admissible lever that reliably lands 1–3/5; and (b) the calibration solver's outcome distribution for these packages is bimodal and, at `max_turns = 100`, occasionally lands in a turn-cap regime that the rules correctly discard.
+`output/` now holds **five audited packages for inspection**, each with its own `calibration.json` and `verification.json`, and **none of them is approved**. `docs/result/verification.json` records `overall_status: "failed"` and `approved_tasks: []`.
 
-The alternative — shipping one of these three with a recorded advisory override, or with the turn-cap trial counted as a failure — would reproduce precisely the defects this audit exists to eliminate, so it was rejected.
+| Package in `output/` | Quality | Structure / oracle / nop | Calibration (GPT-5.4-mini) | Approved |
+|---|---|---|---|---|
+| `repair-attributed-funnel-service` | pass, **0 blocking / 0 advice** | pass / 3/3 / 0 | **5/5** (≈78% over 9 valid trials) | no — too easy |
+| `optimize-policy-decision-audit` | pass (1 advice) | pass / 3/3 / 0 | **4/5** | no — too easy |
+| `repair-reproducible-release-packager` | pass (2 advice) | pass / 3/3 / 0 | **0/5** | no — too hard |
+| `repair-log-replay-sql` | pass | pass / 3/3 / 0 | 5 attempts, 0 valid passes | no — too hard |
+| `global-settlement-reconciliation` | pass | pass / 3/3 / 0 | **5/5** | no — too easy |
+
+A directory in `output/` is **not** an approval: `analysis/report.py` counts a task as shipped only
+when `analysis/package_evidence.approval_errors()` is empty *and* its `verification.json` says
+`status: "passed"`, so listing these packages cannot inflate the shipped count. Two candidate
+explanations for the band failure are supported by the evidence: (a) the difficulty levers that
+produced in-band results — chiefly a stated wall-clock budget — are exactly the ones the rubric
+forbids, so the pipeline currently has no admissible lever that reliably lands 1–3/5; and (b) the
+calibration solver's outcome distribution is strongly bimodal (0/5, 4/5 or 5/5), with an in-band
+plateau largely absent for this pairing.
+
+The alternative — approving one of these five with a recorded advisory override, or with a
+turn-cap trial counted as a failure — would reproduce precisely the defects this audit exists to
+eliminate, so it was rejected.
 
 The final per-task verdict, package hashes and check results are in `docs/result/verification.json`. If neither lands 1–3 with valid failures after repair, **no task is approved** and this document states that plainly rather than shipping a weak task.
 

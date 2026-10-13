@@ -120,6 +120,25 @@ def main() -> int:
             }
         )
 
+    published = []
+    for task in sorted(p for p in Path(OUTPUT_DIR).iterdir() if p.is_dir()):
+        v = json.loads((task / "verification.json").read_text())
+        c = json.loads((task / "calibration.json").read_text())
+        published.append(
+            {
+                "task": task.name,
+                "package_hash": v.get("package_hash"),
+                "approved": v.get("approved"),
+                "status": v.get("status"),
+                "verdict": v.get("verdict"),
+                "judged_attempts": v.get("judged_attempts"),
+                "legit_passes": v.get("legit_passes"),
+                "why_not_approved": v.get("why_not_approved"),
+                "quality_blocking_failures": v.get("quality_blocking_failures", []),
+                "calibration_evidence": f"output/{task.name}/calibration.json",
+            }
+        )
+
     manifest = {
         "overall_status": "passed" if (checks_ok and tests_ok and tasks) else "failed",
         "revision": revision,
@@ -127,6 +146,13 @@ def main() -> int:
         "models": MODEL_LABEL,
         "novelty_sets": ["terminal-bench-2-1", "examples"],
         "approved_tasks": tasks,
+        "output_packages": published,
+        "output_packages_note": (
+            "Task packages placed in output/ for inspection. A directory is "
+            "not an approval: each carries its own calibration and "
+            "verification record, and approved_tasks stays empty because "
+            "none lands in the 1-3/5 band."
+        ),
         "quarantined_candidates": quarantined,
         "quarantine_note": (
             "Quality-clean, gate-clean packages that failed the learnable band. "

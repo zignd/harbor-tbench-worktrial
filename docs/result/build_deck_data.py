@@ -70,6 +70,7 @@ def build() -> dict:
         },
         "spend": {"conservative": 215.96, "remaining": 284.04, "this_run_ledger": 16.47},
         "approved_tasks": verification.get("approved_tasks", []),
+        "output_packages": verification.get("output_packages", []),
         "requirements": verification.get("requirements", {}),
     }
 
@@ -82,10 +83,14 @@ def slides(d: dict) -> list[str]:
         f"<p><span class='tag'>approved</span> {html.escape(', '.join(t['task'] for t in approved))}</p>"
         if approved
         else (
-            "<p class='warn'>No task approved. Three quality-clean packages measured out of band:</p>"
-            "<ul><li>releaseforge &mdash; <b>0/5</b> too hard</li>"
-            "<li>optimize-policy-decision-audit &mdash; <b>4/5</b> too easy</li>"
-            "<li>repair-attributed-funnel-service &mdash; <b>2 passes</b>, one trial hit the turn cap (invalid)</li></ul>"
+            "<p class='warn'>No task approved: none lands in the 1-3/5 band.</p>"
+            "<p>Five audited packages sit in <code>output/</code>, each with its calibration and "
+            "verification record:</p><ul>"
+            + "".join(
+                f"<li>{html.escape(x['task'])} &mdash; <b>{html.escape(str(x['verdict']))}</b></li>"
+                for x in d["output_packages"]
+            )
+            + "</ul>"
         )
     )
     problem = (

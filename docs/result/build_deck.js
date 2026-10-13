@@ -126,7 +126,7 @@ bullets(s, ["Approval = content-hash-bound calibration + verification record ins
   "Independent oracle 3/3 and nop re-run; verification is offline at build time.",
   "Reports use only the declared model pair; stale-version gate successes do not count.",
   "Turn-cap exhaustion is invalid — even when the verifier reward is 1.",
-  "Result: all four earlier 'shipped' tasks failed this audit, so output/ is empty on purpose."]);
+  "output/ holds 5 audited packages; none is approved because none lands in the 1-3/5 band."]);
 notes(s, "These rules are enforced in code and unit-tested after the audit.");
 
 // 9 stretch

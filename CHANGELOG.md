@@ -4,6 +4,10 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 09:12 -03:00 · Difficulty-by-construction levers
+- **What:** three new spec levers (`hidden_seed_instances`, `multi_stage_dependency`, `large_state_scale`) and a "Difficulty by construction" block in the blueprint prompt: the answer follows from a generator or reference the author controls (verify-time instances from a hidden seed, dependent stages, thousands of records, a shallow-self-check trap whose property is stated in the instruction), not from out-thinking the solver. The blueprint and tuner prompts now say the solver is "as capable as you" instead of "Opus class".
+- **Why:** an author as strong as the solver can't rely on tricks; the 9 earlier calibrations showed readable bugs are not difficulty. Forbidden levers are unchanged (hidden limits, timeouts, format fussiness, unstated requirements). 158 tests pass.
+
 ### 09:10 -03:00 · Novelty pool and model labels (code)
 - **Novelty pool:** `NOVELTY_SETS` (comma-separated set names under `data/tb-reference/`; empty = all) selects the published sets for every novelty layer, since they all go through `validator/novelty.load_reference`; `examples/` is always included. `.env` sets `terminal-bench-2-1` for this run (89 tasks), and `analysis/report.py` prints the sets used. Tested: an excluded set no longer flags a near-copy, an included one does. Thresholds unchanged (the 2.1-only corpus has p90 nearest-neighbour cosine 0.48).
 - **Model labels:** `config.MODEL_LABEL` ("generation|calibration") is stored on every new ledger event (`Event.models`; old events read as the Sonnet/Opus legacy label), in `runs/candidates/<id>/models.json`, in calibration records and in shipped-task READMEs. `analysis/report.py` and the watch ETA use only the configured pair, so Sonnet -> Opus and gemini-3.8-flash results never mix in one funnel or estimate. `assert_official_models()` now accepts the configured pair and still refuses dev mode.

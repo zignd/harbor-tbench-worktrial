@@ -30,7 +30,7 @@ BLUEPRINT_PROMPT = """Design ONE original Terminal-Bench task from the coordinat
 {spec}
 
 ## Difficulty target
-The solver is a frontier model (Claude Opus class) working alone in a Linux container for up to an
+The solver is a strong frontier model, as capable as you are, working alone in a Linux container for up to an
 hour with full root access. The task must be solved in only 1-3 out of 5 attempts: hard enough that
 it often fails, possible enough that it sometimes succeeds. Anything an average undergraduate could do
 in a few days is too easy. Difficulty must come from the problem itself, never from format fussiness,
@@ -54,6 +54,16 @@ The task MUST get its difficulty from at least one of these, and the internal_hi
   silently corrupts later results and the solver has to notice.
 - Domain reasoning (numerics, protocols, scheduling, formats) where plausible solutions are subtly
   wrong on cases the samples don't show.
+
+Difficulty by construction (preferred when you are as strong as the solver, since you cannot out-think
+it): build the difficulty into the task with code you control. The answer must follow from a generator or
+reference you write, not from a clever trick the solver might also see:
+- Verify-time instances from a hidden seed (tests build fresh inputs and compare against your reference),
+  so only a correct general solution passes.
+- Three or more dependent stages, so a small early error compounds into a wrong final result.
+- Scale: thousands of records or files, with rare cases that sampling by eye misses.
+- A trap where the natural self-check (the visible examples, a quick run) passes but a property only the
+  hidden tests check fails. State that property as an observable requirement in the instruction.
 
 And what makes strong agents fail for valid reasons once it is hard:
 - They verify shallowly: they check the provided sample and stop. Make correctness hinge on cases the

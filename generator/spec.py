@@ -129,6 +129,20 @@ LEVERS = {
     "build_component": "a non-trivial missing component must be built and passes hidden inputs",
     "opaque_component": "a compiled or black-box component must be characterised by experiment",
     "ordered_procedure": "a multi-step recovery/migration where an early wrong step corrupts later ones",
+    # Difficulty by construction: the answer follows from a generator the author controls, not
+    # from out-thinking the solver.
+    "hidden_seed_instances": (
+        "tests build fresh instances from a hidden seed at verify time, so only a correct general "
+        "solution passes; no hand-made answer or memorised sample works"
+    ),
+    "multi_stage_dependency": (
+        "three or more dependent stages where each stage's output feeds the next and an early "
+        "small error compounds into a wrong final result"
+    ),
+    "large_state_scale": (
+        "many files, rows or events (thousands) that must be handled systematically; sampling a few "
+        "by eye misses the rare cases the tests check"
+    ),
 }
 STYLES = {
     "minimal": "one to three plain sentences stating the goal",

@@ -35,3 +35,14 @@ def test_prompt_and_id():
     assert spec.domain in text and "Difficulty levers" in text
     assert len(spec.spec_id) == 12
     assert TaskSpec(**spec.model_dump()).spec_id == spec.spec_id
+
+
+def test_construction_levers_exist_and_reach_the_blueprint_prompt():
+    from generator import blueprint
+    from generator.spec import LEVERS
+
+    new = ("hidden_seed_instances", "multi_stage_dependency", "large_state_scale")
+    assert all(k in LEVERS for k in new)
+    assert "Difficulty by construction" in blueprint.BLUEPRINT_PROMPT
+    spec = sample_specs(1, 3)[0].model_copy(update={"levers": list(new[:2])})
+    assert "hidden_seed_instances" in spec.to_prompt()

@@ -24,7 +24,7 @@ from analysis.llm import chat, extract_json
 from generator.config import TUNE_BREADTH
 from generator.spec import LEVERS
 
-PLAN_PROMPT = """You tune the difficulty of a Terminal-Bench task. A frontier agent (Claude Opus class) must solve
+PLAN_PROMPT = """You tune the difficulty of a Terminal-Bench task. A frontier agent as capable as you must solve
 it in exactly 1-3 of 5 attempts. Current result: {summary} -> the task is {verdict}.
 
 Blueprint:
@@ -45,7 +45,8 @@ Available levers: {levers}
 Rules:
 - The instruction must still state every requirement the tests check. No hidden traps, no format fussiness,
   no hidden resource or time limits.
-- To make it HARDER: more or nastier verify-time cases, a stricter threshold that is stated in the
+- To make it HARDER: build difficulty in with code you control (verify-time instances from a hidden seed,
+  more dependent stages, larger scale, rare cases), more or nastier verify-time cases, a stricter threshold that is stated in the
   instruction, an extra interacting cause, or removing a hint the environment gives away.
 - To make it EASIER: fewer interacting causes, a clearer symptom in the environment (log line, error
   message), or a looser stated threshold. Never stop testing the core requirement.

@@ -1,0 +1,1 @@
+The v2 design replaced independent line rounding with group apportionment. Chargebacks remain signed members of their original settlement group. Records may be interleaved; release output is normalized for reproducibility.

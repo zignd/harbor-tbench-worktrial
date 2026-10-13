@@ -1,0 +1,2 @@
+# Version 2 format
+Ledger records are pipe-delimited and use the twelve fields in the command contract. Rates are exact rational destination-minor conversion. Group identity includes batch, account, group, and destination currency. Signed Hamilton allocation uses mathematical floors, nearest-even group rounding, and stable line-id remainder order. Split records are complete child sets and their amounts conserve the parent amount.

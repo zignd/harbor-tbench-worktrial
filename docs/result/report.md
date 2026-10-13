@@ -464,13 +464,62 @@ consuming the tasks it produces.
 uv sync
 cp .env.example .env            # set OPENROUTER_API_KEY
 make tb-reference               # optional; the run uses NOVELTY_SETS=terminal-bench-2-1
-bash scripts/validate.sh <task>
-uv run --env-file .env harbor run -p <task> -a oracle -k 3 -n 1
-uv run --env-file .env harbor run -p <task> -a nop
-uv run --env-file .env python -m analysis.report
 ```
 
----
+### Re-verify the approved task (no model calls, no new spend)
+
+```bash
+bash scripts/validate.sh output/optimize-policy-decision-audit
+uv run --env-file .env harbor run -p output/optimize-policy-decision-audit -a oracle -k 3 -n 1
+uv run --env-file .env harbor run -p output/optimize-policy-decision-audit -a nop
+```
+
+### Rebuild every derived artifact from committed sources
+
+These four commands regenerate the report, the manifest and both decks. They make **no model
+calls and start no Docker builds**, and are verified to produce byte-identical output for the same
+commit:
+
+```bash
+uv run --env-file .env python -m analysis.report          # reports/summary.md + summary.json
+uv run --env-file .env python -m scripts.audit_verify      # docs/result/verification.json
+uv run python -m docs.result.build_deck_data               # deck_data.json + presentation.html
+NODE_PATH=<pptxgenjs node_modules> node docs/result/build_deck.js   # presentation.pptx
+```
+
+### Re-run the evidence that the audit rests on (these do spend money)
+
+```bash
+# strict quality rubric (blocking findings decide approval)
+QUALITY_ADVICE_ONLY= uv run --env-file .env python -c \
+  "from pathlib import Path; from evaluator.quality import run_check; import json; \
+   print(json.dumps(run_check(Path('output/optimize-policy-decision-audit'),'recheck'),indent=1))"
+
+# five judged calibration attempts, no curtailment
+OPUS_CONCURRENCY=3 MAX_TURNS=100 uv run --env-file .env python -m scripts.audit_calibrate \
+  output/optimize-policy-decision-audit /tmp/recalibration.json
+
+# decision rule over two or more independent batches
+uv run --env-file .env python -m scripts.audit_pool output/optimize-policy-decision-audit \
+  /tmp/pooled.json docs/result/evidence/policyfinal-calibration.json \
+  docs/result/evidence/policyfinal-calibration-batch2.json
+
+# blinded discrimination experiment (stretch D)
+uv run --env-file .env python -m scripts.audit_discrimination
+```
+
+### Verify from a fresh clone (no local `.env`, no embedded `.git`, no cached images)
+
+```bash
+uv run --env-file .env python -m scripts.audit_freshclone docs/result/evidence/fresh-clone.json
+```
+
+### Reproduce the stretch analyses from the ledger
+
+```bash
+uv run python -m scripts.audit_deck_consistency   # deck/report numbers vs evidence (also in make lint)
+uv run python -c "from analysis.curtailment import table; print(table())"   # stretch A simulation
+```
 
 ## 15. References
 

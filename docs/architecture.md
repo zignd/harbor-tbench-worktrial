@@ -1,15 +1,28 @@
 # Architecture, decisions and Q&A
 
-A presentation-oriented guide to the task-generation pipeline. For the full plan and checklist see `docs/plan.md`, for measured Harbor behavior see `docs/harbor-notes.md`, and for the dated log of what changed and why see `CHANGELOG.md`. Numbers here are as of 2026-10-12 and get refreshed from `reports/summary.md`.
+A presentation-oriented guide to the task-generation pipeline. For the full plan and checklist see `docs/plan.md`, for measured Harbor behavior see `docs/harbor-notes.md`, and for the dated log of what changed and why see `CHANGELOG.md`.
+
+> **Current audited state (2026-10-13).** The diagrams and defaults below describe the *original* pairing
+> (`claude-sonnet-4.6` author, `claude-opus-4.8` calibration), which the code still defaults to. **This run
+> used a different, user-approved pairing**: `openai/gpt-5.6-luna` for authoring, review, judging and
+> red-team, and `openrouter/openai/gpt-5.4-mini` (terminus-2) for calibration. Models are configurable per
+> `AGENTS.md`; the defaults were not changed. Any pass count is relative to its calibration model, and
+> results from different model pairs are never pooled.
+>
+> The audited outcome is in `docs/result/report.md` and `docs/result/verification.json`: **one approved
+> task**, `output/optimize-policy-decision-audit`, at **3 of 5 honest passes** with pooled 7/10 = 0.70 over
+> two independent batches. Four further packages pass every gate but measure 5/5, 5/5, 0/5 and 0/5 — the
+> distribution is bimodal, and the lever that used to land tasks in band (a stated wall-clock budget) is
+> exactly what the quality rubric rejects as an environment-dependent invalid failure mode.
 
 ## 1. The problem in one picture
 
-AfterQuery wants tasks that sit in a narrow band: run 5 times with `terminus-2` + `claude-opus-4.8`, **exactly 1-3 runs pass**. Tasks are authored by `claude-sonnet-4.6`, and no other models may author or measure difficulty.
+AfterQuery wants tasks that sit in a narrow band: run 5 times with `terminus-2` and the calibration model (`claude-opus-4.8` by default; this run used `openrouter/openai/gpt-5.4-mini`), **exactly 1-3 runs pass**. Tasks are authored by a configured model (`claude-sonnet-4.6` by default; this run used `openai/gpt-5.6-luna`). `AGENTS.md` now treats the model choice as **open** — any tool-calling model may author, judge or measure difficulty, provided every result records which models produced it and a batch keeps one fixed calibration model and judge.
 
 ```mermaid
 flowchart LR
-    S[Sonnet 4.6<br/>authors tasks] --> T[Harbor task<br/>instruction + env + solution + tests]
-    T --> O[Opus 4.8 via terminus-2<br/>5 attempts]
+    S[Author model<br/>configurable] --> T[Harbor task<br/>instruction + env + solution + tests]
+    T --> O[Calibration model<br/>via terminus-2, 5 attempts]
     O --> B{passes?}
     B -- "0 of 5" --> H[too hard]
     B -- "1 to 3 of 5" --> L[learnable: ship]
@@ -120,7 +133,7 @@ flowchart TD
 
 After 1 pass and 2 fails, at most 5 − 2 = 3 runs can pass, so the 5-run verdict is already certain. **This is lossless.** It's tested on all 32 pass/fail sequences.
 
-| True pass rate p | P(in band) | Expected Opus trials | Saved |
+| True pass rate p | P(in band) | Expected calibration trials | Saved |
 |---|---|---|---|
 | 0.2 | 0.67 | 4.05 | 19% |
 | 0.35 | 0.83 | 3.85 | 23% |
@@ -223,7 +236,8 @@ Partly, yes. A task with true pass rate 0.5 lands in band 78% of the time. That'
 - Authoring summarizes its history past ~60k tokens, and Anthropic prompt caching is on (measured: 96.5% of authoring input tokens are cache reads; output tokens are now ~43% of an authoring run's cost).
 - Dry runs and dev mode exist for debugging.
 - A $75 reserve is enforced in code.
-- Measured costs so far: Opus trial ≈ $0.23, judge ≈ $0.012, `harbor check` ≈ $0.13, blueprint + gate ≈ $0.13. Sonnet authoring cost $2.75 before the cost levers.
+- Measured costs so far (original pairing): Opus trial ≈ $0.23, judge ≈ $0.012, `harbor check` ≈ $0.13, blueprint + gate ≈ $0.13; Sonnet authoring $2.75 before the cost levers. For the audited pairing, calibration trials cost ≈ $0.09 each and the whole approval of one task (two five-attempt batches, quality reviews, gates and a fresh-clone re-verification) came to well under $2 — see `docs/result/evidence/` and the cost section of `docs/result/report.md`.
+- **Exact curtailment, measured:** 26.5% of calibration trials (≈ $3.79) were saved versus running 5× naively on this run's pairing. Early stops on invalid or hacked runs are reported separately and save nothing (`docs/result/evidence/stretchA-curtailment.json`).
 
 **How do you avoid generating the same task over and over?**
 - Inverse-frequency sampling over a 10-axis taxonomy (SkillSynth): each value's weight is 1/(count+1)², squared after a 300-seed simulation showed plain 1/(count+1) repeated a domain 3+ times in 18% of 8-task batches (5% squared).

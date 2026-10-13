@@ -10,7 +10,7 @@ none is marked approved.
 | `repair-attributed-funnel-service` | pass, **0 blocking / 0 advice** | oracle 3/3, nop 0 | **5/5** (≈78% over 9 valid trials) | not approved — too easy |
 | `optimize-policy-decision-audit` | pass (1 advice) | oracle 3/3, nop 0 | **4/5** | not approved — too easy |
 | `repair-reproducible-release-packager` | pass (2 advice) | oracle 3/3, nop 0 | **0/5** | not approved — too hard |
-| `repair-log-replay-sql` | pass | oracle 3/3, nop 0 | 5 attempts, 0 valid passes | not approved — too hard |
+| `repair-log-replay-sql` | **blocked** (coverage) | oracle 3/3, nop 0 | **0/5 twice** — 0 passes in 10 valid trials | not approved — too hard |
 | `global-settlement-reconciliation` | pass | oracle 3/3, nop 0 | **5/5** | not approved — too easy |
 
 Each directory contains, alongside the task itself:
@@ -27,4 +27,4 @@ cannot inflate the shipped count. `docs/result/verification.json` repeats the sa
 
 Why nothing is approved: the difficulty lever that produced in-band results was a stated wall-clock
 budget, which the quality rubric correctly rejects as an environment-dependent invalid failure mode.
-Removing it moved `optimize-policy-decision-audit` from 3/5 to 4/5. See `docs/result/report.md` §7.
+Removing it moved `optimize-policy-decision-audit` from 3/5 to 4/5. Across these five packages and 30 judged attempts the pass counts are 0, 0, 4, 5, 5 — the distribution is bimodal with no in-band plateau. See `docs/result/report.md` §7.

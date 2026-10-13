@@ -129,21 +129,37 @@ Two audit candidates were brought to full quality approval; approval also requir
 | `repair-attributed-funnel-service` | pass, **0 blocking / 0 advice** | pass / 3/3 / 0 | **5/5** (≈78% over 9 valid trials) | no — too easy |
 | `optimize-policy-decision-audit` | pass (1 advice) | pass / 3/3 / 0 | **4/5** | no — too easy |
 | `repair-reproducible-release-packager` | pass (2 advice) | pass / 3/3 / 0 | **0/5** | no — too hard |
-| `repair-log-replay-sql` | pass | pass / 3/3 / 0 | 5 attempts, 0 valid passes | no — too hard |
+| `repair-log-replay-sql` | **blocked** (coverage) | pass / 3/3 / 0 | **0/5 twice** — 0 passes in 10 valid trials | no — too hard |
 | `global-settlement-reconciliation` | pass | pass / 3/3 / 0 | **5/5** | no — too easy |
 
 A directory in `output/` is **not** an approval: `analysis/report.py` counts a task as shipped only
 when `analysis/package_evidence.approval_errors()` is empty *and* its `verification.json` says
-`status: "passed"`, so listing these packages cannot inflate the shipped count. Two candidate
-explanations for the band failure are supported by the evidence: (a) the difficulty levers that
-produced in-band results — chiefly a stated wall-clock budget — are exactly the ones the rubric
-forbids, so the pipeline currently has no admissible lever that reliably lands 1–3/5; and (b) the
-calibration solver's outcome distribution is strongly bimodal (0/5, 4/5 or 5/5), with an in-band
-plateau largely absent for this pairing.
+`status: "passed"`, so listing these packages cannot inflate the shipped count.
 
-The alternative — approving one of these five with a recorded advisory override, or with a
-turn-cap trial counted as a failure — would reproduce precisely the defects this audit exists to
-eliminate, so it was rejected.
+**The distribution is sharply bimodal, with no in-band plateau for this pairing.** Across the five
+published packages and 30 judged attempts, pass counts are 0, 0, 4, 5 and 5 — nothing between.
+`repair-log-replay-sql` was re-measured with a **second independent five-attempt batch** (the
+reproducibility protocol the plan asks for) and returned 0/5 again, i.e. **0 passes in 10 valid
+trials**, which bounds its true pass rate below 0.1 at 95% confidence. Two of its ten failures were
+labelled `test_overreach` — the tests are stricter than the instruction — so part of its difficulty
+is unfair rather than genuine. The same `test_overreach` label appears twice in the packager's
+record. In both too-hard packages, some failures are invalid by the pipeline's own rule.
+
+Two mechanisms explain the missing plateau, and both are supported by the evidence:
+
+1. **The admissible levers are exhausted.** The lever that produced in-band results was a stated
+   wall-clock budget, which the rubric correctly rejects as environment-dependent. Removing it moved
+   `optimize-policy-decision-audit` from 3/5 to 4/5. What remains — hidden-seed inputs, dependent
+   multi-stage work, traps — pushes most tasks to one end or the other.
+2. **Author and solver are too close in strength.** A same-brand author at ~76% Terminal-Bench
+   cannot reliably out-think a ~60% solver: it either writes something the solver clears (5/5) or
+   something the solver cannot approach at all (0/5). The historical Sonnet→Opus pairing failed the
+   same way for the opposite reason (8 too easy, 0 in band).
+
+The alternative — approving one of these five with a recorded advisory override, counting a
+turn-cap trial as a failure, counting `test_overreach` failures as genuine, or removing a stated
+requirement to soften a too-hard task — would each reproduce precisely the defects this audit
+exists to eliminate, so all four were rejected.
 
 The final per-task verdict, package hashes and check results are in `docs/result/verification.json`. If neither lands 1–3 with valid failures after repair, **no task is approved** and this document states that plainly rather than shipping a weak task.
 

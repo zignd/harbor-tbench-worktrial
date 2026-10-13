@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 08:56 -03:00 · `make watch`: pipeline graph with position and time estimate
+- **What:** a new **Graph** tab (key `1`, now the default; Timeline/Files/Jobs moved to 2/3/4) draws the pipeline for the selected candidate as a graph: blueprint, authoring, structure/lint/leak, build + oracle + nop, then quality check and novelty/difficulty/red-team in parallel, calibration, and audit/verdict. Each node shows done (with its duration), running ("you are here"), pending (typical time) or failed (loop back to authoring, with the repair round). The candidate list has a new **eta** column.
+- **Estimate:** the median duration of each stage over the official ledger (defaults until there are 3 samples), summed over what is left; the running node is reduced by the time since the last ledger event; calibration counts waves of 3 trials with 4 expected (exact curtailment). It assumes no repair; after a failed gate it re-estimates from authoring on, and it warns when a building candidate has had no ledger activity for 45 minutes. Medians now: authoring ~15 min, quality ~2 min, red-team ~2.5 min, a calibration wave ~2.5 min.
+- **Code:** pure functions in `scripts/pipeline_graph.py` (9 tests); the TUI only renders. 152 tests pass. Tradeoff: estimates are ledger medians, so they are rough for slow models until enough events exist for them (a different author or calibration model will have its own timings).
+
 ### 08:49 -03:00 · Plan: one strong model (gemini-3.8-flash) for every operation
 - **What:** the hypothesis track in `docs/plan.md` now uses `google/gemini-3.8-flash` (~89% on Terminal-Bench 2.1) for every pipeline role: blueprint, authoring, judges, red-team, quality check and calibration solver, instead of the earlier 3.7-flash author and 3.8-flash solver pair (user's decision). The weak-author control stays as the contrast.
 - **Why / tradeoff:** it makes author and solver exactly equal in strength, the cleanest test of the "author weaker than solver" explanation. The cost: a model judging its own solver's failures may be lenient, so the instruction-quote rule stays and self-judging is listed as a threat. The probe item now covers all roles. No code changed.

@@ -1,6 +1,8 @@
-"""Interactive pipeline monitor (`make watch`): candidates, per-stage timeline, files, job dirs.
+"""Interactive pipeline monitor (`make watch`): candidates, pipeline graph, timeline, files, jobs.
 
-Pick a candidate on the left. On the right, the Timeline tab lists every ledger event for it
+Pick a candidate on the left. On the right, the Graph tab draws the pipeline with the
+candidate's position, what comes next and a time estimate (scripts/pipeline_graph.py; the
+candidate list also has an eta column). The Timeline tab lists every ledger event for it
 (stage, attempt, cost, outcome); the Files tab browses its directory (blueprint, gate and
 quality feedback, red-team, calibration, every authored attempt); the Jobs tab browses the
 Harbor job dirs for its authoring and calibration runs. Whatever is highlighted is rendered
@@ -8,6 +10,7 @@ in the viewer below (JSON, code, or a condensed trajectory). Read-only.
 """
 
 import json
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,6 +25,7 @@ from textual.widget import Widget
 from textual.widgets import DataTable, DirectoryTree, Footer, Static, TabbedContent, TabPane
 
 from generator.config import JOBS_DIR, LEDGER_PATH
+from scripts import pipeline_graph as pg
 from scripts import status as st
 
 HIGHLIGHT_SEC = 3.0
@@ -63,6 +67,24 @@ def ledger_events(cand_id: str) -> list[dict]:
         if e["task"] == cand_id or e["task"].startswith(cand_id + "-t"):
             out.append(e)
     return out
+
+
+def events_by_candidate() -> dict[str, list[dict]]:
+    """Every official ledger event grouped by candidate id (trial suffixes folded in)."""
+    path = Path(LEDGER_PATH)
+    out: dict[str, list[dict]] = {}
+    for line in path.read_text().splitlines() if path.exists() else []:
+        e = json.loads(line)
+        if e["mode"] != "official":
+            continue
+        out.setdefault(re.sub(r"-[tc]\d+$", "", e["task"]), []).append(e)
+    return out
+
+
+def live_turns(phase: str) -> int | None:
+    """Authoring turn from the status phase text ("authoring turn 12"), if authoring is live."""
+    m = re.match(r"authoring turn (\d+)", phase)
+    return int(m.group(1)) if m else None
 
 
 def render_trajectory(path: Path) -> Text:
@@ -149,6 +171,7 @@ class WatchApp(App):
     .split-x:hover, .split-y:hover { background: $accent; }
     #right { width: 1fr; }
     #tabs { height: 45%; }
+    #graph { padding: 0 1; }
     #viewer { height: 1fr; border: round $primary; }
     #head { height: 1; background: $panel; padding: 0 1; }
     DataTable, DirectoryTree { height: 1fr; }
@@ -157,9 +180,10 @@ class WatchApp(App):
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
         ("h", "toggle_held", "Show/hide held"),
-        ("1", "tab('timeline')", "Timeline"),
-        ("2", "tab('files')", "Files"),
-        ("3", "tab('jobs')", "Jobs"),
+        ("1", "tab('graph')", "Graph"),
+        ("2", "tab('timeline')", "Timeline"),
+        ("3", "tab('files')", "Files"),
+        ("4", "tab('jobs')", "Jobs"),
         ("less_than_sign", "resize('#left', 'x', -4)", "Narrower"),
         ("greater_than_sign", "resize('#left', 'x', 4)", "Wider"),
         ("minus", "resize('#tabs', 'y', -2)", "Shorter top"),
@@ -177,6 +201,7 @@ class WatchApp(App):
         self.events: list[dict] = []
         self.spend = ""
         self.spend_at = 0.0
+        self.etas: dict[str, str] = {}
 
     def compose(self) -> ComposeResult:
         yield Static("loading…", id="head")
@@ -186,11 +211,13 @@ class WatchApp(App):
             yield Splitter("#left", "x")
             with Vertical(id="right"):
                 with TabbedContent(id="tabs"):
-                    with TabPane("Timeline [1]", id="timeline"):
+                    with TabPane("Graph [1]", id="graph"), VerticalScroll():
+                        yield Static("Select a candidate.", id="graphview")
+                    with TabPane("Timeline [2]", id="timeline"):
                         yield DataTable(id="events", cursor_type="row", zebra_stripes=True)
-                    with TabPane("Files [2]", id="files"):
+                    with TabPane("Files [3]", id="files"):
                         yield DirectoryTree(".", id="filetree")
-                    with TabPane("Jobs [3]", id="jobs"):
+                    with TabPane("Jobs [4]", id="jobs"):
                         yield JobsTree(str(JOBS_DIR), id="jobtree")
                 yield Splitter("#tabs", "y")
                 with VerticalScroll(id="viewer"):
@@ -198,7 +225,7 @@ class WatchApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        cols = ("id", "slug", "status", "phase", "a", "age", "cal")
+        cols = ("id", "slug", "status", "phase", "a", "age", "eta", "cal")
         self.query_one("#cands", DataTable).add_columns(*cols)
         self.query_one("#events", DataTable).add_columns("time", "stage", "$", "secs", "summary")
         self.set_interval(self.every, self.action_refresh)
@@ -242,6 +269,15 @@ class WatchApp(App):
             + f" | containers {len(st.containers())} | {self.spend}"
         )
         events = ledger_events(self.selected) if self.selected else []
+        by_cand = events_by_candidate()
+        self.secs = pg.node_seconds(pg.stage_medians(Path(LEDGER_PATH)))
+        self.etas = {}
+        for r in records:
+            eta = pg.candidate_eta(
+                by_cand.get(r["id"], []), live_turns(r["phase"]), r["status"], self.secs
+            )
+            if eta is not None:
+                self.etas[r["id"]] = "~" + pg.fmt_secs(eta)
         self.call_from_thread(self.apply, records, head, events)
 
     def apply(self, records: list[dict], head: str, events: list[dict]) -> None:
@@ -257,6 +293,7 @@ class WatchApp(App):
         stamp = f"{datetime.now(UTC):%H:%M:%S}Z"
         self.query_one("#head", Static).update(f"{stamp}  {head}")
         self.draw_candidates()
+        self.draw_graph()
         if grew:
             self.draw_events()
 
@@ -273,7 +310,7 @@ class WatchApp(App):
             hot = now - self.changed.get(r["id"], 0) < HIGHLIGHT_SEC
             base = "black on yellow" if hot else STATUS_STYLE.get(r["status"], "")
             cells = (r["id"][-12:], r["slug"][:28], r["status"], r["phase"],
-                     r["attempt"], r["age"], r["verdict"])  # fmt: skip
+                     r["attempt"], r["age"], self.etas.get(r["id"], ""), r["verdict"])  # fmt: skip
             texts = [Text(c, style=base) for c in cells]
             if rebuild:
                 table.add_row(*texts, key=r["id"])
@@ -284,6 +321,29 @@ class WatchApp(App):
             for i, r in enumerate(rows):
                 if r["id"] == self.selected:
                     table.move_cursor(row=i, scroll=False)
+
+    def draw_graph(self) -> None:
+        """The pipeline graph for the selected candidate, with its position and a time estimate."""
+        view = self.query_one("#graphview", Static)
+        rec = next((r for r in self.records if r["id"] == self.selected), None)
+        if rec is None:
+            view.update("Select a candidate.")
+            return
+        evs = events_by_candidate().get(self.selected, [])
+        secs = getattr(self, "secs", pg.node_seconds({}))
+        turns = live_turns(rec["phase"])
+        states, repair, attempts = pg.node_states(evs, turns, rec["status"])
+        trials = sum(e["stage"] == "calibration_trial" for e in evs)
+        now = datetime.now(UTC)
+        last = datetime.fromisoformat(evs[-1]["ts"]) if evs else now
+        eta = (
+            pg.estimate(states, secs, repair, trials, (now - last).total_seconds())
+            if rec["status"] == "building"
+            else None
+        )
+        head = Text(f" {rec['slug']}  [{rec['status']}]  {rec['phase']}\n\n", style="bold")
+        idle = (now - last).total_seconds() / 60 if rec["status"] == "building" and evs else 0.0
+        view.update(head + pg.render_graph(states, secs, repair, attempts, eta, now, idle))
 
     def draw_events(self) -> None:
         table = self.query_one("#events", DataTable)
@@ -321,6 +381,7 @@ class WatchApp(App):
         self.selected = cand_id
         self.events = ledger_events(cand_id)
         self.draw_events()
+        self.draw_graph()
         rec = next((r for r in self.records if r["id"] == cand_id), None)
         if rec:
             tree = self.query_one("#filetree", DirectoryTree)

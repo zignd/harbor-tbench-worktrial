@@ -175,8 +175,20 @@ if __name__ == "__main__":
     if "--watch" in sys.argv:  # refresh every N seconds (default 30) until Ctrl-C
         args = sys.argv[sys.argv.index("--watch") + 1 :]
         every = int(args[0]) if args and args[0].isdigit() else 30
+        import contextlib
+        import io
+
+        prev: list[str] = []
         while True:
-            print("\033[2J\033[H", end="")
-            main()
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                main()
+            lines = buf.getvalue().splitlines()
+            out = [
+                f"\033[1;43;30m{ln}\033[0m" if prev and (i >= len(prev) or prev[i] != ln) else ln
+                for i, ln in enumerate(lines)
+            ]
+            print("\033[2J\033[H" + "\n".join(out), flush=True)
+            prev = lines
             time.sleep(every)
     raise SystemExit(main())

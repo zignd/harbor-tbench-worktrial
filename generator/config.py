@@ -51,11 +51,12 @@ MAX_TURNS = int(os.environ.get("MAX_TURNS", "200"))
 METATASK_MAX_TURNS = int(os.environ.get("METATASK_MAX_TURNS", "140"))
 # A repair or tuning round patches /app/previous instead of building from scratch.
 METATASK_REPAIR_MAX_TURNS = int(os.environ.get("METATASK_REPAIR_MAX_TURNS", "70"))
-# Authoring cost lever: terminus-2 summarizes when free context drops below this.
-# LiteLLM gives Sonnet a 200k limit, so 140k summarizes once history passes ~60k
-# (Phase 0: authoring history grew to 104k and cost $2.75). Authoring only; the
-# Opus calibration agent keeps terminus-2's defaults.
-METATASK_SUMMARIZE_THRESHOLD = int(os.environ.get("METATASK_SUMMARIZE_THRESHOLD", "140000"))
+# Authoring only (the Opus calibration agent keeps terminus-2's defaults): terminus-2
+# summarizes its history once free context drops below this. It was a cost lever at 140k
+# (summarize once history passed ~60k; Phase 0 authoring history reached 104k and cost $2.75),
+# but each summarization is a multi-minute pause that drops detail mid-build. Throughput now
+# matters more than cost, so it only fires near the real 200k limit.
+METATASK_SUMMARIZE_THRESHOLD = int(os.environ.get("METATASK_SUMMARIZE_THRESHOLD", "20000"))
 OPUS_CONCURRENCY = int(os.environ.get("OPUS_CONCURRENCY", "5"))
 # Machine-wide cap on functional gates (docker build + oracle x3 + nop): CPU-heavy, and a
 # CPU-starved oracle looks flaky. Authoring is API-bound and isn't capped this way.

@@ -62,7 +62,9 @@ def unstated_interfaces(
     for m in sorted(set(_TEST_PATH.findall(tests))):
         if m.startswith(PATH_SKIP) or m in known or Path(m).name in env_names:
             continue
-        if any(m.startswith(k.rstrip("/") + "/") for k in re.findall(r"/[\w.\-/]*[\w\-/]", instruction)):
+        if any(
+            m.startswith(k.rstrip("/") + "/") for k in re.findall(r"/[\w.\-/]*[\w\-/]", instruction)
+        ):
             continue  # inside a directory the instruction names
         out.append(f"path {m}")
     for groups in sorted(set(_TEST_PORT.findall(tests))):

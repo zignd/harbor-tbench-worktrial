@@ -140,3 +140,12 @@ def test_novelty_sets_select_what_is_compared(tmp_path):
     assert novelty.lexical_flags(copy_of_b, Index(both))  # an included set still flags it
     assert not novelty.lexical_flags(copy_of_b, Index(only_a))  # an excluded set does not
     assert novelty.reference_sets(str(tmp_path), ("set-b",)) == ["set-b"]
+
+
+def test_a_rerun_copy_does_not_match_its_own_source(tmp_path):
+    for name in ("official-abc", "official-abc-m", "official-other"):
+        d = tmp_path / name / "task"
+        d.mkdir(parents=True)
+        (d / "instruction.md").write_text(f"Repair the {name} service so every request succeeds.")
+    ids = {r.ref_id for r in novelty.own_tasks(tmp_path, exclude="official-abc-m")}
+    assert ids == {"ours/official-other"}

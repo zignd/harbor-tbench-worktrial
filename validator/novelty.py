@@ -184,8 +184,9 @@ def own_tasks(candidates_dir: Path, exclude: str = "") -> tuple[RefTask, ...]:
     concurrent build must still see it.
     """
     refs = []
+    family = exclude.removesuffix("-m")  # a re-run copy (`<id>-m`) and its source are one task
     for cand in sorted(p for p in Path(candidates_dir).iterdir() if p.is_dir()):
-        if cand.name == exclude:
+        if exclude and cand.name.removesuffix("-m") == family:
             continue
         inst, bp, gate = (
             cand / "task" / "instruction.md",

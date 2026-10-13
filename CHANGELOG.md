@@ -4,6 +4,10 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 09:08 -03:00 · Plan for the gemini-3.8-flash run; novelty pool narrowed to TB 2.1 + examples/
+- **What:** `docs/plan.md` replaces the hypothesis track with this run's 10 items: one strong model (`google/gemini-3.8-flash`, about 89% on Terminal-Bench 2.1) in every role, tasks that fit the 1-3/5 band shipped to `output/`, a 10+ candidate batch and the Part 3 report. Budget: $150 for the run on top of ~$176 spent, inside the $400 ceiling.
+- **Decision (user):** the novelty reference becomes TB 2.1 (89 tasks) plus `examples/`; latest/4.0, Pro and Science are not compared, because the model was scored on 2.1. Thresholds unchanged. **Tradeoff:** a near-copy of a 4.0, Pro or Science task is no longer flagged automatically; the README ban on reusing or adapting public tasks still applies. AGENTS.md notes `NOVELTY_SETS`.
+
 ### 08:56 -03:00 · `make watch`: pipeline graph with position and time estimate
 - **What:** a new **Graph** tab (key `1`, now the default; Timeline/Files/Jobs moved to 2/3/4) draws the pipeline for the selected candidate as a graph: blueprint, authoring, structure/lint/leak, build + oracle + nop, then quality check and novelty/difficulty/red-team in parallel, calibration, and audit/verdict. Each node shows done (with its duration), running ("you are here"), pending (typical time) or failed (loop back to authoring, with the repair round). The candidate list has a new **eta** column.
 - **Estimate:** the median duration of each stage over the official ledger (defaults until there are 3 samples), summed over what is left; the running node is reduced by the time since the last ledger event; calibration counts waves of 3 trials with 4 expected (exact curtailment). It assumes no repair; after a failed gate it re-estimates from authoring on, and it warns when a building candidate has had no ledger activity for 45 minutes. Medians now: authoring ~15 min, quality ~2 min, red-team ~2.5 min, a calibration wave ~2.5 min.

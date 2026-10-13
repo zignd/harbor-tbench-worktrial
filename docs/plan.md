@@ -283,7 +283,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 65 / 100 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 65 / 102 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -431,19 +431,23 @@ After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for 
 - [x] Research-paper-format report `docs/study-report.md` (abstract, intro, method, results, discussion, threats to validity, conclusion), presentation deck `docs/study-deck.pptx` (or a Marp/HTML deck if pptx is not practical), and updated `docs/architecture.md`, `README.md` and `CHANGELOG.md`.
 - [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).
 
-### Hypothesis track: strong author, strong calibration model (ships to `output/`)
+### Run: one strong model (`google/gemini-3.8-flash`) in every role, shipping to `output/`
 
-**Hypothesis (not yet tested):** the Sonnet 4.6 -> Opus 4.8 pairing gave 0 of 9 in band because the author is weaker than the solver. If the **same strong model** does every job (blueprint, authoring, judges, red-team and calibration), the author is exactly as strong as the solver, and more tasks should land in the 1-3/5 band. The earlier study could not test it (the weak author produced no valid tasks), so this track runs the strong model end to end through the real pipeline, so its tasks can ship: the model is declared the calibration model, the band is relative to it, and every record states it. Fallback if it fails: keep Sonnet -> Opus and the difficulty-by-construction levers below.
+Goal: tasks that fit the trial's band (1-3 of 5 passes for the calibration model, valid failures only), authored and calibrated by the same strong model, a "professors helping professors" setup whose tasks can serve as a benchmark and as training data. Sonnet 4.6 -> Opus 4.8 gave 0 of 9 in band. **Model (context):** `google/gemini-3.8-flash`, about 89% on Terminal-Bench 2.1, tool calls supported, $0.75/$3.75 per M tokens, used for blueprint and review, authoring, quality check, red-team, judges and the calibration solver (terminus-2, 5 trials, exact curtailment); set with `GENERATOR_MODEL` and `EVAL_MODEL`. Every result records the model.
 
-**Model (one for every operation):** `google/gemini-3.8-flash` (~89% on Terminal-Bench 2.1, tool calls supported, $0.75/$3.75 per M tokens) as the author, blueprint and review model, the judges (pass audit and failure judge), the red-team, the quality check and the calibration solver (terminus-2). Set with `GENERATOR_MODEL` and `EVAL_MODEL`. Because author and solver are the same model, the study's weak-author control (`google/gemini-3.5-flash-lite`, ~54%) is the contrast. Probe on 2026-10-13: `gemini-3.7-flash` passed a terminus-2 trial in 21 turns ($0.17, 510 s); `gemini-3.8-flash` is still to be probed. Budget: shares the $400 account ceiling; stop and re-plan if cost per learnable task exceeds ~$40. Known risk: a model judging its own solver's failures may be lenient, so judges keep the instruction-quote rule and the report notes self-judging as a threat.
-- [ ] Model plumbing: `GENERATOR_MODEL` / `EVAL_MODEL` reach blueprint, authoring, judges, red-team, quality check and calibration (one model for all, or per role); `config.assert_official_models()` accepts the configured pair (still refuses dev mode); ledger events, calibration records, shipped-task READMEs and `reports/summary.md` state the models. Unit-tested.
-- [ ] 💲 Probe `gemini-3.8-flash` for every role: one blueprint, one authoring round, one terminus-2 trial, one failure-judge call and one red-team trial. Record speed, cost and any tool-format or JSON problems.
-- [ ] Difficulty-by-construction levers (verify-time generated inputs, long-horizon or multi-stage work, a trap where a shallow self-check passes but hidden property tests fail) added to the spec/blueprint/tuner guidance. Unit-tested.
-- [ ] 💲 Pilot: 3 candidates through the full pipeline (gates, quality, red-team, calibration) with `gemini-3.8-flash` in every role. Record the funnel, time and cost per task. **Go/no-go:** above ~$40 per learnable task, fix generation first.
-- [ ] 💲 Batch of 10+ candidates with `gemini-3.8-flash` in every role; exact curtailment, every trial judged. Learnable tasks ship to `output/<task>/` with the models in their README.
-- [ ] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation, novelty check.
-- [ ] 💲 Weak-author control under a 20-minute authoring budget per task (`google/gemini-3.5-flash-lite`, ~54%), same specs, same gates, for comparison; exploratory, never shipped (builds on `scripts/study.py`).
-- [ ] Outcome recorded in `docs/findings.md` and `reports/summary.md`: the in-band share of same-strong-model tasks against the 0/9 of Sonnet -> Opus, stated plainly whether the hypothesis held, with small-N caveats and the models on every number.
+**Novelty pool (user decision):** the novelty reference is Terminal-Bench 2.1 (`data/tb-reference/terminal-bench-2-1`, 89 tasks) plus `examples/` only, because the model was scored on TB 2.1. The latest/4.0 set, Pro and Science are not compared for this run (they stay on disk; `NOVELTY_SETS` selects the sets). Thresholds (13-gram, cosine 0.70, the semantic judge) are unchanged. Tradeoff: a task close to a 4.0, Pro or Science task would no longer be flagged automatically. The README rule against reusing or adapting any public task still applies.
+
+Budget: this run is capped at $150 on top of ~$176 already spent, inside the $400 account ceiling; stop and fix generation if the pilot costs more than ~$40 per in-band task.
+- [ ] Novelty pool: `NOVELTY_SETS` (unset = every set; `terminal-bench-2-1` set in `.env` for this run; `examples/` always included) applied at every layer (concept list, blueprint gate, final-package re-check, diversity report); the report states the sets used. Unit-tested (an excluded set no longer flags a near-copy, an included one does).
+- [ ] Model plumbing: `GENERATOR_MODEL` / `EVAL_MODEL` reach blueprint, authoring, quality check, red-team, judges, novelty judge and calibration; `config.assert_official_models()` accepts the configured pair (refuses dev mode); the model is recorded in ledger events, calibration records, shipped-task READMEs and `reports/summary.md`. Unit-tested.
+- [ ] 💲 Probe `gemini-3.8-flash` in every role (blueprint, authoring round, terminus-2 trial, failure judge, red-team); record speed, cost and any JSON or tool-format problem, and fix what breaks.
+- [ ] Difficulty-by-construction levers (verify-time inputs from a hidden seed, multi-stage dependent work, a shallow-self-check trap, long-horizon or large inputs) in the spec, blueprint and tuner guidance. Unit-tested.
+- [ ] 💲 Pilot: 3 candidates through the full pipeline; funnel, time and cost per task. Go/no-go at ~$40 per in-band task.
+- [ ] 💲 Batch of 10+ candidates; exact curtailment, every trial judged, tuner on near-misses; tasks in band ship to `output/<task>/` with the model in the README.
+- [ ] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation with an instruction quote, novelty check, canary placement, `timeout_sec = 3600`.
+- [ ] `reports/summary.md` regenerated: funnel, histogram, cost and time, diversity and novelty (sets stated), labelled with the model, and compared with Sonnet -> Opus (0 of 9).
+- [ ] Stretch goals as time allows (A curtailment savings, C diversity, B tuner results, D human-likeness); skipped items stated.
+- [ ] Docs: `docs/findings.md`, `docs/architecture.md`, `README.md`, `CHANGELOG.md` updated with the outcome, spend and decisions.
 
 ## Key tradeoffs (to document in the CHANGELOG)
 

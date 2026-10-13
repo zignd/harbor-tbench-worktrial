@@ -4,6 +4,10 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 08:49 -03:00 · Plan: one strong model (gemini-3.8-flash) for every operation
+- **What:** the hypothesis track in `docs/plan.md` now uses `google/gemini-3.8-flash` (~89% on Terminal-Bench 2.1) for every pipeline role: blueprint, authoring, judges, red-team, quality check and calibration solver, instead of the earlier 3.7-flash author and 3.8-flash solver pair (user's decision). The weak-author control stays as the contrast.
+- **Why / tradeoff:** it makes author and solver exactly equal in strength, the cleanest test of the "author weaker than solver" explanation. The cost: a model judging its own solver's failures may be lenient, so the instruction-quote rule stays and self-judging is listed as a threat. The probe item now covers all roles. No code changed.
+
 ### 08:46 -03:00 · Plan: strong-author, strong-solver hypothesis track
 - **What:** `docs/plan.md` gains a "Hypothesis track" section (8 items, progress 65/100) and the model rule is updated to match the open README/AGENTS.md. Hypothesis: Sonnet -> Opus gave 0 of 9 in band because the author is weaker than the solver; a strong author (`gemini-3.7-flash`) with a strong calibration solver (`gemini-3.8-flash`) run through the real pipeline might land more tasks in band, and could ship to `output/` with the models stated.
 - **Why this way:** the earlier study could not test strong -> strong through shipping gates, and tasks outside the pipeline can't be output. The track needs model plumbing (`GENERATOR_MODEL` / `EVAL_MODEL`, a relaxed `assert_official_models`), difficulty-by-construction levers, a 3-candidate pilot with a ~$40-per-learnable go/no-go, a 10+ batch, and a 20-minute weak-author control. Stated as a hypothesis, with Sonnet -> Opus as the fallback. No code changed.

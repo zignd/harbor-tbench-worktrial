@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 09:47 -03:00 · Probe findings with gemini-3.8-flash; leak-scan false positives fixed
+- **Probe (candidate `3ba65cf95a9b`, all roles):** blueprint and review work (one reply truncated at 12k tokens, so `make_blueprint` now defaults to 24k); authoring 70 turns, 14.5 min, $0.90; oracle 3/3 and nop 0; `harbor check` quality gate ran in 5.8 min for $0.25 and flagged `behavior_in_task_description`; a repair round took 7 turns, $0.20. No tool-format or JSON problems with terminus-2. Gemini steps are slower than Sonnet's (reasoning), so ETA medians are now per model pair.
+- **Leak scan:** the static gate reported 6 blocking "leaks" that were not leaks: `distinctive_tokens` treated numeric constants (1048576, 1000000, 1700000000000, 26214400) from the tests as expected-output tokens and found them in the environment's SQL and schema files. Round numbers (at most 2 significant digits) and binary-size numbers (powers of two, multiples of 1 MiB) are now skipped; hashes and other long numbers still count. Tested. This would have sent every such package through useless repair rounds that rewrite working constants.
+- The probe and the first pilot batch were stopped by explicit pid and restarted so they pick up the fix (both resume from saved files). 159 tests pass.
+
 ### 09:12 -03:00 · Difficulty-by-construction levers
 - **What:** three new spec levers (`hidden_seed_instances`, `multi_stage_dependency`, `large_state_scale`) and a "Difficulty by construction" block in the blueprint prompt: the answer follows from a generator or reference the author controls (verify-time instances from a hidden seed, dependent stages, thousands of records, a shallow-self-check trap whose property is stated in the instruction), not from out-thinking the solver. The blueprint and tuner prompts now say the solver is "as capable as you" instead of "Opus class".
 - **Why:** an author as strong as the solver can't rely on tricks; the 9 earlier calibrations showed readable bugs are not difficulty. Forbidden levers are unchanged (hidden limits, timeouts, format fussiness, unstated requirements). 158 tests pass.

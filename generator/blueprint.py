@@ -217,7 +217,7 @@ def make_blueprint(
     concepts: str | None = None,
     feedback: str | None = None,
     model: str | None = None,
-    max_tokens: int = 12000,
+    max_tokens: int = 24000,  # reasoning models spend 10k+ on thinking before the JSON
 ) -> tuple[Blueprint, float]:
     concepts = concepts if concepts is not None else novelty.concept_list()
     prompt = BLUEPRINT_PROMPT.format(spec=spec.to_prompt(), concepts=concepts)

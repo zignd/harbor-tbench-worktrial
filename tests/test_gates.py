@@ -111,3 +111,18 @@ def test_leak_scan_finds_a_planted_answer(tmp_path):
     assert result["built"]
     assert any("/opt/.cache_value" in leak for leak in result["leaks"])
     assert any("docker history" in leak for leak in result["leaks"])
+
+
+def test_generic_numbers_are_not_distinctive_tokens(tmp_path):
+    from validator import leak_scan
+
+    task = tmp_path / "t"
+    (task / "tests").mkdir(parents=True)
+    (task / "solution").mkdir()
+    (task / "tests" / "test_outputs.py").write_text(
+        "LIMIT = 1048576\nUS = 1000000\nNOW = 1700000000000\nANSWER = 482913657\n"
+    )
+    (task / "solution" / "solve.sh").write_text("echo hi")
+    (task / "instruction.md").write_text("Fix it.")
+    tokens = leak_scan.distinctive_tokens(task)
+    assert set(tokens) == {"482913657"}

@@ -41,6 +41,16 @@ _FIND_NAMED = (
 )
 
 
+def _generic_number(token: str) -> bool:
+    """Round numbers and binary sizes (1000000, 1700000000000, 1048576, 26214400) are constants any
+    config or schema has; they say nothing about an expected output, so they are not leaks."""
+    if not token.isdigit():
+        return False
+    n = int(token)
+    significant = token.rstrip("0")
+    return len(significant) <= 2 or n % (1 << 20) == 0 or (n & (n - 1)) == 0
+
+
 def distinctive_tokens(task_dir: Path) -> dict[str, str]:
     """Answer-like literals from tests/ and solution/ -> kind ("answer" or "string").
 
@@ -61,7 +71,7 @@ def distinctive_tokens(task_dir: Path) -> dict[str, str]:
     return {
         t: kind
         for t, kind in tokens.items()
-        if t not in stated and "canary" not in t.lower() and len(t) >= 6
+        if t not in stated and "canary" not in t.lower() and len(t) >= 6 and not _generic_number(t)
     }
 
 
@@ -107,8 +117,7 @@ def scan(task_dir: Path, tag: str) -> dict:
             tag,
             "sh",
             "-c",
-            "ls -d /solution /tests /app/solution /app/tests 2>/dev/null; "
-            + _FIND_NAMED,
+            "ls -d /solution /tests /app/solution /app/tests 2>/dev/null; " + _FIND_NAMED,
         ).stdout.split()
         leaks += [f"image contains {p}" for p in listing]
         if tokens:

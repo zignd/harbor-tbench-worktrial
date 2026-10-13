@@ -1,0 +1,193 @@
+{
+ "blueprint": {
+  "slug": "repair-release-history-auditor",
+  "title": "Repair the Release History Auditor",
+  "scenario": "A release engineer is unblocking a broken JavaScript build for an internal release-history auditor. The repository contains a small SQLite-backed reporting service, its migration history, several configuration formats used by older release branches, and a deliberately missing SQL migration interpreter; the current sample report looks plausible, but audits assembled from real Git history are incomplete and occasionally continue after a failed migration.",
+  "instruction_draft": "Make the repository\u2019s release audit build and CLI work again. The command `npm test` and `npm run audit -- --config <path> --db <path>` must succeed without network access, and the audit must inspect the configured Git commit range rather than only the checkout\u2019s current files.\n\nFor each first-parent commit in the configured range, process migration files from the configured directories in lexical path order and statements in file order. Translate supported SQL into the schema state represented in SQLite: handle comments, quoted identifiers, string literals containing semicolons, transaction wrappers, CREATE TABLE, ALTER TABLE ADD COLUMN, CREATE INDEX, DROP INDEX, and DROP TABLE; unsupported or invalid statements must reject only their containing migration, leave that migration\u2019s schema changes unapplied, and allow later migrations to be audited. Write deterministic migration and final-schema rows, preserve the configured output-table names, normalize both the current JSON policy and the legacy INI policy found in repository history, and ensure repeated runs produce the same database contents.",
+  "requirements": [
+   "`npm test` exits successfully.",
+   "`npm run audit -- --config <path> --db <path>` exits successfully for valid input and does not require network access.",
+   "The audit reads migration files from each configured Git tree in the configured commit range, not from only the working tree.",
+   "Commits are visited in first-parent chronological order.",
+   "Migration files within a commit are processed in lexical path order, and statements within a file retain source order.",
+   "SQL comments are ignored without changing statement boundaries.",
+   "Semicolons inside single-quoted strings and quoted identifiers do not terminate a statement.",
+   "Transaction wrappers do not create migration rows or schema objects of their own.",
+   "CREATE TABLE, ALTER TABLE ADD COLUMN, CREATE INDEX, DROP INDEX, and DROP TABLE are represented correctly, including quoted identifiers.",
+   "A migration containing an invalid or unsupported statement is marked rejected, none of its schema changes are retained, and later migrations still run.",
+   "A successful migration is marked applied and contributes its resulting schema state.",
+   "The output contains deterministic migration audit rows and final-schema rows in the configured SQLite tables.",
+   "Audit rows include enough information to distinguish commit, migration path, status, and failure reason without depending on wall-clock time.",
+   "The current JSON policy format and the legacy INI policy format normalize to the same effective configuration.",
+   "Configured migration directories, commit range, and output table names are honored after normalization.",
+   "Running the audit twice against the same inputs produces identical rows and does not duplicate results."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt and pip packages and Node.js/npm installed from pinned local packages or the image setup; no network is needed at task time.",
+   "A Git repository of roughly 1,000-1,500 lines of JavaScript, fixtures, SQL, and tests, with a deliberately realistic release-audit CLI and unrelated build components.",
+   "A seeded repository history containing a base tag and several first-parent release commits, including migrations added, modified, renamed, reverted, and deleted across commits; some migration files exist only in historical trees.",
+   "A current checkout containing a broken build: the SQL migration interpreter module is absent or replaced by a minimal throwing stub, the configuration loader has a partial legacy-format path, and the report runner assumes rejected migrations can be skipped without transactional rollback.",
+   "Documentation in the repository describing the JSON policy keys, legacy INI spelling, supported migration statements, output schema, first-parent range semantics, and rejection behavior.",
+   "A visible fixture with ordinary CREATE TABLE and ALTER TABLE migrations that can pass a superficial implementation.",
+   "Generated verifier fixtures with thousands of migration statements and rare cases involving semicolons in strings, quoted mixed-case names, comments between tokens, duplicate indexes, failed multi-statement migrations, and historical-only files.",
+   "A SQLite database schema for migration audit rows and schema-object rows, plus JavaScript code that queries those tables for the release report."
+  ],
+  "internal_hint": "The real difficulty is construction plus observation: the missing component must be built as a stateful SQL migration parser/interpreter, and the key regression only appears when it runs against accumulated Git history. Investigate the CLI, config documentation, existing database schema, `git log --first-parent`, and historical trees before editing. Implement a tokenizer that tracks quote/comment state, parse the documented statement subset into normalized operations, apply each migration against a cloned schema state, and commit the clone only on complete success. Normalize JSON and INI policies before selecting trees and output tables. Test with a temporary repository and SQLite database across failures, renames, and historical-only files; do not rely on reading the current checkout alone.",
+  "trap": "A shallow solution can parse the visible migrations and inspect files at HEAD, producing a plausible sample report. Hidden histories expose that approach through migrations that exist only in old trees, first-parent ordering differences, quoted identifiers, semicolons in string literals, and a migration whose first statement succeeds while a later statement fails. Implementations that mutate the live schema before validating the whole migration, silently ignore unsupported SQL, or treat the legacy INI policy as a few renamed JSON keys produce believable but incorrect final rows.",
+  "tests": [
+   "Build test: installs dependencies from the local environment and checks that the JavaScript project builds and its unit test command exits zero.",
+   "Visible behavior test: runs the supplied policy and repository history, then checks migration statuses, final schema objects, configured table names, and deterministic ordering.",
+   "Legacy configuration test: runs equivalent JSON and historical INI policies against the same repository and compares normalized configuration effects and all output rows.",
+   "Historical-tree test: creates or uses commits where migration files differ from the checkout and checks that rows reflect each commit\u2019s tree.",
+   "Ordering test: generates multiple first-parent and side-branch commits and verifies only the configured first-parent chronological sequence is audited.",
+   "Parser test: verify-time generated SQL includes comments, quoted identifiers, strings containing semicolons, transaction wrappers, varied whitespace, and mixed-case names; rows are compared with a deterministic reference implementation.",
+   "Recovery test: generates migrations with an invalid or unsupported statement after valid statements and checks that the entire migration is rejected, no partial schema objects remain, the failure reason is recorded, and subsequent migrations are applied.",
+   "Schema-operation test: generated inputs exercise CREATE TABLE, ADD COLUMN, CREATE INDEX, DROP INDEX, DROP TABLE, duplicate-object errors, and historical renames; final schema rows must match the reference.",
+   "Scale test: audits thousands of generated statements and checks that all migration rows are present, not merely a sampled or last-commit result.",
+   "Idempotence test: runs the CLI twice on the same database and verifies that it replaces or reconciles the configured report deterministically without duplicate rows or timestamp-dependent values."
+  ],
+  "verifier_knob": {
+   "name": "generated_history_cases",
+   "value": "1200 migration statements across 35 commits, with 18 edge-case migrations and 4 partial-failure migrations",
+   "effect": "Raising it increases the number of historical trees, dependent schema transitions, and rare parser/recovery cases, making shallow inspection and partial interpreters fail more often; lowering it leaves the same semantics but reduces runtime and the chance of encountering interactions."
+  },
+  "expected_failure_modes": [
+   "The solver reads only the working tree instead of loading each commit\u2019s migration files from Git trees.",
+   "The parser splits on every semicolon and corrupts statements containing string literals.",
+   "The implementation handles CREATE TABLE but omits indexes, DROP operations, quoted names, or transaction wrappers.",
+   "A failed migration leaves earlier statements applied because rollback is modeled by error skipping rather than state cloning.",
+   "The solver visits all reachable commits or sorts by commit timestamp instead of using the configured first-parent order.",
+   "The legacy INI loader accepts simple examples but loses nested directory, range, or output-table settings.",
+   "The visible fixture passes while hidden generated histories expose duplicate-object and historical-only-file behavior.",
+   "The report is correct once but rerunning it duplicates rows or introduces nondeterministic values.",
+   "The solver patches the throwing stub without exploring the repository documentation, existing schema, or Git history."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "git-history",
+   "sql-parser",
+   "configuration",
+   "error-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "`pwd && find . -maxdepth 2 -type f | sort`",
+   "`cat package.json && npm test`",
+   "`find . -iname '*readme*' -o -iname '*doc*' -o -iname '*config*' | sort`",
+   "`grep -R \"migration\\|first-parent\\|output table\\|INI\" -n . --exclude-dir=node_modules`",
+   "`git log --graph --oneline --decorate --all --first-parent`",
+   "`git log --name-status --first-parent --all`",
+   "`find . -type f \\( -name '*.js' -o -name '*.sql' \\) -print`",
+   "`sed -n '1,240p' src/cli.js; sed -n '1,280p' src/config*; sed -n '1,320p' src/*migration*`",
+   "`sed -n '1,320p' src/*report*; grep -R \"CREATE TABLE\\|migration_audit\\|schema\" -n . --exclude-dir=node_modules`",
+   "`git show <base-or-release-commit>:<historical-migration-path>`",
+   "`git diff <base>..<release> -- migrations`",
+   "`npm run audit -- --config <visible-policy> --db /tmp/audit.sqlite`",
+   "`sqlite3 /tmp/audit.sqlite '.schema' '.dump'`",
+   "`Implement a tokenizer that preserves quoted identifiers/string literals and removes comments while tracking statement boundaries.`",
+   "`Implement parsing and normalized execution for transaction wrappers, table/index creation and removal, and ADD COLUMN.`",
+   "`Implement cloned schema-state application so a failed statement rejects the whole migration without committing partial changes.`",
+   "`Implement JSON and INI normalization, including directories, range, and output-table names.`",
+   "`Implement first-parent Git tree loading and oldest-to-newest commit traversal instead of reading the checkout.`",
+   "`Implement deterministic migration and schema-row replacement/upsert behavior and failure reasons.`",
+   "`Wire the runner to process configured trees and migration paths in documented order.`",
+   "`node --check src/*.js && npm test`",
+   "`rm -f /tmp/audit.sqlite; npm run audit -- --config <json> --db /tmp/audit.sqlite; cp /tmp/audit.sqlite /tmp/audit1.sqlite; npm run audit -- --config <json> --db /tmp/audit.sqlite`",
+   "`sqlite3 /tmp/audit.sqlite '.dump' > /tmp/out.sql; diff -u <(sqlite3 /tmp/audit1.sqlite '.dump') /tmp/out.sql`",
+   "`npm run audit -- --config <legacy-ini> --db /tmp/legacy.sqlite; diff -u <(sqlite3 /tmp/audit.sqlite '.dump') <(sqlite3 /tmp/legacy.sqlite '.dump')`",
+   "`git diff --check && git status --short`"
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 2,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction does not define whether every migration present in every commit tree is replayed, or only migrations newly introduced/changed since the prior commit; replaying unchanged files would create duplicate-object failures.",
+   "The exact meaning of the configured commit range and 'first-parent chronological order' is unspecified, including endpoint inclusion, merge handling, and whether chronology means ancestry order or commit timestamps.",
+   "Migration identity and behavior for modified, renamed, reverted, or deleted files are not defined, so expected migration rows and schema state can differ between reasonable implementations.",
+   "The SQL subset's grammar and semantic rules are underspecified for duplicate objects, column definitions, quoted names, index/table dependencies, and CREATE TABLE variants; tests may enforce undocumented behavior.",
+   "The output row schemas, ordering keys, and failure-reason normalization are referenced but not fully stated in the blueprint, making deterministic comparisons potentially overreaching.",
+   "The environment claim about pinned local Node/npm packages is not concrete enough to establish that dependency installation and execution work without network access.",
+   "A generated scale test with 1200 statements across 35 commits may exceed the stated under-one-hour and 2 GB constraints depending on Git process and SQLite implementation details."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and genuinely difficult, and the proposed tests could catch shallow implementations. However, its central history semantics are ambiguous: processing files from each commit tree conflicts with migration replay and leaves modified, renamed, reverted, and deleted-file behavior undefined. Consequently a correct implementation cannot be determined uniquely from the instruction, and the score average is below the acceptance threshold.",
+  "fixes": [
+   "Explicitly define the commit range endpoints, merge handling, and exact oldest-to-newest first-parent traversal algorithm.",
+   "Define whether each commit processes all migration files in its tree, only changed files, or migrations identified by a stable migration ID; specify behavior for modification, rename, revert, and deletion.",
+   "Publish the normalized migration-row and final-schema-row schemas, deterministic ordering rules, and canonical failure-reason format.",
+   "Specify the supported SQL grammar and semantics for duplicate objects, column definitions, dependencies, quoted identifiers, and transaction wrappers.",
+   "Provide a pinned Node/npm installation mechanism and a concrete offline dependency cache or vendor all runtime dependencies.",
+   "Add a compact reference fixture showing expected rows for a multi-commit history containing a rename, deletion, modification, and partial failure."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The candidate audits Git-history migrations with a SQL interpreter and schema rollback semantics, whereas the reference validates JSON filter specifications against SQLite query results."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The candidate reconstructs migration schemas across Git commits, while the reference repairs CSV chunking, validation, header handling, and deduplication in an ETL pipeline."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "The candidate implements historical migration auditing and deterministic SQLite reporting, whereas the reference fixes binary packet codec roundtrips and Rust build configuration."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "The candidate parses and applies SQL migrations from Git history, while the reference fixes ECDH session-key derivation between an encryptor and verifier."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The candidate audits versioned database migrations and policies, whereas the reference repairs schema-filtered NDJSON ingestion with a performance requirement."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-18899524e171",
+     0.152
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.131
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.127
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.117
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.11
+    ]
+   ],
+   "cost_usd": 0.0008669999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0032757999999999997
+}

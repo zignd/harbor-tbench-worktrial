@@ -1,0 +1,5 @@
+Our nightly release build is blocked because the telemetry aggregation step (/workspace/scripts/build_release_catalog.sh) fails the release verification gate (/workspace/scripts/check_release_metrics.sh). The step is responsible for decoding raw runner telemetry shards from /var/lib/build_data/shards/ into /var/lib/build_data/release_catalog.db to serve downstream release qualification queries in /workspace/queries/.
+
+Fix /workspace/scripts/build_release_catalog.sh (and any associated SQL queries or schemas in /workspace/) so that running /workspace/scripts/check_release_metrics.sh passes all checks. The build script must accept optional arguments for the input shards directory ($1, defaulting to /var/lib/build_data/shards) and the destination database file ($2, defaulting to /var/lib/build_data/release_catalog.db).
+
+To pass, the generated /var/lib/build_data/release_catalog.db must achieve an analytical query parity score of at least 0.999 against ground truth, complete the benchmark query suite in under 1.80 seconds total execution time on this system, and maintain a final database file size of 25.0 MB or less.

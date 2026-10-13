@@ -1,0 +1,146 @@
+{
+ "blueprint": {
+  "slug": "telemetry-rate-integral-accumulator-repair",
+  "title": "Repair Continuous Rate Integral Accumulator for Telemetry Settlement",
+  "scenario": "An on-call SRE is paged at 03:14 UTC after an automated billing reconciliation job fails in production. An in-house telemetry ingestion engine (/opt/telemetry-drain) processes high-frequency binary span metrics from thousands of worker nodes, integrating continuous compute-unit consumption under dynamic frequency scaling. A recent upgrade caused the batch reconciler to drift by over 14% on production shards due to flawed numerical integration under non-uniform sampling and improper frame boundary state carryover across binary chunk boundaries.",
+  "instruction_draft": "reconcile@prod-worker-04:~$ /opt/telemetry-drain/bin/reconcile-spans --input-dir /var/lib/telemetry/shards --report /tmp/recon_report.json\n[CRIT] Reconciliation failed on shard chunk-20260329-0300.bin:\n  accumulated_units: 4.829104e+07 (reference: 4.195821e+07, rel_err: 1.509e-01 > 1.0e-4)\n  boundary_discontinuities: 412 (max allowed: 0)\n  unhandled_sync_frames: 87\nFAILED: Accumulated compute-unit drift exceeds relative tolerance threshold 1e-4.\n\nInvestigate why /opt/telemetry-drain/bin/reconcile-spans fails to match the reference settlement integral on the binary shards in /var/lib/telemetry/shards. Fix the reconciliation engine in /opt/telemetry-drain so that running `reconcile-spans` against any valid shard set computes the continuous resource integral with a relative error strictly below 1e-4 and zero boundary discontinuities or unhandled sync frames, writing the final metrics to the requested JSON report.",
+  "requirements": [
+   "Execute `/opt/telemetry-drain/bin/reconcile-spans --input-dir <input_dir> --report <output_json>` successfully without crashes or nonzero exit codes.",
+   "Produce accumulated resource integrals across all shards with relative error strictly less than 1.0e-4 (0.01%) against the exact continuous piecewise formulation defined in `/opt/telemetry-drain/docs/SPEC.md`.",
+   "Properly decode packed binary span frames (header, payload, and sync markers) including handling 32-bit timestamp rollover and state resets on sync frames without dropping intermediate boundary intervals.",
+   "Resolve all inter-chunk boundary discontinuities so that state carryover between sequential chunk files maintains continuous integration across shard boundaries.",
+   "Output valid JSON to the target report path containing the exact keys: `total_integral`, `shards_processed`, `sync_frames_handled`, `boundary_discontinuities`, and `relative_error` (or `status: SUCCESS`)."
+  ],
+  "environment": [
+   "Dockerfile based on `python:3.13-slim-bookworm` with standard build utilities and pinned `numpy` installed.",
+   "The codebase in `/opt/telemetry-drain` (~1,400 LOC) structured into: `bin/reconcile-spans`, `src/telemetry_drain/codec.py` (binary span deserialization), `src/telemetry_drain/integrator.py` (rate curve integration), `src/telemetry_drain/shard_manager.py` (chunk sorting, boundary stitching, state carryover), `src/telemetry_drain/models.py`, and `docs/SPEC.md`.",
+   "Historical binary shard files stored in `/var/lib/telemetry/shards/` totaling ~150,000 packed binary span records across 12 sequential chunk files.",
+   "A standalone validation script `/opt/telemetry-drain/tests/validate_shard.py` provided for local verification on sample shards.",
+   "Planted numerical bug: `integrator.py` implements a naive forward-Euler rectangular approximation with assumed fixed dt, whereas `SPEC.md` mandates an exact analytical trapezoidal-exponential decay integral for the dynamic frequency piecewise-linear segments.",
+   "Planted decoding bug: `codec.py` misinterprets 32-bit microsecond counter wraps (treating them as negative intervals and discarding them as corrupt) and ignores type-0xFD sync frames instead of extracting the base epoch offset.",
+   "Planted state bug: `shard_manager.py` re-initializes accumulator state at each chunk boundary instead of carrying over the tail endpoint coordinates of the preceding chunk."
+  ],
+  "internal_hint": "Difficulty stems from mathematical derivation combined with multi-file exploration across a binary-format data processing pipeline. First, the solver must inspect `/opt/telemetry-drain/docs/SPEC.md` to find the differential decay equation governing compute-unit consumption $dE/dt = r(t) - \\lambda E(t)$ with piecewise-linear rate $r(t) = r_a + \\frac{r_b - r_a}{\\Delta t}(t - t_a)$. Solving this analytically yields the closed-form recurrence for $E(t_{k+1})$ in terms of $E(t_k)$, $r_a$, $r_b$, and $\\Delta t$; replacing the forward Euler approximation with this exact closed form removes the accumulated 15% numerical drift. Second, exploring the data via `codec.py` and checking discarded spans reveals thousands of missing spans caused by uint32 microsecond timestamp wraparound (modulo $2^{32}$) and dropped sync frames (tag `0xFD`) that reset the high timestamp bits. Third, fixing inter-chunk boundary continuity in `shard_manager.py` by maintaining the running endpoint state across shard chunk boundaries eliminates the boundary discontinuities.",
+  "trap": "A solver who tests only on a synthetic short sample or a single isolated chunk will see zero timestamp rollover and minimal integration drift, assuming Euler or simple midpoint integration is sufficient. Running against the full 150,000-span dataset or hidden verify-time shards immediately fails due to compound numerical drift and boundary gaps.",
+  "tests": [
+   "Verify `/opt/telemetry-drain/bin/reconcile-spans` runs against the existing production dataset in `/var/lib/telemetry/shards` and produces relative error < 1.0e-4 with 0 boundary discontinuities.",
+   "Generate fresh hidden-seed binary shard datasets at verify time with randomized frequency ramp slopes, non-uniform interval jitter, periodic 32-bit timestamp rollovers, and sync frames; assert relative error < 1.0e-4 across 250,000 spans.",
+   "Verify error handling on out-of-order chunks (shard_manager must sort by chunk sequence index before processing).",
+   "Verify the output JSON schema and check that `sync_frames_handled` matches the ground truth count."
+  ],
+  "verifier_knob": {
+   "name": "relative_error_threshold",
+   "value": "1.0e-4",
+   "effect": "Lowering to 1.0e-5 requires double-precision stability and exact boundary interpolation; raising to 1.0e-2 would permit approximate numerical quadrature methods like Simpson's rule while still rejecting naive Euler."
+  },
+  "expected_failure_modes": [
+   "Attempting to patch integration by simply decreasing an internal step size or tuning heuristic multipliers rather than deriving the exact closed-form solution from SPEC.md.",
+   "Failing to discover the uint32 microsecond timestamp rollover logic in codec.py, resulting in dropped or negative-delta spans across long traces.",
+   "Resetting accumulator state per shard file instead of piping the tail state vector to the subsequent shard.",
+   "Testing only on the first shard file where no timestamp overflow occurs and assuming the fix is complete."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "software-engineering",
+  "tags": [
+   "data-processing",
+   "numerical-methods",
+   "binary-protocols",
+   "debugging",
+   "systems"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/telemetry-drain/docs/SPEC.md",
+   "cat /opt/telemetry-drain/src/telemetry_drain/codec.py",
+   "cat /opt/telemetry-drain/src/telemetry_drain/integrator.py",
+   "cat /opt/telemetry-drain/src/telemetry_drain/shard_manager.py",
+   "python3 -c 'import sympy as sp; t, l, dt, ra, rb, E0 = sp.symbols(\"t l dt ra rb E0\"); r = ra + (rb-ra)/dt*t; E = sp.dsolve(sp.Derivative(sp.Function(\"E\")(t), t) + l*sp.Function(\"E\")(t) - r, ics={sp.Function(\"E\")(0): E0}); print(sp.simplify(E.rhs.subs(t, dt)))'",
+   "sed -i or write patched src/telemetry_drain/integrator.py with analytical recurrence",
+   "edit src/telemetry_drain/codec.py to handle uint32 delta wraparound (dt = (curr - prev) & 0xFFFFFFFF) and parse tag 0xFD sync frames",
+   "edit src/telemetry_drain/shard_manager.py to preserve endpoint state across chunk loops and sort shard files",
+   "/opt/telemetry-drain/bin/reconcile-spans --input-dir /var/lib/telemetry/shards --report /tmp/recon_report.json",
+   "cat /tmp/recon_report.json"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 5,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Ambiguity in output JSON schema: the requirement says 'relative_error (or status: SUCCESS)'. If the test verifier expects exact keys, optional key alternation can fail a valid implementation.",
+   "Unclear source of reference settlement integral: if `reconcile-spans` calculates relative_error directly, where does the reference value come from on fresh hidden test shards if not in the shard metadata?"
+  ],
+  "verdict": "reject",
+  "reasons": "The task is rejected because genuine_difficulty is 2 (below the required minimum score of 3). The instruction prompt spoon-feeds all three root causes directly to the solver (32-bit timestamp rollover, sync frame tag handling, and chunk boundary state carryover), reducing the task to a 10-command code-edit speedrun.",
+  "fixes": [
+   "Remove the explicit root-cause spoilers from the instruction draft. Present only the CLI error output and symptoms (drift, discontinuities, sync frame warnings) without explaining that uint32 rollover is occurring or that shard boundaries are resetting state.",
+   "Require the reconciler to handle multiple concurrent telemetry streams (multiplexed worker node IDs) within shards rather than a single linear stream, requiring genuine trace indexing and state management.",
+   "Firmly specify the JSON schema: specify whether `relative_error` is emitted when a manifest reference is available, or remove `(or status: SUCCESS)` to ensure a deterministic contract."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "While both involve binary telemetry frame decoding, the candidate focuses on numerical rate integration math and inter-chunk state carryover, whereas the reference focuses on repairing a multi-stage pipeline and protocol v2 demuxing panics."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference focuses on decoding runner shards into a SQLite database and optimizing analytical SQL queries, whereas the candidate centers on continuous numerical integration across binary telemetry chunks."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "The reference involves debugging canary deployment health-window evaluation and weighted error rate calculations in a Node.js service."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The reference requires building a bash validator that compiles recursive JSON filter specifications into SQL queries."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "The reference is a multi-component WAF rule compilation and HTTP request classification debugging task."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fc33c63adc58",
+     0.21
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.158
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.092
+    ],
+    [
+     "ours/official-18899524e171",
+     0.089
+    ],
+    [
+     "ours/official-10912a593843",
+     0.083
+    ]
+   ],
+   "cost_usd": 0.005955
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0194835
+}

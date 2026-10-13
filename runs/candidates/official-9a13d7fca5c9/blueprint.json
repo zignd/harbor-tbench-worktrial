@@ -1,0 +1,66 @@
+{
+ "slug": "recover-release-report-queries",
+ "title": "Recover Release Report Queries",
+ "scenario": "A release engineer is unblocking the JavaScript release-audit build after a configuration rollout left some SQL reports unreadable and caused one malformed report to abort the entire audit. The repository contains the audit runner, a small SQLite event database, a custom report-manifest format, and Git history containing earlier versions of query files that are no longer present in the working tree.",
+ "instruction_draft": "The release audit must finish by running `npm run release-audit` with the checked-in sample data. Make the resulting `artifacts/report-results.sqlite` and `artifacts/report-errors.json` correct and deterministic: valid reports must produce their configured rows, malformed or SQL-invalid reports must be recorded and skipped without suppressing other reports, and the effective configuration must honor base, release-channel, and local overrides in that order. Reports use the documented manifest format and PostgreSQL-flavored SQL but execute against SQLite; support the complete documented parameter, quoting, comment, cast, boolean, and case-insensitive comparison behavior rather than special-casing the sample reports.",
+ "requirements": [
+  "Make `npm run release-audit` complete successfully on the checked-in fixture without network access or wall-clock-dependent output.",
+  "Write `artifacts/report-results.sqlite` with the documented result tables and one result set for every successfully executed configured report.",
+  "Write `artifacts/report-errors.json` containing deterministic structured errors for every report that cannot be recovered, parsed, parameterized, or executed; one failing report must not prevent later valid reports from running.",
+  "Load configuration by deep-merging `config/base.json`, `config/channels/<RELEASE_CHANNEL>.json` when that file exists, and `config/local.json` when that file exists, with later object keys overriding earlier keys and arrays replaced rather than concatenated.",
+  "Parse the documented report-manifest format, including section names, escaped scalar values, JSON parameter objects, multiline SQL blocks, blank lines, comments, and reports whose SQL contains `=` or manifest-like text.",
+  "Resolve a configured query path from the working tree, and when it is absent recover the newest blob for that exact path from reachable Git history without changing the checkout.",
+  "Translate the documented PostgreSQL-flavored SQL to SQLite while ignoring syntax inside single-quoted strings, double-quoted identifiers, quoted PostgreSQL dollar blocks, line comments, and block comments.",
+  "Translate positional `$1`, `$2`, and so on into SQLite positional bindings in occurrence order, translate named report parameters according to the manifest contract, remove supported PostgreSQL casts, map standalone `TRUE` and `FALSE` to SQLite values, and provide the documented case-insensitive comparison behavior.",
+  "Preserve parameter values as bound SQLite parameters rather than interpolating user or fixture data into SQL.",
+  "Execute each report in isolation so a failed statement cannot leave partial rows from that report in the output database.",
+  "Produce stable report ordering and stable error ordering based on the manifest/configuration order, not filesystem iteration or Git object ordering."
+ ],
+ "environment": [
+  "The Dockerfile uses `FROM python:3.13-slim-bookworm`, installs pinned `nodejs`/npm and SQLite tooling from apt, and installs only pinned local Python packages needed by the fixture; no internet is needed at runtime.",
+  "A hand-written JavaScript repository of roughly 1,400 lines contains the CLI, SQLite schema loader, event fixture importer, report executor, configuration loader, unrelated release checks, and tests.",
+  "`package.json` exposes `npm run release-audit`; the command imports deterministic NDJSON events into `data/events.sqlite`, loads report configuration, executes reports, and writes the two artifacts.",
+  "`config/base.json`, a channel override, and a local override intentionally exercise nested object merging, array replacement, disabled reports, and a query path whose current-tree file is missing.",
+  "`reports/release.manifest` is a compact documented manifest with multiline SQL, escaped values, comments, valid reports, a deliberately malformed report, and a report whose query must be recovered from Git history.",
+  "The repository has several authored Git commits: a query file is added, modified, and later deleted; the current configuration points at that path. A newer unrelated commit and a same-named file in another directory are present to ensure exact-path and reachable-history behavior matter.",
+  "The existing executor and configuration code are intentionally wired to a missing `src/query/reportCompiler.js` component and contain shallow fallback behavior that aborts on the first report error.",
+  "`docs/report-format.md` and `docs/sql-compatibility.md` define the manifest grammar, configuration precedence, recovery policy, output schema, supported SQL translations, parameter rules, and error categories.",
+  "The visible fixture includes ordinary placeholders and casts, while hidden verification creates temporary repositories, manifests, configurations, and SQLite event tables containing comments, quoted literals, repeated parameters, dollar-quoted text, invalid reports before valid reports, and unusual but documented whitespace and escaping."
+ ],
+ "internal_hint": "The failure is not reliably visible by reading the executor alone. First run the release command and inspect both artifacts, then use `git log --all -- reports/...`, `git show`, and tracing around report execution to discover that the configured query was deleted and that the fallback selects only the working tree. The missing compiler should be implemented as a lexical scanner rather than regular-expression substitutions: scan SQL modes for strings, identifiers, comments, and dollar-quoted blocks, translate only code tokens, and build bindings while preserving occurrence order. Fix configuration merging and report-level savepoints/transactions so a malformed early report is captured and later reports still execute. Verify with generated temporary Git histories and SQL containing parameters and syntax-like text in literals/comments; shallow fixes pass the sample but corrupt hidden queries.",
+ "trap": "A naive solution can hard-code the visible report names, use regex replacements that alter quoted strings or comments, take the oldest or wrong-path Git blob, concatenate channel arrays, interpolate parameters into SQL, or abort after the first bad report. The visible sample still appears correct for simple SQL, but hidden manifests exercise repeated and out-of-order parameters, dollar-quoted text, deleted-file recovery, invalid reports preceding valid ones, and configuration overrides that change the expected result rows.",
+ "tests": [
+  "Run the release command on the checked-in fixture and compare the output SQLite schema, report rows, report ordering, and error JSON against the reference state.",
+  "Generate fresh base/channel/local configuration files with nested values and arrays, vary `RELEASE_CHANNEL`, and verify deep object precedence and array replacement.",
+  "Generate manifests with escaped fields, multiline SQL, comments, blank lines, `=` characters, and reordered report sections; compare parsed and executed results with the reference parser.",
+  "Create temporary Git repositories with multiple reachable commits, deleted query paths, unrelated same-named files, and modified historical blobs; verify exact-path newest-blob recovery without checkout mutation.",
+  "Generate SQL containing positional parameters, repeated parameters, casts, booleans, case-insensitive comparisons, quoted strings containing `$1` and `::`, line/block comments, and PostgreSQL dollar-quoted blocks; compare rows and bindings against the reference translator.",
+  "Place malformed syntax, missing parameters, and SQL constraint failures before successful reports; verify that errors are deterministic, successful reports remain present, and failed reports leave no partial rows.",
+  "Run the same input repeatedly with randomized directory enumeration order and confirm byte-stable JSON and identical SQLite contents."
+ ],
+ "verifier_knob": {
+  "name": "independent_generated_report_cases",
+  "value": "24",
+  "effect": "Raising this adds more generated manifests, Git histories, SQL lexical edge cases, override combinations, and failure-order permutations, making shallow sample-specific repairs fail more often; lowering it leaves more behavior covered only by the visible fixture."
+ },
+ "expected_failure_modes": [
+  "The agent reads the obvious executor bug but does not investigate Git history, so deleted query files remain unrecoverable.",
+  "The SQL translator uses regular expressions and changes placeholders or keywords inside literals, comments, identifiers, or dollar-quoted blocks.",
+  "The manifest parser handles only the visible multiline example and loses escaped values, ordering, or sections with unusual whitespace.",
+  "Configuration merging incorrectly concatenates arrays or applies local settings before channel settings.",
+  "The implementation binds only the first occurrence of a parameter or assumes placeholders are numbered monotonically.",
+  "A report-level error still aborts the entire transaction or leaves partial rows in the result database.",
+  "The agent verifies only the checked-in sample and misses generated histories, invalid-before-valid ordering, or deterministic output requirements."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "data-querying",
+ "tags": [
+  "javascript",
+  "sqlite",
+  "sql-translation",
+  "git-history",
+  "configuration",
+  "error-recovery"
+ ]
+}

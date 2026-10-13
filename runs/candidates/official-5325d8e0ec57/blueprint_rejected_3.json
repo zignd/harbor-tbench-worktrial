@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "repair-authoritative-zone-loader",
+  "title": "Repair the Authoritative Zone Loader",
+  "scenario": "You are the on-call SRE for a small internal authoritative DNS service whose deployment started rejecting unusual but valid zone updates while occasionally persisting malformed records. The container contains a Node.js ingestion daemon, a UDP query service, SQLite-backed zone storage, deployment configuration, migration utilities, and operational fixtures; the zone-file normalization component is incomplete and several configuration and transaction paths are unreliable.",
+  "instruction_draft": "Make the DNS service accept every valid configured zone update, reject every invalid or unsafe update without changing stored state, and serve the resulting records correctly over its documented interface. Preserve the required behavior across reloads and restarts, including unusual valid syntax and verify-time inputs not present in the fixtures.",
+  "requirements": [
+   "Valid zone updates for configured authoritative suffixes must be accepted and made queryable through the service's documented interface.",
+   "Invalid, unsafe, over-limit, and out-of-policy zone updates must be rejected with a non-success result.",
+   "Rejecting an update must leave the SQLite database and previously served zone data unchanged.",
+   "Accepted records must retain their correct owner names, TTLs, classes, types, and decoded values when queried.",
+   "The service must support the documented zone-file syntax, including omitted owners, optional TTL and class fields, quoted and escaped character data, parenthesized multiline records, comments, wildcard names, and relative names.",
+   "The configured origin, permitted suffixes, record-count and record-size limits, and semantic record policies must be enforced consistently on ingestion and reload.",
+   "The resulting data must remain correct after stopping and restarting the service.",
+   "The service must not execute commands, access paths outside its configured data directory, or interpret record content as SQL or JavaScript."
+  ],
+  "environment": [
+   "A Dockerfile based on python:3.13-slim-bookworm installs pinned Node.js, SQLite, and small diagnostic utilities without network access during task execution.",
+   "The repository contains roughly 1,400 lines of JavaScript across a UDP DNS responder, an HTTP health/admin endpoint, SQLite migrations, a supervisor, logging helpers, fixtures, and unrelated operational code.",
+   "The service is started by /opt/zonemesh/bin/zonemesh using /etc/zonemesh/config.json and stores its database below /var/lib/zonemesh/.",
+   "A documented CLI and local HTTP endpoint ingest zone text, reload configuration, inspect rejection reasons, and query normalized records; the exact invocation examples include only a few ordinary single-line records.",
+   "The zone normalizer is intentionally incomplete: its lexer assumes one record per physical line and its semantic phase does not correctly handle inherited owners, multiline records, escaped quoted fields, or all legal field-order combinations.",
+   "The configuration loader has a shallow-defaulting and reload inconsistency, while the persistence path can commit individual rows before all validation has completed.",
+   "The UDP responder and SQLite schema are mostly functional but expose failures when normalized names, relative origins, wildcard records, or escaped rdata are represented incorrectly.",
+   "Visible fixtures contain ordinary A, AAAA, CNAME, MX, and TXT records plus a few obviously malformed files; verify-time tests generate fresh benign and malicious corpus members from a deterministic seed.",
+   "The hidden corpus includes valid records with comments, blank lines, mixed TTL/class order, quoted semicolons, backslash escapes, parentheses, escaped dots, root labels, wildcard labels, long-but-allowed TXT chunks, and owner inheritance, alongside malformed syntax, conflicting SOA/CNAME data, out-of-scope names, resource-limit attacks, NUL/control characters, traversal-like text, and SQL/JavaScript injection payloads."
+  ],
+  "internal_hint": "First inspect the launch script, configuration schema, CLI/API contract, SQLite migrations, and a running service rather than assuming the visible examples define the grammar. Exercise ingestion while tracing database snapshots and UDP/HTTP queries; the key failures only become apparent when state is accumulated across a successful update, a rejected update, reload, and restart. Replace the line-oriented normalizer with a bounded lexer and parser for the documented master-file grammar, perform expansion and semantic validation into an isolated in-memory result, enforce configuration and cross-record policies before one atomic SQLite transaction, and make reload use the same validated configuration object as startup. Then test both normalized queries and persistence with generated corpus cases.",
+  "trap": "A shallow fix that merely splits on whitespace, strips semicolons, or validates the visible examples appears to work but corrupts quoted semicolons, escaped whitespace, multiline records, inherited owners, and relative names. Another plausible fix validates rows after insertion or checks only the first bad record, so a hidden malformed case leaves a partial zone or accepts a policy violation; a service that answers immediately but does not persist the normalized origin also fails restart tests.",
+  "tests": [
+   "Start the service with the shipped configuration, ingest the visible benign fixtures, and verify exact normalized records through the documented query interface.",
+   "For a deterministic verify-time corpus of several hundred generated valid zone files, check that every member is accepted and that every expected normalized record is returned with exact owner, TTL, class, type, and decoded rdata.",
+   "For a separate deterministic corpus of malformed, policy-violating, resource-exhausting, injection, and path/control-character inputs, check that every member is rejected and that the database checksum, zone version, and answers for the prior zone are unchanged.",
+   "Run cases combining several valid records followed by a late invalid record to detect partial SQLite commits and stale in-memory publication.",
+   "Exercise configuration variants with different origins, allowed suffixes, limits, and record policies, including reloads, and verify that startup and reload enforce identical effective settings.",
+   "Query records whose names and values require origin expansion, owner inheritance, wildcard handling, quoted text, escaped characters, comments, and parenthesized continuation; compare wire-level or documented JSON answers with a deterministic reference implementation.",
+   "Stop and restart the daemon after multiple updates, then verify that the persisted accepted zone and rejection history have the required behavior and no rejected records reappear.",
+   "Send adversarial content containing SQL metacharacters, JavaScript-looking strings, NULs, control bytes, very deep names, oversized parenthesized groups, and traversal-like names, checking rejection, bounded completion, and absence of files outside the data directory.",
+   "Verify that unrelated health and metrics endpoints continue to work and that the daemon remains responsive after a rejected corpus member."
+  ],
+  "verifier_knob": {
+   "name": "hidden_zone_corpus_size_and_grammar_coverage",
+   "value": "700 verify-time cases: 420 valid generated zones and 280 malformed or adversarial mutations, with 35% exercising combinations of multiline syntax, escaping, inheritance, limits, and policy interactions",
+   "effect": "Lowering the corpus mostly checks common records and makes line-oriented patches likely to pass; raising it adds more grammar compositions, long histories, rare escapes, and late-failure mutations, making partial parsers, non-atomic persistence, and shallow validation increasingly likely to fail."
+  },
+  "expected_failure_modes": [
+   "Implementing a regex or whitespace splitter that cannot represent the documented master-file grammar.",
+   "Treating semicolons, parentheses, backslashes, or quotes as unconditional delimiters and corrupting valid TXT or multiline records.",
+   "Expanding relative names against the wrong origin or mishandling the root and escaped-dot labels.",
+   "Validating each row independently while missing cross-record invariants such as SOA requirements, CNAME exclusivity, or configured suffix policy.",
+   "Publishing records or committing SQLite rows before the complete zone has been validated.",
+   "Fixing startup configuration but leaving reload on a different defaults or merge path.",
+   "Using the visible examples as the grammar and failing generated valid edge cases.",
+   "Adding permissive fallback behavior that accepts malformed records, SQL-like input, control characters, or oversized structures.",
+   "Correcting ingestion while overlooking the responder's normalized-name representation or restart behavior.",
+   "Running only a few manual queries and missing failures that require accumulated database state and a late invalid record."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "networking-services",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "dns",
+   "configuration",
+   "parser",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd && find . -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' /opt/zonemesh/bin/zonemesh && cat /etc/zonemesh/config.json",
+   "find /opt/zonemesh -type f \\( -name '*.js' -o -name '*.json' -o -name '*.sql' \\) -print",
+   "grep -RniE 'normalize|parse|reload|ingest|transaction|origin|suffix' /opt/zonemesh",
+   "sed -n '1,280p' /opt/zonemesh/package.json; find /opt/zonemesh -type f -path '*migration*' -exec sed -n '1,220p' {} \\;",
+   "sed -n '1,320p' /opt/zonemesh/src/normalizer.js; sed -n '1,280p' /opt/zonemesh/src/config.js",
+   "sed -n '1,320p' /opt/zonemesh/src/ingest.js; sed -n '1,260p' /opt/zonemesh/src/db.js",
+   "sed -n '1,280p' /opt/zonemesh/src/server.js; sed -n '1,240p' /opt/zonemesh/src/responder.js",
+   "grep -RniE 'curl|dig|ingest|reload|query' /opt/zonemesh/README* /opt/zonemesh/docs /opt/zonemesh/bin",
+   "/opt/zonemesh/bin/zonemesh >/tmp/zonemesh.log 2>&1 & echo $!",
+   "curl -fsS http://127.0.0.1:8080/health; curl -fsS http://127.0.0.1:8080/config",
+   "run the documented benign ingestion and query commands, then copy the SQLite database for before/after comparison",
+   "apply_patch to replace the line-oriented normalizer with a bounded lexer, quote/escape handling, parenthesis grouping, and record-field parser",
+   "apply_patch to add origin expansion, owner inheritance, wildcard/root handling, decoded rdata, limits, and semantic cross-record validation",
+   "apply_patch to validate a complete in-memory zone before publication and commit all rows in one SQLite transaction",
+   "apply_patch to unify startup and reload configuration merging and effective-policy validation",
+   "apply_patch to correct normalized-name and relative-origin representation used by persistence and the UDP responder",
+   "node --check on changed JavaScript files and run the visible fixture ingestion/query commands",
+   "exercise quoted semicolons, escaped dots, inherited owners, multiline records, late invalid records, reload, and restart with curl/dig and SQLite checks",
+   "send representative injection, control-byte, traversal, oversized, and policy-invalid inputs, inspect logs/database/files, then kill the daemon and review the diff"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The documented master-file grammar, semantic record policies, exact limits, and required SOA rules are not specified in the blueprint, so tests could require behavior that a solver cannot infer.",
+   "The documented CLI, HTTP, and UDP interfaces are referenced but their exact paths, request formats, status semantics, and normalized JSON or wire representation are not given.",
+   "A hidden reference implementation could disagree about escaped-dot labels, root-label formatting, TXT chunk decoding, wildcard matching, or relative-name expansion.",
+   "The phrase 'every valid' zone update may implicitly include DNS master-file constructs beyond the explicitly listed subset, making the hidden corpus broader than the stated contract.",
+   "Resource-exhaustion tests may be flaky or unfair if bounded completion thresholds, maximum input sizes, and memory/time budgets are not explicit.",
+   "Restart tests may overreach if rejection-history retention, zone-version numbering, or database checksum stability is not defined.",
+   "The environment claims pinned packages and no network access, but does not state whether all Node dependencies and diagnostic tools are preloaded in the image."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and has strong adversarial verification, but the requested repair spans a full parser, semantic validator, transactional persistence path, configuration system, and responder behavior, which is unlikely to be solvable reliably in under an hour. The speedrun reaches roughly 20 commands only by assuming several substantial implementation patches are straightforward; the source-visible bug pattern also triggers the stated cap of 2 for genuine difficulty. Important grammar, policy, interface, and limit details are underspecified, creating invalid-failure risk.",
+  "fixes": [
+   "Specify the complete supported grammar, including field-order rules, escape decoding, owner inheritance, origin syntax, TXT chunk semantics, and explicitly unsupported constructs.",
+   "List the exact semantic policies and limits, including SOA requirements, CNAME exclusivity, permitted types, maximum names, record counts, record sizes, nesting depth, and input size.",
+   "Document the precise CLI, HTTP, and UDP request/response contracts and canonical normalized representation used by tests.",
+   "Reduce the scope to either parser and validation correctness or persistence/configuration/restart correctness, or provide substantially more implementation scaffolding.",
+   "Define atomicity and rejection-history/version semantics precisely, including what must remain byte-for-byte unchanged after rejection.",
+   "Publish deterministic resource and timeout thresholds so adversarial completion tests are not environment-dependent.",
+   "Add a local reference-test command or contract tests covering the full stated grammar before relying on a hidden 700-case corpus."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The candidate centers on DNS zone-file parsing, validation, transactional SQLite updates, and authoritative querying, unlike NDJSON schema-based log ingestion."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The reference is a TCP HMAC protocol and binary WAL serialization task, with no shared core problem beyond general state handling."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Although both involve a query service and persistent data, the candidate requires DNS zone normalization and authoritative semantics rather than metric aggregation over HTTP."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference repairs an opaque sensor transformation and statistical SQL pipeline, while the candidate addresses DNS syntax, policy validation, and zone serving."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The reference concerns artifact scanning and reconciliation for unusual filenames, whereas the candidate concerns authoritative DNS zone parsing, transactional updates, and record semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-94391df591b0",
+     0.15
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.134
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.126
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.124
+    ],
+    [
+     "ours/official-982469e29790",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.0008135999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0034871999999999998
+}

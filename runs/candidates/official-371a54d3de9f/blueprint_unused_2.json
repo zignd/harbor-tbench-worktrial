@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "repair-encrypted-sql-query",
+  "title": "Repair Encrypted Incident Querying",
+  "scenario": "A database administrator is recovering from an incident in which the audit-query tool returned incomplete results from an encrypted SQLite archive. The container contains the archive, key manifests, a command-line SQL query service, migration utilities, generated incident data, and operational notes; the missing feature is a fast, authenticated query path over encrypted audit records.",
+  "instruction_draft": "Implement the encrypted audit query feature described in the repository documentation so that `bin/incident-query` evaluates every supported Boolean, equality, set-membership, range, and tenant constraint with exact results, rejects unauthenticated or malformed records, and emits canonical JSONL. It must process the hidden 50,000-record workloads with at least 99.5% result accuracy and a median query latency below 250 ms without exposing plaintext in the SQLite database or outputting records outside the requested tenant.",
+  "requirements": [
+   "Implement the documented encrypted audit query feature behind `bin/incident-query`.",
+   "Support every documented Boolean, equality, set-membership, range, and tenant constraint.",
+   "Return exact result sets for valid queries, including nested AND, OR, and NOT expressions.",
+   "Reject malformed, tampered, wrong-key, and AAD-mismatched records rather than returning their contents.",
+   "Emit one canonical JSON object per result in the documented stable ordering and emit no diagnostic text on stdout.",
+   "Never write decrypted plaintext back into the SQLite database.",
+   "Never return a record belonging to a tenant other than the tenant requested by the query.",
+   "Achieve at least 99.5% result accuracy on verify-time generated workloads.",
+   "Achieve median latency below 250 ms on the verify-time 50,000-record workload."
+  ],
+  "environment": [
+   "Use a Dockerfile based on `python:3.13-slim-bookworm`, with pinned apt packages including sqlite3, openssl, jq, and build tooling, and pinned Python packages including cryptography.",
+   "Provide roughly 1,400 lines across bash, Python, SQL, configuration, migration, and test-support files, including unrelated maintenance utilities and a small existing query service so the relevant path requires investigation.",
+   "Create `data/audit.sqlite3` containing approximately 18,000 encrypted audit records across multiple tenants, key epochs, event types, timestamps, and payload shapes, plus indexed metadata and blind-search-token tables.",
+   "Create `data/key-manifest.json`, tenant configuration, schema migrations, incident notes, and a README documenting the externally visible query syntax and output format but not all implementation invariants.",
+   "Ship an opaque compiled helper at `lib/libvault.so` and a thin existing ctypes wrapper; the helper performs authenticated envelope encryption and key derivation but its source is not present in the environment.",
+   "The envelope format uses AES-256-GCM, per-record keys derived from the tenant master key and epoch, and associated data formed from the exact tenant, table, record identifier, column name, and format version. The blind-index construction and canonicalization rules are represented in configuration and existing data rather than being duplicated in a convenient source implementation.",
+   "Include a partially implemented `bin/incident-query` bash entry point and several SQL/Python components, with a visible implementation that handles simple equality examples but has incorrect candidate selection and authentication-context handling.",
+   "Include visible sample queries covering one tenant, equality, and a simple AND expression; these samples intentionally do not cover epoch changes, Unicode normalization, empty OR branches, NOT, tampering, or cross-tenant identifiers.",
+   "Provide deterministic verify-time generators that create fresh databases and query suites from hidden seeds, including approximately 50,000 records, multiple key epochs, rare Unicode and delimiter cases, duplicate values across tenants, corrupted envelopes, and adversarial Boolean expressions.",
+   "All generator randomness is seeded and all verification is offline and deterministic."
+  ],
+  "internal_hint": "The intended resolution is investigative rather than a local patch. Run the supplied query examples, inspect SQLite indexes and token distributions, compare successful and failed decryptions, trace the ctypes wrapper, and use the migration/configuration files to reconstruct canonicalization, epoch selection, HKDF context, GCM AAD, and blind-index derivation. The correct implementation should parse the documented expression tree, compile safe parameterized SQL that first uses tenant and indexed blind-token/range candidates, decrypt only candidates, authenticate with the complete row-specific AAD, then evaluate the original expression against canonical plaintext and apply stable ordering. The existing path silently constructs AAD from only the record ID and chooses the current epoch, while its OR/NOT candidate planner treats a missing branch as an empty result; these errors are data-dependent and are not reliably visible from source inspection alone. A deterministic shell reference solution should inspect the schema, run controlled queries and tamper experiments, derive the protocol from the helper behavior and data, then replace the planner/decrypt path and exercise generated edge cases before finishing.",
+  "trap": "A shallow solution can decrypt the visible records with the current key epoch and scan every row, or use a single equality token and then filter simple AND queries in Python. That passes the supplied samples but fails hidden records from older epochs, values requiring the repository's canonical Unicode/length encoding, nested OR/NOT expressions, duplicate identifiers in another tenant, and records whose ciphertext is valid under the wrong AAD. Full-table decryption also exceeds the latency threshold on the generated workload.",
+  "tests": [
+   "Run the command against the supplied sample query suite and compare canonical JSONL output with the reference.",
+   "Generate fresh encrypted SQLite archives with hidden seeds, including all supported epochs and tenants, and compare exact result sets for hundreds of equality, set, range, AND, OR, NOT, and mixed nested queries.",
+   "Include Unicode normalization, empty-set, null-like, boundary timestamp, duplicate-value, and delimiter-containing predicates in generated queries.",
+   "Modify ciphertext, tags, key epochs, tenant identifiers, and associated metadata independently; verify that affected records are rejected and no plaintext is emitted.",
+   "Submit queries containing cross-tenant record IDs and verify that tenant isolation is preserved.",
+   "Inspect the database after execution and verify that encrypted columns and schema contents have not been replaced with plaintext.",
+   "Run the hidden 50,000-record workload with indexed and non-indexed predicate mixes; require at least 99.5% exact result accuracy and median latency below 250 ms.",
+   "Check stdout for canonical JSONL only, stable ordering, no duplicate records, and deterministic repeated results."
+  ],
+  "verifier_knob": {
+   "name": "median_query_latency_ms",
+   "value": "250",
+   "effect": "Lowering the threshold forces more selective SQL candidate planning, better token/range indexing, and less authenticated decryption; raising it permits slower scans and makes a partially correct implementation more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The solver reads the visible implementation and patches the obvious current-epoch or simple-equality bug without experimentally tracing the opaque crypto helper.",
+   "The solver guesses the HKDF or GCM AAD context and passes common records while failing epoch, tenant, or delimiter edge cases.",
+   "The solver evaluates Boolean expressions only after selecting candidates with an unsound OR/NOT approximation, causing false negatives on hidden expressions.",
+   "The solver scans and decrypts the entire archive, producing correct small-sample answers but missing the latency threshold.",
+   "The solver trusts blind-index matches without authenticated plaintext verification and returns tampered or wrong-context records.",
+   "The solver implements a permissive parser that mishandles empty branches, nested negation, Unicode canonicalization, or numeric range boundaries.",
+   "The solver leaks decrypted values through diagnostics or mutates encrypted database columns while testing the implementation."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "cryptography",
+   "sqlite",
+   "constraint-satisfaction",
+   "performance",
+   "bash"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "find . -maxdepth 3 -type f -print | sort",
+   "sed -n '1,240p' README* docs/* 2>/dev/null",
+   "sed -n '1,260p' bin/incident-query",
+   "grep -RInE 'query|canonical|epoch|HKDF|AAD|token|range|tenant' . --exclude-dir=.git",
+   "sqlite3 data/audit.sqlite3 '.schema'",
+   "sqlite3 data/audit.sqlite3 '.indexes'",
+   "sqlite3 data/audit.sqlite3 'select tenant_id,key_epoch,count(*) from audit_records group by 1,2;'",
+   "sqlite3 data/audit.sqlite3 'select * from key_manifest 2>/dev/null limit 5;'",
+   "sed -n '1,260p' lib/* wrapper* config/* migrations/* 2>/dev/null",
+   "cat data/key-manifest.json && find . -iname '*query*' -o -iname '*sample*' -o -iname '*incident*'",
+   "run the supplied sample query suite and save stdout and stderr separately",
+   "inspect the ctypes signatures and call the wrapper on known-good records from each tenant and epoch",
+   "compare successful and deliberately altered decryptions to determine key, epoch, and authentication failure behavior",
+   "inspect migration/configuration code and existing token distributions to recover canonicalization and blind-index encoding",
+   "write a small controlled probe for Unicode, delimiters, null-like values, and boundary timestamps",
+   "replace the permissive query parsing with a documented recursive expression parser and explicit validation",
+   "implement canonical value encoding and all equality, set, range, Boolean, and tenant predicates",
+   "implement row-specific key-epoch selection and complete GCM AAD construction through the supplied wrapper",
+   "compile safe parameterized tenant-scoped SQL candidate queries using all applicable blind-token and range indexes",
+   "evaluate the original AST only after authenticated decryption, treating OR, NOT, and empty branches correctly",
+   "enforce stable ordering, duplicate suppression, canonical JSONL serialization, and stderr-only diagnostics",
+   "run sample queries and compare exact output against the reference",
+   "run ciphertext, tag, epoch, tenant, identifier, and AAD tamper probes and verify no corrupted record is emitted",
+   "generate a smaller fresh archive with multiple epochs and tenants, then run nested Boolean and Unicode cases",
+   "run the hidden-style 50,000-record generator and exact-result workload",
+   "benchmark median latency, profile candidate counts, and optimize SQL indexes or batching if needed",
+   "inspect the SQLite database for unchanged encrypted columns and rerun the full deterministic suite"
+  ],
+  "speedrun_commands": 27,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The latency threshold may be flaky across host CPUs, container scheduling, filesystem state, or process-startup measurement methodology, especially for broad NOT queries that require decrypting most tenant records.",
+   "The blueprint does not specify whether latency includes process startup, database generation, JSON serialization, or only query execution, making the 250 ms metric potentially ambiguous.",
+   "Offline buildability is not fully established: the base image may lack a compatible pinned cryptography wheel, and the opaque shared library may have architecture or runtime-library assumptions not stated in the blueprint.",
+   "If the documentation, generator, and reference implementation disagree about stable ordering, empty Boolean branches, malformed-record handling, or null-like values, failures would reflect oracle ambiguity rather than solver error.",
+   "A requirement for 99.5% accuracy is weaker than the separately described exact-result checks and could permit a solution that intentionally omits difficult records unless the verifier clearly applies exact checks to all relevant suites."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear externally visible outcome and deterministic, adversarial verification that covers the important correctness and security properties. Solving it requires protocol discovery, authenticated candidate planning, and performance work rather than merely reading and patching the obvious implementation, although the opaque helper and performance definition make solvability somewhat marginal. It resembles a credible incident-recovery engineering task and exceeds the stated acceptance threshold.",
+  "fixes": [
+   "Define latency measurement precisely, including whether startup, serialization, and database access are included, and specify the CPU and storage assumptions used for verification.",
+   "Add an offline build smoke test or vendor compatible cryptography dependencies and document the shared-library ABI and runtime requirements.",
+   "State the malformed-record policy, empty AND/OR semantics, null-like representation, stable ordering key, and canonical JSON schema directly in the task contract or an authoritative fixture.",
+   "Make the verifier report exact-result failures separately from the aggregate 99.5% metric, or remove the weaker aggregate threshold where exact suites already apply.",
+   "Ensure the hidden workload contains a documented-enough distribution of broad NOT and non-indexed queries that the latency target is achievable on the specified one-CPU container."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "The candidate requires implementing authenticated encrypted-record querying with predicate evaluation and tenant isolation, not optimizing a static SQLite query."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Although both involve audit data and authentication, the reference implements TCP HMAC verification and record canonicalization rather than encrypted query execution and filtering."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "The reference repairs cross-component ECDH session-key derivation for encrypted log windows, while the candidate implements an authenticated encrypted database query path."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference builds an HTTP time-series aggregation service, whereas the candidate evaluates Boolean and relational predicates over encrypted audit records."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference concerns quantile-sketch accuracy and systemd deployment for a metrics daemon, not encrypted audit-record querying or integrity validation."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.176
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.15
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.134
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.12
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.116
+    ]
+   ],
+   "cost_usd": 0.0008359999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0037997999999999994
+}

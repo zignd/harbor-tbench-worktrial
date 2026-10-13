@@ -1,0 +1,151 @@
+{
+ "blueprint": {
+  "slug": "telemetry-query-partition-repair",
+  "title": "Fix Telemetry Shard Query Coordinator in Release Pipeline",
+  "scenario": "A continuous delivery release build is blocked because the nightly telemetry verification test suite fails its accuracy assertion against the historical event partition store. The repo contains a bash-based distributed query coordinator (`bin/telemetry-query`) that delegates analytical SQL queries across sharded SQLite databases in `/var/lib/telemetry/shards/` using an opaque binary helper (`bin/shard-pruner`) and parallel worker processes. The previous sprint's changes to shard pruning and distributed aggregation caused query results to drift significantly from ground truth on older partition data.",
+  "instruction_draft": "Our nightly release build is blocked because the telemetry validation step (`scripts/ci-verify.sh`) is failing accuracy assertions on historical partition benchmarks. The query coordinator (`bin/telemetry-query`) orchestrates analytical SQL queries across our sharded SQLite archive in `/var/lib/telemetry/shards`, but recent changes to shard pruning and aggregation caused results to drift from expected historical ground truth.\n\nInvestigate and repair `bin/telemetry-query` (and any related repo scripts) so that analytical queries execute accurately across the full partition archive. Your fix must ensure that `scripts/ci-verify.sh` passes successfully, achieving a benchmark accuracy score of at least 0.990 on the validation query suite without breaking the developer test suite.",
+  "requirements": [
+   "Run `scripts/ci-verify.sh` and ensure it exits with code 0.",
+   "Achieve a query benchmark accuracy score of at least 0.990 (99.0%) against the reference validation queries in `scripts/ci-verify.sh`.",
+   "Maintain compatibility with developer smoke tests in `test/test_sample.sh`.",
+   "Correctly aggregate analytical SQL queries (including `COUNT`, `SUM`, `AVG`, and `GROUP BY` with potential `NULL` keys) across all matching partition databases.",
+   "Correctly interface with `bin/shard-pruner` to prune partition files without dropping matching historical shards."
+  ],
+  "environment": [
+   "Base image: `python:3.13-slim-bookworm` with `sqlite3`, `coreutils`, `gawk`, `procps`, `binutils`, and `strace` installed.",
+   "Repository directory `/opt/telemetry-query/` containing `bin/telemetry-query` (bash query coordinator), `bin/shard-pruner` (stripped x86_64 ELF binary without source), `scripts/ci-verify.sh`, and `test/test_sample.sh`.",
+   "Partition archive in `/var/lib/telemetry/shards/` containing 8 SQLite database files (`shard_2023_q1.db` through `shard_2024_q4.db`).",
+   "Historical data variation planted in 2023 shards: timestamps are stored as 13-digit Unix millisecond integers (e.g. `1672531200000`), and soft-deleted rows are indicated by `is_deleted = 1`.",
+   "Modern data variation planted in 2024 shards: timestamps are stored as 10-digit Unix second integers (e.g. `1704067200`), and soft-deleted rows are indicated by `deleted_at IS NOT NULL`.",
+   "Planted aggregation bug in `bin/telemetry-query`: calculates `AVG(col)` across shards by naively computing `AVG(partial_avg)`, which mathematically drifts when partition row counts are unequal.",
+   "Planted systems concurrency bug in `bin/telemetry-query`: workers write to a single hardcoded temp file (`/tmp/partial_results.csv`) concurrently without per-worker isolation or atomic collection.",
+   "Planted pruning bug: `bin/telemetry-query` passes unparsed or millisecond timestamps directly to `bin/shard-pruner`, causing the binary to discard all historical 2023 partitions when a time filter is specified."
+  ],
+  "internal_hint": "Resolution requires: (1) Running `scripts/ci-verify.sh` to observe low accuracy (~0.64) and diffing sample failed queries against the databases. (2) Inspecting the SQLite schemas and actual row values across `/var/lib/telemetry/shards/` to discover the schema shift: 2023 shards use millisecond timestamps and `is_deleted`, while 2024 shards use second timestamps and `deleted_at`. (3) Reverse engineering `bin/shard-pruner` using test inputs and `strace` to confirm it expects epoch seconds for `--start` and `--end`, and that passing ms timestamps or omitting bounds causes empty partition lists. (4) Fixing `bin/telemetry-query` to normalize timestamps in shard queries (`CASE WHEN ts > 1000000000000 THEN ts/1000 ELSE ts END`), filter active records across both schema versions (`COALESCE(is_deleted, 0) = 0` and `deleted_at IS NULL`), and rewrite `AVG` into `SUM` and `COUNT` components so the consolidation phase computes `SUM(sum_val) * 1.0 / SUM(count_val)`. (5) Using isolated per-shard temp files (`mktemp`) and `wait` to avoid race conditions during parallel shard execution.",
+  "trap": "A developer test `test/test_sample.sh` runs queries only against a single recent partition (`shard_2024_q4.db`) with simple `COUNT` and `SUM` metrics. Naively fixing only the hardcoded temp file collision or syntax errors will make `test_sample.sh` pass with 100%, but `scripts/ci-verify.sh` will continue failing at ~0.64 accuracy because the agent did not inspect historical data formats or distributed `AVG` math.",
+  "tests": [
+   "Run `test/test_sample.sh` to confirm no regression on basic single-partition smoke queries (exit code 0).",
+   "Run `scripts/ci-verify.sh` on the full historical dataset to verify accuracy score >= 0.990 across all validation queries.",
+   "Execute dynamic hidden queries containing `AVG`, `GROUP BY`, and timestamp range filters spanning the 2023/2024 boundary to verify exact output alignment with ground truth.",
+   "Verify that NULL group keys and NULL column values in aggregations are preserved and not converted into empty strings or zeros.",
+   "Verify that running queries with 4 concurrent background worker processes does not corrupt or truncate intermediate result files."
+  ],
+  "verifier_knob": {
+   "name": "ACCURACY_THRESHOLD",
+   "value": "0.990",
+   "effect": "Lowering to 0.75 allows solutions that fix only the timestamp issue or only the AVG issue to pass; raising to 0.999 requires floating-point precision alignment on all aggregate calculations."
+  },
+  "expected_failure_modes": [
+   "Agent only checks `test/test_sample.sh`, sees it pass after fixing a minor bash syntax error, and stops without running `scripts/ci-verify.sh`.",
+   "Agent inspects only `bin/telemetry-query` source code and misses the schema and timestamp differences between 2023 and 2024 shard files because they only appear by inspecting the actual SQLite data files.",
+   "Agent fails to reverse engineer `bin/shard-pruner` and continues passing 13-digit millisecond timestamps to it, causing all historical shards to be pruned from the query plan.",
+   "Agent fixes the temp file race condition but retains `AVG(sub_avg)` in the consolidation query, failing the accuracy threshold due to partition size skew."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "sql",
+   "bash",
+   "sqlite",
+   "distributed-systems",
+   "reverse-engineering",
+   "devops"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "bash scripts/ci-verify.sh",
+   "cat bin/telemetry-query",
+   "cat scripts/ci-verify.sh",
+   "sqlite3 /var/lib/telemetry/shards/shard_2023_q1.db '.schema events'",
+   "sqlite3 /var/lib/telemetry/shards/shard_2024_q1.db '.schema events'",
+   "sqlite3 /var/lib/telemetry/shards/shard_2023_q1.db 'SELECT ts, is_deleted FROM events LIMIT 3;'",
+   "sqlite3 /var/lib/telemetry/shards/shard_2024_q1.db 'SELECT ts, deleted_at FROM events LIMIT 3;'",
+   "bin/shard-pruner --help || strace -f -s 128 bin/shard-pruner --start 1672531200 --end 1735689600",
+   "vim bin/telemetry-query",
+   "bash test/test_sample.sh",
+   "bash scripts/ci-verify.sh"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 3
+  },
+  "invalid_failure_risks": [
+   "SQL rewriting fragility: Bash regex/awk-based SQL parsing easily breaks on unexpected SQL formatting (whitespace, column aliases, case-sensitivity, or multiple aggregates) in dynamic hidden tests.",
+   "Schema column mismatch runtime errors: 2023 shards lack `deleted_at` and 2024 shards lack `is_deleted`; queries referencing either column directly will crash with SQLite 'no such column' unless the coordinator rewrites queries or SQLite views/compatibility shims are documented as permitted.",
+   "Hardware architecture lock-in: A precompiled stripped x86_64 ELF binary (`bin/shard-pruner`) will fail on ARM64/aarch64 evaluation hosts unless emulation (qemu-user) is present."
+  ],
+  "verdict": "accept",
+  "reasons": "The task presents genuine layered systems debugging involving distributed aggregation math skew (AVG of AVG), schema drift across time-partitioned SQLite databases, concurrency race conditions, and reverse engineering a partition pruner binary. The bugs are not directly readable from a single source file and require active environment inspection. The average score is 3.6 and all criteria meet minimum acceptable standards.",
+  "fixes": [
+   "Constrain or explicitly document the expected SQL dialect/grammar supported by `bin/telemetry-query` so agents are not penalized by arbitrary SQL formatting variations in hidden tests.",
+   "Ensure `bin/shard-pruner` includes both x86_64 and aarch64 binaries (or a multi-arch dispatcher) to prevent environment failure on ARM-based runner nodes.",
+   "Clarify in the coordinator code or README how schema differences (missing columns `is_deleted` vs `deleted_at`) should be handled (e.g. view creation or SQL rewriting rules)."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "The reference focuses on optimizing a single SQL query against an existing WordNet database, whereas the candidate involves fixing a distributed shard-coordination and aggregation script across sharded SQLite databases."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The reference requires fixing SQL window and ranking functions within a single query file, while the candidate requires debugging a multi-shard query coordinator bash script and its shard pruning logic."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The reference entails compiling JSON filter specifications into single SQLite queries, whereas the candidate involves orchestrating and aggregating distributed query execution across partitioned SQLite files."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference requires implementing a Python HTTP query service that interfaces with a compiled window aggregation library, which is fundamentally different from fixing bash-based distributed shard querying."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference is about characterizing an opaque normalization binary and repairing an ETL pipeline, whereas the candidate focuses on distributed SQL aggregation and shard pruning across partitioned database files."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.166
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.152
+    ],
+    [
+     "ours/official-18899524e171",
+     0.149
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.106
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.101
+    ]
+   ],
+   "cost_usd": 0.0043837500000000005
+  },
+  "novel": true
+ },
+ "cost_usd": 0.01988175
+}

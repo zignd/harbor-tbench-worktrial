@@ -1,0 +1,157 @@
+{
+ "blueprint": {
+  "slug": "telemetry-clock-reconcile-service",
+  "title": "Migrated Log Metric Query Protocol Service",
+  "scenario": "A platform engineering team is migrating cluster telemetry from legacy log forwarders to a new centralized metric daemon (`logmetricd`). The daemon is intended to serve an internal TCP query protocol on port 9042 for Grafana and alert probes, but the migration was left unfinished: legacy compact log segments cannot be parsed, multi-node causal clock skews are not reconciled, and query aggregation requests fail. The environment contains an incomplete Python service codebase (~1,200 lines across 8 files), legacy binary-packed log segments, and sample protocol client scripts.",
+  "instruction_draft": "Hey, we're cutting over the cluster log aggregator to the new ingestion pipeline today, but the metric query daemon (`logmetricd`) isn't hooked up to the legacy compact log format yet and the alert evaluator is timing out. Can you finish implementing the compact reader and the multi-node clock reconciliation in `logmetricd` so it serves the metric query protocol on port 9042? There are sample dump data in `/var/data/telemetry` and some notes in the repo.",
+  "requirements": [
+   "The `logmetricd` service runs as a persistent daemon listening for TCP connections on `0.0.0.0:9042`.",
+   "Reverse-engineer and implement decoding of legacy compact telemetry segments (`.clog` files in `/var/data/telemetry`) including zig-zag varint delta timestamps, bitpacked event flags, and dictionary-encoded tag headers.",
+   "Reconcile host clock skews by solving the causality constraint satisfaction problem across distributed node pairs using inter-node sync heartbeat records (`t_recv - offset_dst >= t_send - offset_src + min_latency`), ensuring all causal parent-child event latencies remain strictly non-negative.",
+   "Correctly answer line-based TCP metric protocol queries (`FETCH <metric_name> <window_start_ms> <window_end_ms> <step_ms> <aggregator: sum|rate|p50|p99> [filter_key=val...]`) with tab-delimited timestamp and value rows followed by `OK` status.",
+   "Handle malformed protocol commands by returning standard `ERR <reason>` responses without crashing or dropping connections."
+  ],
+  "environment": [
+   "Base Debian Bookworm container with Python 3.13, `numpy`, and `scipy` pre-installed.",
+   "Codebase in `/opt/logmetricd`: includes protocol server skeleton (`server.py`), storage manager (`storage.py`), unfinished compact format reader (`ingest/compact.py`), and a stubbed clock reconciler (`reconcile/clocks.py`).",
+   "Sample captured legacy log segment files in `/var/data/telemetry/sample_nodes.clog` and an opaque legacy diagnostic reader binary `/usr/local/bin/legacy_inspect` (stripped ELF) that prints sample records for verification.",
+   "A systemd service or init script `/etc/init.d/logmetricd` to manage service lifecycle.",
+   "Sample queries test script in `/opt/logmetricd/scripts/query_client.py`."
+  ],
+  "internal_hint": "The solver must first inspect the legacy file structure using `/usr/local/bin/legacy_inspect` or by analyzing header magic `CLOG\\x01` and the chunk layout. Timestamps are encoded using variable-length zig-zag delta encoding relative to chunk base timestamps, and tags are mapped via chunk-local string dictionary tables. Second, logs arrive from 4+ independent worker hosts whose local clocks drift arbitrarily; inter-node RPC trace logs contain send/receive pairs that define a linear difference inequality system (`skew_j - skew_i <= delta`). A naive average or zero-skew assumption causes causal violations (negative execution spans) and misaligns sliding-window metric buckets. Solving this requires building a constraint graph (or linear program via `scipy.optimize.linprog`) to find feasible clock offsets satisfying all synchronization markers. Finally, the query protocol handler must aggregate the normalized events into non-overlapping tumbling time windows for the requested reducers (`sum`, `rate`, `p50`, `p99`).",
+  "trap": "A solver might decode timestamps as absolute uint64 instead of signed zig-zag deltas, which appears to work on the first few sample entries but yields astronomical timestamps on subsequent records. Alternatively, the solver may ignore clock reconciliation and rely on raw node timestamps; while single-node queries pass, any query spanning distributed RPC traces will yield corrupted quantiles or zero events due to bucket misplacement.",
+  "tests": [
+   "Service lifecycle check: verifies `logmetricd` is reachable on TCP port 9042 and responds to `PING` with `PONG`.",
+   "Legacy compact decoding unit test: passes a fresh, randomized `.clog` file generated from a hidden seed and verifies decoded event counts, metric values, and tags against the reference decoder.",
+   "Causality constraint check: tests clock reconciliation on a 6-node network with non-uniform network delays and circular clock offsets generated at verify time, checking that all reconstructed RPC spans have strictly positive durations.",
+   "Metric protocol query suite: executes 15 distinct protocol queries (covering `sum`, `rate`, `p50`, `p99`, varied window steps, and label filter combinations) and verifies exact matching against reference values computed on fresh hidden-seed telemetry data.",
+   "Protocol robustness test: sends malformed command strings, unclosed connections, and out-of-range timestamps, verifying proper `ERR` formatting without daemon termination."
+  ],
+  "verifier_knob": {
+   "name": "protocol_scenarios_count",
+   "value": "15",
+   "effect": "Scales the number of independent hidden-seed query scenarios and clock skew topologies tested against the running daemon."
+  },
+  "expected_failure_modes": [
+   "Failure to reverse-engineer the zig-zag varint and chunk dictionary encoding in the `.clog` format, causing decoding to crash on subsequent chunks.",
+   "Implementing clock reconciliation as a simple pairwise average rather than solving the global constraint satisfaction inequality graph, causing negative latencies in multi-hop causal chains.",
+   "Window bucketing off-by-one errors (inclusive vs exclusive window boundaries) when computing percentiles or rates across bucket edges.",
+   "Server crashing or hanging on concurrent TCP client connections due to improper socket handling."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "distributed-systems",
+  "tags": [
+   "log-processing",
+   "constraint-satisfaction",
+   "reverse-engineering",
+   "network-protocols",
+   "telemetry"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/logmetricd && ls -la && git log -p -2",
+   "cat README.md notes.txt 2>/dev/null || cat /opt/logmetricd/docs/* 2>/dev/null",
+   "/usr/local/bin/legacy_inspect -h || strings /usr/local/bin/legacy_inspect | grep -E 'magic|chunk|tag'",
+   "/usr/local/bin/legacy_inspect /var/data/telemetry/sample_nodes.clog",
+   "xxd -l 128 /var/data/telemetry/sample_nodes.clog",
+   "cat ingest/compact.py",
+   "cat reconcile/clocks.py",
+   "cat storage.py server.py",
+   "python3 -c 'import ingest.compact; print(dir(ingest.compact))'",
+   "python3 scripts/query_client.py --help || cat scripts/query_client.py",
+   "vim ingest/compact.py",
+   "python3 -m unittest discover tests/ -k compact || python3 ingest/compact.py",
+   "vim reconcile/clocks.py",
+   "python3 -m unittest discover tests/ -k clocks || python3 reconcile/clocks.py",
+   "vim storage.py server.py",
+   "python3 server.py &",
+   "python3 scripts/query_client.py --query 'FETCH cpu_usage 0 60000 10000 p50'",
+   "killall python3",
+   "service logmetricd restart && service logmetricd status",
+   "python3 scripts/query_client.py --ping"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Translational gauge freedom in clock reconciliation: pairwise difference inequalities (skew_j - skew_i <= delta) only constrain relative offsets. Unless an anchor node (e.g. node 0 offset = 0) and a deterministic LP objective function (e.g. min sum |offset| or min L2) are strictly specified, any valid feasible offset assignment shifts absolute timestamps by an arbitrary constant C, moving events into different tumbling window buckets and breaking test assertion checks.",
+   "Quantile method ambiguity: calculating p50 and p99 has multiple common conventions (numpy linear interpolation, midpoint, nearest-rank, R-types 1-9); exact float matching across 15 test queries will fail if the test expects a specific method not stated in the requirements.",
+   "Rate calculation unit ambiguity: whether `rate` represents metric delta per millisecond or metric delta per second over `step_ms`.",
+   "Scope overload: reverse-engineering an undocumented packed binary format from a stripped ELF, formulating and solving a multi-node LP constraint problem, and implementing multi-reducer tumbling window aggregation within a 60-minute limit."
+  ],
+  "verdict": "reject",
+  "reasons": "The scope combines three distinct complex problems (reverse-engineering an undocumented binary format via a stripped ELF, solving a multi-node linear programming clock skew system, and implementing a streaming window metric aggregation daemon), making it virtually unsolvable within standard time and resource limits. Furthermore, clock difference constraints possess translational gauge freedom where shifting all offsets by a constant satisfies the inequalities but shifts events across tumbling window boundaries, causing verifier query mismatches.",
+  "fixes": [
+   "Document the binary `.clog` header, chunk layout, and varint encoding explicitly in repo notes or provide a working low-level decoder library, shifting the focus to ingestion and protocol handling rather than binary reverse-engineering.",
+   "Specify the exact clock reconciliation reference anchor (e.g., 'host0 offset is fixed to 0, minimize sum of squared offsets' or 'minimize max absolute skew') and explicitly state the `min_latency` value.",
+   "Formally define the aggregator behavior in the prompt or repository specification (e.g., percentile interpolation method, inclusive vs exclusive bucket intervals `[start, end)`, and rate normalization units)."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference task involves repairing quantile sketch accuracy and systemd service stability in a Go daemon, whereas the candidate focuses on binary log decoding, distributed clock skew reconciliation, and implementing a TCP query server in Python."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference task requires building an HTTP service that wraps a SQLite C-extension library for windowed metric aggregation, whereas the candidate requires reverse-engineering a compact binary file format and solving multi-node causal clock skews over TCP."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference task involves debugging a Rust demuxer and shell pipeline for binary trace spools, whereas the candidate focuses on implementing a daemon with custom varint/bitpack parsing and linear causal clock reconciliation."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "The reference task requires debugging a NetFlow v9 UDP aggregator and JSON TCP query server, whereas the candidate involves decoding compact log files and reconciling distributed clock skews."
+    },
+    {
+     "ref_id": "ours/official-cff69805912b",
+     "verdict": "distinct",
+     "reason": "The reference task concerns verifying cryptographic HMAC-SHA256 audit log chains via stdin/stdout, whereas the candidate addresses binary telemetry parsing and multi-node clock synchronization."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-d993c25003e5",
+     0.188
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.174
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.123
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.112
+    ],
+    [
+     "ours/official-cff69805912b",
+     0.105
+    ]
+   ],
+   "cost_usd": 0.00566775
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0162015
+}

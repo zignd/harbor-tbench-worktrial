@@ -1,0 +1,185 @@
+{
+ "blueprint": {
+  "slug": "repair-event-feature-rebuild",
+  "title": "Repair the Event Feature Rebuilder",
+  "scenario": "You are a data engineer inheriting a JavaScript telemetry-feature pipeline whose latest release was enabled after a rushed feature iteration. The repository contains the pipeline, a small SQLite state store, configuration and migration history, several thousand sharded JSONL events, and Git history from the last three releases; production reports that user-day features differ after replaying the same export. Restore deterministic rebuilds and retain the new velocity feature without changing the documented event schema.",
+  "instruction_draft": "Make the repository's rebuild command produce the correct deterministic state for the supplied event export. It must recursively read every JSONL shard, retain only the highest revision of each event ID (with the documented deterministic tie rule), apply deletions before aggregation, globally order surviving events by event time and ID, and produce the canonical event, session, and user-day feature state in SQLite. Session boundaries are gaps strictly greater than 1,800 seconds; for each UTC user-day, compute the configured exponentially decayed signed value using half-life from config, the absolute activity total, active duration, session count, and the documented velocity feature, rounding published decimal features to six places exactly as the repository documentation specifies. Rebuilds must be idempotent, remove rows and output shards that no longer belong to the input, use a transaction and atomic output replacement, and emit the manifest with the input digest, configuration digest, row counts, and schema version. Validate the result on adversarial cases involving duplicate IDs across shards, late events, revisions, deletions, reset events, negative values, timestamps at UTC day boundaries, empty shards, and repeated execution; do not special-case the supplied fixture.",
+  "requirements": [
+   "The rebuild command must recursively discover and process all JSONL input shards rather than relying on shard names or directory order.",
+   "For each event ID, only the highest revision may survive; equal-revision conflicts must follow the deterministic tie rule documented in the repository.",
+   "Deleted or superseded events must not affect sessions, aggregates, feature rows, output shards, or row counts.",
+   "Surviving events must be globally ordered by event timestamp and then event ID before sessionization.",
+   "A new session must begin only when the gap between consecutive events for a user is strictly greater than 1,800 seconds.",
+   "Events exactly on UTC day boundaries must be assigned according to the documented UTC date rule.",
+   "Reset events must have the documented effect on the running feature state and must be handled in timestamp/ID order.",
+   "Each user-day row must contain the correct decayed signed value, absolute activity total, active duration, session count, and velocity feature.",
+   "The decay calculation must use the configured half-life and the documented exponential formula, not a hard-coded fixture value.",
+   "Published decimal features must use the repository's specified six-place rounding behavior.",
+   "The SQLite canonical-events, sessions, and user-day feature tables must contain no stale rows after a rebuild.",
+   "The rebuild must be idempotent: running it twice against identical inputs must produce byte-equivalent logical state and the same manifest.",
+   "The rebuild must commit state transactionally and replace generated output shards atomically.",
+   "The manifest must contain the input digest, configuration digest, schema version, and accurate counts for canonical events, sessions, and feature rows.",
+   "The implementation must work on large exports containing thousands of records and many independent shards without manual file selection or sample-specific logic."
+  ],
+  "environment": [
+   "A Docker image based on FROM python:3.13-slim-bookworm installs pinned Node.js, SQLite CLI, Git, and only offline packages needed by the repository.",
+   "The working directory is a Git repository of roughly 1,500 lines of JavaScript, SQL, shell, configuration, tests, and operational tooling, with four meaningful commits documenting an ingest stage, session stage, velocity-feature iteration, and a regression release.",
+   "The repository contains a command-line entry point such as bin/rebuild.js, package metadata, config/features.json, schema migrations, a SQLite database directory, and generated output-shard directories.",
+   "A supplied fixture contains roughly 14,000 events spread across nested directories and more than 40 JSONL files, including ordinary examples plus duplicate IDs, revisions, deletions, reset events, negative amounts, empty shards, late timestamps, and UTC boundary cases.",
+   "The current branch contains plausible but incorrect implementations in multiple dependent stages: revision resolution is sensitive to shard traversal, sessionization can consume shard-local order, and feature publication mishandles one configuration and rounding path. The defects are data-dependent and are not reliably exposed by the small smoke fixture.",
+   "A checked-in design note and migration history define the exact event fields, equal-revision tie rule, reset semantics, UTC assignment, decay equation, velocity equation, rounding rule, manifest fields, and output layout; unrelated maintenance utilities and an older compatibility command are also present.",
+   "Git history includes an earlier implementation with different intermediate tables and a later feature commit that changed the schema, so the solver must determine which current schema and compatibility behavior are authoritative.",
+   "The Docker image includes a deterministic reference-data generator used only by verification to create fresh exports with new shard layouts, IDs, revisions, and rare edge-case combinations."
+  ],
+  "internal_hint": "The intended resolution is investigative rather than a one-line patch. First inspect Git history, the design note, migrations, package scripts, and the actual command path; then run the smoke rebuild while recording SQLite counts, manifests, and intermediate rows. Generate or isolate tiny probes for duplicate IDs across files, equal revisions, deletion after a high revision, out-of-order timestamps, a gap of exactly 1,800 seconds, reset-before/after-day-boundary cases, and half-life values that expose the rounding branch. Compare shard-local and globally sorted results and use SQLite queries to locate the first stage that diverges. The robust fix is to canonicalize all records in one deterministic pass keyed by event ID and revision/tie rule, discard deletions, sort surviving events globally per user, sessionize from that order, and feed only those sessions/events into the configured decay and velocity calculations. Rebuild tables and generated shards inside a transaction or staging directory, delete obsolete state, and atomically publish both database and manifest. The deterministic reference solution should investigate with Git, targeted generated probes, and SQL before editing files, then invoke the finished command on the full fixture and verify idempotence.",
+  "trap": "A shallow solution can make the visible smoke output look correct by sorting each shard, taking the first duplicate encountered, or fixing only the final feature formula. Hidden exports put the same event ID in differently ordered directories, place a later revision in another shard, combine deletions with resets and late events, and include a 1,800-second boundary. Such a solution produces plausible early-stage rows but silently changes session boundaries and then compounds the error in decay, velocity, counts, manifests, and stale output rows. Another common failure is using JavaScript's default rounding or a hard-coded half-life, which passes ordinary values but fails rare negative and tie cases.",
+  "tests": [
+   "Run the command on the supplied fixture and compare canonical event rows, session rows, user-day feature rows, generated output shards, and manifest fields against the reference state.",
+   "Generate a fresh 10,000-30,000-record export with randomized nested shard layout and compare the complete resulting SQLite state and manifest against a deterministic reference implementation.",
+   "Generate cases with duplicate IDs in separate shards, higher and lower revisions, equal-revision tie conflicts, and deletion records; verify only the specified winner affects downstream state.",
+   "Shuffle all input lines and rename/repartition shards without changing records; verify identical logical database state, output content, digests, and counts.",
+   "Check sessionization around gaps of 1,799, 1,800, and 1,801 seconds and verify that global event ordering is used.",
+   "Check UTC midnight, negative amounts, reset events, empty shards, and users with no surviving events.",
+   "Use generated configurations with several half-lives and values that produce negative and half-way rounded feature results; compare six-place published values exactly.",
+   "Run the rebuild twice, then remove a shard and rebuild; verify idempotence and that obsolete canonical events, sessions, feature rows, and output shards are removed.",
+   "Interrupt or simulate failure during staging and verify that the previously committed database and manifest remain valid, while a successful run publishes them atomically.",
+   "Check that the implementation handles thousands of records and many files within the container's one-CPU, 2-GB environment without manual intervention."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "11",
+   "effect": "Raising the value adds independent checks for canonical rows, revision/deletion semantics, session boundaries, reset behavior, every published feature, stale-row removal, shard contents, digests, counts, idempotence, and atomic failure behavior; lowering it to only final aggregate totals makes partial or sample-specific repairs much more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the current implementation and patches the visible velocity arithmetic without tracing all dependent stages.",
+   "The agent trusts filesystem traversal order or processes each shard independently, so hidden repartitioning changes winners or session boundaries.",
+   "The agent deduplicates by first-seen record or ignores equal-revision and deletion semantics.",
+   "The agent uses local timestamps, lexicographic timestamps, or an inclusive 1,800-second threshold.",
+   "The agent computes the new feature from pre-canonicalized events or pre-reset aggregates, allowing superseded or deleted events to leak downstream.",
+   "The agent hard-codes the fixture's half-life, uses approximate decay, or relies on JavaScript rounding that differs for negative half-way values.",
+   "The agent updates existing SQLite rows but does not remove rows and shards from a previous larger rebuild.",
+   "The agent verifies only row totals or a few hand-picked users and misses rare combinations in the large generated export.",
+   "The agent makes output deterministic but non-atomic, leaving a mixed database and manifest after a failed run.",
+   "The agent misunderstands the migration history and writes correct calculations into an obsolete schema."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "git-history",
+   "event-replay",
+   "feature-engineering",
+   "determinism"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Locate repository files, entry points, tests, and input/output directories with find/ls.",
+   "Inspect git log and the four relevant commits for authoritative schema and compatibility behavior.",
+   "Read the design note, package scripts, configuration, migrations, and current rebuild entry point.",
+   "Trace ingest, revision resolution, sessionization, feature calculation, SQLite writes, manifest generation, and shard publication.",
+   "Run the smoke rebuild and record database counts, representative rows, manifest, and generated shards.",
+   "Query canonical events, sessions, and user-day rows with SQLite to identify current divergences.",
+   "Use git grep/history to confirm equal-revision tie handling, deletion/reset semantics, UTC assignment, decay, velocity, and rounding rules.",
+   "Create small adversarial probes for duplicate revisions, deletions, ordering, session boundaries, resets, UTC boundaries, and half-life rounding.",
+   "Run the probes and compare shard-local versus globally sorted behavior.",
+   "Change ingestion to recursively enumerate JSONL files and deterministically canonicalize each event ID by revision and documented tie rule.",
+   "Discard deleted winners and feed only surviving canonical events to downstream stages.",
+   "Globally sort surviving events by user, timestamp, and event ID before sessionization.",
+   "Fix the strict session-gap boundary and reset handling.",
+   "Fix configured decay, velocity, UTC user-day assignment, and exact six-place publication rounding.",
+   "Rebuild canonical, session, and feature tables from scratch or staged tables so stale rows cannot survive.",
+   "Implement deterministic manifest inputs and counts, and stage generated shards for atomic replacement.",
+   "Run the full supplied fixture and inspect all SQLite tables, shards, and manifest fields.",
+   "Run the rebuild twice and compare logical state, output content, and manifest.",
+   "Remove an input shard and rebuild to verify obsolete rows and shards disappear.",
+   "Run the generated randomized export and compare against the reference implementation.",
+   "Exercise simulated staging failure and confirm the previous committed state remains intact."
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The required input digest is ambiguous: hashing raw files makes the digest change when lines are shuffled or shards are renamed, while one test appears to require identical digests after such repartitioning; the repository must define a canonical digest explicitly.",
+   "Atomic replacement of a SQLite database, manifest, and output-shard directory is not generally crash-atomic across separate filesystem objects; failure tests must define an achievable staging/commit protocol and interruption point.",
+   "The design note and migration history are assumed to contain every exact equation, tie rule, rounding behavior, and output-layout detail; if any are missing or contradictory, failures are invalid ambiguity rather than implementation errors.",
+   "A failure-injection test is only valid if the injection mechanism and expected recovery semantics are deterministic in the one-process container.",
+   "The offline package claim must include all dependencies needed by the repository and reference-data generator; otherwise setup failures are environmental rather than task failures."
+  ],
+  "verdict": "accept",
+  "reasons": "The task describes a realistic multi-stage data-pipeline repair with strong adversarial verification and enough repository history to make the intended behavior discoverable. The main risks are definitional rather than fundamental, especially the digest behavior under input reshuffling and the meaning of atomic publication, so those details must be explicit in the checked-in documentation and tests. The expected investigation and cross-stage fixes are substantial enough that this is not merely a visible one-line source patch.",
+  "fixes": [
+   "Define the input digest as either a raw-export digest or a canonical record digest, and make the shuffle/repartition test consistent with that definition.",
+   "Document an explicit crash-safe publication protocol for the database, manifest, and shard directory, including the exact failure-injection points and recovery expectations.",
+   "State the authoritative migration/schema version and output paths directly in the task fixture metadata, and reject or remove obsolete compatibility outputs from verification scope.",
+   "Specify the reference generator's invocation, seed behavior, and resource budget so generated verification inputs are reproducible and feasible offline."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "variant",
+     "reason": "Both solve deterministic event replay with duplicate resolution, UTC ordering, sessionization, and derived time-based features, but this candidate is an offline sharded SQLite rebuild with revisions, deletions, resets, and user-day aggregation rather than the reference's HTTP campaign-attribution service."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both are deterministic replay utilities, the reference reconstructs incident components, aliases, and dependency order, while this task rebuilds event sessions and numerical user-day features."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The reference validates cryptographic audit chains and emits authoritative events, whereas this task performs semantic event deduplication, deletion handling, sessionization, and feature aggregation."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The shared recursive input discovery, atomic replacement, and deterministic replay concerns are implementation patterns, but the reference replays committed transactional logs into canonical rows and this task computes telemetry-derived feature state."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "The reference is a binary signed-settlement reconciliation problem with authenticated frames and monetary adjustments, not an event-feature rebuild or session aggregation task."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ce30ab52c4d1",
+     0.259
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.183
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.177
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.157
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.145
+    ]
+   ],
+   "cost_usd": 0.0012106
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0039366
+}

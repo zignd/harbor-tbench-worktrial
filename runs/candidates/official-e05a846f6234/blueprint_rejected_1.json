@@ -1,0 +1,179 @@
+{
+ "blueprint": {
+  "slug": "repair-trace-budget-service",
+  "title": "Repair the Trace Budget Service",
+  "scenario": "A backend developer is chasing a production regression in an internal Rust service that turns persisted request traces into SLO and burn-rate metrics. The container contains the service, several unrelated telemetry utilities, a large deterministic trace log with restarts and late amendments, metric fixtures, and a precompiled black-box latency classifier used by the service. The daemon currently gives plausible answers for the small dashboard examples but disagrees with incident reports after recovery and long-running traffic.",
+  "instruction_draft": "Hey, can you get `/opt/tracepulse/bin/tracepulse` working again? It reads the trace log selected by `TRACEPULSE_LOG` and serves newline-delimited JSON requests on stdin, with one JSON response per request; keep that protocol and make the answers correct for arbitrary valid logs, not just the bundled examples. Queries must produce deterministic `count`, `error_count`, `burn_rate`, `longest_bad_span_ms`, and percentile fields exactly as documented in the repo, including after restart records, out-of-order amendments, and traces that cross query boundaries. Please rebuild the Rust service in place and leave it runnable without network access.",
+  "requirements": [
+   "The rebuilt `/opt/tracepulse/bin/tracepulse` must start successfully and read newline-delimited JSON requests from stdin.",
+   "The service must emit exactly one valid JSON response for every valid request and must not depend on wall-clock time, randomness, or network access.",
+   "The service must load the log file named by `TRACEPULSE_LOG`, replay its complete history, and correctly handle restart/checkpoint records, duplicate deliveries, late amendments, and records arriving out of timestamp order.",
+   "For every valid query, the response must contain the documented `count`, `error_count`, `burn_rate`, `longest_bad_span_ms`, and requested percentile fields with the documented integer rounding and boundary semantics.",
+   "A trace amended after a restart must affect the original logical request rather than being counted as a second request or silently discarded.",
+   "Windowed queries must include and exclude events according to the documented half-open interval rules, including events exactly on either boundary and spans crossing a boundary.",
+   "Bad intervals must be merged according to the documented service-level objective threshold, and `longest_bad_span_ms` must be computed from the merged timeline rather than from individual records.",
+   "Percentiles and burn rates must use the service's latency classification and weighting semantics, including all classifier buckets and sparse buckets.",
+   "The implementation must work on fresh valid logs and request sequences, not merely on the supplied fixture.",
+   "The existing JSON request/response shape and command-line invocation must remain compatible with the verifier."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned Debian packages including `rustc`, `cargo`, `build-essential`, and standard debugging tools; no network is available at solve or verify time.",
+   "The repository under `/opt/tracepulse` contains roughly 1,500 lines of Rust split among a daemon, log reader, replay state machine, interval calculator, percentile adapter, and configuration module, plus roughly 500 lines of plausible but unrelated metrics and administrative code.",
+   "The service reads JSON-lines records containing request identifiers, event sequence numbers, event timestamps, completion timestamps, status classes, latency observations, restart markers, checkpoint digests, and amendment references. The README documents the protocol, field meanings, half-open query intervals, SLO threshold, percentile interpolation, and response schema.",
+   "A deterministic production-like log contains approximately 18,000 records across multiple replay epochs. It includes duplicate batches, delayed amendments, checkpoint boundaries, sequence-number gaps, records with identical timestamps, and enough normal traffic to make manual inspection unreliable.",
+   "The image includes several small metric fixtures and a replay inspection tool that can print state transitions, but the main service is initially built with two planted runtime defects.",
+   "A precompiled executable `/opt/tracepulse/lib/latency-classifier` is shipped without source. It accepts a documented probe format on stdin and returns a bucket and weight for each latency value. Its piecewise thresholds, inclusive endpoint behavior, and saturation behavior are intentionally not stated; the Rust adapter assumes a simpler model that happens to pass the visible examples.",
+   "The classifier binary is deterministic and remains available to the repaired service. Its behavior can be characterized by experiments, including probes near thresholds and at large values, but it cannot be inspected by reading source.",
+   "The initial binary and source are installed so that the normal command is `/opt/tracepulse/bin/tracepulse`; the solver may edit the repository and rebuild the binary, but must not replace the protocol with a test-specific script."
+  ],
+  "internal_hint": "The two interacting causes are (1) replay state is keyed by the current epoch's local sequence position instead of the globally identified logical request, so an amendment following a restart can create a new observation or attach to a reused sequence number, and (2) the interval accumulator closes a bad span using the last record seen in log order rather than the maximum timestamp reached by the recovered logical timeline. The first defect changes which observations exist; the second changes whether those observations merge into one outage, so fixing either alone can make the bundled dashboard cases appear correct while hidden combinations fail. A skilled solution should first run the daemon against the fixture, compare checkpoint and post-restart queries, use the replay inspection utility or temporary instrumentation to follow one amended request, and generate tiny logs varying delivery order. It should then probe the opaque classifier around a binary-search set of thresholds, exact endpoints, and saturation values, and use those observations rather than assuming linear latency buckets. The final repair needs a stable request identity/revision selection during replay, timestamp-based interval accumulation and merging, and an adapter that preserves the classifier's actual bucket weights and endpoint semantics. The reference solution is a deterministic shell script that performs these experiments, writes focused Rust fixes, rebuilds, and runs both fixture and generated protocol checks.",
+  "trap": "A shallow solution commonly sorts records by timestamp and deduplicates by sequence number, which fixes ordinary late delivery but loses an amendment whose sequence number is reused after a restart. Another common solution merges intervals in input order and passes the visible examples because their records are nearly ordered. A hand-written percentile formula also passes the dashboard values while failing hidden latencies exactly at opaque classifier thresholds, saturated values, or sparse weighted buckets. Hidden tests combine all three conditions in one log, so fixing replay order, interval merging, or classifier math in isolation is insufficient.",
+  "tests": [
+   "Start-up and protocol test: launch the rebuilt daemon with the bundled log, send the documented health and baseline query requests, and verify valid JSON responses, required fields, and deterministic output.",
+   "Baseline metric test: issue several dashboard-like windows and compare counts, error counts, burn rates, merged bad-span lengths, and percentile fields against the deterministic reference.",
+   "Recovery test: generate a fresh log with multiple restart and checkpoint epochs, duplicate batches, and sequence numbers reused in different epochs; verify that only the selected logical revisions contribute to each query.",
+   "Late-amendment test: generate requests whose amendments arrive before and after restart records and in arbitrary delivery order; verify amendment replacement, duplicate idempotence, and stable answers regardless of delivery ordering.",
+   "Boundary test: generate events and spans exactly at query start and end, exactly at the SLO latency threshold, and with equal timestamps; verify documented half-open window and inclusive/exclusive rules.",
+   "Timeline test: generate out-of-order completions and overlapping bad intervals; verify that the service uses recovered event timestamps and produces the union length and longest merged span, not log-order durations.",
+   "Opaque-classifier test: generate latency values from a hidden seed concentrated just below, at, and just above every classifier threshold, including values beyond its maximum range; compare weighted percentile and burn-rate results to the black-box reference.",
+   "Composed scenario test: combine restart reuse, late amendments, duplicate delivery, boundary timestamps, overlapping outages, and threshold-adjacent latencies in one fresh log, then issue multiple overlapping query windows in one daemon session.",
+   "Regression-volume test: run hundreds of requests over a generated log containing thousands of records and verify that results remain exact, deterministic, and within the service's expected response-time envelope."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9 protocol scenarios, including 5 verify-time generated logs and 4 multi-query sessions",
+   "effect": "Lowering this to a few fixed dashboard queries allows partial fixes and manual hard-coding to pass. Raising it adds more generated replay histories, boundary combinations, and classifier-adjacent query sequences, making the interaction between recovery, interval merging, and opaque classification harder to evade while increasing runtime."
+  },
+  "expected_failure_modes": [
+   "The solver inspects the readable Rust and patches the obvious deduplication branch without running histories that cross a restart.",
+   "The solver sorts all records globally, destroying revision and checkpoint semantics that depend on replay epoch and logical request identity.",
+   "The solver applies every amendment as an additional sample, producing plausible counts but wrong weighted percentiles and burn rates.",
+   "The solver calculates outage duration in log arrival order or fails to merge intervals spanning query boundaries.",
+   "The solver reimplements the opaque classifier as uniform or linearly interpolated buckets instead of experimentally discovering its piecewise thresholds and endpoint rules.",
+   "The solver validates only the supplied examples, which do not contain threshold equality, sequence reuse, or an amendment that changes an interval merge.",
+   "The solver changes the stdin protocol or emits diagnostics on stdout, causing otherwise correct calculations to fail service-protocol verification.",
+   "The solver hard-codes fixture-derived constants or assumes records are sorted, and therefore fails verify-time generated logs.",
+   "The solver makes a mathematically plausible percentile choice but misses the documented weighted-rank rounding and sparse-bucket behavior.",
+   "The solver repairs one interacting cause, sees the dashboard improve, and stops before testing the composed recovery and timeline cases."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "system-administration",
+  "tags": [
+   "rust",
+   "logs",
+   "metrics",
+   "opaque-component",
+   "recovery",
+   "protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/tracepulse && find . -maxdepth 3 -type f | sort",
+   "cat README.md",
+   "rg -n \"dedup|sequence|epoch|amend|restart|checkpoint|interval|percentile|classifier|burn\" src",
+   "sed -n '1,260p' src/replay.rs",
+   "sed -n '1,300p' src/interval.rs",
+   "sed -n '1,260p' src/percentile.rs",
+   "sed -n '1,220p' src/main.rs",
+   "TRACEPULSE_LOG=/opt/tracepulse/fixtures/production.jsonl /opt/tracepulse/bin/tracepulse < /opt/tracepulse/fixtures/queries.jsonl",
+   "/opt/tracepulse/bin/replay-inspect --help && /opt/tracepulse/bin/replay-inspect /opt/tracepulse/fixtures/production.jsonl | head -100",
+   "printf '<documented classifier probes>' | /opt/tracepulse/lib/latency-classifier",
+   "printf '<threshold-adjacent and saturation probes>' | /opt/tracepulse/lib/latency-classifier",
+   "python3 - <<'PY'\n# write tiny logs covering restart reuse, amendments, and out-of-order timestamps\nPY",
+   "TRACEPULSE_LOG=/tmp/recovery.jsonl /opt/tracepulse/bin/tracepulse < /tmp/queries.jsonl",
+   "python3 - <<'PY'\n# patch replay identity and amendment/revision selection to use stable logical request identity\nPY",
+   "python3 - <<'PY'\n# patch interval accumulation and merging to use recovered timestamps and half-open boundaries\nPY",
+   "python3 - <<'PY'\n# patch classifier adapter with experimentally observed buckets, weights, and endpoint rules\nPY",
+   "cargo build --release --offline && cp target/release/tracepulse /opt/tracepulse/bin/tracepulse",
+   "TRACEPULSE_LOG=/opt/tracepulse/fixtures/production.jsonl /opt/tracepulse/bin/tracepulse < /opt/tracepulse/fixtures/queries.jsonl",
+   "python3 - <<'PY'\n# generate composed logs and multiple overlapping query sessions, then compare with an independent oracle\nPY",
+   "TRACEPULSE_LOG=/tmp/composed.jsonl /opt/tracepulse/bin/tracepulse < /tmp/composed-queries.jsonl"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact README protocol and response semantics are not included in the blueprint, so judging clarity depends on those files actually being complete and internally consistent.",
+   "The classifier's undocumented threshold count and probe behavior could make exact characterization impractical if it has more discontinuities or unusual input handling than implied.",
+   "The expected response-time envelope is referenced but not quantitatively specified, allowing a potentially subjective performance failure.",
+   "If verify-time generators produce valid records outside assumptions documented by the replay state machine, failures could reflect an underspecified input domain rather than an incorrect repair.",
+   "Exact floating-point or JSON-number serialization requirements could cause false failures unless the repository explicitly specifies canonical formatting."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly well specified, and its tests appear capable of rejecting shallow fixes. However, the principal defects are readable in a modest Rust codebase, and the shortest plausible repair path is about 20 commands; under the stated rubric that makes genuine difficulty at most 2, so the acceptance threshold is not met.",
+  "fixes": [
+   "Make the replay and interval defects less trivially identifiable by providing realistic surrounding behavior and requiring diagnosis through a stronger set of independent replay and timeline invariants, rather than leaving conspicuous faulty branches.",
+   "Specify the classifier probe protocol, expected discovery scope, and a bounded threshold-search strategy so opaque-component exploration is challenging but reliably solvable within an hour.",
+   "Define the response-time envelope numerically, including limits for log size, query count, and memory use.",
+   "State the canonical JSON number and floating-point serialization rules explicitly, or have the verifier compare parsed numeric values with documented tolerances.",
+   "Include an independent oracle-generation method or reference implementation for verify-time logs so tests do not accidentally encode the same replay, interval, or percentile bug as the intended repair."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f821c68cb15f",
+     "verdict": "distinct",
+     "reason": "The reference centers on live frontend/backend trace attribution and HTTP telemetry queries, while the candidate centers on deterministic replay of amended traces and exact SLO interval metrics."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The reference is an adversarial route-policy classification gateway, whereas the candidate is a persistent trace-replay and metrics-calculation service."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Although both expose metric queries, the reference wraps a database-backed aggregation engine, while the candidate reconstructs trace history and computes amendment-aware SLO metrics with different semantics."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both tasks fundamentally require deterministic event-log recovery across restarts, duplicates, ordering issues, and superseding records, though the candidate adds trace-specific interval and percentile calculations."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference focuses on an approximate quantile-sketch daemon's error bounds and performance, while the candidate focuses on exact trace replay, SLO classification, and merged bad-span semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f821c68cb15f",
+     0.204
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.197
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.188
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.175
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.16
+    ]
+   ],
+   "cost_usd": 0.0016114
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0044208
+}

@@ -1,79 +1,166 @@
-import sys,json,math
+#!/usr/bin/env python3
+import json, os, sys, tempfile
 from pathlib import Path
-R=Path('/opt/metricq'); J=R/'journal.ndjson'; C=R/'checkpoint.json'; M=R/'metrics.prom'; L=R/'service.log'; repaired=(R/'.repaired').exists()
-streams={}; seen=set(); latest={}; dropped=0
 
-def error(m): return {'ok':False,'error':{'code':'invalid_request','message':m}}
-def log(e,**kw):
- with L.open('a') as f:f.write(json.dumps({'event':e,**kw},sort_keys=True,separators=(',',':'))+'\n')
-def metrics(): M.write_text('metricq_events '+str(sum(len(v) for v in streams.values()))+'\nmetricq_dropped_late '+str(dropped)+'\n')
-def check(x):
- if not isinstance(x,dict) or not isinstance(x.get('stream'),str) or not x['stream'] or not isinstance(x.get('id'),str): raise ValueError('stream and id are required')
- for k in ('ts','value'):
-  if not isinstance(x.get(k),(int,float)) or isinstance(x[k],bool) or not math.isfinite(x[k]): raise ValueError(k+' must be finite')
- w=x.get('weight',1)
- if not isinstance(w,int) or isinstance(w,bool) or w<=0: raise ValueError('weight must be a positive integer')
- return x['stream'],x['id'],x['ts'],x['value'],w
-def add(x):
- global dropped
- s,i,t,v,w=check(x); key=(s,i)
- if repaired:
-  if key in seen:return False
- else:
-  if str(i).isdigit() and int(i)<=latest.get(s,-1):return False
- if t<latest.get(s,float('-inf'))-10:dropped+=1;seen.add(key);return False
- latest[s]=max(latest.get(s,float('-inf')),t);seen.add(key);streams.setdefault(s,[]).append((v,t,w));return True
-def pct(a,q):
- if not a:return None
- if not 0<=q<=1:raise ValueError('invalid quantile')
- a=sorted(a,key=lambda z:(z[0],z[1])); target=q*(sum(z[2] for z in a)-1); n=0
- for v,t,w in a:
-  if target<n+w:return v
-  n+=w
- return a[-1][0]
-def reset():
- global streams,seen,latest,dropped
- streams={};seen=set();latest={};dropped=0
- for p in (J,C,M,L):
-  try:p.unlink()
-  except FileNotFoundError:pass
-def checkpoint():
- d={'offset':len(J.read_text().splitlines()) if J.exists() else 0,'streams':streams,'seen':[list(x) for x in seen],'latest':latest,'dropped':dropped};C.write_text(json.dumps(d,sort_keys=True,separators=(',',':')));log('checkpoint',offset=d['offset']);return d['offset']
-def recover():
- global streams,seen,latest,dropped
- if not C.exists():return error('no checkpoint')
- d=json.loads(C.read_text());streams={k:[tuple(z) for z in v] for k,v in d.get('streams',{}).items()};seen={tuple(x) for x in d.get('seen',[])};latest=d.get('latest',{});dropped=d.get('dropped',0); off=int(d['offset']); n=0
- lines=J.read_text().splitlines() if J.exists() else []
- for line in lines[off:]:
-  try:add(json.loads(line));n+=1
-  except Exception:
-   if line is lines[-1] or lines.index(line)==len(lines)-1:break
-   return error('malformed journal record')
- metrics();log('recover',offset=off,recovered=n);return {'ok':True,'recovered':n}
-def handle(x):
- global dropped
- if not isinstance(x,dict) or not isinstance(x.get('op'),str):return error('op is required')
- op=x['op']
- if op=='reset':reset();return {'ok':True,'reset':True}
- if op=='ingest':
-  try:check(x)
-  except Exception as e:return error(str(e))
-  with J.open('a') as f:f.write(json.dumps({k:x[k] for k in ('stream','id','ts','value','weight') if k in x},sort_keys=True,separators=(',',':'))+'\n')
-  try:a=add(x)
-  except Exception as e:return error(str(e))
-  metrics();return {'ok':True,'accepted':a}
- if op=='checkpoint':return {'ok':True,'offset':checkpoint()}
- if op=='recover':return recover()
- if op=='query':
-  try:
-   s=x['stream'];lo=x['start'];hi=x['end'];q=x['q'];qs=q if isinstance(q,list) else [q]
-   if not isinstance(s,str) or not isinstance(lo,(int,float)) or not isinstance(hi,(int,float)) or lo>=hi:raise ValueError('invalid query range')
-   vals=[z for z in streams.get(s,[]) if lo<=z[1]<hi]; out=[pct(vals,float(z)) for z in qs]
-   return {'ok':True,'values':out if isinstance(q,list) else out[0]}
-  except (KeyError,TypeError,ValueError) as e:return error(str(e))
- return error('unknown operation')
-for line in sys.stdin:
- try:r=handle(json.loads(line))
- except json.JSONDecodeError:r=error('invalid JSON')
- except Exception as e:r=error(str(e))
- print(json.dumps(r,separators=(',',':')),flush=True)
+ROOT = Path('/opt/metricq')
+STATE = ROOT / 'state'
+JOURNAL = STATE / 'journal.ndjson'
+CHECKPOINT = STATE / 'checkpoint.json'
+LOG = ROOT / 'logs' / 'service.log'
+BUGGY = True
+
+
+def dump(obj):
+    return json.dumps(obj, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+
+def atomic(path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=str(path.parent), prefix='.tmp-')
+    with os.fdopen(fd, 'w') as f:
+        f.write(dump(obj) + '\n')
+        f.flush(); os.fsync(f.fileno())
+    os.replace(name, path)
+
+
+class Engine:
+    def __init__(self):
+        self.lateness = 10
+        self.events = {}
+        self.ids = {}
+        self.max_ts = {}
+        self.offset = 0
+        self.recovered = 0
+        STATE.mkdir(parents=True, exist_ok=True)
+        (ROOT / 'logs').mkdir(parents=True, exist_ok=True)
+
+    def clear(self):
+        self.events = {}; self.ids = {}; self.max_ts = {}; self.offset = 0
+        for p in (JOURNAL, CHECKPOINT):
+            try: p.unlink()
+            except FileNotFoundError: pass
+        self.log('reset')
+
+    def log(self, event, **kw):
+        try:
+            with LOG.open('a') as f: f.write(dump({'event': event, **kw}) + '\n')
+        except OSError: pass
+
+    def append(self, rec):
+        STATE.mkdir(parents=True, exist_ok=True)
+        with JOURNAL.open('a') as f:
+            f.write(dump(rec) + '\n'); f.flush(); os.fsync(f.fileno())
+        self.offset = JOURNAL.stat().st_size
+
+    def apply(self, rec, from_replay=False):
+        s, eid = rec['stream'], rec['event_id']
+        key = (s, eid)
+        if BUGGY:
+            try:
+                n = int(eid)
+                if n <= self.max_ts.get(s, -1): return False
+                self.max_ts[s] = n
+            except Exception: pass
+        else:
+            if eid in self.ids.get(s, set()): return False
+        ts = rec['timestamp']
+        if s in self.max_ts and not BUGGY:
+            cutoff = self.max_ts[s] - self.lateness
+            if ts < cutoff: return False
+        self.ids.setdefault(s, set()).add(eid)
+        self.events.setdefault(s, []).append(rec)
+        self.max_ts[s] = max(self.max_ts.get(s, ts), ts)
+        return True
+
+    def valid_event(self, x):
+        return (isinstance(x, dict) and isinstance(x.get('stream'), str)
+                and isinstance(x.get('event_id'), str)
+                and isinstance(x.get('timestamp'), (int, float))
+                and isinstance(x.get('value'), (int, float))
+                and not isinstance(x.get('value'), bool)
+                and x.get('weight', 1) > 0)
+
+    def ingest(self, x):
+        if not self.valid_event(x): return {'ok': False, 'error': 'invalid_request'}
+        r = {'stream': x['stream'], 'event_id': x['event_id'], 'timestamp': x['timestamp'],
+             'value': x['value'], 'weight': x.get('weight', 1)}
+        key = (r['stream'], r['event_id'])
+        if r['event_id'] in self.ids.get(r['stream'], set()):
+            return {'ok': True, 'accepted': False, 'duplicate': True}
+        if not BUGGY and r['stream'] in self.max_ts and r['timestamp'] < self.max_ts[r['stream']] - self.lateness:
+            self.append(r); return {'ok': True, 'accepted': False, 'duplicate': False}
+        self.append(r); accepted = self.apply(r)
+        return {'ok': True, 'accepted': bool(accepted), 'duplicate': False}
+
+    def checkpoint(self):
+        snap = {'lateness': self.lateness, 'events': self.events, 'ids': {s: sorted(v) for s,v in self.ids.items()}, 'max_ts': self.max_ts, 'offset': self.offset}
+        atomic(CHECKPOINT, snap)
+        return {'ok': True, 'offset': self.offset}
+
+    def recover(self):
+        self.events = {}; self.ids = {}; self.max_ts = {}; self.offset = 0; self.recovered = 0
+        start = 0
+        if CHECKPOINT.exists():
+            try:
+                s = json.loads(CHECKPOINT.read_text())
+                self.lateness = s.get('lateness', 10); self.events = s.get('events', {})
+                self.ids = {k: set(v) for k,v in s.get('ids', {}).items()}; self.max_ts = s.get('max_ts', {})
+                start = int(s.get('offset', 0)); self.offset = start
+            except Exception: start = 0; self.events = {}; self.ids = {}; self.max_ts = {}
+        if JOURNAL.exists():
+            data = JOURNAL.read_bytes()
+            valid_end = data.rfind(b'\n') + 1
+            if valid_end < len(data):
+                with JOURNAL.open('r+b') as jf:
+                    jf.truncate(valid_end)
+                data = data[:valid_end]
+            pos = min(start, len(data))
+            while pos < len(data):
+                end = data.find(b'\n', pos)
+                if end < 0: break
+                line = data[pos:end]; pos = end + 1
+                try: r = json.loads(line); 
+                except Exception: continue
+                if self.valid_event(r):
+                    if self.apply(r, True): self.recovered += 1
+            self.offset = len(data)
+        self.log('recover', recovered=self.recovered, offset=self.offset)
+        return {'ok': True, 'recovered': self.recovered, 'offset': self.offset}
+
+    def query(self, x):
+        if not (isinstance(x.get('stream'), str) and isinstance(x.get('start'), (int,float)) and isinstance(x.get('end'), (int,float)) and isinstance(x.get('quantile'), (int,float)) and 0 <= x['quantile'] <= 1):
+            return {'ok': False, 'error': 'invalid_request'}
+        rows = [r for r in self.events.get(x['stream'], []) if x['start'] <= r['timestamp'] < x['end']]
+        rows.sort(key=lambda r: (r['value'], r['timestamp'], r['event_id']))
+        total = sum(r['weight'] for r in rows); value = None
+        if rows:
+            target = x['quantile'] * total
+            acc = 0
+            for r in rows:
+                acc += r['weight']
+                if acc >= target: value = r['value']; break
+        return {'ok': True, 'stream': x['stream'], 'start': x['start'], 'end': x['end'], 'quantile': x['quantile'], 'value': value, 'weight': total, 'count': len(rows)}
+
+    def request(self, x):
+        if not isinstance(x, dict) or not isinstance(x.get('op'), str): return {'ok': False, 'error': 'invalid_request'}
+        op = x['op']
+        if op == 'reset':
+            if 'lateness' in x and (not isinstance(x['lateness'], (int,float)) or x['lateness'] < 0): return {'ok': False, 'error': 'invalid_request'}
+            self.clear(); self.lateness = x.get('lateness', 10); return {'ok': True}
+        if op == 'ingest': return self.ingest(x)
+        if op == 'query': return self.query(x)
+        if op == 'checkpoint': return self.checkpoint()
+        if op == 'recover': return self.recover()
+        return {'ok': False, 'error': 'unknown_operation'}
+
+
+def main():
+    e = Engine()
+    for line in sys.stdin:
+        try: x = json.loads(line)
+        except Exception: print(dump({'ok': False, 'error': 'invalid_request'}), flush=True); continue
+        try: ans = e.request(x)
+        except Exception: ans = {'ok': False, 'error': 'invalid_request'}
+        print(dump(ans), flush=True)
+
+if __name__ == '__main__': main()

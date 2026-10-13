@@ -1,0 +1,184 @@
+{
+ "blueprint": {
+  "slug": "repair-session-feature-rollup",
+  "title": "Repair the Session Feature Rollup",
+  "scenario": "You are inheriting a JavaScript telemetry pipeline used to produce device reliability features for an internal operations dashboard. The repository contains its Git history, a multi-stage rebuild command, a large sharded event archive, SQLite output, and regression fixtures; a recent feature iteration made the output depend on late corrections, shard ordering, and session statistics in ways the small visible fixture does not expose.",
+  "instruction_draft": "Make the rebuild pipeline produce the correct final state in `state/features.sqlite` when invoked with `node bin/rebuild.js --input incoming --db state/features.sqlite`. It must recursively consume every `.ndjson` input file, be deterministic and safe to run repeatedly, and preserve the documented four-stage dependency: canonical events, sessions, session features, and UTC device-day rollups. For duplicate event IDs, retain the record with the greatest revision; for equal revisions retain the greatest `updated_at`, then the lexicographically greatest relative filename, then the greatest source line number. Ignore no valid records because of shard or filename order.\n\nSessions must be formed independently for each tenant and device after canonicalization by sorting `(event_ms,event_id)` and joining consecutive events whose gap is at most 1,800,000 ms; a session ID is the first event ID in that ordered component. For every session, calculate count, sum, arithmetic mean, population variance, nearest-rank p95, and span using all canonical reading values, with decimal results rounded to six places using decimal half-up rounding. Build device-day rows in UTC from the session event times, including session count, reading count, sum, active milliseconds, mean of session means weighted by reading count, and `reliability_score = sum / sqrt(1 + active_ms / 60000)`, rounded to six decimal places. The database must contain the exact documented rows in `events`, `sessions`, `session_features`, `device_days`, and `run_meta`, including stable primary keys, row counts, and the input manifest digest; failed runs must not leave a partially replaced database.",
+  "requirements": [
+   "Recursively consume every `.ndjson` file below the supplied input directory.",
+   "Select duplicate records by greatest revision, then greatest updated_at, then lexicographically greatest relative filename, then greatest source line number.",
+   "Make canonicalization independent of filesystem and directory traversal order.",
+   "Sort canonical events by tenant, device, event_ms, and event_id before sessionization.",
+   "Partition sessions by tenant and device.",
+   "Join consecutive ordered events when their timestamp gap is no greater than 1,800,000 milliseconds.",
+   "Use the first event ID in each ordered session as the session ID.",
+   "Populate an events table containing the canonical event set and its source metadata.",
+   "Populate a sessions table containing one row per session with deterministic boundaries and event counts.",
+   "Calculate session count, sum, arithmetic mean, population variance, nearest-rank p95, and span from all session readings.",
+   "Round decimal feature values to six places using decimal half-up rounding.",
+   "Create UTC device-day rollups from the session event times.",
+   "Calculate device-day session count, reading count, sum, active milliseconds, reading-count-weighted mean of session means, and the specified reliability score.",
+   "Use the exact documented schema, primary keys, and column types for events, sessions, session_features, device_days, and run_meta.",
+   "Record the canonical input manifest digest and row counts in run_meta.",
+   "Replace output atomically so an error cannot leave a partially rebuilt database.",
+   "Produce byte-for-byte equivalent logical SQLite state on repeated runs and regardless of input file order."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` with pinned apt and pip dependencies, Node.js, npm, SQLite, Git, and standard build tools.",
+   "A Git repository of approximately 1,500 lines across `bin/`, `lib/`, `config/`, `docs/`, and tests, with several realistic commits documenting incremental telemetry feature work.",
+   "The repository includes a documented NDJSON event format with tenant, device, event_id, revision, updated_at, event_ms, kind, and value fields, plus source filename and line metadata added by ingestion.",
+   "The repository includes roughly 70 nested input shards and approximately 18,000 records, including late revisions, equal-revision collisions, negative and zero readings, repeated timestamps, cross-midnight sessions, and sessions requiring transitive adjacency.",
+   "The visible fixture is intentionally small and mostly ordered, so a naive first-record deduplicator and an input-order sessionizer appear correct on it.",
+   "The current implementation has planted regressions distributed across ingestion, sessionization, numeric feature calculation, and SQLite replacement/manifest handling; surrounding code and historical commits are plausible but not all are relevant.",
+   "A reference state generator and hidden-input generator are included outside the working tree for verification, with deterministic seeds and no network dependency.",
+   "The normal entry point is `node bin/rebuild.js --input incoming --db state/features.sqlite`; existing documentation describes the schema and formulas without identifying the regressions."
+  ],
+  "internal_hint": "The reliable path is to inspect the repository and Git history, read the format/schema documentation, run the shipped rebuild on the large archive, and compare intermediate counts and rows against the historical fixtures and a small independently written checker. The root causes are data-dependent: ingestion keeps the first duplicate encountered rather than the specified winner; a stage relies on recursive directory order and loses source metadata; sessionization uses arrival order or a session-start comparison instead of sorted consecutive event-time adjacency; feature code uses binary floating-point and a non-nearest-rank percentile path for negative values and ties; and the final writer mutates the target database before all stages succeed and computes the manifest from an unstable file order. Fixes should canonicalize and sort explicitly, use exact integer/rational or decimal-safe arithmetic for six-place results, derive every later stage only from the preceding materialized stage, and build a temporary SQLite database followed by an atomic rename. The deterministic reference solution should investigate by running the pipeline, dumping intermediate state, and comparing independent counts before applying the fixes.",
+  "trap": "A shallow solution that sorts the visible fixture or merely changes the duplicate comparison will pass the sample but fail when a late correction bridges two otherwise separate sessions, when equal timestamps arrive in different shards, or when a rare negative value changes nearest-rank p95. Another common failure is producing numerically close values that differ after six-place half-up rounding, or making the final database correct while leaving manifest order, repeated-run behavior, or rollback semantics wrong.",
+  "tests": [
+   "Run the repaired command on the shipped large archive and compare every row and relevant schema property in events, sessions, session_features, device_days, and run_meta against the deterministic reference state.",
+   "Regenerate the same archive with shuffled directory names, file creation order, and record order within shards; verify that the logical SQLite state and manifest digest are unchanged.",
+   "Generate fresh hidden archives containing thousands of records, duplicate revisions, equal-revision tie cases, late events, repeated timestamps, zero and negative readings, and transitive session chains; compare all final rows with the reference implementation.",
+   "Generate hidden cases crossing UTC midnight and daylight-saving transition dates; verify that device-day partitioning uses UTC event time and that session span and active milliseconds are exact.",
+   "Generate hidden cases with percentile ties, odd and even counts, negative values, large integer readings, and values whose sixth decimal place requires half-up carry; verify exact rounded feature values.",
+   "Run the command twice against the same input and compare all rows, schema metadata, and run_meta values for deterministic idempotence.",
+   "Inject a malformed input record late in processing and verify that the command fails without replacing or partially mutating a pre-existing valid database.",
+   "Check that every canonical event is represented exactly once, every event belongs to exactly one session, every session has exactly one feature row, and every device-day rollup agrees with its preceding session rows.",
+   "Check that the recorded input manifest includes every recursive NDJSON shard and changes when any input content or relative path changes."
+  ],
+  "verifier_knob": {
+   "name": "generated_event_and_shard_count",
+   "value": "18,000 visible records, 70 shards, with 4,000-30,000 records and 20-160 shards at verification time",
+   "effect": "Raising the value increases the chance of rare ordering, duplicate, boundary, and numeric cases and makes manual inspection or ad hoc fixture-specific fixes ineffective; lowering it makes sampling and simple in-memory implementations more likely to pass."
+  },
+  "expected_failure_modes": [
+   "Fixing only the obvious duplicate-selection bug while retaining input-order sessionization.",
+   "Treating sessions as separated by a gap from the first event rather than by consecutive sorted events.",
+   "Using JavaScript Number arithmetic and ordinary `toFixed`, which disagrees with decimal half-up behavior on adversarial values.",
+   "Implementing p95 as an interpolated percentile or zero-based index instead of nearest rank.",
+   "Forgetting that canonicalization must happen before sessionization and rollups.",
+   "Relying on filesystem traversal order, JSON object key order, or SQLite implicit row order.",
+   "Computing UTC days from local date formatting.",
+   "Rebuilding the target database in place and leaving partial state after a late parse or calculation error.",
+   "Checking only aggregate counts rather than all intermediate and final rows.",
+   "Overfitting to the visible archive instead of testing shuffled shards and generated corrections."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "git-history",
+   "event-time",
+   "deterministic-pipeline",
+   "numerical-correctness"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "`pwd && find . -maxdepth 3 -type f | sort`",
+   "`git status --short && git log --oneline --decorate -12`",
+   "`find docs config -type f -maxdepth 3 -print -exec sed -n '1,240p' {} \\;`",
+   "`sed -n '1,260p' bin/rebuild.js`",
+   "`find lib -type f -maxdepth 3 -print -exec sed -n '1,260p' {} \\;`",
+   "`grep -RInE 'manifest|session|p95|variance|device_days|updated_at|rename|readdir' bin lib tests`",
+   "`find tests -type f -maxdepth 3 -print -exec sed -n '1,220p' {} \\;`",
+   "`node bin/rebuild.js --input incoming --db state/features.sqlite`",
+   "`sqlite3 state/features.sqlite '.schema'`",
+   "`for t in events sessions session_features device_days run_meta; do sqlite3 -header -column state/features.sqlite \"select * from $t limit 5\"; done`",
+   "`git log --all --oneline -- bin lib && git show <relevant historical commits>`",
+   "`write a small independent checker for canonicalization, sessions, exact decimal rounding, p95, and rollups`",
+   "`apply a patch to canonicalize recursive inputs and deterministic duplicate winners, explicitly sort stages, use exact decimal/integer arithmetic, and materialize each stage`",
+   "`apply a patch to build the manifest deterministically and replace the SQLite target through a temporary database and atomic rename`",
+   "`npm test`",
+   "`rm -f state/features.sqlite && node bin/rebuild.js --input incoming --db state/features.sqlite`",
+   "`run the independent checker and inspect all five tables, schemas, counts, and manifest metadata`",
+   "`regenerate or shuffle shard names, creation order, and record order; rebuild and compare normalized SQLite dumps`",
+   "`inject a late malformed record, verify failure, and compare the pre-existing database before and after`",
+   "`git diff --check && git diff --stat`"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact schema, manifest digest algorithm, timestamp comparison semantics, malformed-record policy, and numeric input bounds are delegated to repository documentation; if those documents do not define them precisely, failures could be caused by ambiguity rather than implementation error.",
+   "A verifier must compare logical SQLite state rather than raw database-file bytes, since SQLite page layout, freelists, and transaction metadata can differ despite identical rows and schema.",
+   "If hidden large integer readings exceed SQLite INTEGER or JavaScript-safe integer limits without an explicitly documented representation, exact numeric verification becomes underspecified.",
+   "Atomic replacement behavior can be platform-dependent if verification runs on a filesystem with unusual rename or open-file semantics, though it is well-defined on the intended Linux container."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic, highly verifiable, and mostly clear, but the shortest plausible repair path is about 20 commands and the principal regressions are discoverable by reading the source and history. Under the stated rubric, that makes genuine_difficulty at most 2, so the task fails the minimum-score acceptance rule despite an average score above 3.6.",
+  "fixes": [
+   "Make the key failures less directly identifiable from a single source inspection by requiring reconciliation across historical implementations, intermediate snapshots, and generated counterexamples.",
+   "Add a required compatibility or migration constraint, such as preserving an existing schema/index contract while changing the rebuild implementation, with hidden tests for legacy databases.",
+   "Include a performance-sensitive hidden case that forces streaming or bounded-memory canonicalization while retaining deterministic global duplicate resolution.",
+   "State the exact manifest canonicalization/hash algorithm, timestamp ordering representation, malformed-record behavior, and numeric bounds directly in the task or authoritative documentation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "Both involve deduplication, sessionization, and deterministic derived state, but this task is a batch telemetry feature rebuild while the reference is an HTTP campaign-attribution service with different core outputs and logic."
+    },
+    {
+     "ref_id": "ours/official-e431c59f65ef",
+     "verdict": "distinct",
+     "reason": "The reference reconstructs fragmented binary database query sessions, whereas this task canonicalizes NDJSON events and computes SQLite session and device-day aggregates."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both are deterministic SQLite repair pipelines with atomic replacement concerns, the reference resolves incident components and actor aliases while this task performs telemetry canonicalization and statistical rollups."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The reference validates cryptographic audit chains and emits authoritative events, which is fundamentally different from rebuilding telemetry sessions and reliability features."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The reference fixes a single SQL report using window-function ranking and running totals, while this task implements a multi-stage event-ingestion and feature-generation pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ce30ab52c4d1",
+     0.248
+    ],
+    [
+     "ours/official-e431c59f65ef",
+     0.201
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.164
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.145
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.125
+    ]
+   ],
+   "cost_usd": 0.0010341999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.003967399999999999
+}

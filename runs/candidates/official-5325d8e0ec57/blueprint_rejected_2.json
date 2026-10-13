@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "repair-proxy-ingest-gateway",
+  "title": "Repair the PROXY Ingest Gateway",
+  "scenario": "An on-call SRE is paged because an internal TCP event gateway intermittently drops traffic and occasionally attributes events to the wrong source. The container contains a Node.js service, a SQLite-backed network policy database, deployment configuration, migration scripts, and captured PROXY protocol traffic from several ingress versions.",
+  "instruction_draft": "Make the gateway accept every valid, authorized event stream and reject every malformed, unauthorized, or ambiguous stream without writing rejected events to SQLite. It must work for fragmented and coalesced TCP reads, IPv4 and IPv6 clients, and configuration changes made through the documented deployment configuration while preserving the existing service API.",
+  "requirements": [
+   "The gateway must accept valid PROXY protocol v2 STREAM frames for configured IPv4 and IPv6 networks and persist their decoded events in SQLite.",
+   "The gateway must reject malformed frames, unsupported commands or address families, truncated frames, invalid lengths, malformed TLVs, invalid checksums when a checksum TLV is present, and payloads that do not satisfy the documented event schema.",
+   "The gateway must reject source addresses outside the configured allowlist, including IPv4-mapped IPv6 representations that do not belong to an allowed network.",
+   "Rejected frames and rejected events must not create rows or partially modify existing rows in SQLite.",
+   "The parser must correctly handle arbitrary TCP fragmentation, multiple frames in one read, payloads split across frames or reads, and connections containing valid traffic followed by invalid traffic.",
+   "IPv4 and IPv6 addresses, network membership, and canonical persisted source values must be interpreted according to the documented address semantics rather than by string comparison.",
+   "The service must load the configured SQLite database, listener settings, allowlisted networks, payload limits, and checksum policy from the documented configuration path and must not silently use hard-coded defaults when those values are changed.",
+   "Accepted events must retain their original event identity and be inserted exactly once, including when a stream contains multiple valid frames.",
+   "The existing health and metrics endpoints must continue to report service readiness, accepted-event counts, rejected-event counts, and parser errors."
+  ],
+  "environment": [
+   "Use a Dockerfile based on FROM python:3.13-slim-bookworm with pinned apt and pip packages; install Node.js, npm, SQLite tooling, and only offline dependencies needed by the service.",
+   "Create an approximately 1,400-line in-house JavaScript repository under /opt/edgegate with a TCP server, HTTP health server, SQLite repository layer, configuration loader, migrations, metrics, logging, tests, and deployment scripts.",
+   "Provide a documented PROXY protocol v2 subset and event schema in a runbook, including STREAM commands, IPv4 and IPv6 address blocks, optional TLVs, checksum behavior, frame limits, and transaction semantics.",
+   "Provide a SQLite database containing network-policy rows, accepted-event history, and parser audit counters, plus a migration that is exercised during startup.",
+   "Plant a missing or deliberately incomplete stream-frame decoder in the JavaScript service and connect it to otherwise plausible ingestion code.",
+   "Plant configuration defects involving precedence between the JSON deployment file and environment variables, an incorrect database path in the launcher, and a migration/startup ordering problem that only becomes visible when the database already contains history.",
+   "Include visible sample captures that use complete single-read IPv4 frames with no TLVs and ordinary JSON payloads; these samples are intentionally insufficient to cover the protocol and stream-state requirements.",
+   "Include deterministic shell launchers and local fixtures, with no network access or wall-clock-dependent behavior required."
+  ],
+  "internal_hint": "A skilled engineer should first inspect the launcher, runbook, SQLite schema, and startup logs, then exercise the service with progressively fragmented and concatenated captures while querying the database after every case. The root causes are a decoder that assumes one socket read equals one frame, calculates offsets from the base header instead of the variable address length, treats TLVs as payload, performs incomplete IPv6/CIDR membership checks, and commits the SQLite row before payload and checksum validation finish. Configuration is also being resolved in the wrong order, so the visible fixture passes while an alternate database or allowlist is ignored. The reference solution should investigate with sqlite3, tcp clients that deliberately control chunk boundaries, and small generated PROXY frames before replacing the decoder with an incremental length-delimited parser, validating the complete frame before a transaction commit, fixing canonical address/network matching, and correcting startup configuration and migration ordering.",
+  "trap": "A shallow fix that checks only the PROXY signature and the visible IPv4 examples passes the supplied samples but fails on fragmented reads, coalesced frames, IPv6 address lengths, nested or unknown TLVs, checksum placement, malformed declared lengths, and an attacker-controlled frame whose payload begins with a plausible JSON object. Another common failure accepts an unauthorized IPv4-mapped IPv6 address or inserts a row before a later validation failure, leaving SQLite polluted by rejected traffic.",
+  "tests": [
+   "Start the service with the shipped configuration and verify health, readiness, migration completion, and metrics behavior.",
+   "Replay the visible benign IPv4 captures and verify that the expected event IDs, source addresses, and payloads appear exactly once in SQLite.",
+   "At verification time, generate a fresh seeded corpus of valid and invalid PROXY v2 frames covering IPv4, IPv6, optional and unknown TLVs, valid and invalid checksum TLVs, boundary lengths, duplicate event IDs, malformed JSON, oversized payloads, unsupported commands, and truncated headers.",
+   "Feed every generated frame through a TCP client using random deterministic fragmentation patterns and combinations of multiple frames per write; compare accepted rows and rejection outcomes against an independent reference parser.",
+   "Run corpus cases with valid traffic followed by invalid traffic and verify that valid prior rows remain intact while invalid traffic creates no rows or partial transactions.",
+   "Generate allowlist networks and source addresses at verify time, including IPv4-mapped IPv6 forms, boundary addresses, overlapping networks, and textual formatting variants; verify exact reference network-membership semantics.",
+   "Launch the gateway with alternate database paths, network policies, payload limits, and checksum settings from the documented configuration file and environment overrides, then verify that the effective configuration follows the documented precedence.",
+   "Restart against a database containing historical rows and rerun migrations, checking that no accepted events are duplicated, existing rows are preserved, and counters remain consistent.",
+   "Check the health and metrics endpoints after mixed accepted and rejected workloads for correct counters and no process crash or connection desynchronization."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size_and_stream_variation",
+   "value": "1,200 generated cases across 40 protocol and policy families, with 25 deterministic fragmentation/coalescing patterns per selected case",
+   "effect": "Raising this value adds rarer TLV, checksum, IPv6, boundary-length, configuration, and history-dependent combinations and makes shallow sample-driven fixes fail more reliably; lowering it reduces coverage and may allow parsers that only handle ordinary complete frames to pass."
+  },
+  "expected_failure_modes": [
+   "The solver patches visible examples without tracing socket buffering and therefore mishandles arbitrary read boundaries.",
+   "The solver implements only IPv4 or uses lexical/string prefix checks for CIDR membership.",
+   "The solver treats the variable address block or TLVs as fixed-width and loses synchronization on valid IPv6 or optional metadata.",
+   "The solver validates after inserting into SQLite, leaving rejected events or duplicate rows after a malformed trailing frame.",
+   "The solver accepts unknown or malformed TLVs and trusts declared lengths without checking stream availability and configured limits.",
+   "The solver fixes the parser but misses configuration precedence, database-path selection, or migration behavior on a non-empty database.",
+   "The solver checks only the supplied captures and never generates adversarial fragmented, coalesced, or history-dependent inputs."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "proxy-protocol",
+   "stream-parser",
+   "configuration",
+   "adversarial-testing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "`pwd; find /opt/edgegate -maxdepth 2 -type f | sort`",
+   "`sed -n '1,240p' /opt/edgegate/runbook*`",
+   "`cat /opt/edgegate/config/*.json /opt/edgegate/deploy/* 2>/dev/null`",
+   "`cat /opt/edgegate/package.json /opt/edgegate/bin/* 2>/dev/null`",
+   "`grep -RIn 'TODO\\|proxy\\|PROXY\\|decoder\\|migration' /opt/edgegate/src /opt/edgegate/scripts`",
+   "`sed -n '1,320p' /opt/edgegate/src/decoder*`",
+   "`sed -n '1,320p' /opt/edgegate/src/server* /opt/edgegate/src/ingest*`",
+   "`sed -n '1,260p' /opt/edgegate/src/config* /opt/edgegate/src/repository*`",
+   "`find /opt/edgegate -iname '*.sql' -o -iname '*migration*' -print -exec sed -n '1,240p' {} \\;`",
+   "`npm test`",
+   "`sqlite3 <configured-db> '.schema' 'select * from network_policy' 'select * from accepted_events'`",
+   "Generate one valid IPv4 and one fragmented/coalesced PROXY v2 fixture from the runbook.",
+   "Replace the read-once decoder with an incremental signature/header/declared-length buffer parser.",
+   "Parse the variable address block and TLVs, validate command, family, lengths, checksum, limits, schema, and canonical network membership before dispatch.",
+   "Wrap validation and exactly-once event insertion in the required SQLite transaction.",
+   "Fix configuration precedence and launcher database-path handling, then run migrations before serving traffic.",
+   "`npm test && ./bin/start.sh`",
+   "Use a deterministic TCP client for fragmentation/coalescing, invalid trailing frames, IPv6, and alternate configuration; query SQLite and health/metrics after each case."
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The runbook is said to define protocol and event semantics, but the blueprint does not specify the exact unknown-TLV policy, checksum TLV placement/coverage, duplicate event-ID behavior, or canonical IPv4-mapped IPv6 semantics; inconsistent documentation would make failures invalid.",
+   "The phrase 'payloads split across frames' is ambiguous for PROXY v2, where each frame has its own payload, and the required connection behavior after a rejected frame is not stated.",
+   "A generated independent reference parser can accidentally encode semantics that differ from the runbook, especially for overlapping networks, textual address forms, TLV ordering, and checksum validation.",
+   "The 1,200-case corpus with 25 stream patterns may exceed practical verification time or expose nondeterministic TCP scheduling and SQLite timing issues on a 1-CPU container.",
+   "Offline installation may fail if the pinned Node.js or SQLite dependencies are not actually cached in the image, despite the stated no-network requirement.",
+   "Migration idempotency and counter semantics for pre-existing historical rows are not fully specified, so a correct implementation could be rejected for preserving versus recalculating audit counters."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and the adversarial tests are largely verifiable, but the core defects are readily discoverable in a short source-and-schema inspection and can plausibly be repaired in about 19 commands, matching the stated speedrun rule for a genuine-difficulty score of at most 2. Several protocol and persistence semantics are also under-specified, creating invalid-failure risk despite the otherwise strong test plan.",
+  "fixes": [
+   "Make the runbook part of the explicit task contract and state exact rules for unknown and duplicate TLVs, checksum coverage and placement, IPv4-mapped IPv6 handling, duplicate event identities, and post-rejection connection behavior.",
+   "Define whether a PROXY frame carries one complete event, whether payload continuation exists, and how malformed trailing frames affect already accepted frames on the same connection.",
+   "Add a required baseline test or observable investigation step that prevents the intended solution from being a straightforward visible-defect patch, such as a history-dependent interaction or a cross-component invariant not exposed by one source file.",
+   "Bound and benchmark the verification corpus, specify per-case timeouts and cleanup, and ensure all dependencies are vendored or present in the Docker build context.",
+   "Specify migration and parser-counter transactional semantics for existing databases, including whether counters are preserved, migrated, or recomputed."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The candidate centers on PROXY protocol v2 stream parsing, source-network authorization, and transactional SQLite ingestion rather than HTTP route classification."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "Although both handle malformed long-lived binary streams, the candidate's core is PROXY v2 validation and network attribution with SQLite persistence, not sensor-wire decoding and relay deployment."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The candidate involves protocol framing and authorization at a TCP gateway, whereas this task concerns deterministic stream analytics, journaling, checkpoint recovery, and histograms."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate performs authenticated network ingestion into SQLite, not reconstruction and mutation of an event-sourced replay catalog from persistent segments."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The candidate validates PROXY frames and persists authorized events, while this task verifies cryptographic audit chains and emits authoritative audit records."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.28
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.227
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.171
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.164
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.157
+    ]
+   ],
+   "cost_usd": 0.0010922
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0038491999999999997
+}

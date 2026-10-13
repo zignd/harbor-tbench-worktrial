@@ -1,0 +1,73 @@
+{
+ "slug": "repair-attributed-funnel-service",
+ "title": "Repair the Attributed Funnel Service",
+ "scenario": "A backend developer is chasing a production discrepancy in an internal campaign-funnel service. The container contains a Python HTTP service, a SQLite-backed event store, materialized SQL stages, replay tooling, fixtures, and several unrelated operational modules. The service is already deployable, but reports become unreliable after realistic event history accumulates and late events are replayed.",
+ "instruction_draft": "Can you get the funnel service back in shape without changing its HTTP contract? `/v1/reset` should clear state, `/v1/append` should accept event batches, and `/v1/report` should return deterministic campaign rows. Reports need to obey the documented deduplication, session, attribution, refund, date-range, and ordering rules for both the fixture data and fresh event histories, and `./run.sh` must still start a service listening on port 8080.",
+ "requirements": [
+  "Preserve the existing HTTP endpoints and JSON request/response shapes for `/v1/reset`, `/v1/append`, `/v1/report`, and `/health`.",
+  "Make `/v1/reset` remove all prior event and derived reporting state and make subsequent reports equivalent to a fresh process.",
+  "Make `/v1/append` accept batches of events containing `event_id`, `user_id`, `occurred_at`, `ingest_seq`, `kind`, and the applicable `campaign`, `order_id`, and `amount_cents` fields.",
+  "For duplicate event IDs, retain exactly the event with the greatest ingest sequence, regardless of append order; replaying an already retained event must be idempotent.",
+  "Interpret timestamps as UTC ISO-8601 timestamps and order events for each user by occurred time followed by ingest sequence and event ID.",
+  "Create a new session for a user only when the gap from the previous retained event is greater than 1800 seconds; a gap of exactly 1800 seconds remains in the same session.",
+  "Attribute each purchase to the most recent touch in its session at or before the purchase, or to `(direct)` when no such touch exists.",
+  "A refund must reverse the purchase identified by its order ID and must use that purchase's campaign attribution even when the refund is in another session.",
+  "A given order contributes at most once to purchase and revenue totals after event deduplication; repeated refunds cannot subtract it more than once.",
+  "For a report query, include only sessions having at least one retained event in the requested half-open UTC interval `[since, until)`, and include only purchases and refunds whose own event timestamps are in that interval.",
+  "Support the existing optional campaign filter without changing attribution before filtering.",
+  "Return one row per requested or observed attribution campaign with campaign name, session count, purchase count, and net revenue in integer cents, using the service's documented JSON field names.",
+  "Sort report rows deterministically by descending net revenue and then ascending campaign name, and return zero-valued rows for explicitly requested campaigns with no matching activity.",
+  "Ensure derived stages are refreshed consistently after appending batches containing out-of-order events, corrections to earlier duplicate IDs, or events that alter a user's prior session boundary.",
+  "Keep the service deterministic, bounded to the supplied data, and runnable offline with `./run.sh` on port 8080."
+ ],
+ "environment": [
+  "A Docker image based on `python:3.13-slim-bookworm` with pinned apt and pip dependencies, one CPU, and 2 GB RAM.",
+  "A roughly 1,500-line Python application split across an HTTP server, SQLite schema/migrations, ingestion code, SQL materialization stages, report formatting, replay utilities, and unrelated health/metrics code.",
+  "A `run.sh` launcher that starts the service on port 8080 and a README documenting the endpoint schemas and report semantics.",
+  "A SQLite database initialized with several thousand historical events, including late arrivals, duplicate IDs, equal timestamps, exact 1,800-second gaps, cross-session refunds, and multiple campaigns.",
+  "A planted multi-stage defect set in which the deduplication/materialization boundary mishandles replacement history, session rebuilding is incomplete for affected users, and downstream attribution or aggregation can retain stale rows after a correction.",
+  "A second data-dependent SQL defect involving tie ordering and boundary handling that does not appear in the small happy-path examples but appears in the historical fixture.",
+  "A few decoy bugs in logging, health metrics, and an unused maintenance command so that locating the active request path requires tracing real requests.",
+  "A deterministic reference generator and verifier-side fixture generator that can create new event histories, append them in adversarial batch orders, and compare HTTP responses with an independent Python/SQL reference implementation."
+ ],
+ "internal_hint": "Start the service, exercise reset/append/report sequences, and compare reports after appending the same logical history in different batch orders. Inspect SQLite tables before and after corrections rather than relying on source reading alone. The reliable repair is to make the retained-event relation authoritative, recompute affected users and their sessions after any winning duplicate replacement or late event, derive purchase attribution from the rebuilt sessions, and rebuild order-level refund/revenue aggregates from those current facts. Pay particular attention to deterministic window ordering, the strict greater-than session gap, half-open report intervals, and applying campaign filters only after attribution.",
+ "trap": "A shallow fix that makes the bundled report look correct, or merely invalidates the final aggregate table, fails when a late event changes an earlier session boundary or when a higher-ingest-sequence duplicate arrives after downstream rows already exist. Implementations that use append order, inclusive end dates, non-deterministic equal-time ordering, or match refunds by amount rather than order ID pass simple examples but diverge on verify-time histories.",
+ "tests": [
+  "Start-up and protocol test: launches `./run.sh`, checks `/health`, validates all required status codes and JSON shapes, and confirms the process binds on port 8080.",
+  "Fixture baseline test: resets the service, appends the supplied historical fixture in its normal order, requests several date ranges and campaign filters, and compares exact rows, integer revenues, and ordering.",
+  "Duplicate-history test: generates events with duplicate IDs whose winning ingest sequence arrives late, appends them in multiple permutations, and requires identical reports and idempotent replays.",
+  "Session-boundary test: generates users with gaps below, exactly at, and just above 1,800 seconds, including equal timestamps and shuffled ingest order, then checks session counts and downstream attribution.",
+  "Late-event dependency test: appends a purchase and report first, then appends an earlier touch that changes the purchase's session or campaign; the subsequent report must reflect the rebuilt chain of derived results.",
+  "Refund test: generates purchases and refunds in different sessions and batches, including repeated refunds and misleading equal amounts, and checks that only the referenced order is reversed once under its original attribution.",
+  "Date/filter test: generates events exactly at `since` and `until`, uses empty and nonempty campaign filters, and verifies half-open interval behavior and zero rows for explicitly requested campaigns.",
+  "Randomized verify-time test: for several hidden seeds, generates hundreds to thousands of events across users and campaigns, partitions them into adversarial append batches, and compares every report against an independent reference implementation.",
+  "State-isolation test: performs reset, runs a second unrelated history, and verifies that no sessions, orders, or materialized rows from the first history leak into the second.",
+  "Resource and repeatability test: repeats representative reports and replay sequences to ensure deterministic JSON output and acceptable completion within the container's CPU and memory limits."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "10 protocol scenarios plus 6 hidden generated histories",
+  "effect": "Raising this adds more append/report permutations, late corrections, filters, and boundary cases, increasing the chance of exposing stale derived state or ordering errors; lowering it toward only the baseline and happy-path reports makes partial fixes appear correct."
+ },
+ "expected_failure_modes": [
+  "The solver fixes the visible baseline query but does not trace the append-time materialization and therefore leaves stale downstream rows after late corrections.",
+  "The solver recomputes sessions but forgets to rebuild attribution or order-level refund aggregates that depend on them.",
+  "The solver uses append order or a non-unique timestamp window ordering, producing nondeterministic results for ties.",
+  "The solver interprets the 1,800-second boundary or report end timestamp incorrectly.",
+  "The solver attributes refunds by amount, session, or campaign rather than following the referenced order ID.",
+  "The solver treats duplicate event IDs as first-write-wins or permanently deletes the old winner without rebuilding affected users.",
+  "The solver validates only the bundled fixture and misses verify-time histories with interleaved users, repeated refunds, and adversarial batch boundaries.",
+  "The solver changes the protocol or launcher while repairing SQL, causing service-level tests to fail despite locally correct calculations."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "data-querying",
+ "tags": [
+  "python",
+  "sql",
+  "sqlite",
+  "service-protocol",
+  "event-sourcing",
+  "adversarial-testing"
+ ]
+}

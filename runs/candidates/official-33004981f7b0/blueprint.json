@@ -1,0 +1,69 @@
+{
+ "slug": "repair-cryptographic-settlement-reconciler",
+ "title": "Repair Cryptographic Settlement Reconciliation",
+ "scenario": "A finance-ops team is reconciling a month's settlement exports after a key-rotation rollout. The container contains a C reconciliation utility, binary settlement spools, bank-side CSV records, configuration and format notes, and a compiled cryptographic helper used by production but shipped without its source. The current utility produces plausible totals, but its audit root and exception counts disagree with the clearing house and it misses the batch processing SLA.",
+ "instruction_draft": "reconcile: 12,384 records, 12,384 accepted, 0 rejected\nexception total: 184.07\nsettlement root: 7d1b...c903 (clearing-house root: 5a82...11fe)\nelapsed: 8.74s (SLA: 2.50s)\n\nRepair the settlement reconciler in /work so that its existing command-line interface produces a correct, deterministic report for the supplied data and for fresh settlement batches generated during verification. Investigate the format documentation, fixtures, executable dependencies, and runtime behavior before changing the implementation. Do not replace the cryptographic helper or hard-code fixture values.\n\nThe command is `./reconcile --manifest <path> --spool <path> --bank <path> --out <path>`. It must process the complete authenticated spool, derive the batch key through the supplied helper, decrypt and validate every frame, apply each adjustment to the transaction it references, and emit the documented JSON report. A report is valid only when every accepted transaction has a valid authentication tag, every adjustment is applied exactly once to its referenced transaction, rejected frames and their reasons are included, and the reported settlement total, exception total, record counts, per-currency subtotals, chained audit root, and reconciliation status exactly match the reference semantics. Preserve integer money arithmetic and the documented canonical byte ordering; do not use floating point for monetary fields.\n\nThe verifier will generate batches containing reordered frames, duplicate transaction identifiers with distinct references, empty and maximum-length metadata, non-ASCII UTF-8 descriptions, negative adjustments, key rotations, malformed/truncated frames, and valid records whose plaintext contains zero bytes. It will compare the complete report rather than only the totals. The implementation must not accept an altered frame or silently discard a malformed one. It must also process a generated 100,000-frame batch in at most 2.50 seconds on the one-CPU container, excluding fixture generation, while staying below 256 MiB of additional resident memory.",
+ "requirements": [
+  "Keep the command-line interface `./reconcile --manifest <path> --spool <path> --bank <path> --out <path>` working.",
+  "Derive the batch key using the supplied compiled cryptographic helper rather than replacing or bypassing it.",
+  "Read and process every frame in the authenticated binary settlement spool.",
+  "Reject altered, unauthenticated, malformed, and truncated frames without treating them as valid transactions.",
+  "Apply every adjustment exactly once to the transaction reference encoded by the adjustment.",
+  "Handle reordered frames, duplicate transaction identifiers with distinct references, empty metadata, maximum-length metadata, UTF-8 text, negative adjustments, key rotations, and plaintext containing zero bytes.",
+  "Emit the documented JSON report with exact counts, rejection reasons, settlement total, exception total, per-currency subtotals, chained audit root, and reconciliation status.",
+  "Use integer arithmetic and the documented canonical byte ordering for monetary values and authenticated/audited data.",
+  "Produce deterministic output independent of frame ordering where the format specifies order-independent reconciliation.",
+  "Do not hard-code supplied fixture values or silently discard malformed records.",
+  "Process a generated 100,000-frame batch within 2.50 seconds on one CPU.",
+  "Use no more than 256 MiB of additional resident memory during the performance test."
+ ],
+ "environment": [
+  "The Dockerfile must use `FROM python:3.13-slim-bookworm`, pin apt and pip dependencies, and build the C utility and an opaque helper deterministically with the container's compiler and OpenSSL/libcrypto development packages.",
+  "The helper executable, `/opt/settlement/bin/settle-crypto`, is compiled during the image build from a temporary source tree that is deleted before the solver starts; only the binary, a terse protocol reference, and sample command transcripts remain.",
+  "The helper exposes deterministic key-unwrapping and key-rotation operations over stdin/stdout, including binary output and error statuses. Its protocol has versioned fields, an endianness convention, and a batch-context binding that must be used by the reconciler.",
+  "The workspace contains roughly 1,500 lines of C across `reconcile.c`, framing and JSON modules, a small unrelated CSV reporting tool, tests, and operational utilities, plus a Makefile and configuration files.",
+  "Documentation describes the spool framing format, manifest fields, bank CSV schema, canonicalization rules, audit-chain construction, report schema, and helper protocol, but deliberately does not provide a ready-made implementation.",
+  "The spool format uses length-delimited binary frames with version, flags, reference identifiers, nonce material, ciphertext, authentication tag, and optional metadata. Frames may be reordered and can contain arbitrary binary plaintext.",
+  "The visible fixture contains enough ordinary records to make the current totals appear plausible and includes a known-good report for a small batch, but does not exercise all length, encoding, ordering, duplicate-reference, or key-rotation cases.",
+  "The starter reconciler has a partially implemented multi-stage pipeline and operational bugs involving streaming behavior, authenticated parsing, canonical serialization, and state handling across batches. Some unrelated modules are intentionally complete.",
+  "The Docker image includes a deterministic fixture generator used only by verification, a supplied sample batch, and scripts for measuring elapsed time and resident memory. No network access is needed."
+ ],
+ "internal_hint": "The intended resolution requires investigation rather than inspection alone. First run the existing binary against the fixture, trace its helper invocations and intermediate files, and use the protocol transcripts plus controlled manifests to establish the helper's binary contract and key-rotation behavior. Build a streaming frame reader that distinguishes EOF, truncation, and malformed lengths; preserve byte lengths rather than C-string termination; verify the per-frame MAC before decrypting; and pass the exact manifest context and nonce/key bytes in the helper's required order. The next stage must index records by the full reference identity, not merely the displayed transaction ID, then apply signed adjustments once while retaining rejected records. Finally serialize each accepted record with the documented length-prefixed UTF-8 canonical form, feed that representation through the ordered audit-chain/Merkle construction, and emit stable JSON with integer values and specified key ordering. The performance failure comes from repeated helper process startup and whole-spool buffering; a persistent helper session and one-pass streaming/indexed processing are needed for the 100,000-frame threshold. The reference solution is a deterministic shell script that first probes the helper, runs the supplied fixtures and boundary cases, instruments stage counts, then patches and rebuilds the C program.",
+ "trap": "A shallow fix can reproduce the visible report by decrypting ordinary frames and matching by transaction ID, yet fail when two references share an ID, when an adjustment arrives before its transaction, or when plaintext contains a zero byte. Another common implementation verifies only the final total, hashes host-endian or NUL-terminated fields, accepts a truncated final frame, or launches the opaque helper once per record; these solutions look correct on the sample but fail exact hidden reports or exceed the 2.50-second threshold.",
+ "tests": [
+  "Run the repaired program on the supplied fixture and compare the complete JSON report with the deterministic reference, including rejection reasons and audit root.",
+  "Generate fresh valid batches from hidden seeds with reordered frames and verify exact report equality, including order-independent totals and the specified audit ordering.",
+  "Generate records with duplicate displayed transaction IDs but distinct cryptographic references and adjustments arriving before or after their targets; verify that each adjustment affects only its referenced transaction once.",
+  "Generate UTF-8 descriptions, empty metadata, maximum permitted metadata, embedded zero bytes, negative adjustments, and boundary-length frames; verify exact decrypted values, totals, and audit root.",
+  "Rotate the batch key at generated boundaries and verify that the program invokes the opaque helper with the correct context and rejects frames from the wrong rotation.",
+  "Mutate ciphertext, tags, headers, lengths, versions, and final-frame truncation; verify that each invalid frame is rejected with the documented reason and cannot affect totals or the audit chain.",
+  "Run a generated 100,000-frame authenticated batch on one CPU and require elapsed time no greater than 2.50 seconds and additional resident memory below 256 MiB.",
+  "Run two identical generated batches in separate processes and verify byte-for-byte deterministic reports."
+ ],
+ "verifier_knob": {
+  "name": "performance_threshold",
+  "value": "2.50 seconds for 100,000 frames on one CPU",
+  "effect": "Raising the limit permits less optimized implementations; lowering it requires more aggressive streaming, persistent-helper, allocation, and indexing optimization."
+ },
+ "expected_failure_modes": [
+  "The agent fixes visible arithmetic while missing the opaque helper's context binding or key-rotation protocol.",
+  "The parser uses strlen, line-oriented reads, or signed length arithmetic and corrupts binary or boundary-case plaintext.",
+  "The implementation authenticates after state mutation, allowing malformed or altered frames to affect counts or totals.",
+  "Matching by transaction ID instead of the full reference silently misapplies adjustments in hidden batches.",
+  "The audit chain uses host endianness, implicit struct padding, floating-point formatting, or NUL-terminated strings and therefore diverges only on rare records.",
+  "The solution buffers the entire spool or forks the helper for every frame and fails the quantitative threshold despite being functionally plausible.",
+  "The agent validates only the visible fixture and does not test truncation, reordering, duplicate references, or key rotations.",
+  "The agent changes the helper or hard-codes the supplied expected root instead of implementing the documented protocol."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "cryptography",
+ "tags": [
+  "c",
+  "cryptography",
+  "binary-format",
+  "streaming",
+  "reconciliation",
+  "performance"
+ ]
+}

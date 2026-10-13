@@ -1,0 +1,193 @@
+{
+ "blueprint": {
+  "slug": "repair-entitlement-rebuild",
+  "title": "Repair entitlement journal recovery",
+  "scenario": "You are the on-call SRE paged at 03:00 because the entitlement rebuild job reports success but customer quota dashboards disagree with the serving database. The container contains an in-house JavaScript recovery service, a SQLite-backed journal format, migration utilities, fixtures, and operational scripts; the service has accumulated several interacting data-dependent regressions.",
+  "instruction_draft": "03:00 pager output:\n```text\n$ node bin/rebuild-entitlements.js --input incident/journal.db --output /tmp/rebuilt.db\nrebuild completed: 1842 source rows, 317 entitlements\n$ node bin/check-rebuild.js /tmp/rebuilt.db\nERROR: tenant acme/team-17 expected 96 active units, found 128\nERROR: 11 journal records were assigned to the wrong recovery batch\n```\n\nFix the recovery service in this container. The command `node bin/rebuild-entitlements.js --input INPUT --output OUTPUT` must deterministically rebuild the output SQLite database from the input journal without modifying the input. Follow the documented recovery semantics and preserve the required output schema: `current_entitlements`, `usage_totals`, `recovery_batches`, `quarantine`, and `migration_meta`.\n\nA journal record is usable only when its record identity, tenant, predecessor relationship, and batch membership satisfy the documented constraints. Resolve duplicate candidates and predecessor chains before applying operations; process each valid chain in causal order, then calculate effective entitlement intervals and usage, and only then materialize the output tables. Revocations and restorations must affect the exact referenced grant or consumption, overlapping intervals must be combined according to the documented half-open interval rules, and records that cannot be assigned to a valid chain must appear in `quarantine` with a stable reason code rather than affecting totals.\n\nThe result must be identical for repeated runs, must not depend on SQLite row-return order, must handle signed 64-bit unit values exactly, and must remain correct for empty journals, duplicate deliveries, disconnected chains, cycles, equal timestamps, batch boundaries, and records whose identifiers are valid only after normalization. Do not hard-code the supplied fixture or alter the checker; validate the fix with the existing tests and additional generated cases before finishing.",
+  "requirements": [
+   "Fix the implementation rather than changing the checker or hard-coding the supplied fixture.",
+   "Make `node bin/rebuild-entitlements.js --input INPUT --output OUTPUT` produce a deterministic SQLite database.",
+   "Never modify the input database.",
+   "Produce the required tables `current_entitlements`, `usage_totals`, `recovery_batches`, `quarantine`, and `migration_meta` with the documented columns and values.",
+   "Reject journal records whose identity, tenant, predecessor relationship, or batch membership violates the documented constraints.",
+   "Resolve duplicate candidates and predecessor chains before applying any journal operation.",
+   "Process every accepted chain in causal order before calculating derived totals.",
+   "Apply revocations and restorations to the exact referenced record rather than to an arbitrary record with matching tenant or amount.",
+   "Calculate effective entitlement intervals using the documented half-open interval rules.",
+   "Combine overlapping intervals and calculate usage according to the documented semantics.",
+   "Place every record that cannot belong to a valid chain in `quarantine` with a deterministic reason code.",
+   "Preserve exact signed 64-bit unit arithmetic without JavaScript floating-point loss.",
+   "Make output independent of SQLite's unspecified row order.",
+   "Handle empty journals, duplicate deliveries, disconnected chains, cycles, equal timestamps, batch boundaries, and identifiers requiring normalization.",
+   "Ensure repeated executions on the same input produce byte-for-byte equivalent logical database contents.",
+   "Run and pass the repository's existing checks after the repair."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt packages including Node.js, SQLite, and shell utilities; no network access is needed.",
+   "An approximately 1,600-line JavaScript service split across a CLI, SQLite adapter, journal normalizer, chain resolver, interval calculator, migration runner, checker, and operational logging modules.",
+   "A documented SQLite input schema containing raw journal records, delivery batches, predecessor references, tenant metadata, and normalization aliases.",
+   "A sample incident database and shell scripts that reproduce the pager output, plus a small visible fixture that intentionally does not exercise all edge cases.",
+   "Planted regressions spread across the pipeline: a data-dependent duplicate-selection path, a parent lookup that becomes ambiguous across tenants, an ordering conversion that treats some sequence values lexicographically, a migration stage whose committed quarantine changes later retries, and numeric conversion that loses precision for large unit totals.",
+   "The interval and batch logic includes plausible unrelated code for logging, health checks, metrics export, and schema version reporting so the defect cannot be located from one tiny source file.",
+   "Repository documentation describes the journal format, normalization rules, chain validity constraints, operation semantics, half-open interval convention, quarantine reason codes, and output schema.",
+   "The reference solution is a deterministic shell script that first inventories the repository, inspects the schema and failing fixture, runs targeted probes against the recovery stages, then applies and validates the repair."
+  ],
+  "internal_hint": "The intended resolution is investigative rather than a one-line patch. Start by tracing the CLI into the migration stages and compare intermediate row sets for the supplied database. Instrument or query each stage independently, especially duplicate selection, predecessor resolution, and interval materialization. The important interactions are that normalized identifiers must be used consistently in both candidate selection and parent joins; candidate ranking is constrained by tenant, batch ancestry, and numeric source sequence rather than text order; cycles and ambiguous predecessor components must be quarantined before any child can contribute; and the migration must compute all stage inputs from an immutable snapshot instead of allowing an early committed quarantine/update to alter later stages. Replace Number arithmetic with validated BigInt-to-SQLite-safe handling, make every ordering explicit, and implement the documented causal topological procedure followed by half-open interval sweep and final materialization. The hidden reference independently generates journals and compares all output rows, so fixing only the visible tenant or changing the sample SQL is insufficient.",
+  "trap": "The visible fixture has unique normalized identifiers, small unit values, no cross-tenant predecessor collision, and no cycles, so a shallow patch can make the displayed count pass. Such a solution fails when a duplicate has a larger textual sequence but a smaller numeric sequence, when a child references a record in another tenant, when a cycle contaminates descendants, when a retry sees rows quarantined by an earlier stage, when equal interval endpoints meet, or when totals exceed JavaScript's exact integer range.",
+  "tests": [
+   "Run the repaired CLI on the supplied incident database and compare every logical row in all required output tables with the independent expected result.",
+   "Generate fresh SQLite journals from a hidden deterministic seed containing valid chains, duplicate deliveries, aliases, batch boundaries, disconnected records, and records with equal timestamps; compare the produced database against the reference computation.",
+   "Generate predecessor graphs containing multiple components, ambiguous candidates, cycles, and descendants of invalid nodes; verify exact quarantine membership and stable reason codes.",
+   "Generate cross-tenant and cross-batch identifier collisions and verify that only relationships satisfying all documented constraints are accepted.",
+   "Generate records whose sequence fields differ in numeric value but have misleading textual representations, and verify causal ordering.",
+   "Generate grants, consumption, revocation, and restoration operations with touching and overlapping effective intervals; compare current entitlements and usage totals using the documented half-open rules.",
+   "Generate signed 64-bit amounts near integer boundaries and verify exact totals, including negative adjustments, without floating-point rounding.",
+   "Run each generated case twice and compare logical contents and schema metadata to ensure deterministic output.",
+   "Verify that input database bytes and logical contents are unchanged after recovery.",
+   "Exercise empty input, malformed payloads, duplicate rows, missing predecessors, and partially valid batches to ensure the CLI completes atomically and quarantines only the appropriate records.",
+   "Use multiple generated databases with different row insertion orders to ensure no result depends on SQLite's unspecified scan order."
+  ],
+  "verifier_knob": {
+   "name": "verify-time journal graph count and adversarial variety",
+   "value": "48 generated databases, 400-3,000 journal rows each, with 12 graph/interval/arithmetic distributions and 20% deliberately adversarial cases",
+   "effect": "Lowering the value makes visible-fixture behavior and a few hand-written edge cases more influential. Raising it increases the number of fresh hidden graphs, duplicate candidates, cycles, boundary intervals, and large-integer cases, sharply reducing the chance that a partial pipeline patch passes by accident."
+  },
+  "expected_failure_modes": [
+   "Patches the displayed SQL count or fixture-specific tenant instead of repairing the general recovery procedure.",
+   "Uses a local greedy predecessor choice and misses the global constraint that determines valid chain components.",
+   "Processes children before resolving an invalid or cyclic ancestor, allowing quarantined history to affect totals.",
+   "Leaves an early write or commit in place, so a retry or later stage observes a different journal than the initial stage.",
+   "Normalizes identifiers in one query but joins raw identifiers in another.",
+   "Relies on implicit SQLite row order or JavaScript string comparison for sequence ordering.",
+   "Uses Number for unit arithmetic and passes ordinary examples while failing near 64-bit boundaries.",
+   "Treats interval endpoints as closed or merges touching intervals incorrectly.",
+   "Quarantines an invalid record but still permits its descendants to contribute.",
+   "Checks only aggregate totals and misses incorrect batch assignment, quarantine reason, or output metadata.",
+   "Runs the visible checker once and does not generate fresh cases with reordered inserts or adversarial graph structure."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "event-sourcing",
+   "constraint-satisfaction",
+   "data-recovery",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "pwd and inventory the repository with find/ls",
+   "read the recovery documentation and journal-format specification",
+   "inspect package metadata, scripts, and available test commands",
+   "run the supplied incident reproduction to establish the baseline",
+   "inspect the input schema and sample journal with sqlite3",
+   "inspect the checker and required output schema",
+   "trace bin/rebuild-entitlements.js into migration and recovery stages",
+   "read the journal normalizer and identifier-alias handling",
+   "read duplicate selection and candidate-ranking code",
+   "read predecessor resolution and batch-membership logic",
+   "read interval calculation and operation application",
+   "read the SQLite adapter and migration transaction boundaries",
+   "inspect schema migrations and output materialization",
+   "grep for Number arithmetic, string sequence comparisons, implicit ordering, and commits",
+   "run targeted probes for duplicates, aliases, cross-tenant parents, and sequence ordering",
+   "query intermediate stage outputs for the supplied incident database",
+   "implement an immutable input snapshot and atomic output transaction",
+   "normalize identifiers once and use normalized keys in all joins and indexes",
+   "replace local greedy selection with constrained duplicate and component resolution",
+   "reject cycles, ambiguous components, and descendants of invalid ancestors before applying operations",
+   "make causal topological ordering explicit, including numeric sequence and deterministic tie breakers",
+   "replace unit arithmetic with validated BigInt and SQLite-safe signed-64-bit serialization",
+   "implement exact-target revocation/restoration and documented half-open interval sweeping",
+   "materialize batches, quarantine, totals, and metadata using explicit deterministic ordering",
+   "run the repository's existing tests and the incident checker",
+   "generate adversarial journals covering graph, batch, alias, interval, and 64-bit cases",
+   "rerun each case with reordered inserts, compare logical outputs and metadata, and verify input hashes"
+  ],
+  "speedrun_commands": 27,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The prompt refers to documented constraints, reason-code precedence, and output columns without reproducing them; if the repository documentation is incomplete or internally inconsistent, failures could be caused by ambiguity rather than the repair.",
+   "The requirement mentions byte-for-byte repeatability but the tests are described as comparing logical contents; if physical SQLite serialization or migration metadata is checked inconsistently, a correct logical result could be rejected.",
+   "The expected behavior for malformed records, partially valid batches, and competing invalidity reasons must be fully specified to make quarantine membership and reason codes unambiguous.",
+   "Pinned package availability or Node.js/SQLite compatibility in the stated offline image could make the environment fail independently of the submitted repair."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a concrete deterministic interface, strong independent fuzz-equivalence verification, and realistic interacting recovery defects. It is difficult for substantive reasons, though completing a broad repair of a 1,600-line service within an hour is challenging and keeps solvability below the top score.",
+  "fixes": [
+   "Include or explicitly reference the authoritative quarantine-reason precedence rules and exact output-column definitions in the task-facing documentation.",
+   "Clarify whether determinism means logical row equivalence only or also byte-identical SQLite files, and exclude SQLite implementation metadata if only logical equivalence is intended.",
+   "State the required atomicity behavior for malformed input and whether an existing output file must be replaced, preserved, or removed on failure.",
+   "Provide a documented command for running the independent reference comparison locally so agents can distinguish implementation errors from schema or fixture issues."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "This is a journal graph recovery and entitlement-interval reconstruction problem, unlike fixed-point sensor statistics aggregation against a reference binary."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "This concerns deterministic validation and filtering of NDJSON records, not resolving predecessor chains, recovery batches, and entitlement semantics."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "This is a chunked CSV validation and deduplication pipeline, whereas the candidate requires causal journal recovery and derived entitlement calculations."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Although both involve records and SQLite-related state, this task is about canonical WAL serialization and HMAC responses rather than journal-chain recovery and entitlement rebuilding."
+    },
+    {
+     "ref_id": "ours/official-48ebd2cd8854",
+     "verdict": "distinct",
+     "reason": "This is a straightforward weighted regional sum and cache correction, not data-dependent recovery-chain validation with interval, revocation, and quarantine semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-c396920d769d",
+     0.162
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.141
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.127
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.117
+    ],
+    [
+     "ours/official-48ebd2cd8854",
+     0.11
+    ]
+   ],
+   "cost_usd": 0.0008544
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0030872
+}

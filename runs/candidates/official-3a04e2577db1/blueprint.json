@@ -1,0 +1,72 @@
+{
+ "slug": "accelerate-sqlite-policy-gate",
+ "title": "Accelerate the SQLite Policy Gate",
+ "scenario": "An embedded telemetry product uses a small C utility to decide whether SQL fragments received from a constrained field device may be executed against its local SQLite database. The current release is both too slow on large synchronization batches and occasionally gives the wrong answer after schema or policy changes. The container contains the utility, its SQLite policy databases, a prebuilt policy extension, diagnostic tools, and representative benign and hostile request corpora.",
+ "instruction_draft": "```\n$ ./build/sqlgate --db samples/device.db --input samples/requests.ndjson\nfatal: request 417 accepted after policy generation changed\nprocessed 10000 requests in 2.81s (target: under 0.70s)\n```\n\nYou are maintaining this C program for a budget-constrained embedded device. Investigate the complete repository and repair or replace the implementation as needed. Keep the existing command-line interface:\n\n`sqlgate --db DB --input REQUESTS [--output OUTPUT]`\n\nEach input line is a JSON object containing an integer `id`, a SQL string `sql`, and an optional `params` array. For every input record, emit exactly one output line containing its `id` and either `ALLOW` or `DENY`, in input order. If `--output` is omitted, write to stdout.\n\nA request may be emitted as `ALLOW` only when the policy engine would authorize the prepared SQLite statement for the database state at the time that request is evaluated. Preserve the policy engine's behavior exactly, including denial of malformed SQL, unsupported parameter bindings, writes, schema-changing operations, unauthorized tables, columns, functions, virtual tables, and indirect access through views, triggers, recursive queries, or attached databases. Valid read-only requests must not be lost or reordered. The process must remain deterministic, must not execute a denied statement, and must continue processing later records after an individual malformed or hostile record.\n\nThe implementation must handle arbitrary request order, repeated SQL, duplicate IDs, empty strings, embedded NULs represented by JSON escapes, large parameter values, and policy or schema changes between batches. It must pass fresh hidden databases and request corpora rather than relying on the supplied examples. On the supplied benchmark machine, process at least 50,000 mixed requests per second with the provided corpus while using less than 256 MiB of RSS. Do not remove the policy extension or weaken the policy to meet the performance target.",
+ "requirements": [
+  "Preserve the CLI form `sqlgate --db DB --input REQUESTS [--output OUTPUT]`.",
+  "Emit exactly one `id ALLOW` or `id DENY` line for every input JSON record, in input order.",
+  "Match the policy engine's authorization result for every request, including malformed SQL, unsupported bindings, writes, schema changes, unauthorized objects, functions, virtual tables, views, triggers, recursive queries, and attached databases.",
+  "Never execute a request that is denied.",
+  "Continue processing after malformed or hostile requests.",
+  "Correctly handle duplicate IDs, repeated SQL, empty strings, embedded NULs, large values, and arbitrary request order.",
+  "Reflect schema and policy changes between batches and never reuse a stale authorization result.",
+  "Remain deterministic and avoid crashes, memory corruption, and unbounded memory growth.",
+  "Process at least 50,000 mixed requests per second on the supplied one-CPU benchmark.",
+  "Use less than 256 MiB resident memory on the supplied benchmark.",
+  "Pass verify-time-generated SQLite databases and adversarial request corpora."
+ ],
+ "environment": [
+  "A Dockerfile based on `python:3.13-slim-bookworm`, with pinned apt packages including gcc, make, gdb, sqlite3, libsqlite3-dev, jq, strace, and time; no network is needed.",
+  "A roughly 1,500-line C repository under `/work/sqlgate`, split among JSON decoding, SQLite connection management, request batching, result formatting, metrics, and a deliberately noisy legacy compatibility layer.",
+  "A build system producing `build/sqlgate` and a prebuilt opaque `libedgepolicy.so`; the extension implements the product's SQLite authorizer and policy-generation hooks and is shipped without source.",
+  "A small probe utility and symbol/debug metadata sufficient to inspect the extension's exported interface, but not its authorization algorithm.",
+  "SQLite databases containing policy generation numbers, allowed table/column/function records, views, triggers, attached-database fixtures, and schema mutations. Some policy facts are encoded in generated rows and are not apparent from a single database dump.",
+  "A visible sample corpus with ordinary SELECTs, obvious writes, malformed SQL, and repeated statements. It intentionally does not include stale-cache sequences, parameter corner cases, indirect object access, or all combinations of policy-generation changes.",
+  "A benchmark corpus of tens of thousands of requests with repeated normalized statements and a small percentage of expensive adversarial statements.",
+  "A planted implementation that prepares every request, performs redundant policy setup, and uses a fast-path authorization cache whose key omits state that matters. It also has failure-path cleanup and parameter-binding interactions that only appear after particular sequences of accepted and denied requests.",
+  "A deterministic reference runner and verifier that create fresh databases and corpora from a hidden seed at verification time, invoke the opaque policy engine as the oracle, compare complete ordered output, check that denied statements were not executed, and measure throughput and RSS."
+ ],
+ "internal_hint": "The real difficulty is runtime behavior rather than a defect visible by reading one file. A skilled engineer first runs the sample, traces SQLite authorizer callbacks, uses the probe and gdb/strace around the opaque extension, then constructs sequences that mutate the database schema or policy generation between batches. The implementation's cache is keyed by normalized SQL and connection identity but not by the effective policy/schema state; a second problem is that a failed bind or authorizer denial leaves reusable statement state and cached parameter metadata behind. The correct repair separates parsing/JSON lifetime from SQLite value lifetime, binds every parameter with exact type and length semantics, resets and clears bindings on every reuse, and keys or invalidates structural authorization decisions using the policy generation plus SQLite schema cookie and relevant attached-database state. A bounded cache of prepared statements and authorization metadata, with safe eviction and a fallback for pathological SQL, reaches the performance target without bypassing the opaque policy callback. The deterministic reference shell script investigates with sample runs, callback tracing, a generated stale-generation reproducer, and benchmark measurements before applying the fix and rebuilding.",
+ "trap": "A shallow solution either removes the cache and becomes functionally correct but misses the throughput requirement, or caches by SQL text and passes the visible repeated-query sample while reusing an ALLOW result after a policy/schema change. Another common solution caches only the SQL parse and accidentally reuses bound values, treating a later malformed, embedded-NUL, or unsupported parameter request as the previous valid request. Sampling only benign SELECTs also misses denied statements reached through views, triggers, attached databases, and recursive CTEs.",
+ "tests": [
+  "Run the supplied sample and verify exact ordered output formatting, including one result for every record.",
+  "Generate fresh policy databases with different allowed tables, columns, functions, attached schemas, views, and triggers; compare every decision with the opaque reference policy engine.",
+  "Generate fresh corpora containing benign statements, malformed SQL, writes, DDL, comments, nested and recursive queries, virtual-table access, indirect view/trigger access, unsupported parameter types, empty and very large values, embedded NULs, duplicate IDs, and repeated normalized SQL.",
+  "Run sequences where policy rows and schema objects are changed between batches on the same process and verify that no decision from the old state is reused.",
+  "Run accepted and denied requests in alternating orders to detect leaked bindings, stale authorizer state, incorrect reset behavior, and process termination after one bad record.",
+  "Instrument the SQLite connection and verify that no denied request reaches execution and that accepted requests are not silently dropped or reordered.",
+  "Use verify-time hidden seed instances rather than fixed files, so hard-coded IDs, SQL strings, policy generations, or corpus-specific answers fail.",
+  "Measure throughput on a generated 50,000-plus request corpus on one CPU and reject implementations below the required rate.",
+  "Measure peak RSS during a large corpus with many distinct statements and reject unbounded caches or retained JSON/SQLite objects.",
+  "Run repeated verification in separate fresh directories and require deterministic byte-for-byte output."
+ ],
+ "verifier_knob": {
+  "name": "hidden_seed_corpus_coverage",
+  "value": "Generate 8,000-40,000 requests per instance, with 10-25% rare cases covering state transitions, indirect SQLite authorization paths, unusual parameter encodings, and cache-eviction pressure.",
+  "effect": "Lower values make shallow cache fixes and sample-driven implementations appear correct; higher values increase the chance of exposing stale policy decisions, binding lifetime bugs, indirect access mistakes, and performance regressions while keeping the oracle and expected behavior unchanged."
+ },
+ "expected_failure_modes": [
+  "Reads the visible C files and patches the obvious cache condition without observing that the relevant state changes only after a sequence of database mutations.",
+  "Uses SQL text alone as the cache key and fails hidden policy-generation or schema-cookie transitions.",
+  "Reuses prepared statements without clearing bindings or without distinguishing SQLite value types and explicit lengths.",
+  "Treats a policy denial as a parse failure and leaves authorizer or statement state dirty for the next request.",
+  "Implements a conservative deny-all or deny-most policy that passes hostile samples but loses valid hidden requests.",
+  "Reimplements policy logic from the visible database tables and misses behavior encoded in the opaque extension.",
+  "Disables caching or reparses everything, preserving correctness but failing the quantitative throughput requirement.",
+  "Adds an unbounded prepared-statement cache that passes speed tests but exceeds the memory limit on generated corpora.",
+  "Validates only top-level SELECT syntax and misses writes or reads reached through views, triggers, recursive queries, functions, or attached databases.",
+  "Fails to test malformed input recovery and exits early, corrupts output order, or emits duplicate results."
+ ],
+ "predicted_pass_rate": 0.22,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "c",
+  "sqlite",
+  "systems",
+  "reverse-engineering",
+  "adversarial-testing",
+  "debugging"
+ ]
+}

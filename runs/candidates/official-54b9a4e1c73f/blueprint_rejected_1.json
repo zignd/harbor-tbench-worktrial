@@ -1,0 +1,189 @@
+{
+ "blueprint": {
+  "slug": "repair-edge-accounting",
+  "title": "Repair Edge Traffic Accounting",
+  "scenario": "The network-analytics team says the gateway traffic numbers no longer reconcile with the request logs, especially after long-running captures and NAT port reuse. This container contains a small in-house replay service, several log and metric producers, a partially implemented report pipeline, and a black-box `wlog-inspect` utility used by operations to inspect the gateway's packed wire logs.",
+  "instruction_draft": "Hey, can you get the edge accounting report working again? `./bin/netreport --capture data/sample.wlog --config etc/report.toml --out /tmp/report.json` should produce per-service request, byte, error, and latency totals that reconcile with the supplied logs and metrics; every request must be counted once and assigned to the correct service, including retries, NAT reuse, fragmented records, and counter resets. Please make it general rather than tuning the sample: on fresh captures, at least 99.5% of reconstructed requests and 99.5% of byte totals must match the reference accounting, and the report must remain deterministic.",
+  "requirements": [
+   "The supplied netreport command must run successfully and write the requested JSON report.",
+   "The report must contain per-service request totals, byte totals, error totals, and latency totals consistent with the supplied logs and metrics.",
+   "Every logical request must be counted exactly once.",
+   "Requests must be assigned to the correct service despite retries and NAT port reuse.",
+   "Fragmented packed wire-log records must be reconstructed correctly.",
+   "Counter resets and metric wraparound must be handled correctly.",
+   "On fresh verification captures, at least 99.5% of reconstructed requests must match the reference accounting.",
+   "On fresh verification captures, at least 99.5% of total bytes must match the reference accounting.",
+   "Outputs must be deterministic for identical inputs."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt and pip dependencies, one CPU, 2 GB RAM, and no network access.",
+   "A roughly 1,600-line Python application spread across `bin/netreport`, `netpulse/ingest.py`, `netpulse/stitch.py`, `netpulse/metrics.py`, `netpulse/report.py`, replay utilities, and unrelated health-check code.",
+   "Sample and medium-sized gateway captures under `data/`, consisting of interleaved client, NAT, proxy, and upstream observations plus Prometheus-like metric snapshots.",
+   "A short operations document describing record magic, version fields, little-endian integers, varint lengths, per-fragment CRCs, timestamp units, and report schema, but omitting several edge-case interactions that can be learned from `wlog-inspect`.",
+   "A compiled, source-less `tools/wlog-inspect` executable that decodes selected packed-record queries and prints normalized observations; it is deterministic and is available for black-box probing but is not used as the production decoder.",
+   "A partially implemented `netpulse/wlog.py` decoder with missing support for chained fragments, escaped payload bytes, optional metadata blocks, and checksum validation. The production pipeline must implement this component rather than shelling out to the inspector.",
+   "A planted report-pipeline problem in which logical request stitching uses an order-dependent greedy choice when multiple observations satisfy the same five-tuple and time constraints; the correct solution requires constraint-based matching using sequence, parent-child, retry, and service metadata relationships.",
+   "Two interacting accounting causes: a timestamp/metric epoch transition is normalized after duplicate suppression, and reset snapshots are merged using a stale pre-reset sequence identity. Fixing either alone makes the visible sample appear correct while leaving failures in captures containing both a clock transition and retransmitted fragments.",
+   "A deterministic generator and hidden reference implementation used at verification time to produce fresh captures with thousands of records, rare fragment boundaries, NAT reuse, retries, malformed-but-ignorable records, counter resets, and simultaneous epoch transitions.",
+   "A local test fixture and README showing the normal invocation and a small sample, without exposing the hidden generator or reference implementation."
+  ],
+  "internal_hint": "Start by running the sample, inspecting the report, replaying captures with verbose logging, and querying `wlog-inspect` on records around mismatches. Differentially compare inspector output with the incomplete decoder, especially at fragment boundaries and escaped bytes. Then instrument the stitcher to emit candidate edges rather than only its greedy winner; the correct reconstruction is a constrained one-to-one assignment across observations, with sequence continuity, valid proxy parentage, retry linkage, and service identity as constraints. Finally compare raw counter timelines around the epoch transition: normalize timestamps and establish post-reset metric identity before duplicate elimination, and carry the reset generation into request/byte aggregation. Tests should be run on generated captures, not just the sample, because the two state/order bugs interact only when retransmissions cross both a reset and an epoch boundary.",
+  "trap": "A shallow fix that replaces the greedy matcher with a five-tuple/time-window lookup passes ordinary traffic but misassigns requests when NAT ports are reused or retries overlap. A decoder that handles the visible record layout but ignores escaped bytes or chained fragments silently loses payload bytes. Likewise, fixing timestamp rollover or reset arithmetic in isolation makes the supplied sample reconcile while hidden captures containing both causes still double-count or drop requests.",
+  "tests": [
+   "Run the command on the supplied sample and verify valid JSON, schema, deterministic output, and exact reconciliation of its known totals.",
+   "Generate fresh captures from hidden seeds containing ordinary records, fragmented records, escaped payloads, optional metadata, and interleaved streams; compare decoded observations and final report values with the reference.",
+   "Generate cases with simultaneous NAT port reuse and overlapping retries; check that each reference logical request is assigned once to the correct service.",
+   "Generate cases with reordered observations and ambiguous candidate matches; check request identity, service totals, and latency attribution against the constrained reference assignment.",
+   "Generate metric sequences containing resets, wraparound, and a timestamp epoch transition; check request and byte totals, including events surrounding the transition.",
+   "Generate combined reset-plus-epoch captures with retransmitted fragments, ensuring that independently plausible partial fixes do not pass.",
+   "Include malformed records with bad fragment checksums and truncated optional sections; verify that the documented recovery behavior is followed without contaminating neighboring records.",
+   "Measure hidden-input request accuracy and byte-total accuracy over thousands of records; require both to be at least 99.5%.",
+   "Run identical generated inputs twice and require byte-for-byte identical reports."
+  ],
+  "verifier_knob": {
+   "name": "minimum hidden accounting accuracy",
+   "value": "0.995",
+   "effect": "Raising the threshold toward 1.0 makes rare matching, parsing, and reset-boundary errors less tolerable; lowering it permits more approximate implementations and makes shallow fixes more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The solver reads only the visible Python files and patches an obvious arithmetic expression without observing runtime behavior around state transitions.",
+   "The solver implements a conventional greedy five-tuple matcher that cannot resolve overlapping retries, NAT reuse, and proxy relationships.",
+   "The solver implements only the common packed-record format and misses chained fragments, escaping, optional sections, or CRC recovery.",
+   "The solver treats a reset as a simple subtraction and loses generation identity when records from before and after the reset are interleaved.",
+   "The solver fixes epoch normalization before deduplication but leaves the reset-generation interaction broken, or vice versa.",
+   "The solver validates only the small sample and never exercises rare fragment boundaries, reordered records, or simultaneous failure conditions.",
+   "The solver delegates decoding to the opaque inspector, which is too slow or unavailable for hidden verify-time inputs.",
+   "The solver produces correct aggregate totals on average but violates exact-once request identity or deterministic ordering."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "networking-services",
+  "tags": [
+   "constraint-satisfaction",
+   "reverse-engineering",
+   "network-logs",
+   "metrics",
+   "binary-parser",
+   "stateful-debugging"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, README, fixture, and executable entry points.",
+   "Read the README and operations document for invocation, schema, and wire-format details.",
+   "Run the supplied netreport command and inspect the generated JSON.",
+   "Run the existing tests and identify current failures.",
+   "Read bin/netreport and trace the pipeline into ingest, wlog, stitch, metrics, and report.",
+   "Search the source for TODOs, placeholder branches, deduplication, reset, epoch, and matching logic.",
+   "Inspect the existing wlog decoder and its callers.",
+   "Inspect the replay utilities and sample capture layout.",
+   "Run wlog-inspect --help or strings on the executable to determine its query interface.",
+   "Probe representative records, including records near suspected fragment boundaries.",
+   "Hex-dump sample records and compare inspector output with the incomplete decoder.",
+   "Implement chained-fragment reconstruction, escaped-byte handling, optional metadata parsing, and CRC validation in netpulse/wlog.py.",
+   "Run decoder checks on normal, fragmented, escaped, optional-metadata, and malformed sample records.",
+   "Instrument the stitcher to emit all candidate observation edges rather than only the greedy winner.",
+   "Classify candidate constraints for sequence continuity, proxy parentage, retry linkage, and service identity.",
+   "Replace greedy five-tuple matching with deterministic one-to-one constrained assignment.",
+   "Run the sample and inspect request identity, service assignment, and latency totals.",
+   "Trace raw metric and timestamp timelines around resets and epoch transitions.",
+   "Move timestamp and metric-epoch normalization before duplicate suppression.",
+   "Add reset-generation identity to metric merging and request/byte aggregation.",
+   "Exercise captures containing both retransmitted fragments and simultaneous reset and epoch transitions.",
+   "Add or adapt local adversarial fixtures for NAT reuse, overlapping retries, reordering, malformed records, and counter wraparound.",
+   "Run the full local test suite against the sample and medium capture.",
+   "Run the report twice on identical inputs and compare the JSON bytes.",
+   "Benchmark decoding and reporting on the largest available capture.",
+   "Validate report schema, totals, error counts, and latency units.",
+   "Review deterministic ordering and error recovery for all emitted records.",
+   "Run the final supplied invocation and inspect the report before submission."
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The report schema does not define whether latency totals mean sum, average, percentile values, or another aggregation, nor does it fully specify latency units and missing-latency behavior.",
+   "The prompt refers to documented malformed-record recovery behavior, but the exact behavior for every combination of bad CRC, truncation, and neighboring fragments is not stated here.",
+   "If multiple constrained assignments remain valid, the hidden reference's tie-breaking rule may reject a semantically valid deterministic implementation unless that rule is specified.",
+   "The black-box inspector's query syntax and supported query set are not described, so probing may be unnecessarily difficult or impossible without executable-specific discovery.",
+   "The 99.5% threshold and thousands-of-record hidden inputs need an explicit runtime limit; otherwise a slow but correct implementation or an inspector-based implementation may be judged inconsistently.",
+   "The interaction between request-level byte totals and metric-derived byte totals is not explicitly defined, especially for malformed or partially decoded records."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is genuinely difficult and largely verifiable, but the proposed solution path requires reverse-engineering a binary format, implementing a robust decoder, replacing the matcher with constrained assignment, and repairing two interacting state machines across a roughly 1,600-line application. That is not plausibly solvable by a skilled engineer in under an hour, and several report, recovery, and tie-breaking semantics remain underspecified.",
+  "fixes": [
+   "Provide an explicit report-schema contract defining latency aggregation, units, missing values, byte-source precedence, and deterministic ordering.",
+   "Specify the inspector invocation and normalized observation format, or include a small documented probing harness.",
+   "State the exact malformed-record recovery rules and whether fragments after a bad CRC are discarded, resynchronized, or independently decoded.",
+   "Define deterministic tie-breaking for assignments when all stated constraints admit more than one solution.",
+   "Reduce the implementation scope or provide a tested decoder and matcher scaffold with clear interfaces, leaving one well-bounded repair area for the solver.",
+   "Include local adversarial fixtures for both interacting state-transition causes so the core behavior can be validated without relying entirely on hidden generation.",
+   "Set an explicit verification timeout and performance expectation for the production decoder."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "Although both aggregate network telemetry from binary logs, this task centers on fragmented custom wire-log reconstruction, request identity across retries and NAT reuse, and metric counter correction rather than NetFlow templates and settlement classification."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task repairs an offline accounting and reconstruction pipeline, whereas the reference builds a persistent HTTP query service over a metrics database."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Despite the networking overlap, the reference aggregates NetFlow records received by a service, while this task reconstructs logical requests from packed fragmented logs and reconciles them with metrics."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "Both involve reconciliation and exactly-once-style accounting, but this task requires network request correlation and wire-log parsing rather than provider transaction and refund matching."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference concerns concurrent per-user CPU quotas and durable ledger consistency in an evaluation service, not network capture reconstruction or traffic accounting."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e5238fcac164",
+     0.145
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.144
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.117
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.113
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.109
+    ]
+   ],
+   "cost_usd": 0.0011964
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0038972
+}

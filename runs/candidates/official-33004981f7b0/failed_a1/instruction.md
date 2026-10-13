@@ -1,0 +1,5 @@
+Repair the settlement reconciler in /work. Preserve `./reconcile --manifest <path> --spool <path> --bank <path> --out <path>` and emit a deterministic JSON report.
+
+Use `/opt/settlement/bin/settle-crypto` for key derivation. Stream every binary spool frame and authenticate it before parsing or mutating state. Reject altered, unauthenticated, malformed, unsupported, wrong-rotation, and truncated frames with reasons. Handle reordered frames, duplicate displayed IDs with distinct references, adjustments before or after targets, negative adjustments, rotations, empty and maximum metadata, UTF-8 descriptions, embedded zero bytes, and boundary lengths.
+
+Apply each adjustment once to its full reference. Use integer money arithmetic and documented little-endian length-prefixed canonical bytes. Report accepted and rejected counts, rejection details, settlement and exception totals, currency subtotals, deterministic audit root, and reconciliation status. Do not hard-code values or bypass the helper. Process 100,000 frames within 2.50 seconds on one CPU and below 256 MiB additional memory.

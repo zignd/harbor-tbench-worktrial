@@ -1,0 +1,155 @@
+{
+ "blueprint": {
+  "slug": "log-routerd-shard-dispatch-engine",
+  "title": "Build Shard Routing Engine for Log Router Service",
+  "scenario": "A platform team is migrating an ingest tier to a modern log routing daemon (`log-routerd`). The service daemon in `/opt/log-router` has HTTP endpoints scaffolded, but the core batch routing endpoint (`POST /v1/route`) is still a stub returning 501. The legacy routing logic must be reverse-engineered from legacy test fixtures, an archived legacy tokenizer module, and schema specs, then integrated into a 3-stage pipeline that runs live on port 8080.",
+  "instruction_draft": "Hey, we need to wrap up the ingest tier migration today. The new `log-routerd` service is scaffolded under `/opt/log-router`, but the `/v1/route` endpoint is still a stub. Can you implement the batch routing feature so it properly handles incoming log dispatch requests? The legacy partitioner rules and recorded validation captures are over in `/opt/log-router/legacy` and `/opt/log-router/fixtures`. Once it's implemented, make sure the `log-routerd` service is running on `127.0.0.1:8080` and ready for traffic.",
+  "requirements": [
+   "The `log-routerd` service must be running and listening for HTTP requests on `127.0.0.1:8080`.",
+   "Requests to `POST /v1/route` with `Content-Type: application/json` containing a batch of raw log events, tenant metadata, and active shard descriptors must return HTTP 200 with the routing manifest, or HTTP 422 if constraints cannot be satisfied.",
+   "Stage 1 log canonicalization: Extract template IDs and event weights from raw log strings following the legacy masking rules (masking ISO/epoch timestamps, UUIDs, IPv4/IPv6 addresses, hex hashes, and quoted string literals, computing 32-bit FNV-1a hash of the canonical template, and calculating dynamic event weight as base length plus entropy penalty).",
+   "Stage 2 constraint satisfaction: Assign normalized event groups to target shards such that all tenant isolation constraints (anti-affinity conflict pairs and allowed shard tier zones) and shard capacity limits are satisfied, minimizing max shard utilization and breaking ties deterministically by lowest shard index.",
+   "Stage 3 receipt generation: For each target shard with allocated events, compute an ordered cryptographic rolling digest chain (seeded by the shard's epoch token) over the assigned event payload hashes and return the partition manifest.",
+   "Reject unschedulable batches with HTTP 422 and a structured JSON body identifying the exact conflicting constraint (`CAPACITY_EXCEEDED` or `AFFINITY_CONFLICT`)."
+  ],
+  "environment": [
+   "Python 3.13-slim-bookworm base image with `aiohttp`, `fastapi`, `uvicorn`, `pydantic`, `pytest`, `requests` installed.",
+   "Directory `/opt/log-router` containing a FastAPI/Uvicorn scaffold `routerd/app.py`, service launcher `bin/log-routerd`, and configuration `config/router.yaml`.",
+   "`/opt/log-router/legacy` containing legacy Python/C-compiled rule artifacts (`legacy_tokenizer.so` or bytecode + obfuscated pattern table) and documentation fragments detailing legacy anti-affinity matrix format and epoch hash seed rules.",
+   "`/opt/log-router/fixtures` containing 8 paired input/output JSON captures demonstrating normal routing, anti-affinity isolation, and capacity rejection cases.",
+   "Systemd or background process supervisor setup for `log-routerd` running on port 8080."
+  ],
+  "internal_hint": "Difficulty lever: Substantial construction + Multi-stage dependency. The solver must reverse engineer how the legacy system extracts event weights and template hashes in Stage 1, implement an exact constraint satisfaction assignment (Integer Linear Programming or deterministic greedy backtracking with tie-breaking) in Stage 2, and construct the sequential hash-chain manifest in Stage 3. An error in Stage 1 template masking silently alters event weights, causing Stage 2 to select different shards or fail capacity checks, which completely invalidates Stage 3 hash-chain receipts. The solver investigates the legacy fixtures to confirm token normalization boundaries (e.g., handling escaped quotes vs unescaped quotes in strings, IPv4 with ports), implements the CSP placement solver in `routerd/engine.py`, plugs it into the FastAPI route in `routerd/app.py`, and starts `log-routerd`.",
+  "trap": "A naive solver tests only the visible fixture inputs or implements a basic greedy First-Fit heuristic without proper anti-affinity conflict checking or tie-breaking order. In visible test cases with small loads, greedy First-Fit happens to match the optimal assignment; under verify-time hidden multi-tenant batches with tight capacities and cyclic anti-affinity rules, the naive heuristic places events into suboptimal shards, producing mismatched rolling digests or false 422 rejections.",
+  "tests": [
+   "Service health and protocol check: Verifies `GET /healthz` and `POST /v1/route` protocol compliance on `127.0.0.1:8080`.",
+   "Visible fixtures parity: Replays all recorded legacy fixture batches and verifies exact JSON response equality.",
+   "Hidden seed fuzz test: Generates 50 fresh randomized multi-tenant log batches using a hidden PRNG seed, verifying Stage 1 template normalization, Stage 2 shard capacity and anti-affinity constraints, and Stage 3 rolling digest receipts against reference output.",
+   "Edge-case constraint verification: Tests complex anti-affinity graphs (bipartite conflict clusters, single-slot zone restrictions, and exact-capacity edge packing) to verify correct constraint satisfaction and rejection semantics (`CAPACITY_EXCEEDED` vs `AFFINITY_CONFLICT`).",
+   "Malformed payload handling: Verifies HTTP 400 for corrupt log schemas and HTTP 422 for provably unsatisfiable constraint sets."
+  ],
+  "verifier_knob": {
+   "name": "hidden_request_scenarios_count",
+   "value": "75",
+   "effect": "Controls the number of procedurally generated request scenarios tested against the running service, scaling tenant conflict density and shard capacity tightness."
+  },
+  "expected_failure_modes": [
+   "Partial implementation: Agent implements the API route and Stage 1 regex parsing but uses simple round-robin or first-fit bin packing that violates tenant anti-affinity rules on complex batches.",
+   "Compounding error in Stage 1: Minor tokenization mismatches (e.g. failing to strip port numbers from IPv4 addresses before masking) produce different event weights, causing the Stage 2 solver to pick alternate shards and invalidating the Stage 3 rolling digest.",
+   "Process lifecycle failure: Agent writes the code into `/opt/log-router` but fails to restart or keep `log-routerd` running as a background service on port 8080."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "algorithmic",
+  "tags": [
+   "log-processing",
+   "reverse-engineering",
+   "constraint-satisfaction",
+   "service-protocol",
+   "api-development"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/log-router && ls -la legacy/ fixtures/ routerd/",
+   "cat legacy/README.md legacy/*.txt 2>/dev/null || true",
+   "cat fixtures/fixture_01.json",
+   "python3 -c 'import sys; sys.path.append(\"legacy\"); import legacy_tokenizer; print(dir(legacy_tokenizer))'",
+   "objdump -d legacy/legacy_tokenizer.so | grep -A 20 entropy || strings legacy/legacy_tokenizer.so",
+   "grep -rn 'route' routerd/ config/",
+   "cat routerd/app.py",
+   "python3 -c 'from legacy import legacy_tokenizer; print(legacy_tokenizer.tokenize(\"test\"))'",
+   "cat fixtures/capacity_exceeded.json fixtures/affinity_conflict.json",
+   "nano routerd/engine.py",
+   "python3 -c 'import routerd.engine as e; print(e.test())'",
+   "nano routerd/app.py",
+   "pytest tests/ 2>/dev/null || python3 -m unittest",
+   "python3 -m routerd.app &",
+   "curl -s http://127.0.0.1:8080/healthz",
+   "curl -s -X POST http://127.0.0.1:8080/v1/route -H 'Content-Type: application/json' -d @fixtures/fixture_01.json",
+   "bin/log-routerd start || systemctl restart log-routerd",
+   "curl -s http://127.0.0.1:8080/healthz"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 3
+  },
+  "invalid_failure_risks": [
+   "ABI / Python version mismatch: Python 3.13 changed CPython internal ABIs; a compiled `legacy_tokenizer.so` built for older Pythons will fail to import with symbol errors.",
+   "Mathematical ambiguity: Reverse-engineering an exact floating-point 'entropy penalty' and FNV-1a hash rules from 8 fixtures or disassembled binary without exact spec is nearly impossible within 60 minutes.",
+   "Instruction underspecification: The instruction draft omits critical requirements (HTTP 422 JSON schema keys, tie-breaking criteria, rolling digest algorithm and format), forcing the agent to guess schema property names unless documented explicitly.",
+   "Resource limits: Running a full CSP/ILP solver for 50-75 hidden multi-tenant batches on 1 CPU / 2 GB RAM may hit test runner timeouts."
+  ],
+  "verdict": "reject",
+  "reasons": "The task suffers from severe clarity and solvability issues. The user instruction is overly brief and omits tested requirements such as the 422 error payload schema, the exact tie-breaking logic, and cryptographic rolling digest specifications. Expecting an engineer or agent to reverse-engineer obfuscated C bytecode/binaries, deduce an exact entropy penalty formula, and implement a full multi-stage CSP pipeline in Python 3.13 within one hour is unrealistic and prone to unfair failures.",
+  "fixes": [
+   "Provide clear legacy specification documents in `/opt/log-router/legacy/SPEC.md` specifying the exact regex patterns, the entropy formula (e.g. Shannon entropy formula and scaling factor), and the rolling digest algorithm rather than relying on reverse-engineering a compiled `.so` file.",
+   "Update the instruction draft to explicitly state the expected HTTP status codes, error response contract (`CAPACITY_EXCEEDED` vs `AFFINITY_CONFLICT`), and tie-breaking requirements.",
+   "Provide pure Python legacy reference implementations or tests in the repo rather than obfuscated bytecode or C-compiled extensions to prevent Python 3.13 ABI import failures."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference focuses on repairing a Go quantile sketch daemon's mathematical accuracy and systemd deployment, whereas the candidate involves implementing a multi-stage shard routing and bin-packing HTTP service from legacy specs."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference requires fixing discrepancy bugs and adding an endpoint in a Flask/SQLite log enrichment pipeline, while the candidate requires implementing a constraint-satisfaction routing engine and cryptographic rolling digest pipeline."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "The reference involves debugging a silent overflow bug in a C extension rate-limiter, whereas the candidate requires greenfield implementation of log canonicalization and shard assignment endpoints."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference tasks the user with wrapping a compiled binary engine to serve SQLite-backed time-series metric queries, whereas the candidate focuses on log template canonicalization, tenant anti-affinity constraint satisfaction, and shard manifests."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference deals with debugging binary demuxing and protocol mismatch in a Rust telemetry trace processor, which is completely different from building an HTTP log routing and shard allocation daemon."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-d993c25003e5",
+     0.194
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.147
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.128
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.127
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.124
+    ]
+   ],
+   "cost_usd": 0.0055815
+  },
+  "novel": true
+ },
+ "cost_usd": 0.01671
+}

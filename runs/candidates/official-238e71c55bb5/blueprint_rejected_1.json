@@ -1,0 +1,177 @@
+{
+ "blueprint": {
+  "slug": "recover-cask-segment-service",
+  "title": "Recover the Cask Segment Service",
+  "scenario": "Hey, the latest release of our small Cask archive utility is serving stale records after a few large rotations, and clients are blaming the query layer because the visible symptom is mostly 404s. Please triage it and leave a deployable C service in place; the container includes the archive files, a protocol-speaking daemon, format notes, and some deliberately unhelpful operational tooling.",
+  "instruction_draft": "Please get the Cask service working again and deploy it using the supplied configuration. It must answer the documented line-oriented JSON requests against the archive in /srv/cask/data, preserve the existing request and error format, and never expose records that are deleted or from an incomplete archive tail. It also needs to return the same results after a restart, correctly handle archives containing thousands of records, and keep the supplied service entrypoint usable for fresh archive files placed in the configured data directory.",
+  "requirements": [
+   "A deployable service must start from the supplied configuration and accept the documented line-oriented JSON protocol on the configured endpoint.",
+   "The service must correctly answer all documented get, range, list, and statistics requests using the archive in /srv/cask/data.",
+   "Results must reflect the archive's ordered updates: the latest live value is returned, deletions remain absent, and records from incomplete or invalid tails are ignored.",
+   "Requests for absent keys and malformed requests must retain the documented JSON response and error behavior.",
+   "The service must produce identical answers after being stopped and restarted without modifying the archive files.",
+   "The implementation must work with fresh archives in the configured directory, not only the supplied fixture, and must handle at least thousands of records without an O(records squared) recovery step.",
+   "The supplied service entrypoint and configuration must remain the way the verifier launches the program."
+  ],
+  "environment": [
+   "The Docker image is based on python:3.13-slim-bookworm with pinned build/runtime packages, GCC, make, and a small JSON utility available; there is no network dependency.",
+   "The workspace contains roughly 1,500 lines of C spread across a daemon, protocol code, an index module, diagnostics, and test utilities, plus a Makefile and deployment configuration.",
+   "The installed entrypoint is /opt/cask/bin/caskd and the configuration points it at /srv/cask/data and a localhost TCP endpoint. The daemon speaks newline-delimited JSON and has commands for get, range, list, stats, and health.",
+   "The data directory contains several binary .cask segment files, a manifest, an index cache, a human-readable format note, and a small command-line archive inspector. The fixture contains rotations, checkpoints, tombstones, escaped keys, multi-byte lengths, duplicate updates, and a torn final write.",
+   "The format uses fixed-size pages with sequence metadata, continuation records, unsigned varints, per-record checksums, and checkpoint metadata. Recovery requires validating page and record boundaries, ordering segments and updates, applying tombstones, and stopping at the first incomplete tail.",
+   "A prebuilt codec/index helper is shipped as a shared object with headers but without its implementation source. The released daemon was linked against it. Its failures occur only for particular page-boundary and history combinations; ordinary inspection of the daemon source does not reveal the complete cause.",
+   "The visible fixture and diagnostic utility are intentionally biased toward short keys and mostly single-page records. A misleading stale-cache warning is emitted by the query layer even when the underlying recovered state is wrong.",
+   "The repository includes unrelated C components for logging, metrics, and a health endpoint so that the recovery and deployment path must be located through experiments rather than by reading one tiny file."
+  ],
+  "internal_hint": "The reference shell script first inventories the launch path and protocol, runs the inspector and daemon against the supplied archive, and compares health/stats/range results with a clean replay. It then generates small archives by using the included archive writer and probes boundaries around page size, varint widths, checkpoint changes, duplicate keys, and torn records. The actual failure is in the opaque codec's recovery behavior: a continuation record whose length varint crosses a page boundary is advanced using the remaining page bytes rather than the logical stream offset, and checkpoint reconstruction can retain an older value when a later tombstone is in the next segment. The shipped cache also permits that partially recovered state to survive a restart. The robust fix is to bypass or replace the helper with a C recovery implementation that walks logical pages in manifest sequence, validates page sequence and record CRCs before applying anything, decodes varints across continuations, replays updates by sequence number, treats tombstones as state, truncates only the invalid tail, and rebuilds the in-memory index deterministically on every startup. The script compiles the repaired daemon, installs it at the configured entrypoint, removes stale cache artifacts, and exercises the protocol before returning.",
+  "trap": "A shallow solution can patch the visible cache warning or delete the index cache, which makes the small supplied example look correct. It still fails when a generated record crosses a page boundary, when a tombstone follows a checkpoint in a later segment, when a varint reaches three or more bytes, or when the verifier restarts the service and checks that a torn tail was not partially applied.",
+  "tests": [
+   "Launches the deployed entrypoint with the supplied configuration, waits for health, and checks protocol framing, documented error responses, and basic get/list behavior.",
+   "Queries a supplied archive containing rotations, checkpoints, deletes, escaped keys, duplicate updates, and an incomplete final record; compares get, range, list, and stats answers with a deterministic reference replay.",
+   "Stops and restarts the service against the same files and verifies byte-equivalent JSON answers and that no cache or startup shortcut resurrects deleted or incomplete records.",
+   "Generates fresh archives with the supplied writer under a hidden seed, including thousands of records, multi-byte varints, records split at every relevant page offset, several segment sequences, and keys containing protocol-significant characters; compares all query classes against the reference.",
+   "Generates archives with valid prefixes followed by bad page headers, bad record checksums, truncated continuation data, and torn tails, and verifies that only the valid prefix is visible.",
+   "Exercises absent keys, repeated updates followed by deletion and reinsertion, empty archives, and statistics after compaction-like segment rotations.",
+   "Checks deployment behavior by launching through the original configuration and entrypoint rather than invoking a newly named helper directly."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "7",
+   "effect": "The seven scenarios cover startup, supplied-history replay, restart, generated boundary cases, corruption/torn tails, update/delete semantics, and deployment compatibility. Lowering this to two or three mostly tests the visible fixture and makes cache-only fixes pass; raising it adds more generated histories, protocol request mixes, and corruption placements, increasing the chance of exposing partial recovery implementations."
+  },
+  "expected_failure_modes": [
+   "The agent edits the query/index layer because the symptom is a stale-cache warning, without validating recovered state against a replay.",
+   "The agent trusts the supplied inspector or examples and implements only ordinary single-page records.",
+   "The agent treats each physical page as an independent record stream and mishandles varints or records continued onto the next page.",
+   "The agent restores checkpoint values but does not replay later segments in sequence order, so deletes or reinserts are lost.",
+   "The agent accepts a record before validating its checksum or applies a partial final record.",
+   "The agent fixes the daemon but leaves the original opaque codec path or stale cache enabled on restart.",
+   "The agent deploys a replacement binary under a different name or changes the protocol framing, so the implementation works manually but not through the verifier.",
+   "The agent builds a quadratic replay/index path that appears correct on the fixture but times out or exceeds memory on hidden thousands-record archives."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "file-formats-and-recovery",
+  "tags": [
+   "c",
+   "binary-format",
+   "service-protocol",
+   "deployment",
+   "data-recovery",
+   "black-box-component"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "find /srv/cask /opt/cask -maxdepth 3 -type f -printf '%p\\n'",
+   "cat the supplied deployment configuration and entrypoint script",
+   "read the format note and protocol documentation",
+   "inspect the Makefile and build targets",
+   "grep for entrypoint, cache, manifest, page, checkpoint, tombstone, and recovery code",
+   "build the existing project and record compiler/linker behavior",
+   "run the archive inspector against every supplied segment and the manifest",
+   "launch the supplied daemon with the configured entrypoint",
+   "probe health and one request of each documented protocol command",
+   "capture baseline get, range, list, and stats responses",
+   "locate and inspect the supplied archive-writer and test utilities",
+   "read the binary-format headers, constants, and record structures",
+   "read the daemon protocol and query/index integration code",
+   "generate a small clean archive with the supplied writer",
+   "generate boundary archives for page splits, varint widths, duplicate updates, and tombstones",
+   "generate archives with truncated records and invalid checksums or page headers",
+   "write a deterministic replay/checking script from the format documentation",
+   "implement a logical-page recovery walker in C, including continuation varints and CRC validation",
+   "replay records by segment and sequence order while treating tombstones as state",
+   "replace the opaque recovery/cache path and rebuild the index on every startup",
+   "update the Makefile or deployment target without changing the configured entrypoint",
+   "compile and install the repaired daemon at /opt/cask/bin/caskd",
+   "remove stale generated cache artifacts from the configured data directory",
+   "launch through the original configuration and rerun protocol smoke tests",
+   "stop and restart the service and compare canonical responses",
+   "run the supplied and generated archives through all query classes",
+   "run thousands-record and malformed-tail cases under a timeout and memory check",
+   "inspect the final deployed files and verify the entrypoint remains unchanged"
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 5,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "If tests require byte-for-byte JSON equality without canonicalizing object key order or whitespace, a correct service could fail for serialization differences.",
+   "The format note and protocol documentation must define statistics semantics, segment ordering, malformed-request responses, and recovery behavior for corruption between segments; otherwise those cases are ambiguous.",
+   "A verifier that assumes a particular cache filename, process shutdown behavior, or timing for health readiness could introduce environment-dependent failures.",
+   "If the supplied writer cannot generate every hidden boundary case or if hidden archives use undocumented format features, rejecting implementations based on those cases would overreach the stated task."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear deployable end state and strong deterministic coverage, including fresh generated archives, restart behavior, corruption handling, and deployment-path checks. It is genuinely difficult because the failure requires black-box investigation and a correct linear recovery implementation, although the format complexity makes the under-an-hour solvability only moderate.",
+  "fixes": [
+   "State that JSON comparisons are canonicalized and define the exact statistics and malformed-request semantics in the protocol documentation.",
+   "Document recovery behavior for invalid pages or records occurring between otherwise valid segments, including whether later segments are ignored.",
+   "Publish explicit timeout and memory expectations for the thousands-record cases and define cache invalidation requirements by path or behavior rather than filename."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task is about recovering and serving state from an append-only archive, whereas the reference implements windowed metric aggregation over a SQLite-backed log database."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/crack-7z-hash",
+     "verdict": "distinct",
+     "reason": "The reference is a simple archive-password extraction task and has no service recovery, protocol, or state-reconstruction component."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "same",
+     "reason": "Both tasks require deterministic recovery of live state from segmented append-only archives, applying ordered updates and deletions while ignoring malformed or incomplete tails and preserving results across restarts."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference centers on enforcing concurrent per-user rolling CPU budgets and database accounting consistency, not archive parsing or state recovery."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both replay ordered durable log records while rejecting incomplete or invalid data and producing restart-safe deterministic state, but this task exposes a read-only JSON service over archives rather than generating an atomic replay snapshot with transaction validation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.168
+    ],
+    [
+     "terminal-bench-2-1/crack-7z-hash",
+     0.167
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.153
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.147
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.128
+    ]
+   ],
+   "cost_usd": 0.0013172
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0037847999999999996
+}

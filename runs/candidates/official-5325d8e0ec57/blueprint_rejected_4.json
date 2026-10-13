@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "harden-dns-update-gate",
+  "title": "Harden the Dynamic DNS Update Gate",
+  "scenario": "You are the on-call SRE for an internal dynamic-DNS service that started intermittently rejecting DHCP updates overnight. The container contains a Node.js UDP/TCP DNS UPDATE gateway, its deployment configuration, an SQLite zone database, and operational tools; the gateway must remain compatible with both ordinary DHCP clients and a legacy TCP updater.",
+  "instruction_draft": "Restore the DNS UPDATE gateway so that it accepts every valid authorized update and rejects every malformed, ambiguous, unauthorized, or resource-exhausting packet without changing the SQLite database. Configure it to serve both UDP and length-prefixed TCP traffic, preserve atomicity when a packet contains multiple changes, and make the result correct for inputs beyond the supplied examples.",
+  "requirements": [
+   "The gateway must listen on the configured UDP and TCP endpoints and support DNS UPDATE packets over both transports.",
+   "It must accept authorized packets that obey the configured zone and record policy, including valid compressed names, escaped label octets, multiple record changes, and TCP frames split across arbitrary reads.",
+   "It must reject malformed or ambiguous DNS wire data, including truncated sections, invalid label encodings, out-of-range or looping compression pointers, forward pointers, names exceeding protocol limits, inconsistent record lengths, unsupported opcodes, and trailing bytes.",
+   "It must reject updates from unauthorized clients and updates outside the configured zones or allowed record types/classes.",
+   "A rejected packet must not partially modify SQLite, and an accepted packet must commit all of its changes atomically.",
+   "Equivalent DNS names must be compared using DNS canonical name semantics rather than raw packet spelling, while record data must not be silently reinterpreted or normalized into a different record.",
+   "The service must enforce configured packet, record-count, name, and TXT-size limits before allocating unbounded memory or performing database writes.",
+   "Responses must contain the original transaction identifier and an appropriate DNS UPDATE response code, and malformed input must not crash or wedge either listener.",
+   "The deployment configuration must use the intended SQLite database, bind the configured interfaces, and apply the same policy to UDP and TCP."
+  ],
+  "environment": [
+   "A Dockerfile based on python:3.13-slim-bookworm installs pinned nodejs, sqlite3, and a small set of pinned system utilities without network access during verification.",
+   "A roughly 1,400-line JavaScript service is split across a launcher, UDP/TCP listeners, configuration loader, SQLite repository, policy evaluator, logging module, and response encoder; unrelated health and metrics code makes locating the effective path nontrivial.",
+   "The DNS wire decoder and canonical-name helper are incomplete components with misleading simple examples that handle ordinary uncompressed A updates but do not correctly implement the full required name and section rules.",
+   "The supplied deployment configuration contains interacting mistakes in the effective config merge and listener setup: a compatibility default is applied after the file policy, and TCP framing uses a different limit path from UDP.",
+   "An initialized SQLite database contains several zones, authorized client CIDRs, existing records, and audit rows. The service uses WAL mode and a transaction-based update repository.",
+   "A visible corpus contains a few valid A and TXT updates, a basic unauthorized request, and one obvious truncated packet; hidden verification creates fresh packets and TCP fragmentation patterns from a seeded generator.",
+   "A command-line harness, health endpoint, packet dumper, and sample replay scripts are included so the solver can observe listener behavior and database state without internet access."
+  ],
+  "internal_hint": "The real work is to investigate the running listeners and database before editing: replay the samples over both transports, inspect SQLite before and after rejected multi-change packets, and compare effective configuration rather than only the config file. Replace the partial decoder with a bounds-checked DNS message parser that tracks every cursor independently, validates compression pointers against the DNS name rules, preserves raw RDATA where appropriate, and canonicalizes names for policy and database keys. Parse UPDATE sections according to their distinct zone/prerequisite/update meanings, validate the complete packet before opening a write transaction, then apply all changes under one SQLite transaction. Fix the config merge so explicit policy cannot be overwritten by compatibility defaults and make UDP/TCP use one shared validation path and limit accounting.",
+  "trap": "A shallow solution that accepts the visible packets and adds a few string checks will pass ordinary uncompressed samples but fail hidden packets using legal compression, escaped or mixed-case names, fragmented TCP frames, multiple updates, and records whose length fields contain embedded zero bytes. Conversely, treating every compressed name as suspicious rejects valid DHCP traffic. Parsing and writing each update incrementally also leaves partial database changes after a later malformed record, while fixing only UDP leaves the TCP listener permissive because it follows the stale compatibility configuration.",
+  "tests": [
+   "Start the configured service and verify that both UDP and TCP listeners answer, with TCP requests delivered in arbitrary chunks and multiple frames on one connection.",
+   "Replay visible valid and invalid packets and check response codes, transaction IDs, process health, and exact SQLite contents.",
+   "At verify time, generate a seeded corpus of thousands of authorized and unauthorized DNS UPDATE packets covering A, AAAA, CNAME, MX, TXT, and deletion operations, varying case, legal compression, escaped octets, section ordering, and record multiplicity; compare response classification and final database state with an independent reference implementation.",
+   "Generate malformed corpus entries with truncated headers and sections, invalid length fields, label and name overflows, forward and looping pointers, pointer targets into RDATA, duplicate or missing zone sections, unsupported classes and opcodes, trailing bytes, oversized TXT data, and packets exceeding configured limits; every one must be rejected without a database or audit mutation.",
+   "Send packets containing several valid changes followed by one invalid or unauthorized change and verify that no earlier change is committed.",
+   "Send semantically equivalent names in different case and legal wire encodings and verify that they address the same canonical database name without allowing an encoded out-of-zone suffix to bypass policy.",
+   "Exercise both transports with the same generated corpus and verify identical policy outcomes, including packets split at every byte boundary and coalesced with another frame.",
+   "Run a restart and WAL recovery check after accepted and rejected batches, confirming that committed updates survive and rejected batches leave no partial records or misleading audit entries.",
+   "Use adversarial packet sizes and repeated connections to ensure configured bounds are enforced and the process remains responsive rather than crashing or allocating unbounded buffers."
+  ],
+  "verifier_knob": {
+   "name": "hidden_dns_corpus_size_and_wire_edge_coverage",
+   "value": "3200 generated packets, including 700 malformed compression/length cases, 500 fragmented TCP cases, and 300 multi-update atomicity cases",
+   "effect": "Increasing the corpus and the proportion of rare legal compression, escaped-name, boundary-length, and cross-section cases makes shallow patches much less likely to pass; lowering it toward ordinary A/TXT packets makes the task substantially easier."
+  },
+  "expected_failure_modes": [
+   "The solver patches the visible examples instead of implementing a complete bounded DNS name and message parser.",
+   "The solver validates decoded strings but loses wire-level cursor and length information, allowing pointer loops, forward references, or trailing data.",
+   "The solver handles UDP correctly but leaves TCP on a separate permissive parser or fails under fragmented reads.",
+   "The solver canonicalizes whole records as text and corrupts binary RDATA or mishandles escaped labels.",
+   "The solver performs database writes while parsing, causing partial commits when a later section fails.",
+   "The solver fixes the configuration file but misses the post-merge compatibility default that changes the effective policy.",
+   "The solver adds broad rejection rules that pass malicious samples while rejecting hidden valid compressed or escaped DNS updates.",
+   "The solver tests only final records and misses audit-row mutations or WAL-visible partial transactions."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "networking-services",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "dns-wire-format",
+   "configuration",
+   "adversarial-validation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd && find . -maxdepth 2 -type f | sort",
+   "cat README* 2>/dev/null; find . -maxdepth 2 -iname '*config*' -o -iname 'Dockerfile'",
+   "cat package.json; npm list --depth=0 2>/dev/null",
+   "grep -RInE 'listen|dgram|net.createServer|UPDATE|sqlite|compat|limit' . --exclude-dir=node_modules",
+   "sqlite3 <database> '.schema'",
+   "sqlite3 <database> 'select name,sql from sqlite_master where type=\"table\";'",
+   "sqlite3 <database> 'select * from zones; select * from clients; select * from records; select * from audit;'",
+   "start the service using the documented launcher and capture its PID and logs",
+   "curl the health endpoint and inspect the bound UDP/TCP sockets with ss",
+   "replay every visible UDP sample and save packets, responses, logs, and database snapshots",
+   "replay every visible TCP sample with one-byte and coalesced frame writes",
+   "trace configuration loading and print the effective merged policy at startup",
+   "trace UDP and TCP entry points to identify whether they share decoding and policy code",
+   "read the wire decoder, name canonicalizer, response encoder, and repository transaction code",
+   "read the sample packet generator and infer the current wire layout and database key format",
+   "replace name decoding with a cursor-bounded parser that validates labels, pointers, and name limits",
+   "implement complete bounded parsing for header, zone, prerequisite, and update sections with exact length checks",
+   "preserve raw RDATA while separately canonicalizing only names used for policy and keys",
+   "validate opcode, classes, sections, trailing bytes, limits, authorization, and zone policy before any write",
+   "make UDP and TCP call the same validator and use one shared packet and frame limit",
+   "fix TCP buffering for arbitrary fragmentation, multiple frames, and bounded allocations",
+   "fix configuration merge ordering so explicit file policy wins over compatibility defaults",
+   "stage all changes in memory and apply them under one SQLite transaction including audit rows",
+   "run visible replays and compare response IDs, RCODEs, records, and audit rows",
+   "run generated valid and malformed packets over UDP and fragmented/coalesced TCP",
+   "restart after accepted and rejected batches, inspect WAL recovery, and run the full verifier"
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The required DNS UPDATE policy is not fully specified: exact permitted classes, prerequisite semantics, deletion behavior, and per-record policy may differ between the service and the independent reference.",
+   "\u201cAppropriate\u201d response codes and malformed-packet response behavior are underspecified, especially for packets that cannot be safely associated with a transaction.",
+   "The phrase about section ordering may conflict with RFC DNS UPDATE section rules; the verifier must define whether only the fixed wire order is accepted.",
+   "Canonical-name behavior for escaped octets, root names, case folding, and names appearing inside RDATA is not specified precisely enough to guarantee agreement with the reference.",
+   "TCP response framing, connection-close behavior, and handling of multiple requests after malformed frames are not explicitly defined.",
+   "The offline Docker build may fail if pinned Node.js or system packages are not vendored or already available in the build environment.",
+   "Assertions about exact SQLite and audit state can be flaky if timestamps, WAL checkpoints, row ordering, or unrelated health activity are included."
+  ],
+  "verdict": "reject",
+  "reasons": "The scenario is realistic and difficult, but the requested implementation is a substantial DNS wire parser, policy engine, framing layer, configuration repair, and transactional integration change that is unlikely to be solvable reliably in under an hour. Several protocol and oracle details are underspecified, so a correct implementation could disagree with the hidden reference; the resulting scores fail the acceptance threshold.",
+  "fixes": [
+   "Specify the exact RFC UPDATE subset, permitted classes and prerequisites, deletion semantics, allowed record types, response RCODE mapping, and TCP response framing.",
+   "Provide a canonical policy/schema document and a small executable reference oracle for names, RDATA handling, limits, and database-key normalization.",
+   "State precise behavior for malformed packets with and without usable transaction IDs, trailing bytes, duplicate sections, and malformed TCP frames.",
+   "Reduce the implementation scope by supplying a tested DNS wire-parser library or an existing parser skeleton with explicit missing functions, or increase the allowed solve time substantially.",
+   "Make the offline build reproducible by vendoring all pinned packages or documenting the preloaded package cache and exact Node.js availability.",
+   "Define deterministic database and audit assertions that ignore timestamps, row order, WAL implementation details, and unrelated operational writes."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "This task hardens a DNS UPDATE protocol gateway with DNS wire parsing, authorization, and atomic zone updates, whereas the reference classifies HTTP request targets under a route policy."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "This task concerns validating and atomically applying DNS UPDATE messages, not decoding NetFlow templates and aggregating flow records."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "Although both involve TCP input validation and SQLite-backed behavior, this task is a DNS wire-protocol update gateway rather than WAL canonicalization and HMAC generation."
+    },
+    {
+     "ref_id": "ours/official-3a04e2577db1",
+     "verdict": "distinct",
+     "reason": "This task enforces DNS protocol and zone-update semantics, while the reference authorizes SQL fragments against SQLite policy state."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "This task requires a stateful DNS UPDATE server with UDP/TCP framing, strict wire parsing, and atomic database changes, not batch NDJSON schema validation and ingestion."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.189
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.152
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.14
+    ],
+    [
+     "ours/official-3a04e2577db1",
+     0.137
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.104
+    ]
+   ],
+   "cost_usd": 0.0009467999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0036781999999999995
+}

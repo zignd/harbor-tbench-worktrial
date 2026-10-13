@@ -1,0 +1,150 @@
+{
+ "blueprint": {
+  "slug": "quantile-telemetry-aggregator-repair",
+  "title": "Repair and Deploy Streaming Quantile Telemetry Service",
+  "scenario": "A research scientist is attempting to reproduce benchmark results from a streaming systems paper evaluating real-time quantile sketches over high-throughput system logs. The daemon in `/opt/logsketchd` is failing to pass the local validation suite: quantile estimates on tail latencies violate the paper's relative error bounds, the HTTP query API chokes under concurrent load, and the supervisor deployment fails on restart. The environment contains the complete Go source code, supervisor configuration, runtime logs, and a local validation script.",
+  "instruction_draft": "Hey, I'm trying to reproduce the tail latency estimation benchmarks from our paper draft, but the aggregator in `/opt/logsketchd` is failing the validation protocol. Tail quantile queries against `http://127.0.0.1:8080/v1/quantile` are drifting past the 1% relative error bound, and the daemon chokes under the benchmark query load. Could you inspect the logs, fix the issues in the codebase, and get the service cleanly deployed under supervisor so it satisfies the precision bounds and passes the load test?",
+  "requirements": [
+   "The `logsketchd` service must be running and managed under supervisor, listening on `127.0.0.1:8080` and accepting log ingestion on UDP port 8125.",
+   "The service must return HTTP 200 with `{\"status\":\"ok\"}` on `GET http://127.0.0.1:8080/health`.",
+   "For any quantile query `POST http://127.0.0.1:8080/v1/quantile` across arbitrary time windows and quantiles $q \\in (0, 1)$, the reported quantile value must satisfy a maximum relative error $\\le 0.01$ (1%) against true empirical values across diverse heavy-tailed distributions (Log-Normal, Pareto, Weibull).",
+   "Under a concurrent benchmark workload (10 concurrent clients issuing 5,000 HTTP quantile queries), the service must sustain at least 2,500 requests per second with 0 failed requests and p99 query latency under 20ms.",
+   "Total sample count across merged sliding-window sketches must strictly satisfy conservation: the reported count must equal the exact number of ingested samples within the requested time interval."
+  ],
+  "environment": [
+   "Go 1.23+ and supervisor installed on Debian Bookworm with Python 3.13.",
+   "Codebase in `/opt/logsketchd` (~1,300 lines across `cmd/logsketchd/main.go`, `pkg/sketch/ddsketch.go`, `pkg/sketch/window.go`, `pkg/server/http.go`, and `pkg/ingest/udp.go`).",
+   "Supervisor config in `/etc/supervisor/conf.d/logsketchd.conf` with misconfigured execution flags, missing `minfds` file descriptor allowance, and bad environment paths that cause startup crashes.",
+   "Plant 1 (Mathematical derivation): In `pkg/sketch/ddsketch.go`, bucket value reconstruction from logarithmic bucket index $k$ uses arithmetic lower bounds rather than geometric midpoints $v = \\frac{2 \\gamma^k}{1 + \\gamma}$, producing relative error up to $2\\alpha \\approx 2.02\\%$ on tail quantiles, exceeding the 1.0% limit. Small-value linear zero-bucket mapping also has an off-by-one scale factor.",
+   "Plant 2 (Constraint satisfaction & conservation): In `pkg/sketch/window.go`, merging time-bucketed ring buffers with dynamic compaction drops partial counts due to integer truncation when re-indexing compacted levels, violating sample count conservation $\\sum w_i = N$.",
+   "Plant 3 (Concurrency & performance bar): In `pkg/server/http.go` and `pkg/sketch/window.go`, query endpoints acquire an exclusive global `sync.Mutex` over the entire store during serialization and quantile interpolation, throttling throughput to ~320 req/s instead of the required $\\ge 2,500$ req/s.",
+   "Synthetic sample script and reference validator in `/opt/logsketchd/scripts/validate.sh` allowing local offline verification."
+  ],
+  "internal_hint": "Inspect `/var/log/supervisor/` and `/var/log/logsketchd.log` to resolve supervisor startup issues (wrong config path parameter and low file descriptor limits). Review `ddsketch.go`: with target error $\\alpha = 0.01$, bucket multiplier is $\\gamma = (1+\\alpha)/(1-\\alpha)$. Inverting bucket index $k$ requires geometric centering $v = \\gamma^{k + 0.5} \\cdot \\frac{2}{1+\\gamma}$ to minimize maximum relative error to $\\le \\alpha$. In `window.go`, fix the re-binning logic when combining windows of differing compaction tiers so bucket weights are preserved without truncation. In `server/http.go`, replace the global write-lock with `sync.RWMutex` (read lock for queries) and decouple window snapshotting from JSON serialization to hit $>2,500$ req/s. Rebuild the binary to `/usr/local/bin/logsketchd` and restart via `supervisorctl`.",
+  "trap": "A naive solver tests only the sample queries in `validate.sh` on standard normal distributions and assumes the math is correct because p50 passes. However, heavy-tailed Pareto and Weibull distributions expose the arithmetic midpoint error on extreme quantiles (p99, p99.9), failing the 1% relative error bound. Furthermore, testing HTTP throughput without concurrency masks the global mutex serialization bottleneck.",
+  "tests": [
+   "Health and Supervisor check: Verifies `supervisorctl status logsketchd` is RUNNING and `GET http://127.0.0.1:8080/health` returns 200 OK.",
+   "Hidden seed instance precision test: Generates 200,000 log events across 3 distinct heavy-tailed distributions (Log-Normal $\\sigma=1.2$, Pareto $\\alpha=1.5$, and multimodal bimodal latencies) seeded with an unshared random seed. Ingests via UDP into port 8125. Evaluates 30 quantile queries across quantiles $q \\in [0.10, 0.50, 0.90, 0.95, 0.99, 0.999]$. Asserts relative error $\\le 0.01$ for all queries.",
+   "Constraint satisfaction test: Queries window aggregations across arbitrary time boundaries ($T_{start}, T_{end}$); asserts total reported count exactly matches ground truth event count within that window.",
+   "Performance and concurrency threshold test: Launches 10 parallel HTTP workers submitting 5,000 requests to `/v1/quantile`. Measures total elapsed time; requires sustained throughput $\\ge 2,500$ queries/second with zero 5xx or connection reset errors."
+  ],
+  "verifier_knob": {
+   "name": "num_request_scenarios",
+   "value": "45",
+   "effect": "Controls the number of distinct seed-generated time windows, distribution shapes, and extreme quantile targets evaluated during verification."
+  },
+  "expected_failure_modes": [
+   "Agent patches supervisor config but fails to rebuild the Go binary, leaving old buggy code running.",
+   "Agent adjusts the quantile calculation using an arbitrary heuristic (like adding a fixed offset) which satisfies p50 on the visible sample but fails mathematically on Pareto distributions generated at verify time.",
+   "Agent fails to replace the global write lock with read-write locks or snapshotting, failing the 2,500 req/s throughput threshold.",
+   "Agent fixes quantile interpolation but ignores the bucket compaction truncation bug in `window.go`, causing sample count conservation to fail when queries span multiple sliding window intervals."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "golang",
+   "telemetry",
+   "streaming",
+   "algorithms",
+   "deployment",
+   "concurrency"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/logsketchd/scripts/validate.sh",
+   "tail -n 50 /var/log/supervisor/* /var/log/logsketchd.log 2>/dev/null || supervisorctl status",
+   "cat /etc/supervisor/conf.d/logsketchd.conf",
+   "sed -i -e 's/wrong_flag/correct_flag/' -e 's/minfds=.*/minfds=65535/' /etc/supervisor/conf.d/logsketchd.conf",
+   "grep -rn 'Mutex' /opt/logsketchd/pkg/",
+   "sed -i 's/sync.Mutex/sync.RWMutex/g' /opt/logsketchd/pkg/server/http.go /opt/logsketchd/pkg/sketch/window.go",
+   "cat /opt/logsketchd/pkg/sketch/ddsketch.go",
+   "python3 -c '\"\"\"patch ddsketch.go bucket center math to geometric midpoint\"\"\"'",
+   "cat /opt/logsketchd/pkg/sketch/window.go",
+   "python3 -c '\"\"\"patch window.go compaction integer division truncation\"\"\"'",
+   "go build -o /usr/local/bin/logsketchd /opt/logsketchd/cmd/logsketchd/main.go",
+   "supervisorctl update && supervisorctl restart logsketchd",
+   "/opt/logsketchd/scripts/validate.sh"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "High performance threshold (2,500 req/s, p99 < 20ms) is prone to flakiness on shared or 1-vCPU evaluation environments where thread scheduling and GC pauses cause transient latency spikes.",
+   "The instruction draft omits the sample count conservation requirement across merged sliding windows, meaning an agent could achieve 1% error via an approximation that drops or rescales boundary buckets without knowing count conservation is tested."
+  ],
+  "verdict": "reject",
+  "reasons": "The task falls into the standard multi-plant debugging mold that frontier LLMs solve in under 15 commands by inspecting logs, grep-ing for mutexes, and fixing straightforward mathematical/truncation formulas visible directly in the source. Furthermore, enforcing 2,500 req/s with p99 < 20ms over HTTP on constrained 1-CPU benchmark containers introduces substantial run-to-run flakiness.",
+  "fixes": [
+   "Lower the performance threshold to a safer baseline (e.g., 1,200 req/s, p99 < 50ms) to prevent false test failures from CPU throttling in 1-CPU container runners.",
+   "Explicitly mention count conservation across time-window queries in the user instruction so the requirement is not hidden.",
+   "Increase difficulty by introducing interdependent structural bugs (e.g., an architectural memory leak under continuous sliding window compaction or protocol serialization bug) rather than isolated, text-searchable code plants."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference task involves implementing a Python HTTP service querying an engine wrapper over SQLite metrics, whereas the candidate involves debugging a Go streaming quantile sketch daemon with UDP ingestion."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference task deals with rolling CPU-time budget accounting and rate limiting in an evaluation service, distinct from streaming quantile algorithm precision and UDP telemetry."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/pypi-server",
+     "verdict": "distinct",
+     "reason": "The reference task is about building a Python package and setting up a local PyPI server, completely unrelated to quantile telemetry daemons."
+    },
+    {
+     "ref_id": "ours/official-9b2573c9729a",
+     "verdict": "distinct",
+     "reason": "The reference task focuses on fixing a token-bucket rate limiter relying on an opaque shared library time source, whereas the candidate focuses on streaming quantile sketch accuracy and high-throughput query concurrency."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference task involves optimizing and fixing a Node.js batch NDJSON schema validator, whereas the candidate involves fixing an active Go daemon computing streaming quantiles."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-f4862e2c2598",
+     0.19
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.164
+    ],
+    [
+     "terminal-bench-2-1/pypi-server",
+     0.104
+    ],
+    [
+     "ours/official-9b2573c9729a",
+     0.102
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.099
+    ]
+   ],
+   "cost_usd": 0.004248
+  },
+  "novel": true
+ },
+ "cost_usd": 0.018174
+}

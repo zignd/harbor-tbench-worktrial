@@ -1,0 +1,70 @@
+{
+ "slug": "repair-incident-replay-migration",
+ "title": "Repair Incident Replay Migration",
+ "scenario": "At 03:00 an on-call SRE is rebuilding the incident database after a failed regional deploy, but the replay tool produces a plausible row count while silently changing incident ownership and resolution times. The container contains a multi-stage Node.js replay service, SQLite schemas and migration tooling, historical fixtures, operational logs, and a documented event contract.",
+ "instruction_draft": "[03:07:14] replay-worker: migration completed with warnings\n[03:07:14] source events=18432 canonical incidents=913\n[03:07:14] audit: 27 incidents have non-monotonic transitions; 11 SLA windows disagree with policy snapshots\n\nRepair the incident replay and migration utility in this container. It must continue to be runnable through the existing command-line interface and must produce the correct canonical SQLite database from any valid input database described by the repository documentation, not merely from the supplied fixture.\n\nThe observable result must satisfy all of the following:\n- Preserve every source event and its original payload in the archival tables.\n- Resolve agent aliases according to the alias validity intervals at the event timestamp, while retaining the original actor value for auditability.\n- Partition events into incidents using the documented correlation and merge rules before applying state transitions.\n- Produce a deterministic, constraint-consistent event order for every incident. Respect source sequence constraints, explicit dependency constraints, and the documented deterministic tie-break rules; handle missing optional dependencies and valid dependency cycles exactly as specified.\n- Apply corrections, supersessions, and tombstones in the prescribed order, without allowing a superseded event to affect the final state or SLA calculation.\n- Evaluate escalation and SLA policy using the policy version effective at each event timestamp, including intervals that cross policy boundaries.\n- Make the migration idempotent: replaying the same input into a fresh output, or rerunning the command against its own output where supported, must yield the same canonical rows and audit records.\n- Complete atomically: a failed replay must not leave a partially migrated output database.\n- Preserve the existing schema and CLI/API contracts except where the repository documentation explicitly marks a field as derived.\n\nUse the repository's tests and diagnostic tools while investigating. Run the full test command and exercise the CLI against more than the visible sample before finishing.",
+ "requirements": [
+  "Preserve every source event and original payload in the archival tables.",
+  "Resolve aliases using validity intervals at each event timestamp while retaining the original actor.",
+  "Partition events according to the documented correlation and merge rules before state transitions.",
+  "Generate deterministic event orders satisfying sequence and dependency constraints, including missing optional dependencies, cycles, and tie-break rules.",
+  "Apply corrections, supersessions, and tombstones in the documented order.",
+  "Use the policy version effective at each event timestamp for escalation and SLA calculations.",
+  "Produce deterministic canonical incident, transition, SLA, and audit rows.",
+  "Be idempotent across repeated replay runs.",
+  "Use atomic database replacement or transaction semantics with no partial output after failure.",
+  "Preserve the documented SQLite schema and existing command-line/API contracts.",
+  "Pass the repository test suite and work on fresh valid input databases rather than only the supplied fixture."
+ ],
+ "environment": [
+  "Dockerfile is based on FROM python:3.13-slim-bookworm, installs pinned Node.js/npm and SQLite-related system packages, and contains no network dependency at runtime.",
+  "The repository is a roughly 1,300-line in-house JavaScript service with bin/replay-incidents.js as its public CLI, several processing modules, a small SQLite bridge, migration SQL, fixtures, and operational diagnostics.",
+  "The input database contains raw_events, actor_aliases, policy_versions, source_cursors, and replay_metadata tables; the output contains archival_events, incidents, incident_events, transitions, sla_windows, and replay_audit tables.",
+  "README and docs/event-contract.md document timestamp normalization, correlation keys, alias validity intervals, source sequence constraints, explicit dependencies, cycle handling, correction semantics, tombstones, policy snapshots, and canonical tie-breaking.",
+  "The supplied fixture is intentionally small and mostly ordered, with a visible replay that completes and appears numerically plausible despite warning output.",
+  "The planted failures arise from interactions across stages: grouping is performed before interval-based alias resolution in one path, a paginated SQLite read skips rows after an in-place update, dependency normalization mishandles absent values, and policy lookup assumes an event batch has one effective policy.",
+  "Additional defects affect correction chains and retry behavior: a superseded event can remain in an intermediate index, and one error path commits archival rows before canonicalization fails.",
+  "Fixtures and diagnostic commands include enough realistic unrelated code and logs that the failing path must be located through execution, SQL inspection, and differential experiments rather than by reading one obviously broken function.",
+  "The repository includes a deterministic fixture generator used by tests, but its hidden verify-time seed and generated databases are not exposed to the solver."
+ ],
+ "internal_hint": "The resolution path is to first run the CLI and inspect row-level diffs, SQLite query plans, and intermediate tables on fixtures that vary one condition at a time. The correct pipeline is: load immutable source rows into a temporary staging database; normalize timestamps and preserve raw values; resolve actor aliases at each event timestamp; form correlation components using the resolved identity and documented merge links; build a dependency graph per component; perform the specified stable topological ordering with the contract's cycle-break rule; apply correction/supersession/tombstone reduction; then evaluate each transition against the policy interval covering that transition timestamp and materialize canonical rows. The existing implementation has an offset-pagination bug while deleting or marking staged rows, uses truthiness rather than explicit null handling for optional dependencies, groups before alias resolution in the legacy path, caches one policy row per batch, and leaves superseded nodes in the transition index. The repair should use immutable snapshots or keyset iteration, explicit three-valued/null-safe handling, interval joins, a graph algorithm with deterministic ordering, and one transaction or temporary-output-and-rename boundary. The reference solution is a deterministic shell script that inventories the code, runs the supplied replay, queries intermediate SQLite state, generates targeted fixtures, compares against the documented reference implementation, patches the JavaScript/SQL stages, and runs differential replay tests across many generated databases.",
+ "trap": "A shallow solution can make the visible fixture's counts and final incident summaries look correct while retaining the wrong actor at an alias boundary, skipping every Nth staged row, applying one policy to a batch spanning a policy change, or allowing a corrected event to influence an earlier transition. A simple sort by timestamp also passes ordered examples but fails when explicit dependencies disagree with timestamps or when a dependency cycle requires the documented deterministic break. Hidden tests compare the complete normalized SQLite result on fresh generated instances, including archival rows, transition order, audit hashes, SLA boundaries, and idempotent reruns.",
+ "tests": [
+  "Run the existing unit and integration suite after rebuilding the fixture databases; verify the public CLI exit status, schema, and deterministic output.",
+  "Generate fresh databases from a hidden seed containing random event batches, aliases with touching and overlapping validity intervals, policy changes, corrections, tombstones, optional dependencies, and merged correlation groups; run the repaired CLI and compare every canonical and archival table with an independent reference computation.",
+  "Fuzz event insertion order and SQLite page/batch boundaries to expose offset-pagination and accidental insertion-order assumptions.",
+  "Generate dependency graphs with timestamp/sequence conflicts, absent optional references, multiple valid topological orders, and valid cycles; compare the exact documented stable ordering and resulting state.",
+  "Generate policy intervals that change between consecutive events in one incident and verify escalation and SLA windows use the effective policy at each timestamp.",
+  "Generate alias changes at exact interval boundaries and verify grouping, actor resolution, original actor preservation, and merge behavior.",
+  "Inject supersession chains and tombstones in different arrival orders and verify that only the surviving logical events affect canonical state while all source events remain archived.",
+  "Run the same generated input twice and replay a produced output where supported; compare canonical rows, audit rows, and database fingerprints for idempotence.",
+  "Force a controlled failure during canonicalization and verify no partially migrated destination database is left behind.",
+  "Repeat all differential checks over a larger generated corpus with thousands of events per database to catch rare data-dependent paths."
+ ],
+ "verifier_knob": {
+  "name": "hidden_generated_databases",
+  "value": "80 databases per verification run, 200-5000 events each, with 12 generator families and randomized batch/page boundaries",
+  "effect": "Lowering the value makes sample-oriented or partially correct repairs more likely to pass. Raising it increases exposure to rare alias boundaries, policy changes, graph cycles, correction chains, pagination boundaries, and stage-order interactions, making memorized or fixture-specific fixes fail."
+ },
+ "expected_failure_modes": [
+  "The agent reads the main replay module, fixes the obvious warning, and stops after the visible fixture passes.",
+  "The agent rewrites ordering as a timestamp sort and misses dependency constraints, stable tie-breaking, or cycle semantics.",
+  "The agent fixes canonical rows but drops or mutates archival payloads and audit records.",
+  "The agent applies alias resolution or policy selection globally instead of at each event's timestamp.",
+  "The agent repairs one migration stage while leaving offset pagination or supersession indexing to corrupt later stages.",
+  "The agent makes the output correct once but leaves retries non-idempotent or commits partial output on failure.",
+  "The agent relies on SQLite insertion order, JavaScript object iteration order, or locale-dependent timestamp parsing.",
+  "The agent tests only small hand-built inputs and does not vary source ordering, page boundaries, policy intervals, or dependency graph shape."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "debugging",
+ "tags": [
+  "javascript",
+  "sqlite",
+  "data-processing",
+  "constraint-satisfaction",
+  "migration",
+  "fuzz-equivalence"
+ ]
+}

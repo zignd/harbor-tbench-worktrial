@@ -1,0 +1,184 @@
+{
+ "blueprint": {
+  "slug": "repair-segment-recovery-service",
+  "title": "Repair the Segment Recovery Service",
+  "scenario": "recoveryd pages the on-call after a regional restart: its import summary says 412 records were recovered, but the SQLite query API reports 409 and several deleted objects have reappeared. The container contains a Go JSON-lines service, a SQLite catalog, sample append-only binary segment files, and an opaque production segment writer used by the ingest sidecar.",
+  "instruction_draft": "recoveryd: imported=412 catalog_rows=409; GET object/7 returned a deleted object after restart.\n\nYou are the on-call SRE. Repair the service in /opt/recovery so that it can be started with `./recoveryd` and serves newline-delimited JSON requests on stdin, with one JSON response per request. `recover` must reconstruct the SQLite catalog from every segment in `$RECOVERY_SEGMENTS` and make the catalog exactly match the valid log state: apply records in global sequence order, let the last record for a key win, treat deletes as absent, preserve arbitrary key/value bytes through base64, ignore incomplete or CRC-invalid frames without importing them, and never retain stale rows from an earlier recovery. Recovery must be transactional and idempotent.\n\nSupport these protocol requests: `{\"op\":\"recover\"}`, `{\"op\":\"get\",\"key\":\"...\"}`, `{\"op\":\"list\",\"after_seq\":N,\"limit\":N}`, and `{\"op\":\"stats\"}`. `get` must distinguish an absent key from a live key and return its winning sequence and base64 value; `list` must return live records in ascending winning sequence then key order, obey the limit, and report the next cursor; `stats` must report imported valid records, ignored invalid/incomplete frames, live rows, and the maximum winning sequence. Invalid requests must return a structured error and must not alter the database. Preserve the existing response field names and exit behavior used by the supplied smoke test, and do not hard-code the sample data.",
+  "requirements": [
+   "The repaired executable must start as `./recoveryd` and implement the newline-delimited JSON protocol on stdin/stdout.",
+   "`recover` must scan every segment under `$RECOVERY_SEGMENTS` rather than only the first or currently indexed segment.",
+   "Only complete frames with valid checksums may affect state; incomplete tails and CRC-invalid frames must be ignored and counted.",
+   "Records must be resolved by global sequence order, with the last record for each key winning; delete records make the key absent.",
+   "Keys and values must support arbitrary bytes represented by the protocol's base64 fields, including empty values, NUL bytes, and non-UTF-8 values.",
+   "Recovery must remove stale catalog rows, commit atomically, and produce the same catalog and counters when run repeatedly.",
+   "`get` must distinguish missing keys from present keys and return the winning sequence and base64 value for present keys.",
+   "`list` must return only live keys, ordered by ascending winning sequence and then key, and must honor `after_seq` and `limit` including zero and oversized limits.",
+   "`stats` must report valid imported records, ignored invalid or incomplete frames, live row count, and maximum winning sequence.",
+   "Malformed or unsupported protocol requests must produce structured errors without changing SQLite state.",
+   "The implementation must work on verify-time segment sets and must not contain sample-specific paths, keys, counts, or assumptions about a fixed number of segments."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned Debian packages for Go, SQLite, gcc, make, and standard debugging utilities; no network access is needed at runtime.",
+   "`/opt/recovery` contains roughly 1,500 lines across a Go daemon, SQLite catalog package, protocol package, fixture tools, tests, and operational scripts.",
+   "`/opt/recovery/recoveryd` is initially built from the supplied Go source and reads `RECOVERY_SEGMENTS` and `RECOVERY_DB`; the solver may modify source and rebuild it.",
+   "The service uses a custom binary `.seg` format with a file header, varint-sized frames, event type, sequence number, byte-string key/value fields, and CRC validation. The format is not fully documented in one place.",
+   "`/opt/recovery/bin/segment-writer` is a compiled opaque Go utility with no source. It generates production-format segments and is used by the hidden fixture generator.",
+   "The visible fixture contains multiple segments, a valid deletion followed by an older-looking replay, an incomplete final frame, and a preexisting SQLite catalog with stale rows. Its smoke test does not exercise empty values, binary keys, duplicate sequences, zero limits, or corruption between valid frames.",
+   "The initial service contains a faulty recovery/parser interaction and a faulty catalog reconciliation path. Some source packages and comments are unrelated logging and health-check code to make location by inspection nontrivial.",
+   "A deterministic shell reference solution and verify harness generate fresh segment directories with seeded combinations of puts, deletes, repeated keys, segment boundaries, malformed frames, truncated tails, empty payloads, NUL bytes, and pre-populated stale databases."
+  ],
+  "internal_hint": "The real failure is distributed across the parser, frame cursor, and SQLite reconciliation code rather than being a single obvious typo. Investigation should first run the daemon against the visible fixture, inspect SQLite before and after recovery, hexdump segment boundaries, trace frame offsets and CRC decisions, and black-box the opaque segment-writer with edge-case records. The format uses unsigned LEB128 lengths and sequence numbers, a distinct delete event with no value, and CRC coverage over the encoded event body; the existing reader incorrectly treats a length/sequence varint as signed in one path and advances past a bad frame using the decoded payload length rather than the frame's actual bounded extent. The catalog updater also uses insert-or-ignore semantics and never removes rows absent from the rebuilt winning set, while its list query mishandles an exclusive sequence cursor and zero limits. A robust fix parses each file with bounds checks, validates CRC before materializing an event, retains valid later frames after a skippable corrupt frame, resolves all events deterministically, builds a replacement table in one transaction, and aligns all protocol queries with that canonical state.",
+  "trap": "A shallow fix that makes the visible import count and GET example pass will commonly accept only the first segment, stop at the first damaged frame, use signed varints, or upsert without deleting stale rows. It will also appear correct for ordinary UTF-8 values while failing on empty/NUL data, a large sequence or length crossing a varint boundary, a corrupt frame followed by a valid frame, delete-then-recreate histories, and `list` requests with `limit:0` or a cursor equal to a winning sequence.",
+  "tests": [
+   "Starts recoveryd with a clean generated database, sends recover, and checks the response counters and exact SQLite live-key/value/sequence state against an independent reference model.",
+   "Runs recover twice after seeding stale rows and verifies byte-for-byte equivalent logical catalog state, unchanged counters, and no duplicate or leftover rows.",
+   "Generates fresh multi-segment histories containing repeated keys, deletes, re-creations, out-of-order segment placement, and duplicate sequence ties, then checks last-winner resolution and deterministic ordering.",
+   "Generates keys and values containing empty byte strings, NULs, high-bit bytes, and varint boundary lengths; checks exact base64 round trips through get and list.",
+   "Places CRC-invalid and truncated frames between valid frames and at file ends; verifies invalid counts, continued recovery of independently parseable later frames, and exclusion of bad records.",
+   "Exercises get for present, deleted, and never-seen keys and verifies distinct response statuses and winning sequence values.",
+   "Exercises list with omitted, negative/edge, zero, one, oversized, and cursor-equal-to-sequence limits; checks live-only ordering, pagination, and next-cursor behavior.",
+   "Sends malformed JSON, unknown operations, wrong field types, unsupported versions, and missing fields; verifies structured errors and unchanged database hashes.",
+   "Runs several protocol request sequences in one process, including recover followed by stats/get/list and a second recover after replacing the segment directory, to check cross-request consistency.",
+   "Uses only subprocess behavior, protocol responses, and SQLite outcomes; no test greps source or relies on a particular implementation."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "10 generated protocol scenarios across 6 history families",
+   "effect": "Lowering this to 3 mostly checks clean recovery and basic queries. Raising it adds more independent histories, repeated recoveries, malformed requests, pagination combinations, and corruption placements, making partial parser or catalog fixes much less likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads the obvious SQL upsert and protocol code but never probes the opaque writer or binary offsets.",
+   "It treats a damaged frame or truncated tail as end-of-file and silently loses valid frames later in the same segment.",
+   "It decodes varints as signed integers or assumes all lengths and sequences fit in one byte.",
+   "It repairs imports but leaves stale SQLite rows because the database is updated incrementally instead of replaced transactionally.",
+   "It uses text strings internally and corrupts NUL or non-UTF-8 keys and values.",
+   "It implements list pagination with inclusive rather than exclusive cursors, or interprets a zero limit as unlimited.",
+   "It validates the sample and one clean restart but does not test idempotence or histories containing delete and re-create events.",
+   "It changes the protocol response shape while fixing the underlying data, causing service-level failures despite correct SQLite contents."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "file-formats-recovery",
+  "tags": [
+   "go",
+   "sqlite",
+   "binary-format",
+   "reverse-engineering",
+   "recovery",
+   "json-protocol"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "`cd /opt/recovery && pwd && find . -maxdepth 3 -type f -print | sort`",
+   "`sed -n '1,240p' README* Makefile 2>/dev/null`",
+   "`find . -type f \\( -name '*.go' -o -name '*.sh' \\) -maxdepth 4 -print`",
+   "`go test ./... && ./recoveryd < tests/smoke.input`",
+   "`grep -RIn 'recover\\|list\\|stats\\|CRC\\|varint\\|sqlite' --include='*.go' .`",
+   "`sed -n '1,280p' $(find . -name '*segment*go' -o -name '*parser*go' | head -1)`",
+   "`sed -n '1,300p' $(find . -name '*catalog*go' | head -1)`",
+   "`sed -n '1,260p' $(find . -name '*protocol*go' | head -1)`",
+   "`find . -type f | grep -E 'fixture|test|smoke' | xargs -r grep -n 'RECOVERY_SEGMENTS\\|RECOVERY_DB\\|segment-writer'`",
+   "`RECOVERY_SEGMENTS=... RECOVERY_DB=/tmp/recovery.db ./recoveryd` and send the visible recover/get/stats requests",
+   "`sqlite3 /tmp/recovery.db '.schema' '.dump'`",
+   "`find ... -name '*.seg' -print -exec xxd -g1 {} \\;`",
+   "`/opt/recovery/bin/segment-writer --help` and generate small put/delete fixtures",
+   "`xxd` the generated fixtures and compare them with the reader's expected header, varints, event body, and CRC coverage",
+   "`run the existing parser or add a temporary frame-offset/CRC trace against valid, truncated, and corrupted fixtures`",
+   "`edit the parser to use bounded unsigned LEB128 decoding, preserve byte slices, validate CRC before materializing events, and skip only the bounded bad frame`",
+   "`edit recovery to scan and merge every segment, sort by the specified global ordering, and resolve puts/deletes before rebuilding state`",
+   "`replace incremental INSERT OR IGNORE catalog updates with a delete/rebuild transaction and persisted recovery counters`",
+   "`fix get/list/stats handling for binary base64 data, exclusive cursors, zero limits, and structured validation errors`",
+   "`gofmt -w ... && go build -o recoveryd .`",
+   "`run the supplied smoke test and inspect SQLite state before and after two recoveries`",
+   "`generate multi-segment histories with the fixture/reference tools, including binary payloads, duplicate keys, deletes, truncation, and CRC corruption`",
+   "`compare protocol responses and SQLite contents with the reference model, including replacement of the segment directory between requests`",
+   "`send malformed JSON, unknown operations, bad types, unsupported versions, and edge-case list requests; verify the database is unchanged`",
+   "`fix any discrepancies, rerun go test ./..., rebuild ./recoveryd, and repeat the full generated verification suite`"
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The winner for records with equal sequence numbers is not specified, although the tests include duplicate-sequence ties; different reasonable segment/path/frame ordering choices can produce different catalogs.",
+   "The exact response schemas, absent-key status, next-cursor semantics, and behavior for negative limits are delegated to an unspecified smoke test or existing code, which is unavailable in the instruction itself.",
+   "It is unclear whether the maximum winning sequence in stats includes a winning delete or only live rows, and whether invalid-frame counters count each malformed frame, each CRC failure, or each truncated tail.",
+   "The requirement to continue after a corrupt frame assumes the frame's bounded extent can be determined from the damaged bytes; if corruption affects framing metadata, the intended resynchronization rule is not stated.",
+   "A verifier that compares SQLite database hashes rather than logical contents could be sensitive to SQLite version, page layout, or transaction details despite equivalent state."
+  ],
+  "verdict": "accept",
+  "reasons": "This is a realistic, cross-component recovery task with strong generated verification and several meaningful failure modes beyond the visible fixture. The speedrun is about 25 substantive commands and requires format probing plus coordinated parser, catalog, and protocol changes, so it is not merely a source-reading typo fix. The specification has a few material ordering and protocol-edge ambiguities, but they are straightforward to resolve before implementation.",
+  "fixes": [
+   "Define the deterministic tie-break for equal sequence numbers, such as segment filename order followed by byte offset, and state it in both recovery and list ordering requirements.",
+   "Document the exact request and response JSON schemas, including present versus absent get responses, list next-cursor representation, negative-limit behavior, and unsupported-version errors.",
+   "Define stats precisely, especially whether maximum winning sequence includes deleted winners and how CRC-invalid, malformed, and truncated frames are counted.",
+   "Specify the frame-resynchronization rule after corrupted length or framing bytes, or constrain corruption fixtures to cases where the bounded frame extent remains recoverable.",
+   "Require verifiers to compare logical SQLite state and explicitly permitted metadata rather than raw database bytes unless SQLite version and initialization details are fixed."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "This task repairs a transactional append-only segment replay and SQLite catalog reconstruction service, not a JSON filter-to-SQL validator."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "This task concerns binary log recovery and catalog materialization, whereas the reference implements event deduplication and campaign funnel reporting."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Although both use SQLite and replay data, this task reconstructs records from checksummed binary segments rather than enriching access logs and serving traffic statistics."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The shared log-oriented setting is superficial: this task resolves and materializes valid segment records, while the reference computes HMAC tags for TCP-delivered WAL records."
+    },
+    {
+     "ref_id": "ours/official-71317ce41ff0",
+     "verdict": "distinct",
+     "reason": "This task requires ordered log recovery, deletion handling, and SQLite catalog rebuilding, not interoperable AES-CTR row encryption and nonce reconstruction."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-18899524e171",
+     0.129
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.127
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.124
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.117
+    ],
+    [
+     "ours/official-71317ce41ff0",
+     0.113
+    ]
+   ],
+   "cost_usd": 0.0009565999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.004024799999999999
+}

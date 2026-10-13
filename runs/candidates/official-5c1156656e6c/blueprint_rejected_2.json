@@ -1,0 +1,192 @@
+{
+ "blueprint": {
+  "slug": "repair-slo-query-service",
+  "title": "Repair the SLO Query Service",
+  "scenario": "You are the on-call SRE paged at 03:00 because the incident dashboard has started returning HTTP 500 responses and, more dangerously, some successful queries disagree with the batch reports. The container contains a small Python service, a SQLite-backed telemetry store, an HTTP protocol client, an operator runbook, seeded telemetry, and several unrelated deployment components. The service is intended to answer a documented SQL-like query protocol for latency and availability data, but its query execution component is incomplete and the visible error points toward SQLite locking rather than the actual query semantics.",
+  "instruction_draft": "03:07 UTC pager output:\n```\nquery-api[418]: POST /v1/query 500\nsqlite3.OperationalError: database is locked\nquery-api[418]: retry exhausted; returned stale dashboard result for service=checkout\n```\n\nRepair the service in this container so that `./run.sh` starts a working query API on `127.0.0.1:8080`. Do not remove or weaken the HTTP protocol. The service must satisfy the SQL/query semantics documented in `/opt/query-api/README.md` and must continue to work after a process restart.\n\nThe observable requirements are:\n- `GET /health` returns HTTP 200 and JSON containing `{\"status\":\"ok\"}` once the service is ready.\n- `POST /v1/ingest` accepts the documented JSON batch format, validates records, and commits the complete batch atomically; malformed records must produce the documented 4xx response without partially changing the database.\n- `POST /v1/query` accepts the documented SQL-like query format and returns deterministic JSON rows, column metadata, and numeric values using the protocol's exact decimal representation.\n- Filtering, named and positional parameters, quoted identifiers, NULL handling, grouping, ordering, LIMIT/OFFSET, and the documented time-window predicates must follow the runbook exactly.\n- Aggregate results must implement the documented weighted mean, availability ratio, and weighted percentile definitions, including empty groups, duplicate timestamps, zero weights, percentile 0 and 1, ties, and values split across multiple histogram buckets.\n- Query results must be independent of insertion order and must not use rows outside the requested half-open time interval `[start, end)`.\n- Concurrent read requests and an ingest followed by a read must return committed, internally consistent snapshots; a failed ingest must never be observable as a partial batch.\n- The API must remain responsive for the supplied large batches and the verifier's freshly generated batches, without changing the public paths or response schema.\n\nUse the existing fixtures and protocol examples to investigate the failure, but correctness will also be checked with new generated data and query combinations not present in the container. Leave the service runnable with only the installed dependencies and no network access.",
+  "requirements": [
+   "Start a working service with ./run.sh on 127.0.0.1:8080.",
+   "Return HTTP 200 and {\"status\":\"ok\"} from GET /health when ready.",
+   "Implement atomic documented JSON batch ingestion at POST /v1/ingest.",
+   "Reject malformed ingestion batches with the documented 4xx response and no partial database mutation.",
+   "Implement the documented SQL-like query protocol at POST /v1/query.",
+   "Support filtering, named parameters, positional parameters, quoted identifiers, NULLs, grouping, ordering, LIMIT, and OFFSET.",
+   "Implement the documented half-open time-window semantics.",
+   "Implement exact weighted mean, availability ratio, and weighted percentile aggregates.",
+   "Handle empty groups, duplicate timestamps, zero weights, percentile endpoints, ties, and values spanning histogram buckets.",
+   "Make results independent of ingestion order.",
+   "Provide committed and internally consistent results during concurrent reads and ingestion.",
+   "Preserve the documented JSON response schema and exact decimal formatting.",
+   "Persist accepted data across service restart.",
+   "Remain responsive for large supplied and verify-time generated batches without network access."
+  ],
+  "environment": [
+   "Use a Dockerfile based on FROM python:3.13-slim-bookworm, with all apt and pip dependencies pinned and installed during image construction.",
+   "Create roughly 1,500 lines of authored Python across an HTTP server, SQLite schema/migrations, ingestion validation, query protocol handling, logging, health checks, configuration, and unrelated deployment helpers.",
+   "Place the application under /opt/query-api with ./run.sh, README.md, protocol examples, configuration, a seeded SQLite database, and deterministic incident logs.",
+   "The public service uses GET /health, POST /v1/ingest, and POST /v1/query. The exact request and response schemas, supported SQL-like grammar, aggregate definitions, decimal rules, and error codes are documented in the runbook.",
+   "Seed data contains several services and regions, overlapping event intervals, duplicate timestamps, NULL deployment labels, histogram-style latency observations, zero-weight observations, and groups with no qualifying rows.",
+   "The query path contains a missing/nonfunctional relational execution component that must be substantially built: it needs lexing/parsing of the documented SQL-like grammar, parameter binding, an internal relational plan, and correct evaluation of scalar expressions, predicates, grouping, ordering, and aggregates.",
+   "The intended aggregate semantics are mathematical rather than SQLite-native: weighted mean is sum(value*weight)/sum(weight), availability is sum(healthy*weight)/sum(weight), and weighted percentile is the smallest value whose cumulative weight is at least p times total positive weight, with the documented interpolation rule for the exact midpoint case.",
+   "The service also contains a connection/retry configuration defect that produces the visible database-locked message under the seeded concurrent dashboard workload, but changing only retry timing does not repair incorrect query answers.",
+   "Include a deterministic foreground mode used by verification and a background-compatible ./run.sh, with no wall-clock-dependent behavior and no external network calls."
+  ],
+  "internal_hint": "The reference solution first lists the application and reads the runbook, then starts the service and reproduces both the lock message and wrong answers using the supplied client. It instruments request boundaries and compares direct SQLite rows with API rows, discovering that the lock is a secondary symptom caused by an ingest transaction being held while the incomplete planner repeatedly falls back to a read connection. The actual fix is to implement the missing lexer/parser and relational evaluator, preserve parameter types, evaluate the half-open interval before grouping, materialize a stable snapshot, and compute aggregates from ordered positive-weight observations rather than asking SQLite for ordinary AVG or percentile behavior. It then fixes transaction scope and busy handling so batch ingest is atomic and readers see either the old or new snapshot. The implementation is checked with generated records containing adversarial ordering, duplicate keys, NULLs, zero weights, ties, and boundary timestamps; a plausible SQLite-only rewrite passes the fixture but fails those generated cases.",
+  "trap": "A shallow solution increases SQLite busy timeouts, serializes all requests, or replaces the custom aggregates with SQLite AVG and a simple ORDER BY. That makes the visible 500 disappear and passes the small examples, but hidden requests expose insertion-order dependence, inclusion of the end timestamp, incorrect weighted percentile tie handling, integer/decimal rounding drift, NULL predicate mistakes, and partial visibility during failed ingestion.",
+  "tests": [
+   "Start the service, poll /health, and verify the exact readiness response and stable startup behavior.",
+   "Run the supplied smoke queries and compare status, metadata, row ordering, NULL encoding, and decimal strings against the reference.",
+   "Submit valid ingestion batches followed by queries, then restart the service and verify that committed records remain available.",
+   "Submit malformed batches with errors in the first, middle, and final record; verify the documented 4xx response and compare row counts before and after to ensure atomic rollback.",
+   "Generate fresh seeded batches of thousands of observations with randomized insertion order, multiple services and regions, duplicate timestamps, NULL dimensions, zero weights, and empty groups; issue group-by aggregate queries and compare every result with the reference implementation.",
+   "Generate boundary queries whose start or end equals an observation timestamp and verify exact [start,end) behavior.",
+   "Exercise named and positional parameters, quoted identifiers, boolean predicates, NULL checks, arithmetic expressions, ORDER BY aliases, LIMIT, and OFFSET in combinations not present in the fixtures.",
+   "Check weighted mean and availability against exact rational reference values, including values that would differ under binary floating-point rounding.",
+   "Check weighted percentile at p=0, p=1, repeated values, zero-weight rows, odd and even total weights, exact cumulative boundaries, and observations distributed across histogram buckets.",
+   "Run concurrent readers while repeatedly ingesting valid and invalid batches; verify each response corresponds to one committed snapshot and no response contains partially committed records.",
+   "Send a larger generated workload and verify bounded completion and absence of deadlock or process termination on the one-CPU, 2-GB container.",
+   "Verify that unrelated health and protocol error behavior remains intact and that no network access is required."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "11",
+   "effect": "Increasing this adds more independently generated query, ingestion, restart, boundary, concurrency, and aggregate scenarios, especially combinations of parser features and mathematical edge cases; lowering it leaves only the smoke, persistence, and basic aggregate checks and makes a fixture-specific or SQLite-only implementation much more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the visible SQLite lock symptom but never implements the missing query evaluator.",
+   "The agent implements only the example SELECT forms and misses combinations of predicates, aliases, grouping, ordering, and pagination.",
+   "The agent delegates aggregates to SQLite and gets weighted percentile, NULL, zero-weight, or decimal semantics wrong.",
+   "The agent uses closed time intervals and includes records exactly at the requested end timestamp.",
+   "The agent sorts by raw floating-point values or relies on insertion order, causing hidden tie and precision failures.",
+   "The agent commits records one at a time or exposes a connection during ingestion, violating atomicity and snapshot consistency.",
+   "The agent tests only the seeded dashboard query and does not generate adversarial data or restart the service.",
+   "The agent introduces a dependency or startup mode that works interactively but fails under the verifier's offline foreground/background protocol.",
+   "The agent over-serializes requests and times out on the generated large-batch workload.",
+   "The agent changes the response schema or error codes while trying to simplify the protocol."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "sqlite",
+   "service-protocol",
+   "weighted-statistics",
+   "reverse-engineering",
+   "devops"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Run `pwd; find /opt/query-api -maxdepth 3 -type f | sort` to inventory the application.",
+   "Read `/opt/query-api/README.md` completely, including grammar, schemas, errors, and aggregate definitions.",
+   "Read the protocol examples, configuration, runbook, and supplied client code.",
+   "Inspect `run.sh` and the HTTP server entrypoint for startup and foreground/background behavior.",
+   "Search the source for TODOs, stubs, retries, transactions, and query execution fallbacks.",
+   "Read the SQLite schema, migrations, and seed-data loader.",
+   "Read the ingestion and validation implementation.",
+   "Read the query parser, planner, evaluator, and response serializer.",
+   "Read logging and connection-management code for the reported lock path.",
+   "Start the service with `./run.sh` and capture its startup behavior.",
+   "Poll `/health` and verify the exact readiness response.",
+   "Run all supplied protocol examples and record wrong rows, metadata, and errors.",
+   "Reproduce the lock with the supplied concurrent workload and inspect database transaction state.",
+   "Write down the documented grammar and map each production to the required relational operations.",
+   "Implement the lexer, parser, AST, and named/positional parameter binding.",
+   "Implement relational planning and evaluation for projection, predicates, grouping, ordering, aliases, pagination, and NULL semantics.",
+   "Implement deterministic decimal arithmetic and the three documented weighted aggregates, including bucket expansion and tie rules.",
+   "Apply the half-open time filter before grouping and materialize a stable ordered snapshot for evaluation.",
+   "Fix ingest validation and transaction scope so batches commit atomically and failed batches never become visible.",
+   "Fix SQLite connection, busy handling, and reader/writer snapshot behavior without serializing the entire service.",
+   "Run formatting, syntax checks, and the supplied smoke tests.",
+   "Generate adversarial batches and queries covering ordering, duplicates, NULLs, zero weights, boundaries, parameters, and empty groups.",
+   "Run concurrent valid and invalid ingestion with readers and check every result against old-or-new snapshots.",
+   "Restart the service and verify persistence, then run the larger workload to check completion and memory behavior.",
+   "Re-run health, protocol error, smoke, generated, concurrency, and restart checks from a clean process."
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The task is not solvable as specified if the runbook does not precisely define the grammar, exact decimal serialization, midpoint percentile rule, empty-group representation, and all error payloads; hidden tests must not infer semantics absent from that document.",
+   "Installing pinned apt and pip dependencies during image construction may fail in an offline or time-varying package environment unless wheels and apt artifacts are cached or the image is built with network access explicitly allowed.",
+   "The large-workload requirement has no numeric latency, memory, or batch-size bound, so a failure based only on an unstated performance threshold could be invalid or flaky on a one-CPU runner.",
+   "Concurrent snapshot tests need to define whether a read started concurrently with ingestion may observe either committed version and how request completion ordering is established.",
+   "Tests for empty groups could overreach if the documented grammar has no operation, dimension domain, or outer-join semantics capable of producing groups with no qualifying rows."
+  ],
+  "verdict": "reject",
+  "reasons": "The observable contract is mostly clear and the verifier can strongly distinguish shallow SQLite-only fixes, but implementing a lexer, parser, relational evaluator, exact arithmetic aggregates, and transaction-safe concurrency behavior from an incomplete component is unlikely to be reliably solvable in under an hour. The blueprint also leaves performance bounds and some edge semantics dependent on documentation that is not shown here, so it fails the required solvability threshold despite being genuinely difficult and realistic.",
+  "fixes": [
+   "Provide a compact starter interface or partial reference implementation for the lexer, parser, AST, and evaluator, leaving a bounded set of clearly identified functions to repair.",
+   "Include the complete runbook or an explicit semantic appendix in the task specification, especially for empty groups, percentile midpoint interpolation, decimal rounding, and error bodies.",
+   "Pre-cache all pinned apt and pip artifacts in the image or state clearly that Docker image construction has network access while service execution does not.",
+   "Specify generated workload sizes and measurable completion/memory limits, and define the allowed old-or-new snapshot outcomes for concurrent requests.",
+   "Reduce the required grammar or split query execution and concurrency repair into separate tasks so a skilled engineer can complete the task within the stated time."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "Both involve telemetry percentiles and persistence, but the candidate centers on repairing a SQLite-backed HTTP SQL-like query and ingestion protocol rather than journal recovery and event-stream replay."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Although both repair an HTTP telemetry query service, the reference wraps a compiled fixed-shape aggregation engine while the candidate requires implementing transactional ingestion and broad SQL-like query semantics in SQLite."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference concerns an approximate quantile daemon's theoretical error bounds, memory, and systemd deployment, whereas the candidate concerns exact SQL-style semantics, transactions, and protocol behavior."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "The reference is a deterministic release-report build pipeline with manifest parsing and SQL translation, not a persistent HTTP telemetry query service with ingestion and aggregate semantics."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "Despite sharing an HTTP service, persistence, and interval/reporting concerns, the reference solves campaign event deduplication and attribution while the candidate solves a general telemetry query language and atomic batch store."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e05a846f6234",
+     0.295
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.254
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.251
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.223
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.203
+    ]
+   ],
+   "cost_usd": 0.0011958
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0043976
+}

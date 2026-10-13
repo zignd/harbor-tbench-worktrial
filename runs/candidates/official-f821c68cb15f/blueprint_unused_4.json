@@ -1,0 +1,153 @@
+{
+ "blueprint": {
+  "slug": "log-partition-constraint-service",
+  "title": "Log Partition Constraint Slicer Service",
+  "scenario": "A platform team is migrating an ingest pipeline to a managed log lake with strict per-shard rate limits and tenant isolation quotas. In `/opt/log-slicer`, an HTTP microservice has a stubbed `/v1/partition` endpoint that needs to be implemented. The endpoint must parse raw batch log payloads adhering to an in-house delta-timestamp and multiline continuation format, calculate trace-level byte sizes and time spans, and partition traces into shards that satisfy multi-dimensional constraints (maximum shard byte budget, maximum chronological time span, and tenant diversity limits) without splitting any distributed trace across shards.",
+  "instruction_draft": "Hey, we're finishing up the telemetry migration and downstream ingest is stalling because the partitioner isn't implemented on `log-slicer`. The service daemon runs on port 9095 (managed by systemd as `log-slicer.service`). Please implement the `POST /v1/partition` endpoint in `/opt/log-slicer/src/app.py` so it parses the incoming raw log batches, groups entries by trace, and assigns traces into valid output shards satisfying the requested limits (max shard bytes, max time span, and max tenants per shard). Make sure the service passes our verification suite and starts cleanly on port 9095.",
+  "requirements": [
+   "The service at `http://127.0.0.1:9095` must accept HTTP `POST /v1/partition` with a JSON payload containing `raw_logs` (string) and `constraints` (`max_shard_bytes`, `max_span_seconds`, `max_tenants_per_shard`).",
+   "Return HTTP 200 with JSON payload `{\"shards\": [{\"shard_id\": int, \"trace_ids\": [str, ...], \"total_bytes\": int, \"tenants\": [str, ...], \"span_seconds\": float}]}` on success, or HTTP 400 `{\"error\": str}` if the payload is malformed or the constraints cannot be satisfied.",
+   "Stage 1 parsing: Correctly parse headers matching `[<ts>] [<trace_id>] [@tenant:<tenant_id>] [<level>] <message>`, handling continuation lines (lines indented with whitespace or starting with `| ` inherit the preceding entry's trace, tenant, and timestamp) and relative timestamps (lines where `<ts>` starts with `+<offset>` represent delta seconds from the immediately preceding timestamp).",
+   "Stage 2 aggregation: Compute each trace's UTF-8 raw byte contribution (sum of all line lengths including trailing newlines), distinct tenants involved, and time bounds `[min_ts, max_ts]`.",
+   "Stage 3 constraint satisfaction: Partition traces into shards such that: (a) no trace is split across multiple shards (atomic traces); (b) the sum of `total_bytes` in any shard does not exceed `max_shard_bytes`; (c) `span_seconds` (max timestamp minus min timestamp across all entries in the shard) does not exceed `max_span_seconds`; (d) the number of unique tenants in any shard does not exceed `max_tenants_per_shard`.",
+   "Optimization bound: For feasible inputs, the total number of shards produced must not exceed 1.25x the theoretical minimum bin count (a greedy first-fit decreasing heuristic or standard bin-packing approach easily satisfies this; trivially creating one shard per trace when packing is possible must be rejected).",
+   "The service must persist changes and run as the systemd service `log-slicer` listening on `127.0.0.1:9095`."
+  ],
+  "environment": [
+   "Debian base with Python 3.13, `pytest`, `requests`, and `uvicorn`/`starlette` or `flask` installed.",
+   "Systemd unit `/etc/systemd/system/log-slicer.service` configured to run `/opt/log-slicer/src/app.py` on port 9095.",
+   "`/opt/log-slicer/src/app.py`: contains existing boilerplate routes (`GET /healthz`, config loading) and an unhandled route stub for `POST /v1/partition` returning 501 Not Implemented.",
+   "`/opt/log-slicer/docs/API.md`: exact JSON request/response schema specifications, error contract (HTTP 400 format), and constraint definitions.",
+   "`/opt/log-slicer/docs/legacy_format.md`: documentation of the legacy log framing format with examples of multiline continuation and delta timestamps.",
+   "`/opt/log-slicer/tests/test_sample_parser.py`: local unit tests validating basic log parsing against 3 sample fixtures in `/opt/log-slicer/data/samples/`."
+  ],
+  "internal_hint": "Difficulty stems from multi-stage dependency and constraint satisfaction: 1) Stage 1 (Parsing): naive line splitting fails on multiline stacktraces (which must be appended to the active trace and count toward its byte size) and relative delta timestamps (`+0.250`). An off-by-one in byte counting (such as omitting trailing newline bytes or misinterpreting UTF-8 characters) invalidates the byte budget in Stage 3. 2) Stage 2 (Trace aggregation): traces can span multiple non-consecutive log lines in an interleaved log stream. 3) Stage 3 (Constraint satisfaction): packing traces into shards requires multidimensional bin packing (bytes, time span `max(ts) - min(ts)`, and unique tenant count). A standard First-Fit-Decreasing heuristic sorted by trace byte size, with candidate shard checks for `new_span <= max_span_seconds` and `len(shard_tenants | trace_tenants) <= max_tenants`, solves all instances efficiently and deterministically.",
+  "trap": "A shallow implementation parses timestamps assuming absolute ISO8601 strings only (ignoring relative `+delta` formats shown in the legacy format docs), or calculates shard time span as the sum of trace spans rather than `max(ts) - min(ts)` across all events in the shard. Furthermore, naive bin-packers that ignore the tenant set union constraint will overflow `max_tenants_per_shard` when traces sharing no tenants are packed into the same shard.",
+  "tests": [
+   "Check service health (`GET /healthz` returns 200).",
+   "Stage 1 Parser validation: Send batches with nested stacktraces, unicode characters, and relative delta timestamps; verify parsed traces reflect exact UTF-8 byte totals and timestamps.",
+   "Stage 2 Validation: Send malformed batches (negative limits, unparseable lines missing mandatory fields) and ensure HTTP 400 is returned.",
+   "Stage 3 Constraint verification across multiple generated scenarios: (a) trace atomicity: no trace_id appears in multiple shards; (b) capacity: each shard's total bytes <= `max_shard_bytes`; (c) time span: `max(ts) - min(ts)` <= `max_span_seconds`; (d) tenant isolation: unique tenants per shard <= `max_tenants_per_shard`.",
+   "Hidden seed benchmark: Run 20 fresh test cases generated at verify time with varying tenant distributions and conflicting time windows, checking all constraints and shard count limits."
+  ],
+  "verifier_knob": {
+   "name": "num_scenarios",
+   "value": "20",
+   "effect": "Controls the number of hidden-seed test scenarios executed against the running service, covering diverse edge cases such as tight tenant quotas, high-concurrency trace interleavings, and zero-headroom byte budgets."
+  },
+  "expected_failure_modes": [
+   "Failing to handle multiline continuation lines, causing stacktraces to either be dropped or treated as orphan records.",
+   "Incorrectly parsing delta timestamps (`+0.500`), resulting in erroneous `min_ts` and `max_ts` bounds that cause the partitioner to falsely claim time span constraint violations.",
+   "Treating the tenant limit as a per-trace check rather than computing the union of distinct tenants already assigned to the target shard.",
+   "Splitting traces across shards to satisfy byte constraints instead of keeping all records of a trace atomic.",
+   "Creating an excessive number of shards (e.g. 1 shard per trace) instead of packing them, violating the optimization ceiling."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "reverse-engineering",
+  "tags": [
+   "log-processing",
+   "constraint-satisfaction",
+   "bin-packing",
+   "service-protocol",
+   "reverse-engineering"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "ls -la /opt/log-slicer/docs /opt/log-slicer/tests /opt/log-slicer/src",
+   "cat /opt/log-slicer/docs/API.md",
+   "cat /opt/log-slicer/docs/legacy_format.md",
+   "cat /opt/log-slicer/tests/test_sample_parser.py",
+   "cat /opt/log-slicer/src/app.py",
+   "python3 -m pytest /opt/log-slicer/tests",
+   "python3 -c 'import app' # inspect imports and framework",
+   "cat << 'EOF' > /opt/log-slicer/src/partitioner.py # implement Stage 1 parser, Stage 2 aggregator, Stage 3 FFD bin packer",
+   "python3 -c 'from partitioner import parse_and_partition; ...' # smoke test logic on sample fixtures",
+   "vim /opt/log-slicer/src/app.py # hook partitioner into POST /v1/partition",
+   "systemctl restart log-slicer.service",
+   "systemctl status log-slicer.service",
+   "curl -s -X POST http://127.0.0.1:9095/v1/partition -H 'Content-Type: application/json' -d @/opt/log-slicer/data/samples/sample1.json"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Running systemd inside Docker containers often fails without PID 1 init, cgroup mounts, or specific container privileges (e.g. systemctl commands hanging or failing with 'System has not been booted with systemd as init system').",
+   "Ambiguity in '1.25x theoretical minimum bin count': because multidimensional bin packing is NP-hard, if theoretical minimum is defined naively as max(ceil(total_bytes / max_shard_bytes), ceil(total_tenants / max_tenants_per_shard)), temporal conflicts could force more shards than 1.25x this byte/tenant lower bound even under optimal packing.",
+   "Floating-point representation errors when calculating relative timestamps (+0.250s) and span bounds (max_ts - min_ts) causing off-by-epsilon constraint rejection."
+  ],
+  "verdict": "accept",
+  "reasons": "The blueprint presents a solid, realistic systems engineering challenge requiring multiline delta log parsing, trace aggregation, and multi-constraint bin packing. It cannot be solved by a simple patch or config flip and genuinely tests an agent's algorithmic implementation and debugging capabilities.",
+  "fixes": [
+   "Ensure the Docker runtime properly supports systemd (e.g. systemd init with /sbin/init or mock systemctl if full cgroups cannot be provided) so the daemon can be managed via systemctl without environment errors.",
+   "Clarify in `/opt/log-slicer/docs/API.md` how shard efficiency is evaluated (e.g. define whether test instances guarantee an optimal packing of K shards where First-Fit Decreasing yields <= 1.25 * K).",
+   "Specify rounding precision for delta timestamp parsing and `span_seconds` calculation (e.g. round to 3 or 6 decimal places / microsecond precision)."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference focuses on fixing quantile mathematical error bounds and latency in a Go streaming sketch daemon, whereas the candidate requires implementing an HTTP endpoint for log parsing and multi-constraint trace bin-packing."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference involves debugging a binary frame demuxing pipeline in Rust and shell, while the candidate involves parsing text logs with delta timestamps and partitioning distributed traces across constrained shards."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference requires implementing a query service backed by an SQLite database and a compiled aggregation shared library, whereas the candidate requires parsing raw log payloads and solving a multi-constraint bin-packing problem."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "The reference fixes wire-level binary frame encoding and decoding bugs, whereas the candidate implements log parsing, trace aggregation, and shard partitioning under multiple capacity bounds."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference involves debugging shell scripts and SQL schemas for aggregating runner shards into an analytical SQLite database, whereas the candidate implements an HTTP endpoint for log parsing and multi-dimensional shard partitioning."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-d993c25003e5",
+     0.196
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.191
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.142
+    ],
+    [
+     "ours/official-aac910462208",
+     0.107
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.106
+    ]
+   ],
+   "cost_usd": 0.0055815
+  },
+  "novel": true
+ },
+ "cost_usd": 0.01616625
+}

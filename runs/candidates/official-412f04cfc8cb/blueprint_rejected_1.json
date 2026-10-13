@@ -1,0 +1,201 @@
+{
+ "blueprint": {
+  "slug": "edge-attestation-reconciliation",
+  "title": "Repair the Edge Attestation Reconciler",
+  "scenario": "A small embedded-device team runs an in-container Go service that consumes exported attestation spools from gateways and maintains a local SQLite trust database. A recent firmware rollout added key rotation, revocation, replayed exports, and a binary spool format, but the existing reconciliation path silently produces unsafe device states and incomplete audit history. The container includes the service, an opaque decoder utility, thousands of seeded records, and deployment scripts that must be iterated without adding network or heavyweight dependencies.",
+  "instruction_draft": "$ /opt/edgeguard/bin/reconcile.sh /var/lib/edgeguard/incoming/current.egspool\nreconcile: decoded 1847 frames; accepted=1791 rejected=56\nedgeguardd: warning: state digest differs from gateway export\nedgeguardd: warning: 23 devices have stale trust decisions\n\nRepair and complete the EdgeGuard reconciliation feature in this container. The resulting installation must work with fresh attestation spools generated at verification time, not only with the supplied export.\n\nThe observable end state is authoritative:\n- `/opt/edgeguard/bin/reconcile.sh <spool>` must decode the spool, reconcile every frame, update `/var/lib/edgeguard/state.db`, and return success only when the complete export has been processed. It must be safe to run repeatedly on the same spool and must not leave a partially committed database after a malformed or interrupted import.\n- The SQLite database must contain exactly the final device state, one row per accepted event in the audit table, and no rows for rejected events. Device state must distinguish active, expired, revoked, unknown, and invalid-chain devices, with the documented reason and the event sequence that caused it.\n- An enrollment starts a device chain at sequence 0. A rotation is usable only when it is signed by the currently trusted key and advances the sequence by exactly one. A heartbeat is usable only from the current key and within the device lease. A revocation is terminal, is usable only when signed by the current key, and must continue to win over later heartbeats or rotations.\n- Frames may be out of order, duplicated, replayed across exports, interspersed between devices, or contain conflicting records with the same event identifier. Reconciliation must be order-independent: an exact duplicate is recorded at most once, while conflicting reuse of an event identifier is rejected and cannot alter device state.\n- Invalid signatures, unknown device references, sequence gaps, expired leases, malformed frames, and records after a valid revocation must be represented as rejected audit outcomes and must not mutate trusted state. A failed import must preserve the prior committed state.\n- The service and its Unix-socket HTTP status endpoint must remain available after reconciliation and must report the same device counts and state digest as the database. Existing query behavior and the supplied compatibility fixture must continue to work.\n- The implementation must use the supplied decoder and verifier interfaces, preserve file ownership and restrictive permissions for the database and generated temporary files, and handle at least 50,000 frames within the container's 1 CPU and 2 GB memory budget.\n\nInvestigate the installed programs, schema, fixtures, logs, and service behavior before making changes. Do not replace the opaque verification utilities, disable signature checking, special-case the supplied export, or hard-code a state digest.",
+  "requirements": [
+   "Provide a working `/opt/edgeguard/bin/reconcile.sh <spool>` command.",
+   "Decode and process every frame in the supplied and verify-time-generated binary spool.",
+   "Commit reconciliation atomically and preserve the previous database state on malformed or interrupted imports.",
+   "Make repeated reconciliation of an identical spool idempotent.",
+   "Maintain exactly one accepted audit row per unique accepted event identifier.",
+   "Reject conflicting reuse of an event identifier without allowing it to mutate trusted device state.",
+   "Correctly implement enrollment at sequence 0.",
+   "Accept key rotation only when signed by the current trusted key and advancing the sequence by exactly one.",
+   "Accept heartbeats only from the current trusted key and within the applicable lease.",
+   "Treat a valid revocation as terminal and dominant over later heartbeats and rotations.",
+   "Handle out-of-order, duplicated, replayed, and interleaved records independently of input order.",
+   "Record rejected malformed frames, invalid signatures, unknown references, sequence gaps, expired leases, and post-revocation records as rejected audit outcomes.",
+   "Ensure rejected records do not mutate trusted device state.",
+   "Expose final device counts and the database state digest through the existing Unix-socket service endpoint.",
+   "Preserve existing compatibility queries and fixture behavior.",
+   "Use the supplied opaque decoder and verifier rather than replacing or bypassing them.",
+   "Maintain restrictive permissions on the database and temporary files.",
+   "Process at least 50,000 frames within the stated resource limits."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm` with pinned SQLite, Go toolchain, and small utility packages installed offline.",
+   "The repository under `/opt/edgeguard` contains roughly 1,600 lines of Go across a daemon, SQLite repository layer, HTTP status handler, migration code, and compatibility tests, plus shell deployment scripts and fixture generators.",
+   "`edgeguardd` is already running in the container, serves a Unix-socket status API, and reads `/var/lib/edgeguard/state.db`.",
+   "`/opt/edgeguard/bin/spooldecode` is a compiled opaque utility with no source shipped; it converts the custom framed binary spool to JSONL and reports frame offsets and decoding errors.",
+   "`/opt/edgeguard/bin/claimverify` is a compiled opaque utility with no source shipped; it validates the supplied detached signatures and emits the canonical event identity and signer key.",
+   "The spool format documentation, schema migration notes, and command examples are present in `/opt/edgeguard/docs`, but the implementation currently assumes ordered input and only partially handles the original enrollment/heartbeat format.",
+   "The initial database contains a compatibility dataset of several thousand events, including duplicates, stale heartbeats, rotated keys, revoked devices, malformed frames, sequence gaps, and records spanning multiple exports.",
+   "The planted defects include non-atomic import behavior, a deduplication key that omits the export event identity, incorrect treatment of rotations after replay, state calculation that depends on input order, and an HTTP digest calculated from a different row ordering than the reconciliation code.",
+   "The supplied fixture is intentionally small enough that a superficial run appears correct; the verifier creates fresh binary spools from hidden seeds with different device counts, event ordering, collision patterns, lease durations, and rare malformed-frame placements.",
+   "A deterministic reference implementation and hidden-seed generator exist outside the container and are used only by verification."
+  ],
+  "internal_hint": "A skilled engineer first runs the daemon, decoder, verifier, fixture importer, SQLite integrity checks, and status endpoint while capturing frame-level traces; reading the obvious Go path alone does not reveal the order dependence or the collision behavior. The repair requires a shell orchestration layer that decodes to a controlled temporary workspace, validates all frames before swapping state, and invokes the opaque verifier without losing its exit status. The Go reconciliation logic must normalize records by canonical event identity, detect conflicting identities, group by device, order valid chain candidates by sequence, and apply terminal revocation and lease rules deterministically. The database transaction should build or validate a replacement state from the complete import, then atomically replace the state tables while preserving audit outcomes. The digest and HTTP status code must use the same canonical ordering and counts. Testing should include generated permutations, repeated imports, injected malformed frames, conflicting IDs, and forced termination between validation and commit.",
+  "trap": "A shallow solution can make the visible export's counts look correct by sorting the input once, deduplicating on device and sequence, or simply ignoring decoder errors. Hidden spools contain same-sequence collisions, valid rotations that arrive before their enrollment, replayed events from older exports, post-revocation records, and conflicting event identifiers; such solutions either allow an unsafe key or revoke the wrong device. Another common failure is updating the live database incrementally, which passes normal runs but leaves mixed state after a bad frame or interruption, while a separate digest ordering bug causes the service endpoint to disagree with the database.",
+  "tests": [
+   "Run the repair against the supplied compatibility spool and compare all device rows, status counts, accepted and rejected audit rows, reasons, sequence values, and state digest with the deterministic reference.",
+   "Generate fresh binary spools from hidden seeds containing thousands to tens of thousands of frames, random record order, interleaved devices, duplicate exports, and rare malformed frames; compare the complete SQLite state with the reference output.",
+   "Check that every accepted event is represented exactly once, every rejected event has the expected rejection reason, and conflicting event-ID reuse never changes trusted state.",
+   "Permute each generated spool repeatedly and verify identical final device state and digest.",
+   "Run the same spool twice and verify no additional accepted audit rows or state changes appear.",
+   "Inject valid rotations before their enrollment, sequence gaps, invalid signatures, expired heartbeats, unknown devices, and records after revocation, then compare chain outcomes and terminal states.",
+   "Terminate reconciliation during decoding, verification, and database construction, then verify that the prior database is unchanged and passes SQLite integrity checks.",
+   "Query the running Unix-socket service after each successful import and compare its counts, per-state totals, and digest with the database contents.",
+   "Check compatibility queries and the existing fixture API response.",
+   "Inspect database and temporary-file modes and reject implementations that expose private attestation material or leave world-readable intermediate files.",
+   "Run a 50,000-frame generated spool under the container resource limits and require successful completion without unbounded memory growth."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances_and_frame_scale",
+   "value": "12 independent hidden seeds with 5,000-50,000 frames each, including 1-3% rare collision or malformed cases",
+   "effect": "Lowering the value permits shallow validation against a few fixtures and makes input-order bugs less likely to appear. Raising it increases the number of independent generated states, permutation patterns, rare event collisions, and frame volume, making hard-coded answers, sampling, and in-memory or order-dependent implementations fail more often."
+  },
+  "expected_failure_modes": [
+   "Reading and patching only the obvious Go importer without exercising the opaque decoder and verifier.",
+   "Deduplicating by device, sequence, or payload instead of canonical event identity and failing conflicting-ID cases.",
+   "Applying records in spool order, so out-of-order rotations, replays, or revocations produce different states.",
+   "Treating any correctly signed record as trusted without checking the current key, exact sequence progression, or terminal revocation.",
+   "Dropping malformed decoder output instead of recording deterministic rejected audit outcomes.",
+   "Committing rows incrementally and leaving a partially updated database after a late failure.",
+   "Fixing database contents while leaving the running service's cached digest or status counts stale.",
+   "Using a different canonical sort for the HTTP digest than for persisted state.",
+   "Passing the visible fixture but failing hidden same-sequence collisions or post-revocation records.",
+   "Creating large temporary JSONL or SQLite copies without cleanup, permission control, or resource-aware streaming.",
+   "Replacing the supplied security utilities or weakening signature checks to make the sample pass."
+  ],
+  "predicted_pass_rate": 0.2,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "shell-scripting",
+   "go",
+   "attestation",
+   "sqlite",
+   "state-reconciliation",
+   "hidden-seeds"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/edgeguard && find bin docs cmd internal migrations tests -maxdepth 3 -type f -print",
+   "sed -n '1,240p' docs/*",
+   "grep -RInE 'reconcile|spool|event_id|digest|audit|rotation|revok|lease' . --exclude-dir=.git",
+   "sed -n '1,260p' bin/reconcile.sh",
+   "sed -n '1,320p' cmd/*/*.go internal/**/*.go",
+   "sqlite3 /var/lib/edgeguard/state.db '.schema' '.headers on' '.tables'",
+   "sqlite3 /var/lib/edgeguard/state.db 'select name,sql from sqlite_master where type in (\"table\",\"index\") order by name;'",
+   "/opt/edgeguard/bin/reconcile.sh --help || true",
+   "/opt/edgeguard/bin/spooldecode /var/lib/edgeguard/incoming/current.egspool > /tmp/frames.jsonl",
+   "/opt/edgeguard/bin/claimverify --help || true",
+   "curl --unix-socket /run/edgeguard.sock http://localhost/status",
+   "systemctl status edgeguardd || ps aux | grep edgeguard",
+   "cp /var/lib/edgeguard/state.db /tmp/before.db && sha256sum /tmp/before.db",
+   "run the supplied fixture while capturing decoder, verifier, SQL, and daemon logs",
+   "map documented frame types and verifier output fields to the existing repository and schema",
+   "design a staging/import representation keyed by canonical event identity, including decoder-error records",
+   "rewrite reconcile.sh to use a private mode-0700 workspace, traps, streaming decoder output, verifier exit-status propagation, and a single commit phase",
+   "patch Go reconciliation to canonicalize identities, reject conflicting reuse, group by device, validate exact sequence/key/lease rules, and apply revocation terminality deterministically",
+   "patch SQLite transaction/migration logic to preserve accepted and rejected audit outcomes and atomically replace derived state",
+   "unify persisted-state and HTTP digest ordering and refresh or safely reopen the daemon's database view after commit",
+   "gofmt -w . && go test ./... && go build ./...",
+   "run repeated imports, permutations, duplicates, same-sequence collisions, invalid signatures, gaps, malformed frames, and post-revocation records",
+   "kill reconciliation during decode, verification, and staging, then compare the database and integrity checks with /tmp/before.db",
+   "run a generated 50000-frame spool, query the Unix socket, verify permissions, cleanup, and compare counts/digests"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The requirements conflict on rejected audit rows: one bullet says there must be no rows for rejected events, while later bullets require rejected events to be represented as rejected audit outcomes.",
+   "It is unspecified whether audit history is cumulative across exports or is replaced by the current export, which affects replay handling and expected row counts.",
+   "The canonical event identity, conflict-equivalence rules, rejected-event identity, and deterministic ordering for malformed frames are referenced but not defined precisely enough for independent implementations.",
+   "The required behavior when the daemon has an open SQLite connection while the database is atomically replaced is unspecified; tests could incorrectly require stale processes to observe replacement contents without a reload protocol.",
+   "Expected reason strings, state precedence for multiple same-device candidates, and whether rejected records after an invalid earlier chain may become valid after another candidate are not fully specified.",
+   "Forced-termination tests can be flaky unless the harness controls exact interruption points and distinguishes a clean failure from process termination during SQLite synchronization.",
+   "The under-one-hour solvability requirement is not realistic for a 1600-line unfamiliar Go service with opaque utilities, hidden semantics, schema changes, daemon lifecycle behavior, and 50000-frame performance constraints."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and strongly verifiable, but the contradictory audit-row requirements and several unspecified reconciliation semantics make the authoritative end state ambiguous. The proposed speedrun is substantially beyond twenty commands and requires a large redesign rather than a focused repair, so solvability is below the required threshold; the average score is also below 3.6.",
+  "fixes": [
+   "Resolve the audit contradiction by explicitly stating whether both accepted and rejected outcomes are stored, their uniqueness keys, and whether audit history is cumulative across imports.",
+   "Define canonical event identity, payload equivalence for duplicate detection, conflicting-ID behavior, malformed-frame identity, exact rejection reason values, and canonical audit/state ordering.",
+   "Specify whether each import is cumulative or rebuilds state from all known audit history, and define how replayed exports interact with existing accepted and rejected rows.",
+   "Document the daemon reload or database-connection protocol required after a successful atomic commit and include it in the observable contract.",
+   "Provide a precise precedence algorithm or reference pseudocode for same-device out-of-order chains, competing candidates, invalid links, leases, and terminal revocations.",
+   "Reduce the implementation scope or relax the under-one-hour criterion; alternatively provide a complete API/schema contract and a starter test harness so the task tests repair work rather than reverse-engineering unspecified semantics.",
+   "Make interruption tests deterministic by defining controlled kill points and the expected behavior at each point.",
+   "State the exact supported decoder and verifier command-line contracts, including exit codes, output schemas, streaming behavior, and how decoder errors map to audit outcomes."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "variant",
+     "reason": "Both repair authenticated binary-spool reconcilers with streaming decode, signature verification, key rotation, order-independent deduplication, rejection accounting, and deterministic committed output, but their state machines and output artifacts differ."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "This indexes scanner-classified repository artifacts and quarantine records, whereas the candidate validates cryptographic attestation events and maintains device trust chains."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "This reconstructs a multi-tenant event-log database and serves CRUD-style recovery queries, while the candidate performs cryptographic device-attestation reconciliation with trust-state transitions."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "variant",
+     "reason": "Both determine authoritative records from signed, ordered event chains while handling forks, gaps, duplicates, and invalid authentication, although the candidate also imports state and applies device-specific lease and revocation rules."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "This concerns deployment and ingestion of quantitative simulation results with finance-specific anomaly processing, not attestation-chain validation or device trust reconciliation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.247
+    ],
+    [
+     "ours/official-982469e29790",
+     0.218
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.197
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.174
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.168
+    ]
+   ],
+   "cost_usd": 0.0019508
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0048801999999999995
+}

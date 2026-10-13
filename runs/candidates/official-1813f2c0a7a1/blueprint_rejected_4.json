@@ -1,0 +1,179 @@
+{
+ "blueprint": {
+  "slug": "repair-sharded-search-materializer",
+  "title": "Repair the Sharded Search Feature Materializer",
+  "scenario": "A data engineer has inherited a Git repository that builds an offline product-search feature store from many catalog shards. A recent feature iteration added field-aware ranking and query-result materialization, but production results disagree with the indexing service on large catalogs; the repository contains the JavaScript pipeline, historical commits, fixtures, and operational scripts.",
+  "instruction_draft": "Repair the catalog search materializer and leave the repository in a reproducible, committed-ready state. Running `npm run rebuild -- --input fixtures/catalog --queries fixtures/queries --output state/search.db` must rebuild the complete SQLite state from all shard files without network access, stale intermediate files, or dependence on input-file order.\n\nThe final state must tokenize active catalog documents using Unicode NFKC normalization and case folding, treating each maximal run of Unicode letters or numbers as a token and treating punctuation, hyphens, and underscores as separators. Build field-aware BM25F ranking over `title`, `description`, and `tags`, with weights 3, 1, and 2; use k1=1.2, b=0.75, document length and average length separately per field, global document frequency counted once per document, and IDF `ln(1 + (N-df+0.5)/(df+0.5))`. For each query, score each active document using each distinct query token once, rank by unrounded score descending then document ID ascending, retain the first 10 results, and store scores rounded to nearest integer micro-score (`round(score*1,000,000)`) in `search_results`. The database must also contain correct document, term-statistics, postings, query, and manifest rows, including zero-result queries and documents containing no indexed tokens; preserve the documented schema and make the manifest checksum reflect the resulting state.",
+  "requirements": [
+   "The rebuild command must process every catalog shard and query file deterministically, independently of filesystem enumeration order.",
+   "Only active catalog documents participate in corpus statistics, postings, and rankings, while inactive documents remain represented in the document table.",
+   "Tokenization must apply Unicode NFKC normalization, Unicode case folding, and maximal Unicode-letter-or-number runs, with punctuation, hyphens, and underscores acting as separators.",
+   "The index must maintain separate title, description, and tags field lengths and global average lengths.",
+   "BM25F must use field weights title=3, description=1, tags=2, k1=1.2, b=0.75, and the stated per-field length normalization.",
+   "Document frequency for a term must count an active document at most once regardless of repetitions or the number of fields containing the term.",
+   "IDF must use the specified natural-log formula with global active-document count and global document frequency.",
+   "Each distinct query token must contribute once, and unknown terms must not produce rows or non-finite scores.",
+   "Results must be ordered by exact unrounded score descending with document ID ascending as the deterministic tie-breaker, then truncated to 10 per query.",
+   "Stored result scores must be integer micro-scores produced by rounding the exact score multiplied by 1,000,000.",
+   "The final SQLite database must contain correct rows for documents, terms, postings, queries, search_results, and the rebuild manifest, including empty-token documents and zero-result queries.",
+   "The rebuild must use atomic output replacement and leave no stale temporary database or segment files that can affect a subsequent rebuild.",
+   "Repeated rebuilds over the same inputs must produce byte-for-byte equivalent logical state and manifest checksums."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` with pinned apt packages, Node.js, npm, SQLite tooling, and no network dependency.",
+   "A private Git repository of roughly 1,500 lines of JavaScript, SQL, shell, and configuration across several historical commits; the current checkout contains an inherited three-stage shard tokenizer, statistics merger, and query materializer plus unrelated catalog utilities.",
+   "The repository includes a documented SQLite schema and operational README, but the current implementation has been modified during a failed field-ranking feature iteration.",
+   "The catalog fixture contains approximately 14,000 active and inactive documents spread across 48 JSONL shards, with repeated terms, empty fields, punctuation-heavy names, Unicode composed and decomposed forms, non-ASCII scripts, and documents whose scores are very close or exactly tied.",
+   "Query fixtures contain several hundred queries, including repeated words, unknown terms, punctuation-only queries, Unicode variants, and queries with more than ten matching documents.",
+   "The planted regressions include shard-local rather than global statistics on one execution path, field-length aggregation that loses empty fields, duplicate term-frequency contributions in one field, an ASCII-only token boundary shortcut, and an unstable result comparator; these defects interact across the three stages.",
+   "A small sample corpus and smoke-test queries are included in Git history and do not exercise the rare Unicode, cross-shard, tie, or repeated-term cases.",
+   "The output directory initially contains an older database and leftover segment files so stale-state handling is observable.",
+   "Verification can replace the fixtures with freshly generated deterministic catalogs and queries while preserving the documented schema and command-line interface."
+  ],
+  "internal_hint": "Start by inspecting Git history, the schema, the stage boundaries, and the rebuild scripts, then run the existing pipeline on both the smoke fixtures and the full corpus while comparing row counts, shard contributions, term frequencies, and score distributions. Reconstruct the contract from the README and historical migration: stage one must normalize and emit per-document field statistics, stage two must perform a global external merge keyed by token and document while deduplicating document frequency, and stage three must use those global statistics and field averages for BM25F scoring. The likely fixes are to make tokenization Unicode-property based after NFKC/casefold, preserve zero lengths, aggregate postings globally rather than per shard, count each term once per document for df, avoid adding repeated query terms, and compare unrounded numeric scores before ID tie-breaking. Rebuild into a temporary SQLite file, validate all stage counts and the manifest, fsync/rename the database, and remove old segments. Test with generated corpora that put the same term in every shard, create ties, use decomposed Unicode, and repeat terms heavily before trusting the visible sample.",
+  "trap": "A shallow repair can make the supplied examples pass while retaining shard-local IDF, ASCII tokenization, or rounded-score sorting. Those errors are rare or invisible in the smoke corpus but alter rankings when a term crosses shard boundaries, appears repeatedly, has Unicode forms, or produces near ties. Reusing the old database or accepting stale segments also passes a sample invocation while leaving incorrect rows for deleted or zero-token documents.",
+  "tests": [
+   "Run the rebuild on the supplied large fixtures and compare every document, term, posting, query, result, and manifest row against a deterministic reference implementation.",
+   "Generate a fresh multi-shard corpus with the same token in different numbers of shards and verify that global N, df, IDF, averages, postings, and rankings are correct.",
+   "Generate Unicode documents containing composed/decomposed forms, non-Latin letters, combining marks, digits, underscores, and hyphens, and verify exact token and result behavior.",
+   "Generate documents with repeated terms across fields and within fields and verify that term frequency, document frequency, and distinct-query-term scoring are not double-counted.",
+   "Generate empty fields, empty-token documents, inactive documents, unknown-only queries, and punctuation-only queries and inspect all required zero-valued and zero-result rows.",
+   "Generate rankings with exact and near score ties and verify ordering uses unrounded score first and document ID only as the secondary key, while stored values use integer micro-score rounding.",
+   "Run the command twice with shuffled shard filenames and query ordering, then compare logical state and manifest checksum; the outputs must be identical.",
+   "Place an old database and arbitrary stale segment files in the output directory before rebuilding and verify that none influence the final state and no temporary artifacts remain.",
+   "Run verification-time generated inputs at several thousand to tens of thousands of documents and ensure the pipeline completes within the container's CPU and memory budget rather than relying on a hand-built in-memory sample."
+  ],
+  "verifier_knob": {
+   "name": "generated_catalog_scale_and_edge_density",
+   "value": "14000 fixture documents, 48 shards, 300 queries, with 8% adversarial Unicode/tie/empty/repetition cases",
+   "effect": "Increasing document and shard counts makes accidental shard-local processing, quadratic joins, stale-state reuse, and order dependence more visible; increasing rare-edge density makes shallow sample-based fixes fail more often. Lowering both permits implementations that only work on small, ordinary ASCII corpora."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the obvious field-weight formula but leaves global statistics or document-frequency deduplication wrong.",
+   "The agent uses JavaScript ASCII regular expressions or lowercasing instead of Unicode NFKC plus case folding and misses hidden token cases.",
+   "The agent sorts by already rounded scores, causing only rare tie and near-tie queries to differ.",
+   "The agent counts repeated query words or repeated postings multiple times, producing plausible but inflated rankings.",
+   "The agent validates only the smoke fixtures and never compares per-stage counts on the large corpus.",
+   "The agent rebuilds the visible database but fails to clear stale segments, inactive rows, zero-token rows, or manifest metadata.",
+   "The agent replaces the pipeline with an in-memory implementation that works functionally on samples but exceeds memory or time on verification-time scale.",
+   "The agent assumes shard and query enumeration order is stable, making results or checksums vary across fresh runs."
+  ],
+  "predicted_pass_rate": 0.2,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "bm25",
+   "external-merge",
+   "unicode",
+   "git-history"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "find . -maxdepth 3 -type f | sort",
+   "git log --oneline --all --decorate -20",
+   "cat README* docs/* schema/* 2>/dev/null",
+   "cat package.json; find src scripts -type f -maxdepth 3 -print",
+   "grep -RIn \"token\\|BM25\\|posting\\|manifest\\|segment\\|rebuild\" src scripts .",
+   "npm run rebuild -- --input fixtures/catalog --queries fixtures/queries --output state/search.db",
+   "sqlite3 state/search.db '.schema' '.tables'",
+   "sqlite3 state/search.db 'select count(*) from documents; select count(*) from terms; select count(*) from postings; select count(*) from search_results;'",
+   "git show --stat --oneline --all; git log -S'BM25' -p --all -- .",
+   "patch tokenizer to use NFKC, Unicode property runs, and case folding",
+   "patch stage-one field lengths and zero-token document handling",
+   "patch global external merge, postings aggregation, and per-document df deduplication",
+   "patch BM25F scoring, distinct query terms, exact-score ordering, and micro-score rounding",
+   "patch deterministic enumeration, stale-artifact cleanup, atomic replacement, and manifest generation",
+   "npm run rebuild -- --input fixtures/catalog --queries fixtures/queries --output state/search.db",
+   "run SQLite assertions against document, term, posting, query, result, and manifest counts",
+   "run generated Unicode, repeated-term, cross-shard, tie, inactive, and empty-input checks",
+   "shuffle shard/query filenames, rebuild twice, compare logical dumps and manifest checksums; inspect git diff/status"
+  ],
+  "speedrun_commands": 19,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The required Unicode case-folding algorithm and Unicode version are not specified; JavaScript lowercasing is not equivalent to full Unicode case folding, and different vendored tables could produce different results.",
+   "The rounding rule does not specify tie behavior, which can differ between JavaScript Math.round, half-even, and other reference implementations.",
+   "It is unclear whether query identity is intrinsic to each query record or assigned from enumeration order; shuffled query files cannot yield identical logical rows if IDs are order-derived.",
+   "The manifest checksum algorithm and whether SQLite WAL or journal artifacts are included are delegated to undocumented repository details, so an external verifier could overreach if it assumes a different definition.",
+   "A strict byte-for-byte database comparison would be invalid unless the verifier compares normalized logical state, because SQLite page layout, freelists, and metadata can vary despite equivalent rows."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic, highly verifiable, and mostly clear, but the speedrun is plausibly 19 commands for a strong agent: the regressions and repair locations are discoverable by reading the source and history. Under the stated rubric that makes genuine difficulty at most 2, so the acceptance threshold is not met; there are also a few contract ambiguities around case folding, rounding, and query identity.",
+  "fixes": [
+   "Specify the exact Unicode case-folding data/version and provide or vendor the required implementation so the JavaScript pipeline has a deterministic contract.",
+   "Define rounding ties explicitly, such as mathematical half-away-from-zero or a precise integer-rounding algorithm.",
+   "State that query records have stable fixture-provided IDs, or define deterministic IDs independent of file and record enumeration order.",
+   "Document the manifest checksum input and algorithm, including canonical row ordering and treatment of SQLite journals/WAL files.",
+   "To increase genuine difficulty without relying on hidden limits, distribute the defects across less obvious historical stages and require a documented performance bound or externally generated adversarial cases rather than making the repair path apparent from the source and history alone."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a deterministic Unicode-tokenized BM25F search index and query materializer, whereas the reference reconstructs and serves transactional replay state from event segments."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/mteb-retrieve",
+     "verdict": "distinct",
+     "reason": "The candidate implements an offline catalog search index and ranking pipeline, while the reference performs a fixed embedding-model similarity retrieval task."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/financial-document-processor",
+     "verdict": "distinct",
+     "reason": "The candidate builds a SQLite-backed sharded search materializer, whereas the reference classifies, moves, and extracts totals from invoice documents."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The candidate requires implementing tokenization, postings, BM25F scoring, and materialization, while the reference only repairs a SQL report using window-function semantics."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "Although both involve deterministic idempotent SQLite pipelines over files, the candidate's core problem is search indexing and BM25F query ranking rather than artifact scanning, quarantine, and reconciliation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.172
+    ],
+    [
+     "terminal-bench-2-1/mteb-retrieve",
+     0.163
+    ],
+    [
+     "terminal-bench-2-1/financial-document-processor",
+     0.158
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.117
+    ],
+    [
+     "ours/official-982469e29790",
+     0.106
+    ]
+   ],
+   "cost_usd": 0.0008476
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0035263999999999994
+}

@@ -1,0 +1,189 @@
+{
+ "blueprint": {
+  "slug": "edge-attestation-state-rebuild",
+  "title": "Repair Edge Attestation State Rebuild",
+  "scenario": "An embedded-device developer maintains a budget-constrained attestation gateway that runs several cooperating services in one container. A recent feature iteration added key rotation, device revocation, and offline replay recovery, but the gateway's rebuild command now produces a plausible state while silently accepting or losing some historical claims. The container contains the Go gateway, a shell deployment/reconciliation pipeline, a SQLite state database, a documented binary spool format, and a compiled local verifier service with no source.",
+  "instruction_draft": "$ ./bin/edgeguardctl rebuild --check\nrebuild completed: 18437 frames, 18102 accepted, 335 rejected\nwarning: live gateway reports 27 devices with stale trust state\nwarning: state digest differs from deployment manifest\n\nYou are the embedded systems developer responsible for shipping this feature iteration. Inspect the files and services in this container and repair the attestation rebuild/deployment workflow. Do not merely make the displayed sample pass.\n\nWhen finished, `/opt/edgeguard/deploy/reconcile.sh` must deterministically rebuild the gateway state from the current spool and policy inputs, then atomically install the result and reload the running services. It must work when run repeatedly, after interruption between stages, and with a fresh spool generated from the documented format.\n\nThe resulting SQLite state must contain exactly the valid device, key, claim, revocation, quarantine, and cursor state implied by the complete input history. A claim is valid only when its frame is authenticated by the verifier, its device and key are authorized at that point in the device's history, its sequence is not replayed, and its referenced firmware digest is allowed by the active policy. Key rotations, revocations, and policy changes must take effect in their recorded order; records rejected for one reason must not advance any device cursor or alter trust state.\n\nPreserve valid historical claims across rebuilds, make duplicate and out-of-order frames idempotent, quarantine devices that have an authenticated security event requiring quarantine, and ensure no quarantined device is reported as trusted. The installed manifest, database contents, service health endpoint, and reconciliation exit status must agree. Keep the implementation dependency-free apart from packages already installed in the image and keep the normal rebuild within the provided CPU and memory budget.",
+  "requirements": [
+   "The reconciliation entry point is `/opt/edgeguard/deploy/reconcile.sh` and it deterministically consumes the current spool and policy inputs.",
+   "Reconciliation is repeatable and idempotent, including after an interrupted run between staging, database installation, manifest installation, and service reload.",
+   "The final SQLite database contains exactly the valid device, key, claim, revocation, quarantine, and cursor state implied by the complete input history.",
+   "Frames are accepted only when authenticated by the local verifier, authorized by the device and key state at that point in history, non-replayed, and consistent with the active firmware policy.",
+   "Key rotations, revocations, and policy changes are applied in recorded order.",
+   "A rejected frame does not advance a device cursor or mutate trust, claim, revocation, or quarantine state.",
+   "Duplicate and out-of-order frames do not create duplicate claims or corrupt cursor state.",
+   "Authenticated security events that require quarantine result in a quarantined device, and quarantined devices are never reported as trusted.",
+   "Valid historical claims survive a rebuild and remain represented in the installed database.",
+   "The installed manifest, database digest, service health endpoint, and reconciliation result agree after deployment.",
+   "The implementation remains within the container's one-CPU and 2 GB memory budget and uses only available offline dependencies."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` with pinned apt and pip packages, Go toolchain, SQLite, and standard shell utilities.",
+   "A roughly 1,600-line Go codebase under `/opt/edgeguard`, split among a frame reader, state reducer, SQLite writer, HTTP health service, policy loader, and CLI; several unrelated diagnostic and metrics components are present to require investigation.",
+   "`/opt/edgeguard/deploy/reconcile.sh` is the production entry point and currently uses temporary files, a staging database, a manifest, and service reload hooks.",
+   "A compiled binary `/usr/local/libexec/attest-verifier` communicates over a Unix socket and authenticates canonicalized frame payloads; its implementation source is not present in the container.",
+   "The documented spool format consists of length-prefixed frames containing device identity, per-device sequence, event kind, key epoch, policy version, payload, and verifier metadata. It includes escaped fields, binary digests, rotation records, revocations, and intentionally malformed frames.",
+   "The initial seed contains tens of thousands of frames across hundreds of devices, multiple key epochs, duplicate frames, late rotations, revoked keys, policy transitions, and a small number of rare inter-device and same-device sequence collisions.",
+   "The initial running services include `edgeguard-api`, `edgeguard-reducer`, and a Unix-socket verifier, supervised by a small local service manager rather than systemd.",
+   "The existing implementation has planted defects involving canonical byte construction, ordering of mixed event types, cursor advancement on rejection, transaction boundaries, stale manifest generation, and recovery after a partially completed deployment. These defects are not all apparent from source inspection and interact only on accumulated histories.",
+   "A policy directory, key metadata directory, spool directory, SQLite schema/migrations, service configuration, and sample diagnostic dump are supplied. Hidden verification replaces the seed spool, keys, and policies with freshly generated instances using the same documented rules.",
+   "The reference solution is a deterministic shell script that first inspects the service behavior, probes the verifier and reducer with controlled records, compares intermediate state and manifests, and then applies the repair."
+  ],
+  "internal_hint": "A skilled solution should first inventory the processes, schema, deployment stages, and verifier protocol, then generate small histories that distinguish canonicalization, authorization-at-event-time, and cursor semantics. Instrumenting the shell pipeline and querying SQLite after each stage exposes that the reducer mixes lexical frame order with event order, advances cursors before all validation succeeds, and uses a different byte representation from the opaque verifier for escaped payloads. The deployment script also promotes the manifest before the database rename and leaves stale rows when rebuilding from an existing database. Fixes require a streaming parser with explicit frame boundaries, stable per-device ordered reduction with authenticated control events, transactional all-or-nothing row changes, durable input cursors, and atomic database/manifest promotion followed by verified service reload. The shell script should use a staging directory, fsync/rename-style promotion, recovery markers, and a post-install digest check. Testing only the supplied dump misses the rare escaped payloads, equal-sequence collisions, late rotation, and interruption points.",
+  "trap": "A shallow solution can make the sample digest and health endpoint look correct by sorting frames globally, deleting and recreating the database, or trusting the reducer's accepted count. Hidden histories include records whose authorization changes mid-stream, escaped bytes whose textual and canonical forms differ, duplicate sequence numbers with different authenticated contents, and interruptions after only one artifact is promoted. Such a solution either loses valid claims, advances a cursor for a rejected frame, reports a revoked device as trusted, or leaves the database and manifest inconsistent.",
+  "tests": [
+   "Builds a fresh hidden spool, key set, and policy set from a seed and runs the repaired reconciliation script; compares every relevant row in devices, keys, claims, revocations, quarantines, and cursors against a deterministic reference reducer.",
+   "Checks exact accepted/rejected classification for thousands of frames, including malformed length fields, escaped payloads, binary digests, duplicate frames, and unknown event kinds.",
+   "Checks that device-local sequence and event ordering rules are preserved across rotations, revocations, policy changes, late records, and equal-sequence conflicts.",
+   "Checks that rejected frames leave no state mutation and that valid claims before and after a rejected frame remain present.",
+   "Checks idempotence by running reconciliation multiple times and comparing database rows, manifest bytes, cursor values, and service-reported digest.",
+   "Runs reconciliation from staged interruption points and verifies that the next invocation repairs or completes the deployment without mixed database/manifest state.",
+   "Queries the live health and trust endpoints after reload and verifies that their answers match the installed SQLite state, especially for quarantined and revoked devices.",
+   "Generates a second hidden instance with different device counts, key epochs, policy transitions, and rare malformed records to prevent hard-coded or sample-specific behavior.",
+   "Measures peak memory and elapsed processing under the large hidden spool and rejects implementations that load the entire event history into an unbounded in-memory structure."
+  ],
+  "verifier_knob": {
+   "name": "hidden_history_scale_and_event_interaction",
+   "value": "24,000-80,000 frames, 400-1,200 devices, 4-12 key epochs per active device, and 8-15% control or malformed frames with rare escaped and collision cases",
+   "effect": "Lowering it makes manual inspection and a simple in-memory reducer more likely to pass. Raising it increases the chance of encountering ordering, replay, transaction, and recovery interactions while also exposing memory-heavy implementations and shallow sample-based validation."
+  },
+  "expected_failure_modes": [
+   "The solver reads the visible source and patches an obvious branch without probing the opaque verifier's canonicalization behavior.",
+   "The parser handles ordinary sample frames but mishandles escaped delimiters, binary digests, truncated frames, or length-prefix boundaries.",
+   "The reducer sorts all records globally rather than preserving the required per-device historical semantics for mixed control and claim events.",
+   "The implementation advances cursors or persists quarantine changes before authentication and policy validation have fully succeeded.",
+   "The solver rebuilds an existing database by deleting rows in place, so an interruption leaves a partially rebuilt state.",
+   "The shell deployment promotes the manifest and database in separate non-atomic steps, producing a state digest mismatch after interruption.",
+   "The implementation treats duplicate sequence numbers as harmless duplicates without comparing authenticated contents, accepting conflicting replay data.",
+   "The agent validates only the supplied 18,437-frame example and misses hidden rare cases involving late revocation, escaped payloads, or policy transitions.",
+   "A memory-heavy implementation materializes all frames or all claims and exceeds practical limits on the largest generated instance.",
+   "The service is repaired but not reloaded correctly, so the live endpoint continues serving stale trust state despite a correct database."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "go",
+   "shell-scripting",
+   "attestation",
+   "state-rebuild",
+   "sqlite",
+   "hidden-seeds"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd && find /opt/edgeguard -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' /opt/edgeguard/deploy/reconcile.sh",
+   "find /opt/edgeguard -maxdepth 2 -type f \\( -name '*.md' -o -name '*.txt' -o -name '*.sql' \\) -print",
+   "ps auxww && inspect the local service-manager configuration",
+   "sqlite3 /opt/edgeguard/state/*.db '.schema'",
+   "grep -RIn 'cursor\\|quarantine\\|canonical\\|rotation\\|revocation' /opt/edgeguard",
+   "inspect the frame reader and documented spool format",
+   "inspect the reducer and SQLite transaction boundaries",
+   "inspect service reload, health, and manifest-generation code",
+   "inspect verifier socket configuration and protocol documentation",
+   "run the existing CLI, health endpoint, and verifier status checks",
+   "copy the current deployment and database for comparison",
+   "create minimal records for a claim, rotation, revocation, malformed frame, and duplicate",
+   "send controlled records to the verifier and record canonicalization results",
+   "run the reducer on each controlled history and query all resulting tables",
+   "compare frame order, device-local order, cursor changes, and rejected-row mutations",
+   "identify the required ordering and conflict rules from documentation and probes",
+   "implement strict length-prefixed streaming parsing with explicit escaped and binary-field handling",
+   "implement authenticated per-device reduction with transactional all-or-nothing state changes",
+   "handle duplicate and conflicting equal-sequence records without cursor advancement on rejection",
+   "rebuild the database in a fresh staging directory rather than mutating the installed database",
+   "rewrite reconciliation to persist recovery metadata and promote database and manifest consistently",
+   "add fsync/rename-style promotion, restart recovery, and post-install digest verification",
+   "build the Go components and run visible unit or integration checks",
+   "generate adversarial histories covering late controls, escaped payloads, collisions, and truncation",
+   "run repeated, interrupted, health-consistency, and large-spool performance tests"
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The required tie-breaking and ordering semantics for equal device sequences, inter-device events, late records, and malformed records are not stated precisely; relying on undocumented files may make otherwise correct implementations diverge from the tests.",
+   "Atomic agreement between a SQLite file and a separate manifest is not literally guaranteed by ordinary filesystem rename operations; the interruption protocol and when recovery is invoked must be specified for tests to distinguish an acceptable recoverable state from failure.",
+   "The opaque verifier protocol and canonicalization behavior may not be sufficiently discoverable within the stated time if documentation, socket permissions, or service startup state are incomplete.",
+   "The phrase 'active policy' can mean policy at frame time or final policy unless the supplied policy-history format explicitly resolves that distinction.",
+   "Peak-memory and CPU thresholds are mentioned without numeric limits or a defined measurement method, which can create environment-dependent failures.",
+   "Tests that inject interruption at arbitrary points need a documented injection mechanism and expected post-crash invariants; otherwise failures may reflect harness timing rather than implementation correctness."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and difficult, and its end-state checks are mostly strong, but it is not plausibly solvable in under an hour from the stated starting point: it requires reverse-engineering an opaque verifier, repairing a substantial reducer, and designing crash recovery. Several ordering, tie-breaking, and cross-file atomicity semantics are also delegated to implied documentation or an unspecified reference, so clarity and solvability do not meet the acceptance threshold.",
+  "fixes": [
+   "Provide an explicit event-ordering specification, including equal-sequence conflicts, late control records, malformed-frame handling, and whether authorization and policy are evaluated at event time or final state.",
+   "Define a concrete crash-consistency protocol for database, manifest, and service reload, including the recovery marker format and expected state after every injected interruption point.",
+   "Include a verifier protocol contract and canonicalization examples, including escaped payloads and binary digests, while preserving hidden cases for generalization.",
+   "Reduce the scope to either reducer correctness or deployment crash recovery, or provide a tested helper/reference library so a skilled engineer can complete the task within an hour.",
+   "Specify numeric CPU, memory, elapsed-time, and interruption-test thresholds and how the harness measures them."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "This concerns stateful attestation-history replay and deployment rather than request-target classification and normalization."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "Although both use SQLite reconciliation and quarantine, this task rebuilds authenticated device trust state rather than indexing scanner-classified filesystem artifacts."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "same",
+     "reason": "Both are deterministic authenticated binary-spool reconcilers that must handle rotations, reordered or duplicate frames, rejection semantics, and exact derived state."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both reconstruct idempotent authoritative state by replaying potentially malformed historical records, but this task adds attestation authentication, authorization, policy transitions, and deployment installation."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "This is a domain-specific incident correlation and alias-resolution pipeline, not authenticated device-state reconstruction or deployment reconciliation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.229
+    ],
+    [
+     "ours/official-982469e29790",
+     0.225
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.198
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.168
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.147
+    ]
+   ],
+   "cost_usd": 0.0017178
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0042438
+}

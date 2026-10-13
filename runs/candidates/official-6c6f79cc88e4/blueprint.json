@@ -1,0 +1,59 @@
+{
+ "slug": "harden-route-policy-gateway",
+ "title": "Harden the Route Policy Gateway",
+ "scenario": "A security engineer is auditing an in-container Rust HTTP gateway that classifies request targets before forwarding them to an internal service. The deployment includes several Rust components, shell-based process supervision, a documented route policy, historical request fixtures, and a compiled route-normalization helper with no source available.",
+ "instruction_draft": "Harden the deployed gateway so that every request is classified according to the route policy in `/etc/gateway/policy.toml`: allow every policy-valid request and reject every policy-invalid request, including after arbitrary prior traffic. Preserve request order, remain deterministic, and do not hang or crash on malformed input.",
+ "requirements": [
+  "The running gateway must allow every policy-valid request in the policy corpus.",
+  "The running gateway must reject every policy-invalid request in the policy corpus.",
+  "Classification must remain correct for every request regardless of the complete sequence of earlier requests handled by the process.",
+  "The gateway must preserve input order and emit exactly one decision for each input request.",
+  "Malformed, oversized, embedded-control-character, and adversarially encoded inputs must produce a deterministic rejection or documented error decision rather than a crash, hang, or accidental allow.",
+  "The deployment must remain runnable using the supplied container entrypoint and must not require network access."
+ ],
+ "environment": [
+  "A Dockerfile based on `python:3.13-slim-bookworm` installs pinned Rust build/runtime dependencies and creates an approximately 1,500-line in-house gateway across Rust modules, shell launchers, configuration, fixtures, and test utilities.",
+  "The gateway accepts newline-delimited JSON requests on its command-line stream and also exposes a local HTTP endpoint used by the supervisor; its output contains request identifiers and ALLOW or DENY decisions.",
+  "The route policy file defines byte-oriented path canonicalization, permitted methods, route automata, maximum decoded length, and handling of percent escapes, dot segments, Unicode, separators, and control bytes.",
+  "A shell supervisor batches requests through an opaque compiled executable `/opt/gateway/bin/routecanon`; the executable is shipped only as a binary and a short protocol description, never with source code.",
+  "The current deployment contains plausible but unrelated Rust code for metrics, health checks, logging, and forwarding, plus public fixtures that exercise ordinary routes and a few obvious traversal attempts.",
+  "The opaque helper has state-dependent behavior after its internal history grows: its normalization cache uses a lossy key and stale arena references, so collisions and prior requests can change the canonical result. The issue is not apparent from static inspection of the gateway source.",
+  "The shell supervisor also uses a stream framing and restart strategy that interacts with the helper's state, so fixes that only work for one request or one short fixture file are insufficient.",
+  "A deterministic corpus generator and reference policy evaluator are present only in the verifier; verify-time corpora contain thousands of fresh benign and malicious requests, including encoded separators, repeated decoding, mixed case escapes, Unicode normalization cases, CR/LF and NUL representations, boundary lengths, cache-collision histories, and interleaved HTTP and stream requests."
+ ],
+ "internal_hint": "A skilled solution first runs the supplied service and records decisions over controlled request sequences rather than trusting source inspection. Differential probing of `routecanon` reveals that equivalent raw targets can normalize differently after particular prior inputs, especially when lengths collide in its bounded cache; long histories expose stale state and arena-offset reuse. Tracing the shell supervisor shows that it keeps one helper process across batches and frames records through shell text processing, allowing control characters and whitespace to alter boundaries. The robust repair is to implement byte-safe framing in the supervisor, avoid shell word splitting and command interpolation, canonicalize and validate against the policy's exact ordered stages, and isolate or explicitly reset the opaque helper for each independent request/batch so its historical cache cannot affect a decision. The reference shell solution generates probes, establishes the cache/state transition, checks the policy evaluator against thousands of local cases, then installs the corrected supervisor and performs sequence-based regression tests before launching the service.",
+ "trap": "A shallow solution typically fixes obvious `../` checks or tests only the visible fixtures, while leaving the helper alive across requests and trusting its cached normalization. It passes isolated examples and short runs but misclassifies a benign request after a crafted preceding request, loses records containing spaces or escaped newlines through shell tokenization, or allows a malicious request whose dangerous bytes appear only after repeated decoding.",
+ "tests": [
+  "Start the supplied entrypoint and submit the public benign and malicious fixtures, checking exact request order, one decision per request, and expected ALLOW or DENY results.",
+  "Generate a fresh corpus from a hidden seed using the policy reference evaluator, including valid routes at length and encoding boundaries; compare every gateway decision with the reference result.",
+  "Replay each generated request alone and then in many adversarial histories containing cache-collision requests, verifying that the decision is history-independent.",
+  "Test mixed batches containing whitespace, quoted JSON strings, percent-encoded CR/LF, escaped NUL, Unicode, malformed UTF-8 representations, and shell metacharacters, checking that framing is preserved and invalid inputs never become accidental allows.",
+  "Send several thousand requests through one long-lived process and verify no stale normalization, arena reuse, output reordering, deadlock, or unbounded memory growth changes the results.",
+  "Exercise the HTTP endpoint and the newline-delimited command interface with equivalent requests and verify consistent policy decisions, deterministic error handling, and service availability after malformed inputs.",
+  "Inspect only observable behavior and process state: the verifier does not award credit for source edits, and a gateway that merely restarts after individual failures is rejected if it loses requests or violates ordering."
+ ],
+ "verifier_knob": {
+  "name": "hidden adversarial corpus size and history coverage",
+  "value": "12,000 generated requests across 400 stateful replay sequences, with roughly 8% boundary and malformed cases",
+  "effect": "Increasing corpus size, normalization-depth diversity, and the number of crafted preceding histories makes sampling-based fixes increasingly likely to fail; lowering them makes isolated policy fixes and short-process workarounds more likely to pass."
+ },
+ "expected_failure_modes": [
+  "The agent reads the Rust service and patches visible traversal checks without experimentally characterizing the compiled normalizer.",
+  "The agent validates only individual requests and misses the state-dependent cache corruption that appears after a long request history.",
+  "The agent uses shell command substitution, `for` loops, or unquoted expansion and corrupts framing for whitespace and control-containing JSON.",
+  "The agent implements one percent-decoding pass or checks raw paths instead of applying the policy's ordered canonicalization stages.",
+  "The agent restarts the service or helper on errors, causing dropped or reordered requests that are caught by the long-stream tests.",
+  "The agent replaces the policy with an overbroad deny rule, passing malicious examples while rejecting hidden benign encodings.",
+  "The agent discovers a working workaround but fails to test both the HTTP and stream interfaces or fails under thousands of requests."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "security",
+ "tags": [
+  "rust",
+  "shell-scripting",
+  "black-box",
+  "stateful-service",
+  "adversarial-corpus"
+ ]
+}

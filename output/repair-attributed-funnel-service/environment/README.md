@@ -1,5 +1,0 @@
-# Attributed Funnel Service
-
-Run `./run.sh`; it listens on TCP port 8080. `GET /health` returns `{ "status": "ok" }`. `POST /v1/reset` takes `{}` and returns `{ "ok": true }`. `POST /v1/append` takes `{ "events": [...] }` and on success returns `{ "ok": true, "accepted": N }`; each event has `event_id`, `user_id`, `occurred_at`, `ingest_seq`, and `kind` (`touch`, `purchase`, or `refund`). Touches have `campaign`; purchases have `order_id` and `amount_cents`; refunds have `order_id` and may have `amount_cents`.
-
-`POST /v1/report` takes `since` and `until` UTC ISO-8601 strings and optional `campaigns` list. It returns `{ "rows": [...] }`; rows contain string `campaign` and `campaign_name`, integer `sessions`, `purchases`, and `revenue_cents`. Campaign names are the supplied touch campaign, or `(direct)` when no applicable touch exists. Ranges are half-open, duplicate IDs retain the greatest ingest sequence, sessions split only for gaps greater than 1800 seconds, refunds follow order IDs, and rows sort by descending revenue then ascending campaign. Invalid JSON or requests return HTTP 400.

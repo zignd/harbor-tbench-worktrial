@@ -1,0 +1,146 @@
+{
+ "blueprint": {
+  "slug": "stratified-trace-sampler-repair",
+  "title": "Stratified Trace Sampler Neyman Allocation Repair",
+  "scenario": "An on-call SRE is paged at 3am because the cluster-wide distributed trace sampler service (`/opt/trace-sampler`) in an in-house Python codebase (~1,250 lines) is violating both its strict span storage budget and its tail-latency statistical accuracy thresholds. Upstream microservices stream hundreds of thousands of trace span records into local partition buffers; the sampler groups spans into strata by service, status, and latency class, and is supposed to allocate sample quotas using iterative bounded Neyman allocation with Horvitz-Thompson unbiased weight tracking. Due to silent mathematical defects in iterative budget redistribution and variance estimation during bursty, heavy-tailed traffic, tail strata estimates have drifted and sample budgets are severely breached.",
+  "instruction_draft": "```\n$ /opt/trace-sampler/bin/sample-ctl run --config /etc/trace-sampler/config.yaml --input-dir /var/log/trace-spans/staging --output /var/log/trace-spans/sampled.parquet\n[2025-03-29 03:14:02] INFO Loading 200,000 trace spans across 64 strata...\n[2025-03-29 03:14:04] ERROR Budget constraint violated: allocated 71,482 spans (hard limit: 50,000 +/- 250 spans).\n[2025-03-29 03:14:04] ERROR Metric verification failed: Relative Root Mean Square Error (RRMSE) across stratum p95/p99 latency sums = 0.231 (threshold <= 0.035).\n[2025-03-29 03:14:04] CRITICAL Trace sampling quality gate FAILED. Pipeline aborted.\n```\n\nThe trace sampling engine at `/opt/trace-sampler` is failing its production quality checks. Fix the defect in the sampling pipeline so that running `/opt/trace-sampler/bin/sample-ctl run` on any valid batch of spans produces a sampled Parquet dataset satisfying:\n1. Total sampled spans must be within the target sample budget $B \\pm 0.5\\%$ (unless the total input spans $N < B$, in which case exactly $N$ spans must be retained).\n2. No stratum with available spans may be assigned negative or zero quota if $B \\ge$ total active strata count.\n3. Stratum sample quota $n_h$ must never exceed the stratum population size $N_h$ ($n_h \\le N_h$).\n4. Each sampled span must include its exact Horvitz-Thompson expansion weight $w_h = N_h / n_h$.\n5. The weighted Horvitz-Thompson Relative Root Mean Square Error (RRMSE) of reconstructed total latency across all strata against ground truth must be $\\le 0.035$ (3.5%).",
+  "requirements": [
+   "Execute `/opt/trace-sampler/bin/sample-ctl run` against batch inputs and generate the output Parquet file without errors.",
+   "Total number of sampled spans in the output Parquet file must equal the target budget $B$ within a $\\pm 0.5\\%$ tolerance (or exactly total input spans $N$ when $N < B$).",
+   "For every active stratum $h$ where $N_h > 0$, the allocated sample count must satisfy $1 \\le n_h \\le N_h$ whenever $B \\ge$ the number of active strata.",
+   "Every sampled record in the output must record the stratum's exact Horvitz-Thompson weight $w_h = N_h / n_h$, such that the weighted sum $\\sum_{i \\in S_h} w_h \\cdot x_i$ is an unbiased estimator of total stratum metric values.",
+   "The Relative Root Mean Square Error (RRMSE) of Horvitz-Thompson estimated latency totals across all strata must not exceed 0.035 (3.5%) across all hidden evaluation batches."
+  ],
+  "environment": [
+   "Python 3.13-slim-bookworm container with `pyarrow`, `numpy`, `pyyaml`, and `scipy` pre-installed.",
+   "Small in-house codebase at `/opt/trace-sampler` containing ~1,250 lines across `sampler/ingest.py`, `sampler/stats.py`, `sampler/allocator.py`, `sampler/engine.py`, `sampler/evaluator.py`, and `bin/sample-ctl`.",
+   "Configuration file at `/etc/trace-sampler/config.yaml` specifying default parameters: `budget: 50000`, `tolerance: 0.005`, `max_rrmse: 0.035`.",
+   "Staging dataset in `/var/log/trace-spans/staging` containing 200,000 real traces partitioned into 64 strata with highly skewed, log-normal and Pareto tail latencies.",
+   "Planted Bug 1 in `sampler/allocator.py`: The Neyman allocation formula $n_h = B \\frac{N_h s_h}{\\sum_j N_j s_j}$ naively clips $n_h = \\min(n_h, N_h)$ in a single pass without redistributing excess budget $B - \\sum_{\\text{saturated}} N_h$ over the remaining unsaturated strata (water-filling algorithm). This causes severe budget under-allocation or sudden overflow when fallback floor rounding accumulates.",
+   "Planted Bug 2 in `sampler/stats.py`: Welford's online variance algorithm incorrectly accumulates intermediate variance by squaring raw nanosecond timestamps without zero-centering or log-scaling, triggering severe floating-point catastrophic cancellation for small variance strata with large baseline offsets, resulting in near-zero or negative variance estimates that starve high-volume baseline strata.",
+   "Planted Bug 3 in `sampler/engine.py`: When recording the Horvitz-Thompson expansion weight on each span, the code sets $w_h = B / n_h$ instead of $w_h = N_h / n_h$, causing estimators to diverge whenever individual strata sampling rates deviate from the global average rate $B / N$."
+  ],
+  "internal_hint": "Resolution requires: (1) Diagnosing `sampler/stats.py` where online variance calculation suffers catastrophic numerical cancellation; fixing it to maintain proper numerically stable two-pass or Welford updates with mean-centering. (2) Fixing `sampler/allocator.py` by implementing iterative bounded Neyman allocation (exact water-filling): repeatedly fix strata where $n_h \\ge N_h$ to $n_h = N_h$, subtract their count from remaining budget, and reallocate the remaining budget proportionally to $N_h s_h$ among the remaining unsaturated strata until all $n_h \\le N_h$ and integer rounding sums to $B$. (3) Fixing `sampler/engine.py` to write $w_h = N_h / n_h$ as the per-record expansion weight.",
+  "trap": "Testing only on uniform synthetic inputs or reading only `engine.py` might suggest just scaling the final span count with a uniform global multiplier or simple clipping. A uniform multiplier or single-pass clipping fails whenever heavy-tailed strata demand $n_h > N_h$, skewing RRMSE on tail latency strata beyond 0.15 on hidden seeds with heterogeneous variance.",
+  "tests": [
+   "Run `bin/sample-ctl run` on the staging data and verify that the exit code is 0 and output Parquet contains within [49750, 50250] spans.",
+   "Verify that every sampled span's recorded weight $w$ matches $N_h / n_h$ for its respective stratum.",
+   "Generate 3 fresh hidden datasets with random seeds (50k, 250k, and 500k spans) with heterogeneous Pareto tail latencies, run the sampler with diverse budgets (e.g., $B=12000, 45000, 80000$), and assert $n_h \\le N_h$ for all strata and total span count matches $B \\pm 0.5\\%$.",
+   "Compute RRMSE of the Horvitz-Thompson weighted latency totals across all strata against true population totals for all hidden runs; assert RRMSE <= 0.035 for every run."
+  ],
+  "verifier_knob": {
+   "name": "max_rrmse_threshold",
+   "value": "0.035",
+   "effect": "Lowering to 0.020 requires highly accurate integer apportionment (e.g. Largest Remainder / Hare-Niemeyer method); raising to 0.080 allows coarser integer rounding while still enforcing correct water-filling and variance estimation."
+  },
+  "expected_failure_modes": [
+   "Agent patches the single-pass clipping in `allocator.py` with an ad-hoc budget scale factor, which violates $n_h \\le N_h$ on small strata and fails the population bounds check on hidden runs.",
+   "Agent notices the budget failure and tunes the global budget clipping without discovering the catastrophic cancellation bug in `stats.py`, failing the RRMSE <= 0.035 accuracy threshold on heavy-tailed distributions.",
+   "Agent replaces Neyman allocation with uniform proportional sampling ($n_h = B \\cdot N_h / N$), which trivially meets the budget but fails the tail strata error threshold (RRMSE ~0.09-0.14) because tail strata with high variance are under-sampled."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "software-engineering",
+  "tags": [
+   "python",
+   "data-processing",
+   "debugging",
+   "statistics",
+   "algorithms"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/trace-sampler/bin/sample-ctl",
+   "cat /opt/trace-sampler/sampler/engine.py",
+   "cat /opt/trace-sampler/sampler/allocator.py",
+   "cat /opt/trace-sampler/sampler/stats.py",
+   "python3 -c \"import pyarrow.parquet as pq; df = pq.read_table('/var/log/trace-spans/staging').to_pandas(); print(df.columns, df.shape)\"",
+   "sed -i 's/weight = budget \\/ n_h/weight = N_h \\/ n_h/g' /opt/trace-sampler/sampler/engine.py",
+   "python3 -c \"# edit sampler/stats.py to replace naive sum-of-squares with mean-centered Welford / numpy.var(ddof=1)\"",
+   "python3 -c \"# edit sampler/allocator.py to implement iterative bounded Neyman allocation (water-filling) with floor=1\"",
+   "/opt/trace-sampler/bin/sample-ctl run --config /etc/trace-sampler/config.yaml --input-dir /var/log/trace-spans/staging --output /tmp/test.parquet",
+   "python3 -c \"import pyarrow.parquet as pq; t = pq.read_table('/tmp/test.parquet'); print(len(t), t.column('weight').to_numpy()[:5])\""
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Hidden seed datasets containing zero-variance strata (e.g. constant latency): pure Neyman allocation gives n_h = 0, but requirement 2 mandates n_h >= 1 when B >= stratum count. Solvers who implement standard Neyman formulas without special-casing zero variance might fail unexpectedly.",
+   "Ambiguity in handling B < total_active_strata: requirement 2 states 'if B >= total active strata count', but hidden tests testing small budgets could produce inconsistent allocation assertions if behavior for B < active strata count is unspecified.",
+   "Floating-point rounding differences in remainder allocation (e.g., largest remainder method vs floor rounding) could cause off-by-one budget violations if tolerances are tight on small budgets."
+  ],
+  "verdict": "reject",
+  "reasons": "All three planted bugs are directly visible on a quick read-through of a compact 1,250-line codebase across just three files (`engine.py`, `allocator.py`, `stats.py`). A frontier agent can inspect the source, recognize standard Neyman allocation clipping and Welford variance cancellation, and complete the repair in under 12 commands. Under the speedrun threshold guideline, tasks of this shape score at most 2 for genuine difficulty.",
+  "fixes": [
+   "Increase systemic complexity by decoupling the allocation logic across streaming micro-batches with persistent state rather than a single self-contained batch function.",
+   "Introduce non-trivial boundary interactions, such as dynamic strata discovery or memory-constrained reservoir sampling where water-filling cannot be done in a single in-memory array.",
+   "Explicitly define tie-breaking and zero-variance behavior in the specification so solvers do not fail hidden seed evaluation on synthetic zero-variance edge cases."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference task fixes binary frame demuxing and protocol parsing in a Rust telemetry pipeline, whereas the candidate focuses on correcting mathematical Neyman allocation and Horvitz-Thompson sampling algorithms in Python."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "The reference task debugs an eviction and silent overflow bug in a C sliding-window log deduplicator, while the candidate addresses stratified statistical sampling budget redistribution."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "The reference task involves state-machine rollback decisions and health-window tracking in a Node.js canary orchestrator, whereas the candidate is about repair of bounded Neyman allocation math in a trace sampler."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference task enforces rolling CPU-time budgets and ledger consistency in an HTTP evaluation service, which is unrelated to statistical survey sampling algorithms."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference task involves optimizing and fixing fixed-point arithmetic in a Rust sensor aggregation binary to match a reference binary, whereas the candidate focuses on stratified trace sampling quota allocation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fc33c63adc58",
+     0.178
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.125
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.107
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.066
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.065
+    ]
+   ],
+   "cost_usd": 0.00571725
+  },
+  "novel": true
+ },
+ "cost_usd": 0.020355750000000002
+}

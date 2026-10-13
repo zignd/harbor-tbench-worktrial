@@ -1,0 +1,188 @@
+{
+ "blueprint": {
+  "slug": "repair-fast-telemetry-replay",
+  "title": "Repair and accelerate telemetry replay",
+  "scenario": "An embedded gateway replays compact sensor frames into a SQLite-backed diagnostic database on a single low-power CPU. A recent firmware update made the replay utility both slow and unreliable: production logs show mismatched accepted-frame counts, occasional policy violations, and large slowdowns on mixed-quality input. The container contains a several-component C implementation, seeded SQLite databases, an opaque frame-policy shared library, a small visible corpus, and tools for generating larger replay runs.",
+  "instruction_draft": "$ ./bin/replay --db samples/gateway.db --input samples/mixed.frames\nreplayed 2400 frames: accepted=1718 rejected=682\nwarning: accepted count differs from audit expectation (1709)\nperf: 2400 frames in 1.84s (1304 frames/s)\nerror: policy audit mismatch for device edge-07\n\nThe gateway team needs this utility repaired before deploying it to battery-powered diagnostic units. Investigate the implementation and the supplied database/corpus, then modify the project so that `make clean all` succeeds and `bin/replay` satisfies all of the following observable behavior:\n\n- For every input frame, accept exactly the frames allowed by the frame format, the applicable device-policy history, the opaque policy library, and the replay rules represented by the existing schema; reject every other frame without crashing or corrupting the database.\n- Preserve the existing SQLite schema and produce deterministic `accepted_frames`, `rejections`, and `policy_audit` contents, including exact rejection categories and canonical payload hashes.\n- Apply the policy that was effective for a device at the frame timestamp, not merely the device's newest or currently active policy; sequence and replay checks must remain correct when frames are out of order, duplicated, or interleaved across devices.\n- Treat malformed lengths, truncated TLVs, embedded NUL bytes, invalid UTF-8 identifiers, integer boundary values, duplicate fields, hostile payloads, and SQL metacharacters as untrusted input. Such input must be rejected safely and must not alter SQL structure or process memory.\n- Retain every valid frame, including valid frames whose payload contains zero bytes or unusual but permitted extension fields, and retain no frame twice even when duplicates occur in one batch or across separate invocations.\n- Make repeated replay idempotent: replaying the same input against the resulting database must not add accepted rows or change audit results.\n- Improve the supplied workload throughput to at least 30,000 frames per second on the container's single CPU, while keeping peak resident memory below 160 MiB. The measurement uses a fresh database and a generated 25,000-frame mixed corpus, so a special case for the sample files is not sufficient.\n- Do not change the command-line interface, database filename arguments, output table names, or the public ABI used to load `libwiregate.so`.",
+  "requirements": [
+   "The project must build successfully with `make clean all`.",
+   "The replay utility must accept exactly valid frames and reject every invalid or policy-disallowed frame without crashing or corrupting SQLite state.",
+   "The resulting `accepted_frames`, `rejections`, and `policy_audit` tables must be deterministic and contain exact expected values and canonical payload hashes.",
+   "Historical device policy effective at each frame timestamp must be used.",
+   "Out-of-order, duplicate, and interleaved device sequences must be handled correctly.",
+   "Malformed lengths, truncated TLVs, embedded NULs, invalid UTF-8, integer boundaries, duplicate fields, hostile payloads, and SQL metacharacters must be handled safely.",
+   "Valid binary payloads and permitted extension fields must be retained.",
+   "Replay must be idempotent across repeated invocations.",
+   "The generated workload must reach at least 30,000 frames per second on one CPU.",
+   "Peak resident memory must remain below 160 MiB.",
+   "The existing CLI, SQLite schema, table names, and `libwiregate.so` ABI must remain compatible."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned apt packages including gcc, make, sqlite3, libsqlite3-dev, binutils, gdb, strace, and valgrind.",
+   "The repository contains approximately 1,500 lines of C across `src/replay.c`, `src/frame.c`, `src/sqlite_store.c`, `src/policy_cache.c`, and unrelated logging and CLI components, plus a Makefile and fixture-generation scripts.",
+   "Input is a documented binary FRM2 stream: fixed header, little-endian length, mandatory and optional TLV fields, CRC, and payload bytes. The format permits binary payloads and versioned extension fields.",
+   "The supplied `samples/gateway.db` contains device metadata, multiple historical policy intervals, accepted-frame history, and audit rows. Several visible examples are deliberately ordinary and do not exercise temporal policy transitions or NUL-containing payloads.",
+   "The project ships `libwiregate.so` as an opaque precompiled shared object with a public header but no source. It performs canonical frame authorization and payload digesting, and must continue to be loaded through the existing ABI.",
+   "The initial implementation performs SQLite work through a mixture of per-frame statements and cached state, uses a bounded scratch buffer in the frame path, and has state-dependent behavior that only diverges after prior accepted history, policy changes, or binary payloads.",
+   "A visible corpus in `samples/mixed.frames` includes benign frames, malformed frames, duplicate sequence numbers, and a few policy failures. `tools/inspect_db.py`, `tools/frame_dump`, and `tools/bench_replay.py` allow investigation without network access.",
+   "The verifier has a reference implementation and a corpus generator. At verification time it creates fresh databases from hidden seeds, including different policy interval layouts, device counts, historical accepted sequences, extension-field ordering, and generated benign and malicious frames."
+  ],
+  "internal_hint": "The intended resolution requires instrumenting and running the program rather than merely reading the obvious parser. First compare database snapshots and audit rows before and after batches, trace SQLite statements, and use frame_dump plus the opaque library on crafted inputs. The major correctness issue is a combination of stale per-device replay state and policy lookup that assumes the newest policy applies globally; the correct decision uses the policy interval containing the frame timestamp and the maximum accepted sequence already committed for that device. A second data-dependent issue is the frame/canonicalizer boundary: binary payloads and extension fields can contain NULs, so C-string length and comparison assumptions lose bytes and produce an incorrect digest or authorization result. The performance repair is to use one explicit transaction per replay, reset/bind a small set of prepared statements, and maintain only safe per-device state while preserving SQLite's uniqueness/idempotence constraints. The opaque library can be reverse-engineered experimentally with its header, frame_dump, and differential calls; it must not be replaced with an approximate reimplementation.",
+  "trap": "A shallow fix commonly makes the sample count match by selecting the latest device policy, using `strlen`-based payload handling, or wrapping all visible rows in one transaction. That passes ordinary ASCII samples but fails fresh databases with policy rollovers, frames containing embedded NULs, reordered TLVs, duplicate history, and sequences that become valid or invalid only after earlier records. Another common solution caches the newest sequence in process memory and therefore breaks idempotence or a second invocation. A benchmark-only solution that bulk-loads or skips rejected rows can meet the speed target while producing incorrect audit tables.",
+  "tests": [
+   "Build test: runs `make clean all` and executes the existing visible regression suite.",
+   "Visible functional test: replays the supplied mixed corpus and compares accepted rows, rejection categories, policy audit rows, and hashes with the reference.",
+   "Malformed-input corpus test: feeds truncated headers, inconsistent lengths, invalid TLVs, duplicate mandatory fields, invalid UTF-8, extreme integer values, embedded NULs, oversized payloads, and SQL metacharacters; checks for rejection, no crash, unchanged schema, and no SQL injection.",
+   "Binary-retention test: generates valid payloads containing zero bytes, all byte values, and permitted extension fields in multiple orders; checks exact canonical hashes and accepted payload lengths.",
+   "Historical-policy test: builds fresh databases with several overlapping and adjacent policy intervals and generates frames around every boundary; compares decisions with the timestamp-effective reference policy.",
+   "Replay-state test: generates interleaved devices, out-of-order sequence numbers, duplicates within one stream, and duplicates across two invocations; checks accepted history, rejection reasons, and idempotence.",
+   "Opaque-policy differential test: uses hidden frames that distinguish exact `libwiregate.so` authorization and canonicalization from simplified parser approximations.",
+   "Fresh-seed corpus test: creates new databases and 25,000-frame mixed corpora from hidden seeds, including rare malformed and benign extension cases, then compares the complete SQLite state to the reference rather than checking only counts.",
+   "Performance test: measures end-to-end replay on a fresh generated corpus and requires at least 30,000 frames/second on one CPU with peak RSS below 160 MiB.",
+   "Adversarial repeat test: runs the same generated corpus twice and verifies byte-equivalent database dumps and unchanged accepted-row cardinality."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_corpus_size_and_coverage",
+   "value": "18 hidden database seeds and 60,000 generated frames per verification run, with approximately 20% malformed/adversarial inputs, 15% historical-policy boundary cases, 10% binary/NUL payload cases, and 10% duplicate or out-of-order sequence cases",
+   "effect": "Lowering the value makes sample-oriented fixes more likely to pass and reduces performance pressure. Raising it adds more policy histories, extension combinations, rare binary cases, and longer stateful streams, making hard-coded assumptions and shallow validation increasingly likely to fail while preserving deterministic reference results."
+  },
+  "expected_failure_modes": [
+   "Uses current device policy instead of timestamp-effective historical policy.",
+   "Tracks only the last input sequence rather than the maximum committed accepted sequence.",
+   "Uses strlen, strcmp, or text SQLite bindings for binary payloads containing NUL bytes.",
+   "Reimplements the opaque policy library approximately and differs on extension ordering or canonicalization.",
+   "Fixes visible counts but leaves stale prepared-statement bindings or transaction state that contaminates later records.",
+   "Uses one transaction but fails to preserve exact rejection and policy-audit rows.",
+   "Passes one invocation but inserts duplicates or changes results on replay.",
+   "Improves speed by buffering all input or accepted payloads and exceeds the memory limit.",
+   "Validates only the visible corpus and misses rare valid extension fields or malicious length combinations.",
+   "Changes the schema, CLI, or shared-library loading contract while making the local sample pass."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "c",
+   "sqlite",
+   "performance",
+   "reverse-engineering",
+   "adversarial-input",
+   "stateful-debugging"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, build artifacts, fixtures, and helper tools.",
+   "Read the Makefile, public ABI header, schema definitions, and all replay-related C sources.",
+   "Run `make clean all` and the visible regression suite.",
+   "Run the sample replay and record its stdout, exit status, and database diff.",
+   "Inspect the seeded database and audit rows with `tools/inspect_db.py` and SQLite queries.",
+   "Dump representative frames, including malformed and duplicate samples, with `tools/frame_dump`.",
+   "Capture SQLite statements and transaction behavior with `strace` or SQLite tracing.",
+   "Inspect `libwiregate.so` symbols, strings, ABI usage, and existing call sites.",
+   "Construct small differential inputs and compare frame-dump and opaque-library authorization and digest results.",
+   "Trace the parser, policy lookup, replay-state handling, and SQL binding paths in the source.",
+   "Identify all text-length, string-comparison, stale-state, and per-frame transaction paths.",
+   "Fix frame parsing to use bounded byte lengths and preserve binary payloads and extension fields.",
+   "Fix validation for lengths, TLVs, duplicate fields, UTF-8, integer bounds, and hostile input.",
+   "Replace newest-policy lookup with timestamp-effective historical interval lookup and explicit tie handling.",
+   "Compute replay validity from the maximum committed accepted sequence for each device.",
+   "Preserve the opaque library as the authorization and canonicalization authority through its existing ABI.",
+   "Make accepted, rejection, and audit writes use correct binary bindings and exact categories.",
+   "Add idempotent uniqueness/conflict handling without changing the schema or table names.",
+   "Use one explicit replay transaction with reset-and-bind prepared statements and bounded per-device state.",
+   "Rebuild with `make clean all` and rerun the visible sample comparison.",
+   "Run malformed-input and SQL-injection cases, checking crashes, schema changes, and database integrity.",
+   "Run binary/NUL payload and extension-order cases and compare hashes and retained lengths.",
+   "Run historical-policy, interleaving, out-of-order, and repeated-invocation cases against fresh databases.",
+   "Compare complete SQLite state and audit output against the supplied reference tooling.",
+   "Run the generated 25,000-frame benchmark while measuring throughput and peak RSS.",
+   "Repeat the full corpus and verify idempotence, deterministic dumps, and final performance."
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact rejection-category vocabulary and canonical payload-hash rules are not stated explicitly, so a solver may be unable to reproduce required values without relying on undocumented implementation details.",
+   "Overlapping policy intervals and equal timestamps do not specify a deterministic precedence rule.",
+   "Performance and peak-RSS results can vary with container scheduling, SQLite build options, CPU frequency, and the unspecified measurement procedure.",
+   "A requirement for byte-equivalent SQLite dumps is potentially invalid unless the verifier uses a canonical logical dump rather than raw database bytes or unordered query output.",
+   "The boundary between malformed input and valid versioned extension fields is not fully specified, especially for duplicate or reordered TLVs.",
+   "The opaque library may be impossible to reproduce or probe reliably if required runtime files, symbol visibility, or its test ABI differ across the described image and actual verifier."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic, highly verifiable in principle, and genuinely difficult, but the required repair scope is not plausibly solvable by a skilled engineer in under an hour: it combines parser hardening, opaque-library differential work, temporal policy semantics, idempotent state repair, SQLite optimization, and extensive validation. Several exact-output and benchmark details are also underspecified, so the low solvability score violates the acceptance rule.",
+  "fixes": [
+   "Provide an explicit normative specification for rejection categories, canonical hashing, policy-interval tie breaking, and duplicate/audit semantics.",
+   "Define the benchmark CPU pinning, warm-up, timing interval, SQLite configuration, and RSS measurement method.",
+   "Require canonical logical database comparisons with explicit ordering instead of byte-equivalent raw SQLite dumps.",
+   "Either split the task into correctness and performance phases or reduce hidden-case breadth and provide substantially more time.",
+   "Document a supported way to exercise the opaque library differentially, including required ABI calls and expected input/output conventions."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a stateful binary telemetry validator and SQLite replay pipeline, whereas this task hardens an HTTP route-classification gateway."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Although both process hostile binary frames deterministically, the candidate concerns device policies and SQLite acceptance history while this task performs cryptographic settlement reconciliation and monetary adjustment accounting."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Both involve replay utilities, but the candidate validates sensor frames against historical device policy into existing SQLite tables, while this task reconstructs committed sharded transactions into a canonical JSON snapshot."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate handles frame admission, sequencing, policy audits, and idempotent SQLite storage, whereas this task archives events and builds incidents through timestamped aliases and correlation components."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate is a bounded telemetry-frame validator and database writer, while this task is a persistent multi-tenant log-recovery service with CRUD operations and reconstructed authoritative state."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.278
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.253
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.232
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.23
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.23
+    ]
+   ],
+   "cost_usd": 0.0012691999999999998
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0040782
+}

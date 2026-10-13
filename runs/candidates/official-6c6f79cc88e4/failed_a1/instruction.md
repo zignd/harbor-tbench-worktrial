@@ -1,0 +1,5 @@
+Harden the deployed gateway so every request is classified according to the route policy in `/etc/gateway/policy.toml`: allow every policy-valid request and reject every policy-invalid request, including after arbitrary prior traffic.
+
+The newline-delimited JSON interface and local HTTP endpoint must preserve input order and emit exactly one deterministic decision per request. Malformed JSON, missing or invalid fields, oversized targets, embedded control bytes, invalid encodings, and adversarial percent-encoded or dot-segment paths must be rejected without crashing or hanging. Equivalent requests through either interface must receive the same result, and the service must remain available after malformed requests and long streams.
+
+Keep the deployment runnable through `/opt/gateway/bin/entrypoint` without network access. Apply the ordered byte-oriented policy in `/etc/gateway/policy.toml`, including method and route rules, decoding, separator and dot-segment handling, Unicode behavior, control-byte restrictions, and maximum decoded length. Do not lose, reorder, or merge requests containing whitespace, quoting, escaped characters, or shell metacharacters.

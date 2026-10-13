@@ -1,0 +1,195 @@
+{
+ "blueprint": {
+  "slug": "offline-vulnerability-feed-gate",
+  "title": "Repair the Offline Vulnerability Gate",
+  "scenario": "A small embedded-device vendor runs an offline package inventory and vulnerability gate inside one container because its gateways cannot afford a hosted security service. The container contains a Go inventory service, a Go gatekeeper service, several feed importers, a SQLite state store, and shell deployment tooling; a recent feed-format feature was shipped but produces subtly incorrect enforcement decisions on real fleet data.",
+  "instruction_draft": "$ ./deploy.sh --check\ninventory: 2,384 packages scanned\nfeeds: 17 imported, 4 warnings\n gatekeeper: 1,912 vulnerable packages, 0 quarantines\nERROR: policy snapshot is inconsistent with inventory\n\nImplement the offline vulnerability-gate feature so that a clean deployment builds the authoritative state from the supplied inventory and feeds, starts or reloads the services, and produces the correct decisions for every package. The deployment must accept all documented feed formats in the fixture tree, including files and package names containing whitespace, preserve advisory aliases and source provenance, and be safe to run repeatedly.\n\nFor each inventory package, record exactly one current assessment per applicable advisory in the SQLite state database. An assessment is vulnerable only when the package's normalized name and supported architecture match the advisory and its version lies in an affected interval; a package at a listed fixed version is not vulnerable. Apply documented product, package, severity, ignore, and withdrawal policy rules in their stated order, retain non-vulnerable and suppressed assessments with their reason, and do not let a malformed feed remove previously committed valid data.\n\nThe running gatekeeper must answer the documented Unix-socket query protocol from the committed snapshot. Its answers must agree with the database, include all applicable advisory aliases and the effective remediation version, and distinguish vulnerable, fixed, ignored, withdrawn, and unknown packages. A successful deployment must atomically publish the complete snapshot, remove stale rows from an earlier deployment, emit deterministic sorted exports and counts, and leave no temporary or partially written state. Do not change the fixture inputs or weaken the query protocol.",
+  "requirements": [
+   "Implement a repeatable deployment using the supplied deploy/check entry points.",
+   "Import every documented vulnerability-feed format present in the fixture tree.",
+   "Handle arbitrary file names and package names containing whitespace without losing or merging records.",
+   "Normalize package names, architectures, and versions according to the repository's documented rules.",
+   "Create exactly one current assessment for each inventory-package/advisory pair that is applicable under the documented matching rules.",
+   "Determine vulnerability from the documented affected intervals and fixed-version semantics, including boundary versions.",
+   "Apply product, package, severity, ignore, withdrawal, and precedence policies in the documented order.",
+   "Preserve advisory aliases, source provenance, effective remediation versions, and suppression or withdrawal reasons.",
+   "Retain valid previously committed data when a feed is malformed, while reporting the malformed input.",
+   "Remove stale assessments and inventory rows from prior deployments.",
+   "Publish the complete SQLite snapshot atomically.",
+   "Make repeated deployments idempotent and deterministic.",
+   "Keep deterministic sorted exports and aggregate counts synchronized with the SQLite snapshot.",
+   "Start or reload the gatekeeper service only after a complete snapshot is committed.",
+   "Make gatekeeper Unix-socket responses agree with the committed database.",
+   "Support the documented vulnerable, fixed, ignored, withdrawn, and unknown query outcomes.",
+   "Do not modify fixture inputs or weaken the existing query protocol.",
+   "Leave no temporary, partial, or obsolete snapshot artifacts after a successful deployment."
+  ],
+  "environment": [
+   "The Dockerfile uses FROM python:3.13-slim-bookworm with pinned apt and pip dependencies, Go tooling, SQLite, and no network access.",
+   "The image contains roughly 1,600 lines of Go across an inventory scanner, feed importer, SQLite writer, Unix-socket gatekeeper, and command-line diagnostics, plus several shell deployment scripts.",
+   "A background inventory service exposes the current embedded-device package inventory through a local Unix socket and periodically writes raw inventory batches.",
+   "A background gatekeeper service reads a generated SQLite snapshot and answers newline-delimited JSON queries over another Unix socket.",
+   "The repository contains documented JSON advisories, vendor CSV advisories, and a compact line-oriented delta-feed format, along with product policy files and an inventory of approximately 2,000 packages.",
+   "The planted implementation problems include lexical version comparisons in one importer, inconsistent normalization between importers, incorrect interval endpoint handling, alias loss during deduplication, stale-row retention, a shell loop that mishandles whitespace, and service reloads that can observe an incomplete snapshot.",
+   "The fixtures include duplicate advisories, withdrawn advisories, package renames, multiple architectures, epochs and revision suffixes in versions, overlapping affected intervals, fixed-version boundaries, ignored findings, malformed optional records, and a few filenames containing spaces.",
+   "The repository includes a protocol document and small visible examples, but the large verification corpus is generated from a hidden seed at verification time."
+  ],
+  "internal_hint": "First map the deployment graph, SQLite schema, socket protocols, and feed documentation rather than trusting the visible count. Exercise each importer against records whose versions sit exactly on interval and fixed-version boundaries, then compare raw inventory, canonical advisory rows, findings, exports, and socket answers; this exposes that each path applies a different normalization and comparison rule. Replace the scattered matching logic with one deterministic Go canonicalization and interval engine, preserve aliases and provenance through deduplication, and make policy evaluation an explicit ordered stage. Fix the shell orchestration to use null-delimited discovery and checked temporary directories, build the complete database in a temporary SQLite file, validate it and its exports, atomically rename it, and only then signal the gatekeeper. The reference solution is a deterministic shell script that investigates the service/schema behavior and generated intermediate data before applying these fixes.",
+  "trap": "A shallow solution can make the visible sample count look correct by sorting strings or importing only the newest advisory, but hidden records use epochs, tilde-like prereleases, revision suffixes, overlapping intervals, renamed packages, and aliases. It also commonly leaves stale rows, drops files with spaces, treats withdrawn findings as absent, or reloads the service before the database and exports are consistent; the hidden verifier checks all of those properties on a newly generated corpus.",
+  "tests": [
+   "Generate a fresh inventory and feed tree from a hidden seed containing thousands of package records and compare every canonical advisory, alias, provenance, finding status, reason, and remediation version in SQLite with the reference state.",
+   "Exercise all three documented feed formats, including duplicate, overlapping, withdrawn, malformed, and package-rename records.",
+   "Check version ordering across epochs, prerelease markers, revisions, equal fixed versions, and affected-interval open and closed endpoints.",
+   "Check architecture and normalized-name matching, including non-applicable records that must not create findings.",
+   "Check policy precedence for product exclusions, package ignores, severity thresholds, and withdrawal handling.",
+   "Run deployment twice and verify byte-for-byte deterministic exports, identical row sets, stable counts, and no duplicate rows.",
+   "Seed the destination with rows from a previous inventory and verify that removed packages and advisories are absent after deployment.",
+   "Inject a malformed feed and verify that valid committed data remains intact and the deployment reports the malformed input rather than publishing partial state.",
+   "Create fixture paths and package names containing whitespace and verify that every record is imported.",
+   "Query the running Unix-socket gatekeeper for generated vulnerable, fixed, ignored, withdrawn, and unknown packages and compare responses with SQLite.",
+   "Interrupt or force a failed pre-commit step and verify that the old complete snapshot remains usable and no partial snapshot is visible.",
+   "Check aggregate vulnerable, fixed, ignored, withdrawn, and unknown counts and the deterministic sorted export against the reference."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "fresh hidden feed and inventory seeds with approximately 2,000 packages, 1,000 advisories, and 10,000 assessment candidates",
+   "effect": "Increasing the number and diversity of generated records makes sampling or hard-coding visible examples ineffective and exposes rare version, alias, policy, and stale-state interactions; lowering it makes manual inspection and partial importer fixes more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the visible lexical comparison but leaves a second importer or the gatekeeper using different version semantics.",
+   "The agent implements only the JSON feed and silently ignores vendor or delta records.",
+   "The agent treats advisory aliases as duplicate rows and loses required aliases or provenance.",
+   "The agent interprets withdrawal as deletion instead of a retained withdrawn assessment.",
+   "The agent uses a shell pipeline that splits whitespace-containing paths or records.",
+   "The agent performs an in-place SQLite update and leaves stale rows or a partially published snapshot.",
+   "The agent reloads the service before the atomic commit, causing socket answers to disagree with final database state.",
+   "The agent validates only aggregate counts, missing rare boundary-version and policy-precedence cases.",
+   "The agent makes the visible example pass with a special-case ordering or fixed-version rule that fails hidden generated intervals.",
+   "The agent changes the query protocol or fixture data instead of repairing the importer and deployment pipeline."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "go",
+   "shell-scripting",
+   "sqlite",
+   "vulnerability-management",
+   "hidden-seeds",
+   "atomic-deployment"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "find . -maxdepth 2 -type f -print0 | sort -z | xargs -0 -n1 echo",
+   "cat README* and repository task documentation",
+   "read the feed-format, policy, schema, deployment, and socket-protocol documents",
+   "inspect deploy.sh, check entry points, and service startup/reload scripts",
+   "inspect the SQLite schema and existing migrations or snapshot builders",
+   "inspect inventory scanning, raw-batch generation, and normalization code",
+   "inspect all three feed importers and their deduplication paths",
+   "inspect version comparison and affected-interval logic",
+   "inspect policy evaluation and gatekeeper query handling",
+   "run the visible check and capture baseline database, exports, logs, and socket responses",
+   "trace one record from each feed format through canonical advisory rows and assessments",
+   "add one shared Go canonicalization and version/interval engine",
+   "update every importer and gatekeeper path to use the shared engine",
+   "preserve aliases, provenance, remediation versions, and suppression or withdrawal reasons through deduplication",
+   "implement explicit ordered product, package, severity, ignore, and withdrawal policy evaluation",
+   "replace whitespace-unsafe shell discovery and loops with null-delimited handling",
+   "make deployment build and validate a complete temporary SQLite snapshot and exports",
+   "remove stale inventory and assessment rows by rebuilding from the current authoritative inputs",
+   "atomically publish the database and exports only after validation succeeds",
+   "reload or start the gatekeeper only after the atomic publish",
+   "run gofmt, go test, shell syntax checks, and rebuild all binaries",
+   "run deployment twice and compare database rows, exports, counts, and service responses byte-for-byte",
+   "exercise malformed feeds, whitespace paths, boundary versions, aliases, withdrawals, and policy precedence",
+   "exercise a forced pre-commit failure and verify the old snapshot and gatekeeper remain usable"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact normalization, version ordering, policy precedence, assessment schema, and socket response fields are delegated to repository documentation; if those documents are incomplete or inconsistent, failures would be ambiguous rather than task failures.",
+   "The requirement to retain valid data after a malformed feed does not specify the behavior on a first-ever deployment, which committed version is retained, or whether the malformed feed causes a nonzero deployment while leaving services running.",
+   "The meaning of an 'unknown' package and whether unknown packages require assessment rows and aggregate counts is not fully defined.",
+   "Interrupting a deployment at a precise pre-commit point can be timing-sensitive unless the repository provides an explicit failure-injection hook.",
+   "Verify-time hidden seed generation and service reload tests could be flaky if record ordering, timestamps, socket startup, or export metadata are not controlled.",
+   "A no-network Docker build is invalid if Go modules or pinned apt/pip dependencies are not vendored or present in the image cache."
+  ],
+  "verdict": "reject",
+  "reasons": "The intended behavior is broadly clear and the verification plan is strong, but the requested repair spans multiple importers, a shared version engine, policy semantics, SQLite publication, shell orchestration, and a live service. A skilled engineer is unlikely to implement and validate all of this reliably in under an hour, so solvability fails the acceptance threshold. Several malformed-input, unknown-status, and failure-injection semantics also need to be made explicit.",
+  "fixes": [
+   "Reduce the scope to one primary importer plus the canonical matching and atomic deployment path, or provide substantially more implementation time.",
+   "Add a concise normative behavior document with canonical normalization, version ordering, interval endpoint rules, policy precedence, unknown semantics, and exact malformed-feed behavior.",
+   "Specify first-deployment behavior when a feed is malformed and define whether the command exits nonzero while preserving the prior service state.",
+   "Provide deterministic failure-injection controls for pre-commit and reload tests instead of relying on timing or process interruption.",
+   "Make the hidden-seed generator and verifier ignore timestamps and filesystem ordering, and document all required response fields and aggregate-count definitions."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/pypi-server",
+     "verdict": "distinct",
+     "reason": "This concerns building and serving a Python package, not reconciling vulnerability feeds, inventory assessments, and policy-driven gatekeeper state."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Although both require deterministic atomic snapshot generation, this task evaluates vulnerability-feed normalization and policy matching rather than replaying checksummed transactional event shards."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The artifact index reconciler shares idempotent SQLite and unusual-filename handling, but its core problem is scanner-authoritative artifact classification rather than advisory applicability and vulnerability enforcement."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "This task reconstructs incident and actor-correlation records from event data, whereas the candidate computes package-advisory assessments and gatekeeper decisions from feeds and inventory."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "Despite overlapping persistence, recovery, and deterministic protocol requirements, this task is an event-log-backed key-value replay service rather than an offline vulnerability-gate deployment."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/pypi-server",
+     0.163
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.147
+    ],
+    [
+     "ours/official-982469e29790",
+     0.134
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.133
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.128
+    ]
+   ],
+   "cost_usd": 0.0009361999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0033956
+}

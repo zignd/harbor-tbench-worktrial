@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "repair-log-metric-replay",
+  "title": "Repair the Log Metric Replay Pipeline",
+  "scenario": "I inherited an internal SQL-backed log replay job that turns newline-delimited service logs into session and metric tables, but its recovery behavior and edge-case handling are no longer trustworthy. The container includes the runner, schema, SQL stages, a small opaque line-framing helper, fixtures, and operational notes; please make the existing command produce correct results without changing its CLI.",
+  "instruction_draft": "Can you get `./bin/replay-metrics` working reliably again? It must process every independent NDJSON record, keep every record that satisfies the documented event contract, reject only invalid records with a reason, and never let one bad line discard neighboring good lines. The final session and daily metric outputs must be deterministic, must treat fields as data rather than executable SQL, and must be identical whether the run completes normally or resumes after any injected stage failure; please preserve the existing output schemas and command-line interface.",
+  "requirements": [
+   "The existing `./bin/replay-metrics` command-line interface and output schemas must remain usable.",
+   "Each newline-delimited input record must be handled independently.",
+   "Every record satisfying the documented event contract must be retained.",
+   "Every record violating the documented event contract must be rejected with the documented rejection category and must not enter downstream tables.",
+   "A malformed or hostile record must not abort processing or cause adjacent valid records to be discarded.",
+   "Input values, including service names, tenant names, request identifiers, and message text, must be treated as data and must not alter SQL behavior.",
+   "Session assignment and metric aggregation must be deterministic for equal timestamps and repeated input.",
+   "The final output must be identical after a normal run and after resuming from an injected failure at any stage boundary.",
+   "Replaying the same input, including a replay after partial progress, must not double-count accepted events or sessions.",
+   "The final session output and daily metric output must use the existing documented schemas and exact reference values."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned SQLite/Python dependencies and no network requirement.",
+   "Roughly 1,500 lines across a Python command runner, SQL schema and stage files, a recovery/checkpoint module, test utilities, configuration, and unrelated operational helpers.",
+   "The pipeline has four dependent stages: line framing and staging, SQL validation/canonicalization, SQL sessionization, and SQL daily metric aggregation.",
+   "The input contract and output schemas are documented in `/opt/replay/README.md` and `/opt/replay/docs/event-contract.md`; the contract includes UTC-normalized timestamps, bounded numeric fields, required tenant/service/request fields, event-type-specific columns, and a deterministic source-position tie breaker.",
+   "The supplied fixtures contain ordinary requests, retries, offset timestamps, equal timestamps, malformed JSON, missing fields, and a few SQL-looking strings, but do not cover the full adversarial corpus.",
+   "An opaque `/opt/replay/bin/linecodec` helper is used for physical line framing and byte decoding. It is shipped without source and has a documented interface; it emits record offsets, decoded text, and framing errors.",
+   "The planted defects include validation that relies on permissive SQLite coercions and incomplete JSON-key checks, timestamp ordering that loses source-position information, a session window partition that omits a tenancy dimension, aggregation that can consume stale intermediate rows after recovery, and non-idempotent checkpoint writes.",
+   "The runner supports deterministic failure injection through the existing `REPLAY_FAIL_AFTER` environment variable and has resume/checkpoint commands described in the operational notes.",
+   "A deterministic reference generator and hidden-test harness are included outside the solver-visible fixture corpus; the reference solution is a shell script that first exercises framing, validation, recovery, and stage outputs before applying the repair."
+  ],
+  "internal_hint": "Start by listing the repository and reading the contract and recovery notes, then run the supplied fixtures while dumping each stage's tables and checkpoint state. Generate small probes for duplicate JSON keys, numeric-looking strings, offset timestamps, embedded NUL/control bytes, malformed neighbors, repeated request IDs, equal timestamps, and tenant changes; compare normal, interrupted, resumed, and replayed runs. The durable fix is to make stage one validate the decoded record against the full contract without SQLite's implicit conversions, persist a canonical accepted/rejected decision keyed by source identity, carry source position and normalized timestamp through every stage, use the full tenant/service/request identity in session windows, and make each stage's replacement/checkpoint transaction idempotent. Verify all failure offsets and then run a larger generated corpus before finalizing.",
+  "trap": "A shallow repair that tightens a visible regex or adds a simple `json_valid` check passes the fixtures but accepts duplicate-key objects, booleans or numeric strings through SQLite coercion, mishandles offset timestamps, or rejects valid records containing escaped control characters. Another plausible repair fixes normal aggregation but loses source-position tie ordering, merges sessions across tenants, or leaves stale rows after a crash, causing hidden generated inputs to differ only after stage recovery or replay.",
+  "tests": [
+   "Run the original visible fixtures and compare accepted rows, rejection reasons, sessions, and daily metrics against the reference.",
+   "Generate fresh valid events with varied tenants, services, request IDs, escaped Unicode, messages containing SQL metacharacters, offset timestamps, retries, equal timestamps, and boundary numeric values; verify that all valid events survive and produce exact reference outputs.",
+   "Generate invalid events covering malformed JSON, duplicate keys, wrong JSON types, missing event-specific fields, invalid timestamp offsets, out-of-range values, control-byte framing errors, and extra ambiguous fields; verify exact rejection behavior and that valid neighboring lines remain present.",
+   "Use generated hostile strings containing quotes, semicolons, comments, null bytes where permitted by the contract, and SQL keywords; verify that they are stored or rejected as data and never execute or alter table contents.",
+   "Generate records whose chronological order differs from file order and whose timestamps tie; verify canonical UTC ordering and deterministic source-position tie breaking in sessions and metrics.",
+   "Generate multiple tenants sharing service names and request identifiers; verify that session boundaries and counts do not cross the documented identity dimensions.",
+   "Inject a deterministic failure after each framing, validation, sessionization, and aggregation checkpoint, resume the run, and compare every final table byte-for-byte with a clean run.",
+   "Run the same completed input twice and resume after a completed or partially completed run; verify no duplicate accepted events, sessions, or metric counts.",
+   "Run a corpus of thousands of mixed benign and malicious records with rare boundary cases and compare all stage outputs to a hidden deterministic reference implementation."
+  ],
+  "verifier_knob": {
+   "name": "adversarial corpus size and coverage",
+   "value": "12,000 generated records across 40 seeded corpora, including approximately 1,000 invalid records and 200 recovery schedules",
+   "effect": "Lowering this to a few hundred records makes shallow validation and normal-run-only fixes look correct. Raising it adds more combinations of JSON type confusion, Unicode and framing boundaries, timestamp ties, tenant interleavings, replay patterns, and crash points, making partial repairs increasingly unlikely to pass."
+  },
+  "expected_failure_modes": [
+   "The solver fixes only the visible malformed-JSON examples and misses SQLite type coercion or duplicate-key semantics.",
+   "The solver validates records correctly but drops valid lines when the opaque framer reports a neighboring framing error.",
+   "The solver normalizes timestamps but fails to preserve deterministic source-position ordering for ties.",
+   "The solver repairs sessionization without carrying tenant identity through all dependent stages.",
+   "The solver makes a normal run correct while leaving checkpoint writes or stage replacement non-atomic, so resume produces stale or duplicated downstream rows.",
+   "The solver tests only the final CSV and does not inspect intermediate state, missing a small early error that compounds into metrics.",
+   "The solver changes output formats or CLI behavior while attempting to simplify the pipeline.",
+   "The solver relies on ad hoc Python preprocessing instead of making the SQL stages and recovery protocol agree, causing hidden replay cases to diverge."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "sql-log-recovery",
+  "tags": [
+   "sql",
+   "logs",
+   "metrics",
+   "recovery",
+   "adversarial-inputs",
+   "systems"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect repository tree and executable entry point.",
+   "Read `/opt/replay/README.md`, `docs/event-contract.md`, and operational recovery notes.",
+   "Read the Python runner, configuration, and test utilities.",
+   "Read the schema and all four SQL stage files.",
+   "Read the checkpoint/recovery module and inspect the opaque `linecodec` interface.",
+   "Run the supplied fixtures normally and dump accepted, rejected, staged, session, metric, and checkpoint tables.",
+   "Run small probes for duplicate keys, JSON type coercion, offset timestamps, control bytes, hostile strings, equal timestamps, repeated IDs, and tenant changes.",
+   "Run failure injection at each documented checkpoint and compare resumed state with a clean run.",
+   "Patch framing/staging so each physical record has stable source identity and neighboring framing errors do not discard it.",
+   "Patch validation/canonicalization to parse exact JSON types, detect duplicate keys, enforce the full contract, and persist idempotent accepted/rejected decisions.",
+   "Carry normalized timestamps, source position, and full identity through sessionization and preserve deterministic tie ordering.",
+   "Fix session partitioning to include all documented tenancy dimensions.",
+   "Make stage replacement, checkpoint writes, and downstream invalidation atomic and idempotent.",
+   "Run normal, interrupted/resumed, completed replay, and partial replay scenarios.",
+   "Run the visible tests and a generated adversarial corpus, comparing every stage and final output to the reference."
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The task is invalid if the event contract does not explicitly define duplicate-key handling, extra-field policy, JSON number versus boolean/string typing, and exact rejection-category precedence.",
+   "The task is invalid if the opaque framer's behavior for malformed neighboring lines, embedded NULs, and decoded control characters is not deterministic and fully documented.",
+   "A requirement for final tables to match byte-for-byte is ambiguous unless it specifies a canonical serialization or exact row/order comparison; SQLite table storage bytes are not a stable verifier-level output.",
+   "Recovery tests could be flaky or overreaching if checkpoint boundaries and the precise transaction/visibility semantics of injected failures are not fixed.",
+   "The hidden reference is invalid if it applies parsing or timestamp rules that are absent from the solver-visible contract."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements and verification plan are mostly clear, realistic, and strongly testable, but the supplied hint exposes nearly the complete repair strategy and the planted defects are identifiable by source inspection. A strong agent can plausibly complete the core repair in about 15 focused steps, so genuine difficulty is only 2; the task therefore fails the requirement that every score be at least 3 despite an overall average of 3.6.",
+  "fixes": [
+   "Remove the internal hint's prescriptive repair recipe and describe symptoms rather than the exact durable design.",
+   "Avoid enumerating the planted defects in the blueprint; require investigation through observable behavior and documented invariants instead.",
+   "Add interacting recovery and parsing failures whose remedy is not directly implied, while keeping the contract and checkpoint semantics explicit.",
+   "Define canonical output comparison, duplicate-key policy, rejection precedence, extra-field handling, and framer behavior in the visible documentation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Both involve deterministic replay and failure-safe outputs, but this task processes independent NDJSON events into session and metric tables rather than applying transactional database-log shards into a live-row snapshot."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is primarily schema validation and high-throughput NDJSON cleaning, while this task additionally requires SQL-backed sessionization, aggregation, deterministic recovery, and idempotent replay."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both are replay pipelines with deterministic derived records, the reference centers on SQLite incident archival and dependency-ordered correlation components rather than session and daily metric ETL."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference implements recovery and mutation of a persistent multi-tenant key-value event store, whereas this task repairs an input-to-session-and-metrics batch pipeline with record validation."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "Despite shared sessionization, deduplication, and metric concepts, the reference is an HTTP campaign-attribution service with purchase and refund semantics, not a SQL-backed NDJSON replay pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.212
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.202
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.2
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.192
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.188
+    ]
+   ],
+   "cost_usd": 0.0011968
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0035084
+}

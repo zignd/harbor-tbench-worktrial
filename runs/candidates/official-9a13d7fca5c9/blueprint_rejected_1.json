@@ -1,0 +1,184 @@
+{
+ "blueprint": {
+  "slug": "repair-release-schema-inspector",
+  "title": "Repair Release Schema Inspector",
+  "scenario": "A release engineer is unblocking the JavaScript release build for an internal schema-inspection tool. The repository contains a small SQLite-backed query service, migration files in two historical formats, configuration overlays, and several Git commits representing prior release candidates; the current build produces a plausible result for the checked-in sample but disagrees with older release history and larger migration sets.",
+  "instruction_draft": "Make the release inspector produce a correct, reproducible release database and manifest from the repository's configured Git revision. The command `npm run release -- --config config/release.json` must accept both the configured SQL migration files and JSON migration manifests, translate them to the same canonical migration model, resolve all declared dependencies deterministically, and execute the resulting SQL against SQLite.\n\nPreserve the repository's public CLI and configuration format. The final run must use the revision and overlay selected by configuration, include the exact schema and release rows for that revision, report rejected migrations without leaving partial database changes, and write deterministic `out/release.db` and `out/release.json` artifacts. It must continue to work for fresh hidden repositories containing thousands of migrations, equivalent SQL and JSON inputs, duplicate names, quoted values, independent dependency branches, and recoverable migration failures.",
+  "requirements": [
+   "The existing `npm run release -- --config config/release.json` command completes successfully without changing its public CLI.",
+   "The configured Git revision and configuration overlay, rather than only the current working tree, determine the migration inputs and release metadata.",
+   "SQL migration files and JSON migration manifests are both accepted and translated into identical canonical migration records when they describe the same migrations.",
+   "Migration dependencies are resolved with a deterministic topological order, including deterministic ordering of otherwise independent migrations.",
+   "Duplicate migration identifiers, missing dependencies, dependency cycles, malformed records, and unsupported migration operations are reported as rejected migrations rather than silently applied.",
+   "A migration that fails during SQLite execution is rolled back completely, and later independent migrations can still be processed according to the documented recovery policy.",
+   "The generated SQLite database contains the expected schema, applied-migration records, rejected-migration records, and release metadata for the configured revision.",
+   "The generated JSON manifest is deterministic and agrees with the database on migration status, order, revision, and release metadata.",
+   "The implementation handles hidden inputs with thousands of migrations, long dependency chains, multiple independent branches, quoted SQL or JSON values, and equivalent inputs in either supported modality.",
+   "The checked-in sample output and all repository tests continue to pass after the repair."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt packages including `nodejs`, `npm`, `git`, and `sqlite3`; no network access is needed.",
+   "A Git repository at `/workspace/release-inspector` with approximately 1,400 lines of JavaScript, SQL fixtures, configuration, tests, and unrelated release-reporting components.",
+   "A package script named `release` that invokes the JavaScript CLI and writes `out/release.db` and `out/release.json`.",
+   "A configuration loader supporting a base JSON configuration plus a revision-specific overlay selected from Git history; the checked-in configuration selects an older release-candidate commit rather than the current tip.",
+   "SQL migrations using comments and statements for identifiers, dependencies, preconditions, and schema changes, plus JSON migration manifests expressing the same canonical fields.",
+   "A partially implemented migration normalization and dependency-resolution component with an incomplete public interface used by several callers; some apparently working fixtures avoid its difficult branches.",
+   "A deliberately misleading current-tree fixture and a later Git commit that changes migration metadata, so inspecting only the present files gives a plausible but incorrect release result.",
+   "Fixtures containing a failed migration followed by independent migrations, duplicate identifiers across modalities, and a dependency chain whose correct order differs from lexical file order.",
+   "Repository history with tags and overlays that exercise revision checkout, path filtering, deleted migrations, renamed migration files, and configuration precedence.",
+   "A reference test harness that can create temporary Git repositories and generate fresh migration sets at verification time without relying on wall-clock time or randomness."
+  ],
+  "internal_hint": "The central repair is to implement the canonical migration parser/normalizer and dependency planner, then refactor the SQL and JSON loaders and the SQLite runner to use it. The planner must validate identifiers and references, preserve all records including rejected ones, perform a stable topological sort, and avoid mutating shared state while recovering from a failed transaction. The history bug is exposed by running the CLI against the configured revision: the current implementation combines the current filesystem with overlay metadata from the selected commit, while the correct implementation reads both migration content and configuration from that revision and handles renames/deletions through Git's tree/history APIs. A skilled engineer should run the CLI at multiple tags, inspect the generated database and Git tree rather than only read the obvious stub, compare SQL and JSON fixtures, and use temporary generated DAGs to discover ordering and rollback failures.",
+  "trap": "A shallow solution can hard-code the checked-in migration order, read only the current worktree, or sort filenames and still pass the visible sample. It can also normalize only SQL input, record a failed migration after partial SQLite changes, or stop at the first bad node. Hidden tests expose these shortcuts with equivalent JSON input, large graphs containing ties and cycles, a configured historical revision whose files differ from HEAD, quoted values, and an execution failure followed by valid independent migrations.",
+  "tests": [
+   "Runs the public release command on the checked-in repository and compares the SQLite tables, row values, migration statuses, selected revision, and JSON manifest against the expected final state.",
+   "Creates a temporary repository with the same configuration shape at several commits, including a renamed and deleted migration, and verifies that selecting an older revision uses that revision's tree and overlay rather than HEAD.",
+   "Generates thousands of valid migrations with seeded dependency DAGs and checks the complete stable topological order, not merely the final schema.",
+   "Generates equivalent migration sets as SQL files and JSON manifests and compares canonical records, database contents, rejection details, and manifest output.",
+   "Injects duplicate identifiers, missing references, cycles, malformed directives, and unsupported operations and verifies that every affected record is classified deterministically without unrelated valid migrations being lost.",
+   "Injects a migration whose SQL fails after earlier statements and verifies transaction rollback, rejected status, absence of partial schema/data changes, and continued processing of independent migrations.",
+   "Uses quoted identifiers, escaped strings, multiline SQL, unusual but valid dependency names, long chains, and many independent branches to test parser and planner behavior beyond the visible fixtures.",
+   "Runs the command twice and compares hashes and row ordering of both output artifacts to enforce deterministic results.",
+   "Runs the repository's existing unit and integration tests to ensure unrelated release-reporting and query components remain compatible with the refactored interfaces."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "10",
+   "effect": "The verifier checks revision selection, overlay precedence, canonical parsing, ordering, rejection classification, rollback, continuation, database rows, manifest rows, modality equivalence, and determinism as separate state properties. Lowering this to 3 would allow partial planners or a current-tree-only implementation to pass; raising it with more generated graph, history, and rollback cases makes shallow fixes fail more often."
+  },
+  "expected_failure_modes": [
+   "The agent reads the visible source and patches the obvious missing function without exercising the configured historical revision.",
+   "The agent uses the current filesystem for migrations while reading release metadata from Git, producing internally plausible but historically inconsistent output.",
+   "The agent implements a parser for the sample syntax but mishandles quoted, multiline, or escaped fields in hidden inputs.",
+   "The agent performs a lexical sort or a non-stable topological sort, so simple chains pass but tied dependency branches produce different manifests.",
+   "The agent treats a cycle or missing dependency as a fatal process error and loses otherwise valid independent migrations.",
+   "The agent catches SQLite errors without a savepoint or transaction rollback, leaving partial schema changes that are only visible in later queries.",
+   "The agent supports SQL input but overlooks the JSON-to-canonical translation path or gives the two modalities different default semantics.",
+   "The agent writes correct-looking JSON but omits rejected records, applied order, or revision metadata from the database, causing state checks to disagree.",
+   "The agent verifies only the checked-in sample and does not generate larger DAGs or compare multiple Git revisions.",
+   "The agent refactors one caller while leaving legacy callers dependent on the old incomplete component contract."
+  ],
+  "predicted_pass_rate": 0.23,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "javascript",
+   "sql",
+   "git-history",
+   "configuration",
+   "migration-planning",
+   "error-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /workspace/release-inspector && find . -maxdepth 3 -type f | sort",
+   "cat package.json && git status --short",
+   "git log --oneline --decorate --all -15",
+   "sed -n '1,240p' config/release.json && find config -type f -maxdepth 3 -print",
+   "sed -n '1,260p' src/cli.js 2>/dev/null || find . -iname '*release*' -o -iname '*migration*'",
+   "grep -R \"migration\\|revision\\|overlay\\|release.db\" -n src lib test tests 2>/dev/null | head -200",
+   "inspect the SQL and JSON migration fixtures plus the existing database schema and manifest writer",
+   "inspect all callers and tests of the incomplete normalization and dependency-resolution interfaces",
+   "npm test && npm run release -- --config config/release.json",
+   "sqlite3 out/release.db '.tables' && cat out/release.json",
+   "git show --stat $(jq -r '.revision // .gitRevision // .commit' config/release.json) && inspect that revision's tree and overlay files",
+   "compare migration inputs and configuration between the selected revision and HEAD",
+   "define the canonical migration record, rejection record, ordering tie-breaker, and recovery behavior from repository conventions and tests",
+   "implement a shared SQL/JSON normalizer with validation and quoted/multiline value handling",
+   "implement revision-tree loading so migrations and overlays both come from the configured Git revision, including deleted and renamed paths",
+   "implement stable dependency validation and topological planning that preserves rejected records and independent valid branches",
+   "refactor SQLite execution to use per-migration transactions or savepoints and continue after recoverable failures",
+   "update database schema, applied/rejected rows, release metadata, and deterministic manifest generation",
+   "run targeted CLI, parser, planner, history, and rollback tests",
+   "generate temporary repositories with large DAGs, duplicate IDs, cycles, malformed records, and equivalent SQL/JSON inputs",
+   "run the command twice and compare database and manifest hashes and row ordering",
+   "npm test && npm run release -- --config config/release.json && inspect final git diff and artifacts"
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The required tie-break rule for otherwise independent migrations is not explicitly specified; tests could assume lexical path order, identifier order, input order, or another rule.",
+   "The phrase \"documented recovery policy\" does not identify where that policy is documented, and the required treatment of migrations depending on rejected migrations is unspecified.",
+   "The exact canonical fields, rejection classifications, database schema, manifest shape, and configuration overlay precedence are not stated, so hidden tests could require behavior that cannot be derived from the instruction alone.",
+   "A requirement to handle arbitrary quoted SQL, multiline SQL, and escaped values may exceed a small directive parser unless the repository defines a precise supported grammar; tests should not demand a general SQL parser without saying so.",
+   "Git behavior for uncommitted files, renamed files, path filtering, and revision-specific configuration precedence could be ambiguous if the repository fixtures do not define one authoritative interpretation."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and genuinely difficult, and the proposed tests are mostly deterministic, but the required semantics for ordering, rejection propagation, recovery, canonical records, and configuration precedence are not precise enough for an unambiguous implementation. The central repair spans Git-tree loading, two parsers, graph planning, transactional execution, and artifact compatibility, making completion within the stated under-one-hour solvability target unlikely; the speedrun is already about 23 substantive steps before debugging.",
+  "fixes": [
+   "Specify the exact canonical migration and rejection schemas, including required fields, status values, error classifications, and manifest/database ordering.",
+   "Define the deterministic topological tie-breaker and whether rejected or dependency-blocked migrations participate in the reported order.",
+   "State the recovery policy explicitly: which failures roll back, whether dependent migrations are rejected or skipped, and whether independent migrations continue.",
+   "Document the SQL directive grammar and JSON schema, including quoting, escaping, multiline values, unsupported-operation rules, and duplicate semantics.",
+   "Specify Git revision semantics and overlay precedence with a concrete example covering renamed, deleted, and modified files.",
+   "Provide a small compatibility contract or fixture for the expected database tables and public normalization interface so the repair remains solvable without reverse-engineering hidden assumptions."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a Git-revision-aware migration ingestion, dependency-resolution, rollback, and release-artifact pipeline, whereas the reference validates JSON filter specifications against SQLite query results."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "The candidate concerns canonicalizing and executing SQL/JSON database migrations with deterministic dependency handling, while the reference fixes a Rust packet codec and release-build configuration."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/custom-memory-heap-crash",
+     "verdict": "distinct",
+     "reason": "The candidate is a JavaScript/SQLite release migration and manifest problem, not a C++ release-mode memory safety and leak debugging task."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "Although both involve SQLite-backed release pipelines, the candidate centers on Git-selected migration schemas and transactional migration status, while the reference repairs an opaque sensor-normalization and aggregation pipeline."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The candidate builds a deterministic migration-derived release database and manifest, whereas the reference optimizes telemetry-shard aggregation for analytical parity, runtime, and database-size constraints."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-18899524e171",
+     0.184
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.177
+    ],
+    [
+     "terminal-bench-2-1/custom-memory-heap-crash",
+     0.125
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.092
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.089
+    ]
+   ],
+   "cost_usd": 0.0008192
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0035974
+}

@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "deploy-march-archive-recovery",
+  "title": "Deploy MARCH archive recovery service",
+  "scenario": "I maintain a small C utility that recovers records from MARCH, our append-only archive format used by release tooling. A recent format iteration made the deployed recovery daemon report checksum failures and return incomplete snapshots, but nobody has isolated a minimal reproduction; the container contains the daemon sources, format notes, deployment files, and a large damaged archive corpus from CI.",
+  "instruction_draft": "Can you get the MARCH recovery daemon deployed and usable again? Make the installed service answer the documented line-oriented protocol correctly for healthy archives, damaged archives, stale indexes, tombstones, and records that cross storage-page boundaries; recovery must preserve the archive's sequence ordering and return the same records as a clean rebuild. Please leave the normal launcher/configuration working and make sure it handles fresh archives rather than only the corpus in the container.",
+  "requirements": [
+   "An installed launcher must start the MARCH recovery service using the repository's documented configuration and data locations.",
+   "The service must accept the documented line-oriented protocol and produce one valid response for every valid request without diagnostic text on the protocol stream.",
+   "The service must read healthy and damaged MARCH archives, including archives with corrupt or stale checkpoint/index metadata.",
+   "Recovered state must include the newest live version of each key according to archive sequence numbers, while correctly applying tombstones.",
+   "Records whose encoded bytes cross a storage-page boundary must be decoded without truncation, duplication, or corruption.",
+   "Protocol results must match a clean archive rebuild for fresh archives generated after deployment, not merely match the supplied examples.",
+   "The daemon must remain usable after a failed request and must report malformed or unrecoverable input as a structured protocol error rather than exiting."
+  ],
+  "environment": [
+   "A Dockerfile based on FROM python:3.13-slim-bookworm, with pinned apt packages including gcc, make, binutils, and procps; no network access is needed at runtime.",
+   "A roughly 1,700-line C project under /workspace/march containing the daemon, a command-line archive inspector, a recovery library, protocol handling, a Makefile, and a deliberately plausible amount of unrelated metrics and logging code.",
+   "A format note and protocol note discovered in the repository describing MARCH v2/v3 headers, variable-length record framing, little-endian page trailers, sequence numbers, tombstones, checkpoint tables, and the JSON-lines request/response operations.",
+   "A deployment tree under /workspace/deploy containing a launcher, example environment file, service unit template, and an installation target expected to place the daemon at /opt/march/bin/marchd.",
+   "A deterministic corpus under /srv/march/archive containing about 18,000 records spread across many segments and pages. It includes valid segments, one segment with a damaged footer, stale checkpoint entries, tombstoned keys, large signed deltas, and several records deliberately split at page boundaries.",
+   "The planted regression is data-dependent: the v3 recovery fast path trusts a stale checkpoint too aggressively, stops scanning after a bad footer instead of resynchronizing at the next segment, and mishandles a continuation frame at an exact page boundary. A separate signed-varint narrowing error only appears for the large deltas in the corpus.",
+   "The visible sample archive is clean enough that the normal indexed lookup path and the simple protocol examples pass before the fix. The supplied daemon currently builds and launches, but its recovery results are incomplete or inconsistent on the historical corpus.",
+   "A deterministic Python archive generator and oracle are included for verification use, but are not named as the service implementation and do not need external packages."
+  ],
+  "internal_hint": "The deterministic reference shell first inventories the deployment files, builds the daemon with warnings and sanitizers, runs the shipped inspector against the corpus, and exercises protocol requests while capturing stderr separately. Comparing indexed lookup, sequential scan, and a clean rebuild reveals that the apparent CRC problem is downstream: the recovery loop abandons the segment after a bad footer, while the checkpoint path also suppresses newer records when its generation is stale. A hexdump around a 4096-byte boundary exposes a continuation frame whose trailer belongs to the following page; the decoder advances by the payload length rather than the framed length. Sanitizer output and generated archives then expose the signed-varint value being narrowed before zigzag decoding. The fix is to validate checkpoint generation against the archive superblock, fall back to a full segment scan, resynchronize after damaged footers, carry continuation state across pages, and decode varints in a wide unsigned type before signed conversion. The reference shell rebuilds, installs, launches the service, and runs protocol checks over both the shipped corpus and seeded generated archives before finishing.",
+  "trap": "A shallow solution that disables CRC checks or always uses the checkpoint index appears to repair the obvious checksum symptom and passes the clean examples, but loses records after the damaged segment and returns old values for keys whose checkpoint entries are stale. A parser that handles ordinary continuation records still fails when the frame ends exactly at a page boundary, and a 32-bit varint fix passes small samples while corrupting the rare large-delta records in verify-time archives.",
+  "tests": [
+   "Build and deployment test: install the project through the expected target or launcher path, start the configured daemon, and verify that it stays alive and emits no protocol noise on stdout.",
+   "Protocol smoke test: send open, summary, lookup, list, and close requests against a clean generated archive and compare structured responses with the reference oracle.",
+   "Historical recovery test: query the supplied damaged corpus and verify record counts, live values, tombstones, sequence maxima, and segment summaries against a clean rebuild rather than the stale checkpoint.",
+   "Corruption-resynchronization test: generate archives with one damaged footer followed by valid segments and ensure later valid records remain queryable while the damaged region is reported in the structured audit response.",
+   "Page-boundary test: generate records with frame headers, payloads, and trailers landing at many offsets around the page size, including exact-boundary continuations, and compare every returned value and checksum.",
+   "Ordering and tombstone test: generate repeated updates and deletes in non-file-order segment layouts; verify that sequence-number ordering, not segment order or lexical key order, determines the final state.",
+   "Large-delta test: generate valid signed-varint deltas near 32-bit and 64-bit boundaries and check decoded keys/values and rebuilt sequence numbers.",
+   "Malformed-request test: send unknown operations, missing fields, invalid archive paths, and malformed JSON between valid requests; require structured errors and successful processing of subsequent valid requests.",
+   "Fresh-input isolation test: create several new archives with a hidden seed after the service is built, including combinations of stale indexes, damaged segments, tombstones, and page splits, so hard-coded repairs for the supplied corpus do not pass."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9 protocol and generated-data scenarios",
+   "effect": "Lowering this to two or three mostly clean requests makes an indexed-only or corpus-specific repair look successful. Raising it adds independent combinations of corruption, ordering, page boundaries, malformed requests, and fresh generated archives, making partial recovery fixes fail."
+  },
+  "expected_failure_modes": [
+   "The agent follows the checksum error and changes validation policy without investigating recovery state transitions.",
+   "The agent fixes the shipped archive with a special-case fallback but does not implement general segment resynchronization for fresh inputs.",
+   "The agent repairs sequential scanning but leaves the stale checkpoint fast path active for some operations.",
+   "The agent treats page continuation as a local buffer detail and mishandles exact-boundary frames.",
+   "The agent widens only one varint intermediate and still truncates signed deltas during zigzag conversion.",
+   "The agent validates output using only the visible clean sample and never compares indexed recovery with a clean rebuild.",
+   "The agent changes protocol output or writes diagnostics to stdout, causing otherwise correct recovery results to fail service verification.",
+   "The agent builds the binary but neglects the launcher, installation path, or configuration expected by the deployed service."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "file-formats-recovery",
+  "tags": [
+   "c",
+   "deployment",
+   "binary-format",
+   "data-recovery",
+   "service-protocol",
+   "regression"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /workspace/march && find . -maxdepth 3 -type f | sort",
+   "cat /workspace/deploy/README* /workspace/deploy/*.env 2>/dev/null; sed -n '1,240p' /workspace/deploy/Makefile",
+   "sed -n '1,260p' FORMAT* README* docs/* 2>/dev/null",
+   "sed -n '1,260p' *protocol* docs/*protocol* 2>/dev/null",
+   "make clean && make CFLAGS='-Wall -Wextra -g -fsanitize=address,undefined'",
+   "./march-inspector /srv/march/archive 2>&1 | tee /tmp/inspect.log",
+   "/workspace/deploy/launcher 2>/tmp/marchd.err & echo $! >/tmp/marchd.pid",
+   "python3 tools/protocol_client.py --archive /srv/march/archive --smoke 2>/tmp/protocol.err",
+   "grep -RniE 'checkpoint|footer|continu|varint|zigzag|page|crc|resync' . --exclude-dir=.git",
+   "sed -n '1,320p' src/recovery*.c src/*scan*.c",
+   "sed -n '1,300p' src/*frame*.c src/*format*.c",
+   "sed -n '1,240p' src/*varint*.c src/*decode*.c",
+   "sed -n '1,260p' tools/generator.py tools/oracle.py",
+   "edit recovery selection to validate checkpoint generation and fall back to a full scan",
+   "edit segment scanning to resynchronize after damaged footers and continue with later segments",
+   "edit page/frame decoding to retain continuation state and advance by the complete framed length",
+   "edit signed-varint decoding to use wide unsigned intermediates through zigzag conversion",
+   "make clean && make CFLAGS='-Wall -Wextra -g -fsanitize=address,undefined'",
+   "make install PREFIX=/opt/march && /workspace/deploy/launcher 2>/tmp/marchd.err &",
+   "run the protocol smoke, historical corpus, malformed-request, and generated-archive checks against the installed launcher and compare with the oracle"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The requirement to report a damaged region in a structured audit response may be overreach if that operation or its exact response schema is not explicitly defined in the protocol note.",
+   "Tests could be invalid if they assume a particular launcher process model, port, archive-path syntax, or installation behavior that the documented configuration does not specify.",
+   "Pinned apt versions may fail to build if they are not available in the selected Bookworm repository snapshot.",
+   "Tests that share a daemon, port, or temporary archive directory without deterministic cleanup could be flaky.",
+   "The reference oracle and service may disagree on how unrecoverable records, damaged segments, or duplicate sequence numbers should be represented unless those semantics are specified precisely."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and has strong deterministic verification, but the planted failure modes and required fixes make a successful path plausible in about 20 commands for a strong agent. Under the stated review rule, that caps genuine_difficulty at 2, so the task fails the requirement that every score be at least 3 despite having an overall average above 3.6.",
+  "fixes": [
+   "Remove solver-facing details that directly enumerate the regression mechanisms and expected fixes; retain only the observable symptoms and format contract.",
+   "Define the audit operation and exact structured fields for damaged-region reporting, malformed requests, unrecoverable records, and sequence summaries.",
+   "Specify the launcher lifecycle, socket or stdin transport, archive-path configuration, installation target, and cleanup behavior unambiguously.",
+   "Use a reproducible apt repository snapshot or verify that every pinned package version exists in the stated base image.",
+   "Add less obvious interacting failures or a more independent deployment constraint so that source inspection and straightforward targeted edits are not sufficient for a sub-hour solution."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "same",
+     "reason": "Both require deploying a line-oriented recovery service that reconstructs authoritative archive state despite corruption, stale metadata, ordering, tombstones, and malformed input."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "same",
+     "reason": "Both center on replaying damaged append-only archive data into the correct sequence-ordered live state while handling malformed records, deletes, and fresh inputs through a deployed tool."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/crack-7z-hash",
+     "verdict": "distinct",
+     "reason": "This is a simple archive password/secret extraction task rather than a recovery-daemon implementation and deployment problem."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task builds a live HTTP metrics query service over SQLite and a native aggregation engine, not an append-only archive recovery system."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "This task hardens a route-policy HTTP gateway against adversarial request parsing, with no archive replay or state recovery problem."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.165
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.146
+    ],
+    [
+     "terminal-bench-2-1/crack-7z-hash",
+     0.121
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.112
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.107
+    ]
+   ],
+   "cost_usd": 0.0008552
+  },
+  "novel": false
+ },
+ "cost_usd": 0.004168999999999999
+}

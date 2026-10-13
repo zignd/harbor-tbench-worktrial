@@ -1,0 +1,188 @@
+{
+ "blueprint": {
+  "slug": "recover-fragmented-metric-spools",
+  "title": "Recover Fragmented Metric Spools",
+  "scenario": "A research scientist is reproducing a distributed telemetry experiment whose published figures were computed from an internal SQLite replay database. The container contains the replay runner, schema migrations, sample telemetry spools, operational logs, and a partially prepared SQL pipeline; the original ingestion job was lost during an instrument upgrade.",
+  "instruction_draft": "Implement the SQLite replay pipeline so that `bin/replay` can rebuild the derived database from the supplied telemetry spool directory. It must recover valid events from arbitrarily fragmented, reordered, duplicated, truncated, and partially corrupted spool chunks; preserve per-stream sequence and timestamp semantics; ignore invalid frames; and produce deterministic results when run repeatedly.\n\nThe resulting `events`, `stream_state`, `minute_metrics`, and `replay_manifest` tables must remain mutually consistent, including after recovery gaps and reset markers. On the supplied corpus and fresh verifier-generated corpora, recover at least 99.5% of recoverable events exactly and keep the absolute error of every generated minute-level count, sum, and p99 metric below 0.5%; do not solve this by changing the verifier or hard-coding the visible data.",
+  "requirements": [
+   "Make `bin/replay` successfully rebuild the derived SQLite database from the spool directory using the repository's documented SQLite interface.",
+   "Decode the documented telemetry frame format, including unsigned varints, zigzag signed values, frame boundaries crossing chunk files, and CRC validation.",
+   "Recover valid frames despite arbitrary chunk fragmentation, chunk ordering, duplicate retransmissions, truncated tails, and invalid or corrupted frames.",
+   "Apply frames in per-stream sequence order rather than filesystem or arrival order, while handling reset markers and recoverable sequence gaps according to the repository specification.",
+   "Populate `events` with the exact recovered event identity, stream, sequence, timestamp, value, and source metadata required by the schema.",
+   "Keep `stream_state` synchronized with the recovered event history and represent gaps and resets deterministically.",
+   "Recompute `minute_metrics` from recovered events, including count, sum, and p99 values, without retaining stale values from a prior replay.",
+   "Write a deterministic `replay_manifest` that records the input digest, accepted and rejected frame counts, gap information, and derived-table digest.",
+   "Make replay idempotent: running it multiple times on the same inputs must not duplicate events or change any derived result.",
+   "Achieve at least 99.5% exact recovery of recoverable events on verifier-generated inputs.",
+   "Keep the absolute error of every verifier-generated minute-level count, sum, and p99 metric below 0.5% relative to the reference result, with the repository's documented zero-denominator rule."
+  ],
+  "environment": [
+   "Use a Docker image based on `python:3.13-slim-bookworm`, with pinned system and Python dependencies and no network requirement.",
+   "Provide roughly 1,400 lines across a Python/SQLite replay runner, schema migrations, logging and metrics utilities, SQL fixtures, tests, and decoy operational components.",
+   "Provide `bin/replay`, which opens a SQLite database, loads `sql/recover.sql`, registers only the documented deterministic SQLite helper functions, and emits structured logs and Prometheus-style counters.",
+   "Provide a documented binary telemetry format in `docs/spool-format.md`: sync bytes, flags, unsigned LEB128 length, payload fields encoded with unsigned varints and zigzag deltas, and CRC-16-CCITT protection.",
+   "Provide `spools/sample/` containing several hundred chunk files with frames split at arbitrary byte positions, reordered files, duplicates, invalid CRCs, truncated tails, reset markers, and sequence gaps.",
+   "Provide a partially prepared schema with `raw_chunks`, `events`, `stream_state`, `minute_metrics`, and `replay_manifest` tables plus indexes and consistency constraints.",
+   "Provide an incomplete or intentionally inadequate `sql/recover.sql` that handles simple whole-frame samples but fails on cross-chunk parsing, sequence reconstruction, and stale aggregate cleanup.",
+   "Provide a reference query and expected summaries only through the runner's sample fixtures, not as source code that can be copied for hidden inputs.",
+   "Provide logs showing apparently plausible sample metrics even though the current implementation silently drops split frames and applies delta values in arrival order.",
+   "At verification time, generate fresh seeded spool corpora with thousands of frames, multiple streams, varied fragmentation boundaries, duplicate and corrupted candidates, reset epochs, gaps, and adversarially ordered chunks."
+  ],
+  "internal_hint": "The intended path is investigative rather than a one-line patch: inspect the runner, schema, logs, and spool-format document; run the baseline on the sample and compare raw accepted-frame counts with the manifest. The planted failures are data-dependent: the existing SQL treats each chunk as independently framed, uses arrival order for delta decoding, permits duplicate sequence rows, and leaves old minute aggregates behind on rerun. Build a recursive SQLite byte scanner that carries state across chunk boundaries and resynchronizes after bad CRC frames, materialize candidate frames, deduplicate by stream/epoch/sequence using the specified deterministic source ordering, then reconstruct timestamp/value deltas in sequence order with reset baselines. Rebuild all derived tables in dependency order inside a transaction, calculate p99 using the documented nearest-rank rule, and ensure the manifest digests the final state. Exercise generated-looking cases locally by changing fragmentation and file order; visible samples do not expose all interactions.",
+  "trap": "A shallow solution can pass the visible sample by concatenating chunks in filename order or by accepting only complete frames. It fails hidden inputs where a frame crosses three chunks, a duplicated retransmission has a different arrival position, a reset changes delta baselines, or a valid later frame follows a corrupt candidate. Another common failure is producing correct events but retaining stale minute metrics or using an interpolated/continuous percentile definition, which leaves the final cross-table digest and p99 threshold wrong.",
+  "tests": [
+   "Run the sample corpus from a clean database and check successful completion, schema constraints, expected event identities, stream states, metrics, and manifest fields.",
+   "Run replay twice on the same sample corpus and verify byte-equivalent derived-table dumps, unchanged counts, and unchanged manifest digest.",
+   "Generate fresh seeded corpora with random chunk boundaries, including boundaries inside varints, payloads, and CRCs; compare recovered events against the reference decoder.",
+   "Generate reordered and duplicated chunks and verify that results are independent of filesystem enumeration order and contain one deterministic row per logical frame.",
+   "Inject bad CRCs, malformed lengths, random garbage, truncated tails, and valid-looking decoys; verify invalid frames are rejected while later valid frames are recovered.",
+   "Generate multiple streams with interleaved sequence numbers, reset markers, recoverable gaps, negative zigzag deltas, timestamp rollovers, and large varints; compare reconstructed timestamps and values.",
+   "Check the exact-recovery threshold of at least 99.5% over recoverable hidden events.",
+   "Recompute hidden minute count, sum, and nearest-rank p99 metrics from the reference event set and require absolute error below 0.5% for every checked metric, using the documented zero-denominator rule.",
+   "Verify `stream_state`, `minute_metrics`, and `replay_manifest` agree with `events`, including gap counts, reset epochs, accepted/rejected frame counts, and final digests.",
+   "Run hidden corpora in different chunk-file orders and after a failed/interrupted transaction, confirming deterministic output and no partial or stale derived state."
+  ],
+  "verifier_knob": {
+   "name": "metric_error_threshold",
+   "value": "0.5% absolute relative error for each hidden minute-level count, sum, and p99 metric",
+   "effect": "Lowering the threshold makes percentile definitions, delta reconstruction, duplicate handling, and aggregate consistency more exacting; raising it permits approximate or partially correct aggregation while the exact event-recovery threshold remains active."
+  },
+  "expected_failure_modes": [
+   "The solver reads only the visible sample and never tests frames split across unusual boundaries.",
+   "A recursive SQL parser mishandles varints that cross chunk boundaries or loses scanner state after malformed bytes.",
+   "Delta-coded timestamps and values are decoded in arrival order or across reset epochs.",
+   "Deduplication uses a global sequence number, ignores stream identity, or chooses a nondeterministic duplicate.",
+   "CRC validation or resynchronization skips valid frames after a corrupted candidate.",
+   "The event table is correct but minute metrics use the wrong p99 convention or stale rows survive a rerun.",
+   "The solver modifies the runner or verifier rather than completing the SQL pipeline.",
+   "The implementation is logically correct but exceeds SQLite recursive-query or memory assumptions on thousands of frames.",
+   "The manifest and state tables are populated independently, so a partial failure leaves cross-component digests inconsistent."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "sqlite",
+   "recursive-cte",
+   "binary-recovery",
+   "telemetry",
+   "metrics",
+   "determinism"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, entry points, migrations, SQL, tests, fixtures, and sample spools.",
+   "Read the README and replay interface documentation.",
+   "Read docs/spool-format.md completely, including reset, gap, ordering, digest, and percentile rules.",
+   "Inspect schema migrations and all constraints and indexes.",
+   "Read bin/replay and determine transaction, helper-function, logging, and manifest behavior.",
+   "Read sql/recover.sql and identify the existing framing and aggregation assumptions.",
+   "Read visible tests, fixtures, and operational logs.",
+   "Inspect sample filenames and metadata to determine chunk identity and ordering semantics.",
+   "Run the baseline replay on a clean database.",
+   "Dump raw_chunks, events, stream_state, minute_metrics, and replay_manifest from the baseline.",
+   "Compare baseline counts and metrics with the supplied expected summaries.",
+   "Trace the runner's SQLite API and determine which deterministic functions are available.",
+   "Design a stateful scanner representation for chunk boundaries, malformed frames, CRC failures, and resynchronization.",
+   "Implement or repair cross-chunk frame scanning and candidate materialization.",
+   "Add deterministic duplicate selection keyed by stream, reset epoch, and sequence.",
+   "Implement per-stream sequence reconstruction, reset baselines, gaps, timestamp deltas, and zigzag values.",
+   "Rebuild events and stream_state transactionally and deterministically.",
+   "Replace aggregate computation with fresh minute_metrics generation using the documented nearest-rank p99.",
+   "Implement canonical manifest input, rejection, gap, and derived-table digests.",
+   "Run the sample from a newly initialized database and inspect all consistency constraints.",
+   "Run replay twice and compare canonical dumps and manifest digests.",
+   "Create local reordered, duplicated, split-varint, split-CRC, corrupted, and truncated variants of the sample.",
+   "Run those variants and debug parser, deduplication, reset, and aggregation failures.",
+   "Run a larger local stress corpus, verify transaction rollback behavior, and check resource usage."
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The blueprint refers to repository-specific reset, gap, source-ordering, digest, and zero-denominator rules without stating them; if those rules are not fully documented in the supplied files, failures are ambiguous.",
+   "The exact byte-level frame fields, chunk identity metadata, and resynchronization policy must be precise enough to distinguish valid later frames from decoys after corruption.",
+   "A requirement to use a recursive SQLite scanner may overconstrain implementation if the documented interface does not expose sufficient byte, CRC, or arithmetic helpers; failures caused by SQLite recursion limits or memory use could be environmental rather than logical.",
+   "Per-minute count and p99 thresholds can become effectively exact for small groups, and p99 comparisons can be sensitive to whether the reference uses raw or rounded values.",
+   "Manifest and table digest checks can be flaky if canonical row ordering, integer/text serialization, SQLite version behavior, or transaction-failure cleanup is not explicitly specified.",
+   "The stated 99.5% recovery target may be incompatible with the reference if the generated corpus contains frames that are theoretically unrecoverable but are counted as recoverable by the verifier."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and strongly verifiable, but the required parser, resynchronization, sequence reconstruction, deterministic deduplication, and cross-table rebuilding are unlikely to be completed reliably by a skilled engineer within the stated under-an-hour solvability target. The speedrun requires about 24 meaningful investigation and implementation steps, and the specification delegates several outcome-critical semantics to documents that are not included in the blueprint. Since solvability scores below 3, the acceptance rule is not met.",
+  "fixes": [
+   "Provide an explicit, complete format and semantics appendix in the task materials covering chunk identity and ordering, reset epochs, gap recovery, duplicate source selection, resynchronization, canonical serialization, and p99.",
+   "Reduce scope by supplying a deterministic scanner primitive or documented helper functions for byte access, CRC, and frame resynchronization, leaving the solver to implement reconstruction and derived-table consistency.",
+   "Either relax the under-one-hour solvability expectation or reduce the corpus and implementation surface so a robust solution can be built and tested within that limit.",
+   "Specify exact verifier treatment of unrecoverable frames, rounded metrics, zero denominators, and small-minute p99 groups.",
+   "Define a version-independent canonical digest algorithm and provide a small adversarial fixture for each required parser edge case.",
+   "Separate functional correctness from resource-limit failures by stating recursion, memory, and runtime budgets and ensuring hidden corpora stay within them."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "Both recover deterministic state from damaged replay data, but this task reconstructs telemetry events and metrics while the reference implements a transactional multi-tenant object store with CRUD and audit semantics."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Although both parse reordered or corrupted binary spools deterministically, the reference solves authenticated settlement adjustment reconciliation rather than telemetry sequence recovery and metric aggregation."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The reference correlates incident events through aliases and dependency ordering, whereas this task decodes telemetry frames, repairs stream histories, and computes minute-level metrics."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both are deterministic replay pipelines that recover valid records from fragmented or duplicated log files, apply them in a specified order, and emit derived database state, with the candidate specializing the format and metric semantics."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The reference validates signed audit chains and terminal checkpoints, while this task performs CRC-validated telemetry spool recovery with sequence gaps, resets, and statistical aggregation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.231
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.188
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.188
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.178
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.177
+    ]
+   ],
+   "cost_usd": 0.0020185999999999997
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0049364
+}

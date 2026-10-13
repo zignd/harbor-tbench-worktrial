@@ -1,0 +1,151 @@
+{
+ "blueprint": {
+  "slug": "telemetry-spool-rollup-pipeline",
+  "title": "Fix Multi-Stage Telemetry Spool Ingestion and SQL Rollup Pipeline",
+  "scenario": "An embedded systems developer running low-cost field gateways collects raw sensor records in rotary spool files under `/var/spool/telemetry/`. The daily processing pipeline (`scripts/run_aggregation.sh`) relies on an in-house C decoder (`/usr/local/bin/spool_dump`, compiled without source retained), a Python normalization stage (`etl/normalize.py`), and a SQL rollup script (`etl/aggregate_metrics.py`) that populates `/var/db/telemetry_rollup.db`. Due to recent chunk rotation changes and unhandled hardware flags in the compiled binary's output, the aggregation pipeline crashes mid-run, drops keyframe delta streams across chunk boundaries, and writes corrupt rollup statistics.",
+  "instruction_draft": "```\n$ ./scripts/run_aggregation.sh --date 2025-05-10\n[INFO] Discovering spool chunks in /var/spool/telemetry/2025-05-10...\n[INFO] Found 1440 chunk files across 32 devices.\n[ERROR] Stage 2 (etl/normalize.py): corrupted record stream at chunk dev_1a_chunk_0042.spool:\n  KeyframeMissingError: received delta frame seq=147 for dev_id=0x1a chan=0 without active baseline.\n[ERROR] Stage 3 failed: /var/db/telemetry_rollup.db verification mismatch:\n  - expected populated table 'metrics_15m' with 48 active devices, found 0 rows\nexit status 2\n```\n\nRepair the telemetry aggregation pipeline so that `./scripts/run_aggregation.sh --date <YYYY-MM-DD>` completes successfully and correctly populates `/var/db/telemetry_rollup.db`.\n\nThe pipeline must satisfy the following specification:\n1. Execution & Interface: `./scripts/run_aggregation.sh --date <YYYY-MM-DD>` must execute end-to-end without unhandled errors, accepting any date with spools under `/var/spool/telemetry/<YYYY-MM-DD>` and writing rollups to `/var/db/telemetry_rollup.db`.\n2. Chunk Sequencing: Spool chunks are named `dev_<hex_id>_chunk_<seq>.spool`. Stage 1 (`scripts/process_spool.sh`) must process all chunks for each device in strictly ascending chunk sequence order so that delta frames have their preceding keyframe available.\n3. Binary Decoder Integration: Reverse-engineer the command-line usage and output format of `/usr/local/bin/spool_dump`. Pass appropriate flags to parse corrupted CRC records gracefully (`--skip-corrupt`) and decode the tab-delimited records.\n4. Delta Frame & Flag Normalization (`etl/normalize.py`):\n   - Frame types: 'K' (keyframe, provides new absolute baseline `raw_val`), 'D' (delta frame, adds signed `raw_val` delta to current baseline), 'A' (alarm event, preserves current baseline and records alarm code in `raw_val`).\n   - Bit flags from decoder:\n     * Bit 0 (`0x01`): Sensor warm-up sample. Warm-up samples must NOT be emitted as valid telemetry readings for metric aggregations (nor update baseline deltas).\n     * Bit 1 (`0x02`): Saturation flag. Saturated readings must be clamped to the sensor's physical range specified in `/etc/telemetry/sensors.json`.\n     * Bits 4-7 (`(flags >> 4) & 0x0F`): Power-of-ten divisor exponent. Calibrated value is calculated as: `(clamped_value * sensor_scale) / (10 ^ exponent)` where `sensor_scale` is looked up by `chan_id` from `/etc/telemetry/sensors.json`.\n   - Output normalized records into the staging table `staging_records` in `/var/db/telemetry_rollup.db`.\n5. SQL Rollup (`etl/aggregate_metrics.py`):\n   - Aggregate records into 15-minute fixed windows aligned to the Unix epoch (`floor(epoch_ms / 900000) * 900000`), storing results in table `metrics_15m` with schema:\n     `window_start_ms INTEGER, dev_id TEXT, chan_id INTEGER, sample_count INTEGER, min_val REAL, max_val REAL, avg_val REAL, alarm_count INTEGER, PRIMARY KEY(window_start_ms, dev_id, chan_id)`.\n   - `sample_count`, `min_val`, `max_val`, and `avg_val` must only account for valid, non-warmup readings of type 'K' and 'D'.\n   - `alarm_count` must reflect the count of type 'A' records for that device and channel in the 15-minute window.\n   - Values must be rounded to 4 decimal places where applicable.",
+  "requirements": [
+   "./scripts/run_aggregation.sh --date <YYYY-MM-DD> runs non-interactively and exits with status 0 for any valid date directory under /var/spool/telemetry/.",
+   "scripts/process_spool.sh groups and sorts spool chunk files by device ID and ascending numeric chunk sequence before feeding them into /usr/local/bin/spool_dump.",
+   "/usr/local/bin/spool_dump is invoked with proper arguments (--skip-corrupt or -s) to avoid halting on damaged checksum blocks in raw spools.",
+   "etl/normalize.py tracks state baselines across keyframes and deltas per (dev_id, chan_id), correctly ignoring warm-up frames (bit 0) from baseline updates and valid sample emissions.",
+   "etl/normalize.py applies sensor saturation clamping from /etc/telemetry/sensors.json when bit 1 is set, and applies the decimal exponent scaling (flags >> 4) alongside sensor_scale.",
+   "etl/aggregate_metrics.py populates table metrics_15m in /var/db/telemetry_rollup.db with 15-minute windowed aggregations (epoch_ms bucketed to 900,000 ms multiples) containing exact sample_count, min_val, max_val, avg_val, and alarm_count."
+  ],
+  "environment": [
+   "Base Python 3.13 image with sqlite3 and standard utilities installed.",
+   "/usr/local/bin/spool_dump: compiled ELF 64-bit binary built from a custom C source in Dockerfile, with the source code stripped and deleted after compilation. Supports flags: -h/--help, -s/--skip-corrupt, -v/--verbose, outputs TSV records: dev_id, chan_id, seq, ts_offset_ms, frame_type (K/D/A), raw_val, flags.",
+   "/etc/telemetry/sensors.json: mapping of channel ID to sensor configuration { chan_id: { name: str, sensor_scale: float, min_clamp: float, max_clamp: float } }.",
+   "/var/spool/telemetry/2025-05-10/: 1,440 spool chunk files containing realistic synthetic sensor traces with corrupted checksum blocks, warm-up samples, delta sequences across chunks, and alarm frames.",
+   "scripts/run_aggregation.sh: top-level pipeline runner with multi-stage orchestration.",
+   "scripts/process_spool.sh: buggy shell script using unsorted globbing (e.g. `ls *.spool | xargs spool_dump`) without grouping by dev_id, and failing to handle spool_dump non-zero exit codes on corrupted frames.",
+   "etl/normalize.py: Python staging script with missing state tracking across chunks, incorrect flag bitfield decoding (treating flags as signed int or wrong bitshifts), and unhandled baseline reset on keyframes.",
+   "etl/aggregate_metrics.py: SQLite ingestion and window calculation script with incorrect SQL windowing math (seconds vs milliseconds bucket mismatch) and including warmup/alarm frames in min/max/avg math.",
+   "/var/db/telemetry_rollup.db: pre-initialized SQLite database with schemas for staging_records and metrics_15m."
+  ],
+  "internal_hint": "1. Inspect /usr/local/bin/spool_dump using --help, strings, or running it on a single .spool chunk. Discover that spool_dump exits with code 3 on corrupted frames unless passed `-s` or `--skip-corrupt`.\n2. Fix scripts/process_spool.sh: Ensure chunk files are sorted numerically by chunk index per device (e.g., using `sort -t_ -k2,2 -k4,4n`) so keyframes ('K') always precede dependent delta frames ('D') for each device.\n3. Inspect the bitfield format of the decoder output in etl/normalize.py: bit 0 (warmup) must discard the sample from metrics and baseline; bit 1 (saturation) requires clamping `raw_val` to [min_clamp, max_clamp]; bits 4-7 represent the power-of-10 exponent: value = (clamped_val * sensor_scale) / (10 ** ((flags >> 4) & 0x0F)).\n4. Fix etl/aggregate_metrics.py: Bucket timestamps by `(epoch_ms / 900000) * 900000`. Group by `window_start_ms, dev_id, chan_id`. Compute min/max/avg/sample_count strictly on valid 'K' and 'D' frames; count 'A' frames as alarm_count.",
+  "trap": "A solver might test on only dev_01_chunk_0001.spool, where no corrupt frames exist, chunk ordering happens to be trivial (single chunk), and no warmup flags or exponents are active. The initial sample looks like it works, but running the full dataset or hidden verify-time date directories fails due to chunk reordering, checksum crashes, and skewed rollup metrics from warm-up samples and exponent scaling.",
+  "tests": [
+   "Run ./scripts/run_aggregation.sh --date 2025-05-10 and verify exit code 0 and table metrics_15m row count > 0.",
+   "Fuzz test: generate a fresh random date directory /var/spool/telemetry/2025-06-01 with 2,000+ spool chunks across 20 devices containing delta chains, warm-up frames, out-of-order chunk sequences, and random corrupted blocks.",
+   "Run ./scripts/run_aggregation.sh --date 2025-06-01 and compare the generated metrics_15m rows in /var/db/telemetry_rollup.db against an internal Python reference engine over all 15-minute buckets.",
+   "Verify numeric tolerances: window_start_ms match, sample_count exact match, alarm_count exact match, and min_val, max_val, avg_val match within 1e-3 tolerance."
+  ],
+  "verifier_knob": {
+   "name": "num_fuzz_devices_and_chunks",
+   "value": "25 devices, 2500 chunks, 50000 records",
+   "effect": "Increasing this scales the state size and probability of rare flag combinations (e.g. simultaneous saturation and non-zero exponent on delta frames across chunk boundaries)."
+  },
+  "expected_failure_modes": [
+   "Agent fails to inspect spool_dump flags, leading to pipeline crashes on corrupt CRC blocks.",
+   "Agent sorts chunks alphabetically instead of numerically (e.g. chunk_10 before chunk_2), causing KeyframeMissingError when delta frames appear before their keyframe chunk.",
+   "Agent misinterprets the bitmask for the decimal exponent (e.g., using flags >> 3 or (flags & 0xF0) without shift), corrupting calibrated values by orders of magnitude.",
+   "Agent includes warm-up frames (bit 0) in the SQL aggregate calculation or uses warm-up frames to update baseline delta values.",
+   "Agent calculates 15-minute windows in seconds (900s) instead of milliseconds (900000ms), resulting in mismatched window timestamps and zero matches in the reference verification."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "devops",
+  "tags": [
+   "data-querying",
+   "sql",
+   "shell-scripting",
+   "reverse-engineering",
+   "fuzz-equivalence",
+   "multi-stage-pipeline"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "sed -n '1,100p' scripts/run_aggregation.sh scripts/process_spool.sh",
+   "sed -n '1,100p' etl/normalize.py etl/aggregate_metrics.py",
+   "/usr/local/bin/spool_dump --help",
+   "python3 -c 'import json; print(json.load(open(\"/etc/telemetry/sensors.json\")))'",
+   "sed -i 's/spool_dump/spool_dump --skip-corrupt/g' scripts/process_spool.sh",
+   "cat << 'EOF' > scripts/process_spool.sh\n#!/usr/bin/env bash\nset -euo pipefail\nDATE_DIR=\"$1\"\nfind \"$DATE_DIR\" -name '*.spool' | sort -t_ -k2,2 -k4,4n | xargs /usr/local/bin/spool_dump --skip-corrupt\nEOF",
+   "patch etl/normalize.py to apply bit 0 (warmup ignore), bit 1 (saturation clamp), bits 4-7 ((flags >> 4) & 0xF exponent), and baseline state tracking",
+   "patch etl/aggregate_metrics.py to bucket by (epoch_ms // 900000) * 900000 and compute min/max/avg on K/D and alarm_count on A",
+   "./scripts/run_aggregation.sh --date 2025-05-10",
+   "sqlite3 /var/db/telemetry_rollup.db 'SELECT count(*), min(sample_count), max(alarm_count) FROM metrics_15m;'"
+  ],
+  "speedrun_commands": 10,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Database idempotency / primary key collision: if the test re-runs scripts/run_aggregation.sh on the same date without wiping /var/db/telemetry_rollup.db or using INSERT OR REPLACE, it will crash with UNIQUE constraint violations.",
+   "Pipeline execution timeout: processing 2,500 chunks via find | xargs or unbuffered pipe can exceed standard test runner timeouts if batching or SQLite commit transactions are not tuned."
+  ],
+  "verdict": "reject",
+  "reasons": "The instruction draft gives away the exact implementation details, flags, and formulas: it explicitly tells the solver to pass `--skip-corrupt`, provides the exact bitmask operations (`(flags >> 4) & 0x0F`, `0x01`, `0x02`), and writes out the windowing arithmetic formula. An agent does not need to troubleshoot, inspect binary behaviors, or reverse-engineer anything; it simply applies a provided 10-command code specification.",
+  "fixes": [
+   "Remove the spoon-fed decoder flag (`--skip-corrupt`), bitfield layout (`0x01`, `0x02`, `(flags >> 4) & 0x0F`), and calibration formula from the prompt instruction; require the solver to inspect `spool_dump --help` or reverse-engineer the decoder output headers and existing ETL comments.",
+   "Turn the prompt into an issue report describing the symptoms (dropped delta baselines across boundaries, corrupt CRC crashes, incorrect rollup aggregates) rather than an explicit step-by-step implementation guide.",
+   "Specify idempotency expectations in the prompt and schema (e.g. `INSERT OR REPLACE` into `metrics_15m`) so repeated executions or verify-phase test runs do not fail on duplicate key errors."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "While both involve telemetry spool files, the candidate requires sorting chunked inputs in shell, handling bitwise flags and delta state decompression in Python, and computing SQLite window rollups, whereas fc33c63adc58 focuses on fixing protocol v2 demuxing and trace extraction in a Rust engine."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference focuses on optimizing and matching fixed-point statistical computations in Rust against a reference binary, whereas the candidate deals with multi-stage Python/shell ingestion, delta state tracking, and SQL windowing."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference focuses on SQL performance tuning and analytic query parity for runner telemetry shards, whereas the candidate focuses on fixing pipeline sequencing, binary CLI invocation, and bitmask/delta decoding logic."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference requires black-box empirical characterization of an unknown normalizer transfer function, whereas the candidate provides explicit bitflag, clamping, and delta decoding specifications across a multi-stage shell/Python ETL pipeline."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The reference involves CSV chunking, deduplication, and schema rejection in Python, whereas the candidate centers on binary spool decoding, delta-frame statefulness, and time-bucketed database rollups."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fc33c63adc58",
+     0.26
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.213
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.167
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.166
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.152
+    ]
+   ],
+   "cost_usd": 0.007254
+  },
+  "novel": true
+ },
+ "cost_usd": 0.02124375
+}

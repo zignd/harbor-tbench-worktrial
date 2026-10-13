@@ -1,0 +1,192 @@
+{
+ "blueprint": {
+  "slug": "cdc-snapshot-replay-deployment",
+  "title": "Deploy the CDC Snapshot Rebuilder",
+  "scenario": "After a failed database migration, the DBA needs to reconstruct the last committed contents of several tenant tables from an exported change-data-capture spool. The container contains an in-house JavaScript deployment wrapper, thousands of mixed JSON and packed binary spool files, an opaque native frame decoder, and operational configuration from the incident; the currently deployed command produces a plausible snapshot on the small sample but loses rows in the full export.",
+  "instruction_draft": "$ journal-snapshot --config /etc/journal-snapshot/production.json --input /srv/cdc-export --output /srv/recovered\njournal-snapshot: processed 184 records, emitted 177 rows\njournal-snapshot: warning: 7 records could not be assigned to a transaction\n\nYou are the database administrator repairing this incident deployment. Make the installed `journal-snapshot` command operational and deploy it using the supplied configuration; do not require internet access or modify the input export.\n\nFor every invocation, recursively consume all supported CDC files under the configured input directory, including files encountered in arbitrary directory and filename order. Reconstruct the final committed state of every `(tenant, table, primary_key)` row: apply operations in database commit order and source order within a committed transaction, ignore aborted or incomplete transactions, and honor inserts, updates, deletes, and transaction metadata represented by either input modality. Emit one canonical UTF-8 JSON object per surviving row in `output/rows.jsonl`, sorted by tenant, table, and primary key using bytewise UTF-8 ordering. Emit `output/manifest.json` containing the input file count, decoded event count, committed transaction count, surviving row count, and SHA-256 of `rows.jsonl`; numbers and hashes must be exact.\n\nThe command must produce identical output for the same input regardless of filesystem traversal order, must not silently skip a malformed or unsupported record, and must exit nonzero with a diagnostic that names the file and byte offset when an input is genuinely invalid. It must publish output atomically so an interrupted run does not leave a partially replaced snapshot.\n\nDeploy it as `/usr/local/bin/journal-snapshot`, with no working-directory assumption, and preserve the documented `--config`, `--input`, `--output`, and `--workers` options. On the verification corpus, the median of three cold-cache runs must process at least 35,000 decoded CDC events per second on the single available CPU while using less than 700 MiB RSS. The verifier will generate additional exports with fresh seeds, mixed text/binary records, transaction rollbacks, sequence resets, duplicate delivery, Unicode keys, and rare malformed records; correctness and the performance threshold apply to those exports too.",
+  "requirements": [
+   "Install a working `/usr/local/bin/journal-snapshot` deployment.",
+   "Support `--config`, `--input`, `--output`, and `--workers` without depending on the current working directory.",
+   "Recursively consume every supported CDC file under the configured input directory in arbitrary filesystem order.",
+   "Decode both supported CDC modalities: textual JSON records and packed binary records.",
+   "Reconstruct the final state for every `(tenant, table, primary_key)` row.",
+   "Apply committed transactions in database commit order and preserve source order within each transaction.",
+   "Ignore aborted and incomplete transactions.",
+   "Correctly handle inserts, updates, deletes, transaction metadata, duplicate delivery, and sequence resets.",
+   "Emit exactly one canonical UTF-8 JSON object per surviving row in `output/rows.jsonl`.",
+   "Sort rows by tenant, table, and primary key using bytewise UTF-8 ordering.",
+   "Emit exact file count, decoded event count, committed transaction count, surviving row count, and SHA-256 metadata in `output/manifest.json`.",
+   "Produce byte-identical output independent of filesystem traversal order.",
+   "Fail nonzero on genuinely invalid input and identify the file and byte offset in the diagnostic.",
+   "Publish output atomically and avoid leaving a partially replaced snapshot after interruption.",
+   "Reach at least 35,000 decoded CDC events per second on the verification corpus.",
+   "Remain below 700 MiB RSS.",
+   "Pass correctness and performance checks on fresh hidden exports, not only the supplied sample."
+  ],
+  "environment": [
+   "Use `FROM python:3.13-slim-bookworm` with pinned apt packages and no network access at runtime; Node.js is installed from a pinned local package during image construction.",
+   "Provide an approximately 1,500-line in-house JavaScript codebase under `/opt/journal-snapshot`, split among a CLI, configuration loader, deployment script, text reader, transaction assembler, row reducer, manifest writer, and intentionally unrelated operational utilities.",
+   "Provide several thousand CDC files under `/srv/cdc-export`, including JSONL shards and packed binary `.jpk` shards, with nested directories, misleading lexical names, duplicate deliveries, Unicode identifiers, transaction fragments split across files, aborted transactions, and a small number of records that exercise sequence-number resets.",
+   "Provide a short operator runbook and format notes describing record families and command-line behavior, but require correlation of those notes with actual data and runtime experiments to determine the native decoder mode and transaction ordering behavior.",
+   "Ship `/opt/journal-snapshot/native/journal-frame-decoder`, a stripped compiled executable with no source, which converts packed frames to a length-delimited event stream. Its behavior changes with the supplied deployment mode and frame batch boundaries; it is the only supported way to decode the packed payload.",
+   "Provide a sample export and expected operational log, but make the sample too small to expose cross-file transaction fragments, reset epochs, duplicate delivery, or the rare malformed-frame path.",
+   "Plant a deployment/configuration failure in which the wrapper selects a text-only decoder mode for binary shards and a reducer failure in which arrival order is used for some cross-file commits. Include plausible, unrelated source code so locating the actual failure requires running the command against the corpus, instrumenting intermediate counts, and comparing modalities.",
+   "Include a deterministic export generator used by the verifier but not needed to be edited by the solver; generated exports contain 10,000-40,000 files and are created with fixed hidden seeds.",
+   "Include a pinned SHA-256 utility and a minimal interruption harness for checking atomic publication."
+  ],
+  "internal_hint": "The reference shell script first inventories file types and sizes, runs the deployed command on selected text-only and binary subsets, and compares event counts with the native decoder directly. It discovers that the production config passes the wrong decoder mode and that packed frames can contain transaction fragments whose commit records occur in a different shard from their operations. Instrumentation reveals that commit order is the decoded database LSN/epoch tuple, not filename order or per-file sequence alone; sequence numbers restart at each epoch, and duplicate delivery must be collapsed by event identity before reduction. The fix deploys a mode-aware streaming decoder, buffers only transaction fragments and compact per-key state, globally orders committed transaction metadata by epoch and LSN, rejects malformed frames with offsets, sorts the final keys bytewise, and writes a temporary output directory followed by an atomic rename. The reference solution validates a generated corpus, measures three cold-cache runs, then installs the launcher and permissions.",
+  "trap": "A shallow solution passes the visible sample by globbing JSON files, trusting filesystem order, or sorting only by numeric sequence. Hidden exports place a transaction's operations and commit in different files, reuse sequence numbers after an epoch reset, deliver some events twice, and put rare Unicode keys and malformed frames in binary shards. Such implementations either silently omit rows, apply a later update before an earlier commit, produce nondeterministic manifests, or exceed the memory/performance bar by loading every event or spawning one decoder process per file.",
+  "tests": [
+   "Invoke the installed command from a different working directory with the supplied production config and verify successful deployment and required options.",
+   "Run against a hidden deterministic export with shuffled directory enumeration and compare `rows.jsonl` and `manifest.json` against an independent reference reducer.",
+   "Check that all JSON and packed binary records are decoded, including transactions split across files and binary/text representations of equivalent events.",
+   "Check committed transaction ordering, intra-transaction operation order, aborted and incomplete transaction exclusion, epoch sequence resets, duplicate delivery, inserts, updates, deletes, and Unicode bytewise sorting.",
+   "Compare every manifest field and the SHA-256 digest, not merely the row count.",
+   "Inject a genuinely malformed record and require nonzero exit plus a diagnostic containing the source path and byte offset; verify that valid prior output is not published as the new snapshot.",
+   "Run the interruption harness during publication and verify that the old complete snapshot or the new complete snapshot remains visible, never a partially written directory.",
+   "Generate fresh hidden exports from multiple fixed seeds containing 10,000-40,000 files and rare edge cases, then repeat correctness checks without exposing expected intermediate counts.",
+   "Measure three cold-cache runs on a fixed single-CPU corpus and require median throughput of at least 35,000 decoded events per second.",
+   "Measure peak RSS during the performance run and require it to remain below 700 MiB."
+  ],
+  "verifier_knob": {
+   "name": "minimum_decoded_events_per_second",
+   "value": "35000",
+   "effect": "Raising the value forces more efficient streaming, batching, decoder invocation, and sorting; lowering it permits slower but still correct implementations. The hidden-corpus scale and rare-case coverage remain unchanged."
+  },
+  "expected_failure_modes": [
+   "Treating filesystem or filename order as database commit order.",
+   "Using sequence numbers without incorporating their reset epoch.",
+   "Reading only JSONL files or invoking the opaque decoder with the visible sample's mode.",
+   "Discarding operations whose transaction metadata is in another shard.",
+   "Applying duplicate events twice or deduplicating by an insufficient key.",
+   "Loading all decoded events into memory and exceeding the RSS limit.",
+   "Creating one child decoder process per small file and missing the throughput threshold.",
+   "Sorting JavaScript strings rather than using the required bytewise UTF-8 ordering.",
+   "Computing manifest counts from emitted rows instead of decoded and committed event stages.",
+   "Leaving partial output visible after a failure or interruption.",
+   "Testing only the supplied sample, where arrival order and sequence-only ordering happen to agree.",
+   "Making a source-level patch without actually installing the command or preserving its configured invocation."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "javascript",
+   "cdc-recovery",
+   "binary-decoding",
+   "streaming",
+   "transaction-ordering",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `find /opt/journal-snapshot /etc/journal-snapshot /srv/cdc-export -maxdepth 3 -type f | sort | head -200`",
+   "2. `cat /opt/journal-snapshot/README* /opt/journal-snapshot/runbook* /opt/journal-snapshot/*format* 2>/dev/null`",
+   "3. `cat /etc/journal-snapshot/production.json`",
+   "4. `sed -n '1,240p' /opt/journal-snapshot/cli.js`",
+   "5. `grep -RniE 'decoder|mode|sequence|epoch|commit|transaction|workers|rename|manifest' /opt/journal-snapshot`",
+   "6. `cat /usr/local/bin/journal-snapshot 2>/dev/null; cat /opt/journal-snapshot/deploy*`",
+   "7. `journal-snapshot --config /etc/journal-snapshot/production.json --input /srv/cdc-export --output /tmp/baseline`",
+   "8. `find /srv/cdc-export -type f \\( -name '*.json' -o -name '*.jsonl' -o -name '*.jpk' \\) -printf '%s %p\\n' | sort -n | tail`",
+   "9. `find /srv/cdc-export -type f -name '*.jpk' | head -1 | xargs -r /opt/journal-snapshot/native/journal-frame-decoder --help`",
+   "10. `find /srv/cdc-export -type f -name '*.jpk' | head -1 | xargs -r /opt/journal-snapshot/native/journal-frame-decoder < /dev/null | head`",
+   "11. `sed -n '1,280p' /opt/journal-snapshot/{text-reader,transaction-assembler,row-reducer,manifest-writer}.js`",
+   "12. `node /opt/journal-snapshot/cli.js --config /etc/journal-snapshot/production.json --input /srv/cdc-export --output /tmp/text-only`",
+   "13. `node - <<'NODE'` plus a short probe comparing text-reader counts with direct native-decoder counts on binary shards",
+   "14. Patch the deployment configuration and launcher to select the binary/native mode and resolve paths independently of the working directory.",
+   "15. Patch decoding and reduction to stream records, deduplicate by event identity, retain cross-file transaction fragments, order commits by epoch and LSN, and preserve source order within transactions.",
+   "16. Patch parsing errors to carry source path and byte offset, and make unsupported or malformed records fatal.",
+   "17. Patch finalization to sort UTF-8 key bytes, compute manifest counts from each processing stage, and write a temporary directory followed by an atomic rename.",
+   "18. `chmod +x /opt/journal-snapshot/deploy.sh && /opt/journal-snapshot/deploy.sh && ls -l /usr/local/bin/journal-snapshot`",
+   "19. `cd /tmp && journal-snapshot --config /etc/journal-snapshot/production.json --input /srv/cdc-export --output /tmp/recovered --workers 1 && cat /tmp/recovered/manifest.json && sha256sum /tmp/recovered/rows.jsonl`",
+   "20. Run the supplied generator, malformed-input check, interruption harness, and three timed cold-cache runs; inspect RSS and adjust streaming/worker behavior if needed."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction does not define the exact JSON field schema or canonical serialization rules for row objects, so an implementation can be semantically correct but disagree with the verifier.",
+   "The meaning of input file count, decoded event count, and duplicate events is not fully specified, especially for malformed records and unsupported files.",
+   "The required byte offset is ambiguous for multibyte text, buffered input, and length-delimited binary frames.",
+   "The 35,000-events-per-second threshold and cold-cache behavior may vary substantially with container storage, CPU scheduling, and the verifier's cache-clearing method.",
+   "The interruption test can be flaky if it relies on a timing window rather than a deterministic failpoint during publication.",
+   "The statement that the native executable is the only supported binary decoder leaves its invocation protocol insufficiently specified if the runbook is incomplete or inconsistent with the executable."
+  ],
+  "verdict": "reject",
+  "reasons": "The outcome requirements and hidden-data checks are mostly clear and realistic, but the planted defects are discoverable by inspecting a relatively small codebase and can plausibly be repaired in about twenty commands, so the genuine-difficulty score is only 2. The resulting average is 3.4, below the required 3.6 threshold, and several serialization and metric details could make failures invalid rather than genuinely challenging.",
+  "fixes": [
+   "Specify the exact row JSON schema, canonical JSON escaping/number rules, manifest schema, and whether the trailing newline is included in the hash.",
+   "Define file-count and event-count semantics for unsupported files, duplicate deliveries, malformed records, and transaction metadata.",
+   "Document the native decoder's mode, framing, offset semantics, and failure contract while retaining hidden behavioral cases.",
+   "Move the key invariant out of readily inspectable source and require discovery through a less obvious but documented operational artifact or differential experiment.",
+   "Make the interruption test deterministic with an explicit publication failpoint and define the cold-cache/performance measurement procedure and hardware limits.",
+   "Either reduce the amount of preexisting implementation or add independent hidden invariants so that a shallow source patch cannot solve the task in roughly twenty commands."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The candidate reconstructs committed database row state from mixed-format CDC transactions, whereas the reference fixes CSV chunking, validation, and deduplication in an ETL pipeline."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The candidate implements CDC decoding and transactionally ordered snapshot reconstruction, while the reference corrects a SQLite analytical query involving windowed sums and ranking."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The candidate rebuilds database rows from textual and packed CDC logs with transaction semantics, whereas the reference fixes a Rust fixed-point sensor-statistics aggregator against a reference binary."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The candidate deploys a high-throughput CDC parser and transactional state rebuild, while the reference translates recursive JSON filter specifications into SQLite queries."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "Although both process binary records from directories, the candidate reconstructs committed relational state from CDC transactions, whereas the reference aggregates NetFlow bytes using templates, IP mappings, and traffic classes."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-aa07807ed980",
+     0.193
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.135
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.134
+    ],
+    [
+     "ours/official-18899524e171",
+     0.118
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.101
+    ]
+   ],
+   "cost_usd": 0.0009601999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0041308
+}

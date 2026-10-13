@@ -1,0 +1,185 @@
+{
+ "blueprint": {
+  "slug": "repair-graph-health-index",
+  "title": "Repair the Graph Health Index",
+  "scenario": "You are inheriting an internal JavaScript data pipeline that turns partitioned service-to-service telemetry into a graph-health index. The repository contains several feature iterations in Git history, a native graph-solving executable used by the current release, thousands of NDJSON observations, and a SQLite materialization job; the latest iteration produces plausible results on its small fixture but is not trustworthy at production scale.\n\nMake the current rebuild produce the documented release state without changing the input data or weakening the checks. The final database must contain the complete canonical graph, deterministic weighted edges, converged node scores, percentile bands, and derived hotspot rows, and repeated rebuilds with the same inputs must produce byte-for-byte identical state even when directory enumeration and input partition order differ.",
+  "instruction_draft": "Repair the inherited pipeline in this repository and leave it ready for evaluation with `node bin/rebuild.js --input data/observations --db build/graph.sqlite`. Preserve the documented release semantics found in the repository and Git history: every valid observation must contribute exactly once to its canonical directed edge, edge weights must use the specified byte/kind/epoch calculation, the graph solver must receive the complete graph and converge according to the release stopping rule (including disconnected and dangling nodes), and all downstream features must be computed from those solved scores rather than from partial batches.\n\nThe resulting SQLite state must include every canonical node and edge, the recorded solver metadata, deterministic score ordering, the documented percentile bands with the specified tie behavior, and hotspot rows with their required contributing edges. It must be reproducible across input-file permutations and reruns, handle malformed records and duplicate observations according to the repository's documented policy, use bounded memory for the supplied production-sized data, and pass the repository checks as well as fresh verify-time datasets containing rare numeric extremes, empty partitions, disconnected components, dangling nodes, duplicate names, and tied scores.",
+  "requirements": [
+   "The command `node bin/rebuild.js --input data/observations --db build/graph.sqlite` completes successfully without modifying the input directory.",
+   "Every valid observation contributes exactly once to its canonical directed edge, with canonicalization and malformed-record handling matching the repository's documented release semantics.",
+   "Edge weights match the documented byte, kind, and epoch calculation, including extreme byte values and observations from all partitions.",
+   "The graph solver receives the complete graph rather than independent partial graphs, handles disconnected components and dangling nodes, and stops only under the documented convergence rule.",
+   "All node scores, solver metadata, percentile bands, and hotspot rows are derived from the final converged scores.",
+   "The SQLite database contains every required node, edge, score, band, metadata, and hotspot row with the documented schema and values.",
+   "Score and row ordering is deterministic, including ties, independent of filesystem enumeration order and input partition order.",
+   "Running the rebuild twice on unchanged inputs produces identical SQLite logical state and identical generated metadata.",
+   "The rebuild handles the supplied thousands of observations within bounded memory rather than loading all raw observations at once.",
+   "The implementation passes repository checks and fresh generated verification datasets containing numeric extremes, empty partitions, disconnected and dangling graph regions, duplicate canonical names, and tied scores."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` with pinned system packages, Node.js, SQLite, Git, and a small Python data-generation utility; no network is needed.",
+   "A Git repository of roughly 1,500 lines of JavaScript, SQL, shell, and documentation, with commits for v1 ingestion, v2 weighted edges, v3 native scoring, and the current feature-iteration merge. Several unrelated health-report and CLI components make repository navigation nontrivial.",
+   "The current tree contains `bin/rebuild.js`, ingestion and external-sort stages, SQLite schema/migration files, a score-wrapper module, percentile/hotspot feature code, configuration, fixtures, and operational scripts.",
+   "A shipped executable `native/graphsolve` is present as a black-box ELF component with no source in the repository. Its CLI protocol and mathematical contract are documented in release notes and can be probed with controlled graphs.",
+   "The input tree contains several thousand partitioned NDJSON telemetry records, including empty files, duplicate canonical service names, disconnected services, dangling destinations, malformed lines, tied values, and a small number of byte counts large enough to expose unsafe numeric handling.",
+   "Git history contains a deliberately incomplete feature merge: a streaming ingestion change, a native solver integration change, and a percentile/hotspot feature were individually valid but their combined release wiring violates cross-stage invariants. The visible fixture is too small and well ordered to expose all failures.",
+   "The repository includes a sample expected report and shallow tests that exercise one connected graph, one partition, ordinary byte counts, and no percentile ties."
+  ],
+  "internal_hint": "The genuine difficulty is not visible by reading one source file: the failures emerge from running the pipeline on accumulated production-shaped data and from interactions with the opaque native component. Investigate `git log`, release notes, schemas, and stage boundaries, then instrument or independently rerun each stage on permuted and adversarial subsets. The intended repair is to make partition ingestion and external merging use an explicit total order and the documented canonical key, preserve exact/high-range weight inputs until the solver boundary, aggregate all edge contributions before invoking the native solver, and use the solver's global metadata and convergence result rather than treating each batch as a finished graph. The final feature stage must implement the documented percentile rank/tie rule over a deterministic score order and compute hotspots from the final scores. A skilled reference solution builds tiny diagnostic graphs to distinguish dangling-node redistribution, disconnected-component normalization, convergence tolerance, and tie behavior, compares SQLite state after shuffled rebuilds, then patches the orchestration, numeric serialization, and downstream ordering. The key hard lever is that the native solver is opaque and the source-level happy path looks reasonable; the root causes show only on rare values, graph topology, and long multi-stage state accumulation.",
+  "trap": "A shallow repair that merely fixes the sample fixture or sorts filenames will still fail: solving each input partition separately changes scores in disconnected and dangling regions, summing weights in JavaScript numbers loses low-order contributions after an extreme value, and using array index or unstable sort order assigns different bands to tied scores. Another plausible solution can produce correct-looking scores while deriving hotspots from pre-convergence or per-batch scores, leaving later rows consistently but silently wrong. Hidden tests permute files and generate fresh large graphs, so sampling the provided database or matching the visible report is insufficient.",
+  "tests": [
+   "A baseline state test runs the repaired command on the supplied production-sized tree and checks row counts, canonical node and edge keys, exact edge weights, solver metadata, all score rows, bands, hotspots, and schema-level invariants.",
+   "A reproducibility test copies the observations into several differently named and differently ordered partition trees, rebuilds fresh databases, and compares their logical SQLite state and generated manifest.",
+   "A generated large-state test creates thousands of observations across many partitions with empty files, malformed records, repeated canonical names, rare huge byte values, and small contributions following huge contributions; it compares every edge, score, and derived feature against an independent deterministic reference.",
+   "A topology test generates graphs with several disconnected components, dangling destinations, isolated nodes, cycles, and self-loops, then checks the native-solver contract, convergence metadata, and final global score values.",
+   "A numerical test generates observations spanning the documented byte range and epoch range, including cases where naive IEEE-754 accumulation loses a contribution; it checks serialized edge weights and all downstream scores within the release's stated precision.",
+   "A percentile test generates many tied and near-tied scores, including ties across component boundaries, and checks the documented rank, tie, boundary, and deterministic secondary-key behavior for every band.",
+   "A dependency test mutates one early observation and verifies that edge totals, solver scores, percentile assignments, hotspot membership, and summary metadata all change consistently through the later stages.",
+   "A rerun test executes the rebuild twice against the same input and verifies that no duplicate rows, changing timestamps, nondeterministic IDs, or stale derived rows remain.",
+   "A resource-oriented test uses the supplied scale and observes that the implementation does not materialize all raw NDJSON records in one in-memory array; it also checks successful completion under the one-CPU, 2-GB container constraints."
+  ],
+  "verifier_knob": {
+   "name": "generated_graph_observations",
+   "value": "12000",
+   "effect": "Raising this increases the number of partitions, records, duplicate keys, rare numeric cases, and dependent score/feature rows that must be handled systematically; lowering it makes shallow inspection and in-memory implementations more likely to pass. Hidden topology and tie-case proportions remain fixed."
+  },
+  "expected_failure_modes": [
+   "Reading only the current JavaScript files and missing the semantic changes and invariants recorded in Git history and release notes.",
+   "Treating the opaque native solver as a per-partition operation, or inferring its behavior from only the connected sample graph.",
+   "Using ordinary JavaScript Number accumulation or lossy text conversion for high-range weighted observations.",
+   "Relying on filesystem order, object insertion order, SQL implicit row order, or an unstable tie sort.",
+   "Fixing ingestion while leaving percentile and hotspot stages attached to an intermediate or pre-convergence score table.",
+   "Implementing a mathematically plausible PageRank-like calculation that differs in dangling redistribution, disconnected normalization, damping, tolerance, iteration limits, or rounding from the documented native contract.",
+   "Loading all raw observations into memory, causing failure or excessive degradation at verify-time scale.",
+   "Checking only row counts or the visible report and overlooking rare edge, score, tie, and metadata mismatches."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "systems",
+   "graph-ranking",
+   "git-history",
+   "streaming",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd; find . -maxdepth 2 -type f | sort",
+   "git log --oneline --all --decorate -20",
+   "git show --stat --oneline HEAD~5..HEAD; grep -RniE 'release|canonical|percentile|hotspot|converg|dangling|weight' README* docs . 2>/dev/null",
+   "find bin lib src sql migrations native -type f 2>/dev/null | sort",
+   "cat package.json; sed -n '1,240p' bin/rebuild.js",
+   "node bin/rebuild.js --input data/observations --db build/baseline.sqlite",
+   "sqlite3 build/baseline.sqlite '.schema' '.tables'",
+   "sed -n '1,260p' lib/ingest* lib/*sort* 2>/dev/null",
+   "sed -n '1,260p' lib/*score* lib/*solver* 2>/dev/null",
+   "sed -n '1,260p' lib/*percent* lib/*hotspot* 2>/dev/null",
+   "cat schema.sql migrations/*.sql 2>/dev/null",
+   "native/graphsolve --help 2>&1 || true; grep -Rni 'graphsolve' .",
+   "npm test",
+   "run each pipeline stage on tiny graphs and inspect intermediate files",
+   "patch ingestion canonicalization and malformed-record policy",
+   "patch external-sort keys and exact/high-range weight serialization",
+   "patch orchestration to aggregate all partitions before one solver invocation",
+   "patch solver wrapper for global metadata and documented convergence handling",
+   "patch score, percentile, and hotspot stages to consume final scores",
+   "patch SQL inserts and queries to use explicit deterministic ordering",
+   "node bin/rebuild.js --input data/observations --db build/graph.sqlite",
+   "copy observations into shuffled and renamed partition trees",
+   "rebuild databases for each shuffled tree",
+   "compare normalized SQLite contents and generated manifests",
+   "generate adversarial graphs with extremes, ties, dangling nodes, and empty files",
+   "run the generated verification suite",
+   "measure memory and runtime under one CPU and 2 GB",
+   "rerun unchanged input and compare all database and metadata state",
+   "git diff --check; npm test; inspect final row counts and invariants"
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The release semantics are delegated to undocumented repository files and Git history in the blueprint, so malformed-record policy, canonicalization, numeric precision, percentile ties, and solver normalization may be ambiguous before the repository is inspected.",
+   "Exact SQLite logical-state or byte-for-byte comparisons can be sensitive to SQLite version, schema/index details, floating-point serialization, WAL state, or generated timestamps unless the verifier defines a canonical comparison.",
+   "The opaque ELF solver may not be portable across the stated Docker base image or may expose insufficient diagnostics to establish its convergence and dangling-node contract.",
+   "A resource test that asserts no in-memory raw-record materialization is difficult to verify black-box and could reject valid implementations based on incidental allocator or runtime behavior.",
+   "The requirement to solve and validate a roughly 1,500-line inherited system with adversarial generated data in under an hour is likely unrealistic even for a skilled engineer."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and strongly verifiable, and its multi-stage failures provide genuine difficulty. However, the required investigation, black-box solver characterization, numeric repair, orchestration changes, and adversarial validation are unlikely to be solvable in under an hour, and several key release semantics are only indirectly specified; solvability is below the acceptance threshold.",
+  "fixes": [
+   "Provide a concise authoritative release-contract document or executable reference covering canonical keys, malformed and duplicate handling, exact weight representation, solver parameters, convergence metadata, percentile ties, and hotspot ordering.",
+   "Reduce the repository scope or raise the time expectation; alternatively provide focused diagnostics and a reference harness for probing the native solver.",
+   "Define canonical SQLite-state comparison precisely, including floating-point serialization, metadata timestamps, WAL handling, and ordering.",
+   "Replace the black-box memory-materialization assertion with a measurable memory budget or an explicit required streaming interface, and verify native executable compatibility in the image.",
+   "State whether generated datasets may introduce new schema or configuration values and provide the exact expected precision/tolerance for numeric and solver checks."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a partitioned telemetry graph construction and convergence pipeline, whereas this task reconciles authenticated binary settlement frames and financial adjustments."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate computes a deterministic graph index from observations, while this task resolves aliases and dependencies to replay events into incident components."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The candidate solves and materializes a weighted service graph, whereas this task reconciles filesystem artifacts using an authoritative scanner and quarantine rules."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The candidate aggregates telemetry into graph scores and derived rows, while this task replays sharded database transactions into a canonical snapshot."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "Although both are data pipelines producing SQLite results, the candidate's core problem is complete graph construction and iterative node scoring rather than fixed-point sensor statistics matching a reference binary."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.176
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.173
+    ],
+    [
+     "ours/official-982469e29790",
+     0.164
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.123
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.123
+    ]
+   ],
+   "cost_usd": 0.0009335999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0035223999999999993
+}

@@ -1,0 +1,187 @@
+{
+ "blueprint": {
+  "slug": "restore-audit-ingest-integrity",
+  "title": "Restore Audit Ingest Integrity",
+  "scenario": "An open-source security maintainer is triaging a regression in a release-audit ingester. The container contains a Python ingestion service, a SQLite state database, several thousand recorded security events, and a proprietary compiled envelope verifier whose source is not shipped; the current materialized state was produced by a broken release of the service.",
+  "instruction_draft": "Repair the audit ingester and rebuild its SQLite state so that it faithfully materializes the supplied event spool. Use the installed envelope verifier as the authority for event validity and canonical identity; preserve every input event, place invalid or conflicting events in the documented quarantine state, and make accepted events queryable with their tenant and sequence relationships intact.\n\nThe rebuilt database must be deterministic and idempotent: rerunning the repair must not change any rows or counts, accepted events must form exactly the valid per-tenant chains, and no event may be accepted merely because it resembles another tenant's event or has a duplicate-looking payload. Keep the verifier binary unchanged, leave a reproducible run manifest, and ensure the repair command also works on newly supplied spools rather than only on the included sample.",
+  "requirements": [
+   "Repair the supplied audit-ingestion implementation rather than manually editing the resulting SQLite rows.",
+   "Use the installed compiled envelope verifier as the authority for envelope validity and canonical event identity, without modifying or replacing that binary.",
+   "Preserve every input event in the database, including events that are rejected or quarantined.",
+   "Materialize accepted events with the verifier's canonical identity, tenant, sequence number, predecessor relationship, and original payload.",
+   "Place invalid signatures, malformed envelopes, replayed sequence numbers, broken predecessor links, and other verifier-reported conflicts in the documented quarantine representation with a deterministic reason.",
+   "Scope identity, replay detection, and chain continuity by tenant; events from different tenants must never collide or satisfy each other's predecessor requirements.",
+   "Ensure accepted rows form exactly the valid per-tenant chains represented by the input spool, with at most one accepted event for each tenant and sequence number.",
+   "Make rebuilding idempotent: two runs over the same spool produce byte-for-byte equivalent logical SQLite state and do not accumulate duplicate rows.",
+   "Write a deterministic run manifest containing the input digest, verifier version, accepted count, quarantined count, and per-tenant head information.",
+   "Provide a documented or discoverable repair entry point that accepts a fresh event spool and database path, and works without network access or wall-clock-dependent behavior.",
+   "Retain required SQLite constraints and indexes so that the materialized state remains queryable at the documented interfaces."
+  ],
+  "environment": [
+   "A Docker image based on python:3.13-slim-bookworm with pinned apt packages and no network dependency.",
+   "A roughly 1,400-line Python codebase split across an ingestion CLI, SQLite repository layer, chain materializer, spool reader, reporting code, and unrelated operational utilities.",
+   "An existing command such as /opt/audit/bin/rebuild-state that reads newline-delimited event envelopes from /opt/audit/spool and writes /opt/audit/state/audit.sqlite.",
+   "A compiled, stripped executable /opt/audit/lib/sealcheck with no adjacent source code. It accepts documented JSON envelope queries and emits canonical identity, signature status, tenant, sequence, and predecessor metadata; several status combinations only appear on unusual inputs.",
+   "A supplied spool containing approximately 18,000 deterministic events across 37 tenants, including malformed JSON, escaped and reordered payloads, duplicate envelopes, cross-tenant sequence collisions, sparse sequence ranges, and rare valid-looking events whose predecessor is invalid.",
+   "A prebuilt SQLite database and schema documentation showing raw_events, accepted_events, quarantine, tenant_heads, and run_manifest tables, plus indexes and foreign-key relationships.",
+   "A planted regression in the ingestion/materialization path involving canonical identity caching and stateful chain processing, along with plausible unrelated code and passing small fixtures.",
+   "A fixture generator and verifier-side harness capable of creating fresh signed and malformed spools with the same format but a hidden deterministic seed."
+  ],
+  "internal_hint": "The reference solution first inventories the CLI, schema, fixtures, and verifier interface, then probes sealcheck with reordered JSON, escaped strings, repeated envelopes, tenant changes, sequence gaps, and predecessor mutations. The opaque tool's canonical digest is not simply a hash of the raw line, and its replay/conflict statuses must be treated as authoritative before chain validation. Investigation of the large spool reveals that the regression reuses a process-global canonicalization cache and mutates a tenant-head lookup while batching rows, allowing a prior tenant or prior duplicate to influence later decisions; a second defect persists the batch's provisional heads before all verifier outcomes are applied. The repair isolates verifier results by event, keys all state by tenant plus canonical sequence identity, validates predecessor links against committed accepted rows, inserts raw and quarantine records transactionally, and replaces rather than accumulates materialized state on rebuild. The reference shell script records experiments against sealcheck, runs targeted fixtures, rebuilds from scratch, checks idempotence, and then exercises hidden-style generated spools.",
+  "trap": "A shallow solution can make the visible sample counts look correct by clearing the database, hashing raw JSON, or deduplicating on a global digest. It fails on hidden spools containing semantically identical but differently serialized envelopes, the same sequence number in multiple tenants, a duplicate after a malformed predecessor, and tenant interleavings that expose leaked batch state. Another common failure is accepting a complete-looking chain before all verifier results are known, which incorrectly preserves descendants of a later-rejected predecessor.",
+  "tests": [
+   "Build a clean database from the supplied 18,000-event spool and compare all required tables, counts, canonical identities, quarantine reasons, tenant heads, indexes, and manifest fields against the deterministic reference state.",
+   "Run the repair twice on the same spool and verify logical row equality, stable ordering, unchanged counts, and no duplicate raw, accepted, quarantine, or manifest records.",
+   "Generate fresh spools with a hidden seed containing reordered JSON keys, alternate escaping, repeated envelopes, malformed records, cross-tenant sequence reuse, sparse chains, and descendants of invalid predecessors; run the submitted repair entry point and compare the resulting SQLite state with the reference implementation.",
+   "Check that every input line has exactly one raw-event representation and exactly the expected accepted-or-quarantined disposition.",
+   "Check that accepted events have unique tenant/sequence identities, valid verifier status, matching canonical identity, and predecessor links to the accepted event required by the verifier.",
+   "Check that no accepted event from one tenant is used as a predecessor, replay witness, or identity collision for another tenant.",
+   "Check tenant_heads for every tenant, including tenants with no accepted events and tenants whose final candidate was quarantined.",
+   "Check that the run manifest is deterministic, contains the input digest and verifier version, and reports counts and heads matching the rebuilt state.",
+   "Invoke the repair against a different database path and a generated spool without changing configuration or relying on the prebuilt sample database.",
+   "Inspect outcome behavior rather than source text: the verifier binary remains unchanged, no network is used, and the command exits nonzero with an explicit deterministic error for unusable input paths."
+  ],
+  "verifier_knob": {
+   "name": "independent_materialized-state properties",
+   "value": "9",
+   "effect": "Raising this adds checks for additional table contents, tenant heads, quarantine classifications, indexes, manifest fields, idempotence, and generated-input behavior; lowering it to only aggregate counts makes shallow global-deduplication solutions much more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads the readable Python defect and patches only the obvious cache or SQL statement without experimentally characterizing the compiled verifier.",
+   "The agent hashes raw input lines instead of using verifier canonicalization, so semantically equivalent envelopes split or collide incorrectly.",
+   "The agent uses a global event or sequence key and fails cross-tenant collisions.",
+   "The agent validates chains online and accepts descendants before discovering that an earlier predecessor is invalid.",
+   "The agent fixes the sample by manually rebuilding or deleting rows but does not implement a reusable repair entry point.",
+   "The agent verifies only aggregate counts and misses rare malformed, replay, or interleaved-tenant cases in the large spool.",
+   "The agent makes rebuilds append-only, causing duplicate state or stale tenant heads on the second run.",
+   "The agent records wall-clock timestamps or nondeterministic row ordering in the manifest.",
+   "The agent modifies, wraps, or replaces the opaque verifier with an approximation that passes visible examples but disagrees on hidden envelopes."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "security-data-processing",
+  "tags": [
+   "sqlite",
+   "opaque-binary",
+   "audit-integrity",
+   "chain-validation",
+   "large-state",
+   "idempotent-migration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `cd /opt/audit && find . -maxdepth 3 -type f -printf '%p\\n' | sort`",
+   "2. Read README, schema documentation, CLI help, and the existing rebuild entry point.",
+   "3. Inspect the ingestion CLI and spool reader, including malformed-line handling.",
+   "4. Inspect the SQLite repository and schema creation/migration code.",
+   "5. Inspect chain materialization, batching, caching, and tenant-head updates.",
+   "6. Inspect reporting and run-manifest generation.",
+   "7. Inspect fixture-generator and verifier-harness usage examples.",
+   "8. Run `/opt/audit/lib/sealcheck --help` or the documented JSON protocol against one valid sample.",
+   "9. Probe reordered keys, alternate escaping, repeated envelopes, tenant changes, sequence gaps, and predecessor mutations.",
+   "10. Record verifier canonical identities, statuses, tenant/sequence metadata, and predecessor behavior.",
+   "11. Inventory the supplied spool and compare raw-line counts with existing database rows.",
+   "12. Query all required tables, indexes, constraints, and foreign keys in the prebuilt database.",
+   "13. Reproduce the visible regression with interleaved tenants, duplicates, and malformed predecessors.",
+   "14. Patch verifier invocation and result handling so each input event is independently canonicalized and classified.",
+   "15. Remove process-global canonicalization/state leakage and key replay/identity state by tenant and canonical sequence identity.",
+   "16. Refactor materialization into a deterministic two-phase process: collect verifier outcomes, then validate predecessor links against committed accepted rows.",
+   "17. Ensure descendants of invalid or quarantined predecessors are quarantined with deterministic reasons.",
+   "18. Preserve one raw-event row per input line and transactionally create exactly one accepted or quarantine disposition.",
+   "19. Replace rebuild state transactionally rather than appending; clear or replace stale materialized rows and tenant heads.",
+   "20. Preserve documented schema constraints and indexes and make fresh database paths work.",
+   "21. Make manifest fields deterministic, including input digest, verifier version, counts, and all tenant heads.",
+   "22. Add explicit deterministic nonzero errors for unusable spool or database paths and remove timestamps/randomness.",
+   "23. Run syntax checks and the supplied targeted fixtures.",
+   "24. Rebuild the sample into a clean database and compare counts, identities, chains, quarantine reasons, heads, and manifest.",
+   "25. Run the repair twice and compare normalized SQLite state and row counts.",
+   "26. Generate hidden-style fresh spools and run the repair against a different database path.",
+   "27. Verify verifier binary hash is unchanged, inspect indexes/foreign keys, and run final invariant queries."
+  ],
+  "speedrun_commands": 27,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The blueprint does not explicitly define tie-breaking when multiple verifier-valid candidates share a tenant and sequence, so tests must derive that rule unambiguously from the documented verifier behavior or fixtures.",
+   "Exact quarantine reason strings, raw-event encoding for malformed lines, manifest serialization, and tenant-head representation must be documented; otherwise an otherwise-correct implementation could fail on representation details.",
+   "If verifier version is not exposed deterministically by the binary or supplied metadata, requiring an exact manifest version is overreaching.",
+   "Comparisons must use explicit logical ordering rather than SQLite's unspecified natural row order; byte-for-byte database-file comparison would be flaky or implementation-dependent.",
+   "The fixture generator and verifier harness must be present and usable offline, with resource limits appropriate for 18,000 events on 1 CPU and 2 GB RAM."
+  ],
+  "verdict": "accept",
+  "reasons": "The end state and adversarial behaviors are sufficiently specified, and the outcome-based tests can distinguish canonicalization, tenant isolation, chain validation, idempotence, and manual sample-only fixes. The task is realistically difficult because it combines black-box verifier characterization with stateful large-scale materialization, although the existing codebase makes it solvable in the stated environment. Acceptance depends on documenting the few representation and tie-breaking details noted above.",
+  "fixes": [
+   "Document the exact raw-event, quarantine-reason, tenant-head, manifest, and row-order representations expected by the tests.",
+   "Specify deterministic resolution or quarantine behavior for multiple otherwise-valid candidates with the same tenant and sequence.",
+   "State how verifier version is obtained and normalized when producing the manifest.",
+   "Require tests to compare ordered logical rows and schema metadata, not SQLite file bytes or unspecified natural row order.",
+   "Include a documented offline smoke command for the fixture generator and verifier harness and confirm its memory/time budget."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "variant",
+     "reason": "Both require validating authenticated audit-event chains with canonical identities, predecessor continuity, and rejection of forks or duplicates, but this task repairs an ingest/materialization pipeline with tenant-scoped quarantine and idempotent rebuilding rather than exporting authoritative events from epoch-based chains."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "Although both use an opaque authority to rebuild an idempotent SQLite state while preserving rejected inputs, this task concerns cryptographically linked tenant event chains rather than filesystem artifact classification and reconciliation."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576",
+     "verdict": "distinct",
+     "reason": "The reference is an authorization-policy precedence and export problem, whereas this task validates signed event envelopes and reconstructs tenant-scoped sequence chains."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference reconstructs a replay service from segmented transactional logs and serves a JSON state protocol, while this task materializes verifier-authoritative security-event chains and quarantine records."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The reference performs incident correlation, alias resolution, and deterministic component ordering, not cryptographic envelope verification or per-tenant audit-chain ingestion."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-371a54d3de9f",
+     0.237
+    ],
+    [
+     "ours/official-982469e29790",
+     0.226
+    ],
+    [
+     "ours/official-a111d7f89576",
+     0.214
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.208
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.204
+    ]
+   ],
+   "cost_usd": 0.0013966
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0041934
+}

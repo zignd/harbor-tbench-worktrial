@@ -104,7 +104,7 @@ cards(s, [{ big: D.batch.records, label: "records" },
   { big: D.batch.learnable, label: "learnable (in band)" },
   { big: `${D.batch.too_hard}/${D.batch.too_easy}`, label: "too hard / too easy" },
   { big: D.batch.invalid, label: "invalid" }]);
-s.addText("Bimodal, as predicted without continuous difficulty control. Reused copies are not independent generations.",
+s.addText("Bimodal, as predicted. Reused copies are not independent generations. Historical candidate records, not approvals - none survives the audit.",
   { x: 0.5, y: 3.6, w: 9, h: 0.7, fontSize: 15, color: C.text2, isTextBox: true, margin: 0, valign: "top" });
 notes(s, "22 records: 12 fresh, 10 recalibrated copies. Three landed in band for this solver.");
 
@@ -125,7 +125,8 @@ s = lightTitle("Verification discipline");
 bullets(s, ["Approval = content-hash-bound calibration + verification record inside the package.",
   "Independent oracle 3/3 and nop re-run; verification is offline at build time.",
   "Reports use only the declared model pair; stale-version gate successes do not count.",
-  "Turn-cap exhaustion is invalid — even when the verifier reward is 1."]);
+  "Turn-cap exhaustion is invalid — even when the verifier reward is 1.",
+  "Result: all four earlier 'shipped' tasks failed this audit, so output/ is empty on purpose."]);
 notes(s, "These rules are enforced in code and unit-tested after the audit.");
 
 // 9 stretch

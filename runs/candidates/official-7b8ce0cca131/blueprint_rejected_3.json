@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "recover-parity-metric-sketches",
+  "title": "Recover Parity-Coded Metric Sketches",
+  "scenario": "A research scientist is reproducing a cardinality result from an experiment whose observability agent writes LogSketch Metric files and periodically uploads them to a SQLite-backed analysis service. A disk incident left some sketch pages unreadable, and the current SQL materializer produces plausible but incomplete service-level metrics; the container includes the service, format notes, sample logs, damaged files, and its metrics database.",
+  "instruction_draft": "Add the missing recovery/materialization feature so that `bin/materialize_metrics --db <db> --input <directory>` consumes the LogSketch files and atomically rebuilds the `recovered_pages`, `service_metrics`, and `metric_rollup` tables. The result must recover every stripe that is recoverable from its parity, reject unrecoverable or semantically invalid stripes, merge HLL registers across runs, and preserve the run and service identities recorded in the files.\n\nThe materialized cardinality estimates must use the documented LogSketch estimator and be within 3.5% of the reference estimates on the supplied data and on fresh verifier-generated inputs. All three output tables must agree on the same recovered page set and merge scope, repeated execution must be deterministic and idempotent, and the command must process at least 250,000 generated pages per minute on the container.",
+  "requirements": [
+   "Implement the missing LogSketch page recovery and metric materialization feature.",
+   "Make `bin/materialize_metrics --db <db> --input <directory>` the working entry point.",
+   "Recover a stripe when its damaged or missing page can be reconstructed from the stripe parity.",
+   "Reject unrecoverable stripes and pages whose reconstructed header, sequence, length, or checksum is invalid.",
+   "Populate `recovered_pages`, `service_metrics`, and `metric_rollup` atomically.",
+   "Merge recovered HLL registers according to the documented register-wise merge rule.",
+   "Use the documented LogSketch cardinality estimator.",
+   "Preserve run, stripe, and service identity and do not merge unrelated scopes.",
+   "Ensure the three output tables describe the same recovered page set and merge scope.",
+   "Be deterministic and idempotent when run more than once on the same database and input.",
+   "Stay within 3.5% of the reference cardinality estimates on supplied and hidden generated inputs.",
+   "Process at least 250,000 generated pages per minute on the one-CPU verifier container."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned SQLite/Python dependencies and no network access.",
+   "The repository contains roughly 1,300 lines across a Python command wrapper, SQL migrations, logging helpers, a metrics exporter, fixtures, and tests; only the recovery/materialization portion is incomplete.",
+   "`docs/logsketch-v2.md` documents a deterministic binary format: a file header, fixed-size pages, per-page CRC32, four data pages plus one XOR parity page per stripe, six-bit packed HLL registers, service/run/stripe identifiers, and the estimator constants.",
+   "`tools/import_logsketch.py` is the existing file reader and loads page metadata and payload blobs into SQLite tables, exposing documented byte/CRC helper functions to SQL. It intentionally leaves damaged payloads represented rather than silently dropping them.",
+   "`bin/materialize_metrics` currently creates the schema and invokes `sql/materialize.sql`, but the recovery CTEs and register merge query are missing or incomplete; unrelated logging and metrics-export code is present to make the investigation realistic.",
+   "The database contains normal pages, pages with bad CRCs, duplicate uploads, a few whole missing pages, multiple services, and interleaved runs. The supplied fixture is small enough for manual inspection but does not include every corruption pattern.",
+   "A deterministic generator used only by verification creates fresh databases and LogSketch directories with thousands of stripes, shuffled file order, duplicate files, one-erasure stripes, unrecoverable multi-erasure stripes, malformed reconstructed headers, and service/run scopes that must not be merged.",
+   "The verifier provides the reference recovered-page identities and reference estimates through its own generator rather than exposing them as files in the task environment."
+  ],
+  "internal_hint": "Investigate by running the importer and materializer on the supplied fixture, inspecting page status counts, duplicate keys, CRC failures, and the existing SQL schema rather than assuming damaged rows should be discarded. The key repair is to group pages by run and stripe, canonicalize duplicate candidates deterministically, XOR the complete encoded page bytes only when exactly one slot is unavailable or invalid, validate the reconstructed page before accepting it, and keep unrecoverable stripes out of every downstream table. Decode the six-bit registers with the documented bit order, merge only pages sharing the same service and run scope, and implement the estimator with its small-range linear-counting correction and large-range correction. The wrapper must clear or stage the affected materialization atomically; otherwise a failed second run leaves cross-table state from two different recovery attempts. Benchmarking should reveal that row-at-a-time Python decoding or repeated SQL scans misses the throughput threshold, while set-based grouping and one-pass register expansion passes it. The reference solution is a deterministic shell script that first inspects the schema, fixture counts, and command behavior, then patches the SQL and wrapper and runs generated-style local checks.",
+  "trap": "A shallow solution that drops CRC-failed pages, chooses the first duplicate, or XORs payload bodies without the encoded header can match the supplied cardinality closely while silently losing one-erasure stripes. Another common solution merges all recovered registers by service and therefore passes a single-run sample but contaminates hidden multi-run inputs. Direct raw-register averaging, omission of linear counting, or a row-at-a-time decoder can produce plausible estimates yet fail the hidden accuracy or throughput threshold; partial table replacement also fails idempotence and cross-component consistency checks.",
+  "tests": [
+   "Run the CLI on the supplied damaged fixture and check that recoverable pages, rejected pages, service metrics, and rollups match the reference identities and values.",
+   "Run the CLI twice on the same database and input and verify byte-equivalent output tables, stable counts, and no duplicate materialized rows.",
+   "Generate hidden inputs with shuffled files and duplicate uploads and verify deterministic duplicate selection and unchanged results under input ordering changes.",
+   "Generate hidden stripes with one bad or missing page and verify exact parity recovery, header/sequence/CRC validation, and inclusion in all three output tables.",
+   "Generate hidden stripes with two erasures or an invalid reconstructed header and verify that they are excluded consistently from all three output tables.",
+   "Generate multiple services and runs with interleaved stripe identifiers and verify that registers are never merged across scopes.",
+   "Compare hidden service and global cardinality estimates against the reference estimator and require absolute relative error no greater than 3.5%.",
+   "Check the documented small-cardinality and large-cardinality estimator regimes, including empty and near-empty sketches.",
+   "Run a large generated workload of at least 250,000 pages and require materialization throughput of at least 250,000 pages per minute on the one-CPU container.",
+   "Force a materialization error midway through processing and verify that no partially rebuilt mixture remains in the output tables."
+  ],
+  "verifier_knob": {
+   "name": "cardinality_accuracy_and_page_throughput",
+   "value": "3.5% relative estimate error and 250,000 pages/minute",
+   "effect": "Raising the allowed error or lowering the throughput makes approximate, less optimized implementations more likely to pass; tightening the error or increasing the throughput requires exact bit-order/recovery semantics and more set-based processing."
+  },
+  "expected_failure_modes": [
+   "The solver treats every CRC failure as unrecoverable and never implements parity reconstruction.",
+   "The solver XORs only payload bytes or fails to validate the reconstructed page metadata.",
+   "The solver mishandles six-bit register boundaries or little-endian bit order, which is invisible on simple register values.",
+   "The solver merges sketches across runs or services because it groups only by stripe or metric name.",
+   "The solver uses the raw HLL harmonic estimate without the documented small-range correction.",
+   "The solver resolves duplicates by filesystem order, making results nondeterministic on hidden inputs.",
+   "The solver updates the three output tables independently and leaves stale rows after a failed or repeated run.",
+   "The solver writes a correct but row-at-a-time implementation that exceeds the hidden workload time threshold.",
+   "The solver validates only the supplied fixture and misses multi-erasure, malformed-reconstruction, and interleaved-scope cases."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "file-formats-recovery",
+  "tags": [
+   "sql",
+   "parity-recovery",
+   "hyperloglog",
+   "metrics",
+   "binary-format",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, entry points, fixtures, and test files.",
+   "Read docs/logsketch-v2.md for page layout, parity scope, register packing, and estimator constants.",
+   "Read bin/materialize_metrics and identify transaction and schema initialization behavior.",
+   "Read sql/materialize.sql and the SQL migrations for source and output table schemas.",
+   "Read tools/import_logsketch.py and inspect the exposed CRC, byte, and payload helpers.",
+   "Run the importer on the supplied fixture.",
+   "Run the existing materializer and inspect SQLite page-status, duplicate, CRC, and output counts.",
+   "Inspect relevant tests and grep for expected identity, scope, and estimator behavior.",
+   "Implement deterministic duplicate canonicalization grouped by run and stripe and page slot.",
+   "Implement complete encoded-page XOR recovery for exactly one unavailable or invalid slot.",
+   "Add reconstructed header, sequence, length, and CRC validation and exclude unrecoverable stripes.",
+   "Implement six-bit register decoding and register-wise HLL merging grouped by service and run scope.",
+   "Implement the documented estimator, including small-range and large-range corrections.",
+   "Change the wrapper or SQL execution path to stage or replace all three output tables in one transaction.",
+   "Run materialization on the supplied fixture and query recovered pages, service metrics, and rollups.",
+   "Run materialization twice and compare counts, rows, and serialized output.",
+   "Run the available test suite and add local checks for missing pages, bad parity candidates, duplicate ordering, and interleaved scopes.",
+   "Run a generated or large fixture benchmark and profile SQL versus row-at-a-time decoding.",
+   "Optimize register expansion and grouping if the throughput check is below target.",
+   "Run final fixture, idempotence, corruption, scope, accuracy, and performance checks."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The required deterministic rule for choosing among duplicate candidates is not stated explicitly; different valid canonicalization rules could produce different recovered identities.",
+   "The exact schemas and semantic aggregation scope of service_metrics versus metric_rollup are assumed to be discoverable rather than specified in the instruction.",
+   "The forced-midway-error test needs a defined injection mechanism; otherwise it may depend on an implementation-specific failure point.",
+   "A fixed 250,000-pages-per-minute threshold can be flaky on shared or throttled verification hardware, even with one CPU and pinned dependencies.",
+   "The relative-error requirement is ambiguous for empty or zero-reference cardinalities unless the verifier defines the comparison rule.",
+   "The claim that all recoverable stripes must be recovered depends on precise rules for conflicting duplicate candidates and invalid parity-page candidates."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly testable, but the speedrun is about 20 commands and the supplied source structure plus internal algorithm hints make it likely that a strong agent can solve it by reading and patching visible code. Under the stated rubric this caps genuine_difficulty at 2, leaving the average below 3.6; several duplicate-selection and failure-injection semantics are also underspecified.",
+  "fixes": [
+   "Specify the exact duplicate canonicalization ordering, including how valid, CRC-invalid, and conflicting candidates are ranked.",
+   "Define the precise row semantics and merge keys for recovered_pages, service_metrics, and metric_rollup, including whether rollups are per run, service, or global.",
+   "Specify a verifier-supported failure-injection mechanism and the expected transaction boundary for the atomicity test.",
+   "Define accuracy handling for zero and near-zero references and state whether the performance threshold includes import, schema setup, and database I/O.",
+   "To raise genuine difficulty, avoid a nearly complete materialization skeleton and helper path that exposes the repair shape directly; distribute the missing logic across a smaller but realistic integration surface while retaining complete format documentation.",
+   "Use multiple independent performance samples or a calibrated workload threshold to reduce timing flakiness."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "This task concerns parity-based recovery of LogSketch pages and HLL metric materialization, whereas the reference fixes fixed-point sensor aggregation output."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This task reconstructs damaged sketch stripes and materializes SQLite metrics, whereas the reference replays checksummed transactional event shards into canonical JSONL."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task implements offline parity recovery and cardinality rollups, whereas the reference builds a live HTTP query service over an existing metrics database."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "This task recovers encoded metric pages and merges HLL registers, whereas the reference repairs a sensor normalization and SQL rollup pipeline."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5",
+     "verdict": "distinct",
+     "reason": "This task focuses on binary sketch recovery, validation, and cardinality estimation, whereas the reference implements configuration-driven report parsing and SQL translation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-c396920d769d",
+     0.131
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.109
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.099
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.093
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.092
+    ]
+   ],
+   "cost_usd": 0.0008098000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0035659999999999997
+}

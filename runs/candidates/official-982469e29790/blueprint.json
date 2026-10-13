@@ -1,0 +1,63 @@
+{
+ "slug": "repair-forge-index-reconciler",
+ "title": "Repair the Forge Artifact Index Reconciler",
+ "scenario": "An open-source package maintainer is triaging a regression in an internal artifact-indexing utility after a release added unusual filenames and a much larger repository mirror. The container contains a Bash reconciliation pipeline, SQLite state, configuration and fixtures, plus an opaque compiled scanner binary built in the Dockerfile; the scanner is the supported authority for artifact classification and canonical metadata.",
+ "instruction_draft": "Repair the Forge reconciliation command so that each run produces an idempotent SQLite index, quarantine tree, and JSON summary matching the scanner's canonical records for every artifact in the spool, including rejected files, symlinks, spaces, tabs, and newlines in names. It must preserve the documented state invariants and complete a 12,000-artifact run in under 10 seconds on the provided one-CPU container.",
+ "requirements": [
+  "The reconciliation command must process every artifact in the configured spool, including names containing spaces, tabs, and newlines and supported symlinks.",
+  "The SQLite index must contain exactly the scanner-authoritative canonical record for each accepted artifact, with no stale, duplicate, or missing rows.",
+  "Rejected artifacts must be represented exactly as required by the existing quarantine and rejection-state conventions, including their reason and canonical path.",
+  "The generated JSON summary must agree with the final SQLite state across all counts, byte totals, channels, and rejection classes.",
+  "Repeated reconciliation runs over unchanged input must leave the database, quarantine tree, summary, and metadata unchanged.",
+  "The command must safely remove or replace state for artifacts deleted or changed since the previous run without leaving stale rows or quarantine entries.",
+  "The implementation must complete the supplied 12,000-artifact benchmark in less than 10 seconds on one CPU.",
+  "The repaired command must remain usable through the existing configured entry point and must not modify the scanner binary."
+ ],
+ "environment": [
+  "The Dockerfile uses FROM python:3.13-slim-bookworm, installs pinned bash, gcc, make, sqlite3 and core utilities, and builds an opaque `/usr/local/libexec/forge-scan` C binary before deleting its source.",
+  "The binary accepts the repository's documented scanner protocol and emits canonical records; it has batch and NUL-safe input modes, performs content-sensitive classification, normalizes selected paths, and emits rejection reasons that cannot be reconstructed reliably by filename inspection alone.",
+  "The repository under `/opt/forge` contains roughly 1,500 lines of Bash, Python helper code, SQL schema/migrations, configuration, fixtures, and operator documentation, with unrelated maintenance commands mixed into the relevant pipeline.",
+  "The entry point is `/usr/local/sbin/forge-reconcile`, which invokes scripts under `/opt/forge/lib` and writes `/var/lib/forge/index.db`, `/var/lib/forge/quarantine`, and `/var/lib/forge/summary.json`.",
+  "The planted regression combines line-oriented traversal with scanner output parsing, per-file scanner invocation, an unsafe shell word-splitting path, and an incremental deletion check that only examines the current directory's ordinary names.",
+  "Fixtures contain several thousand ordinary artifacts plus rare filenames with tabs, newlines, leading dashes, Unicode, duplicate normalized names, broken and relative symlinks, content-triggered rejects, and files whose scanner record contains escaped delimiters.",
+  "The configuration and schema document the expected tables, keys, summary fields, quarantine naming rules, and scanner invocation protocol, but the efficient bulk protocol and the data-dependent edge cases require experimentation with the opaque binary.",
+  "The verifier replaces the spool with deterministic hidden-seed inputs of the same format, runs the installed entry point from a clean state, and compares final state rather than source text."
+ ],
+ "internal_hint": "First inventory the entry point, configuration, schema, fixtures, and scanner help/strings, then run the existing command on progressively pathological names and content while tracing scanner calls and SQLite writes. The robust fix is to refactor the Bash pipeline around one NUL-safe bulk scanner invocation, parse its length/escaping protocol without shell word splitting, stage results in a temporary SQLite table, reconcile accepted and rejected records transactionally, derive the summary from the staged final table, and separately remove stale quarantine entries; use indexed set-based SQLite operations rather than one process and one SQL transaction per file. Validate with generated names and repeated runs, because the root causes only appear on data-dependent scanner classifications and accumulated historical state.",
+ "trap": "A shallow solution that quotes the ordinary `find` loop or fixes only visible fixture names still invokes the scanner thousands of times, mishandles scanner records containing escaped delimiters, or leaves stale rows and quarantine files from the previous run. A quick sample can pass while hidden inputs expose normalized-name collisions, rejected symlinks, newline-bearing paths, changed content, and the performance limit.",
+ "tests": [
+  "Run the repaired command on the supplied fixture set and compare every SQLite row, primary key, rejection reason, metadata field, quarantine entry, and summary value with the deterministic reference state.",
+  "Generate a fresh 12,000-artifact spool from a hidden seed containing rare path bytes, duplicate normalized paths, symlink variants, content-sensitive classifications, and mixed accepted/rejected records, then compare the complete final filesystem and database state with the reference.",
+  "Modify, delete, replace, and rename a subset of artifacts after an initial run; rerun reconciliation and verify that accepted rows, rejected rows, quarantine files, and all aggregate fields exactly reflect only the current spool.",
+  "Run reconciliation twice without changing input and verify byte-for-byte summary stability, identical database contents and ordering-independent row sets, unchanged quarantine contents, and absence of leaked temporary files.",
+  "Inject scanner records whose escaped fields contain tabs, newlines, backslashes, and delimiter-like text and verify that parsed paths, reasons, hashes, and metadata are exact.",
+  "Measure the hidden 12,000-artifact run on the one-CPU container and fail solutions exceeding 10 seconds or creating one scanner process per artifact.",
+  "Check that the configured entry point remains executable, uses the existing state locations and schema, and does not replace or alter the opaque scanner binary."
+ ],
+ "verifier_knob": {
+  "name": "independent_state_properties",
+  "value": "11",
+  "effect": "Raising this adds independently checked row fields, rejection and quarantine invariants, summary aggregates, stale-state transitions, and idempotence cases; lowering it allows partial pipelines that appear correct on a small clean run."
+ },
+ "expected_failure_modes": [
+  "The agent reads the obvious Bash bug and applies quoting without discovering the scanner's bulk protocol or output escaping rules.",
+  "The agent uses command substitution or line-oriented tools, silently corrupting newline-bearing names and escaped scanner fields.",
+  "The agent produces correct records but performs one subprocess or SQLite transaction per artifact and misses the runtime bar.",
+  "The agent rebuilds the current index but does not reconcile deleted artifacts or historical quarantine entries.",
+  "The agent computes summary values incrementally and leaves them inconsistent after replacements, duplicate normalized paths, or rejected files.",
+  "The agent verifies only the visible fixtures and misses content-dependent classifications and rare path cases in hidden generated inputs.",
+  "The agent makes repeated runs append duplicate rows or create nondeterministically named quarantine files.",
+  "The agent attempts to replace or reverse-engineer the scanner instead of treating its runtime output and documented protocol as authoritative."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "system-administration",
+ "tags": [
+  "bash",
+  "sqlite",
+  "opaque-binary",
+  "large-scale-refactoring",
+  "performance",
+  "state-reconciliation"
+ ]
+}

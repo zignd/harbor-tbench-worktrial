@@ -1,0 +1,181 @@
+{
+ "blueprint": {
+  "slug": "recover-delta-metric-logs",
+  "title": "Recover Delta Metric Logs",
+  "scenario": "A research scientist is reproducing a distributed-systems measurement whose metrics were written by several instrumented workers into a compact append-only binary log. The container contains an in-house SQLite-backed analysis tool, SQL migrations, recovery reports, and several damaged log captures; the recovery query is the missing component needed to regenerate the published aggregates.",
+  "instruction_draft": "Implement the missing metric-log recovery feature in `/opt/metriclab` and make `metricctl recover` produce a usable SQLite result database from the supplied captures. Recovered samples must preserve their metric identity, sequence, timestamp, value, and source page, reject damaged or unverifiable records, tolerate truncated and reordered pages, and report recovery and corruption statistics in the existing logs and metrics tables.\n\nThe recovered database must contain exactly one canonical row for every valid input sample, with no duplicate sequence numbers, and its hourly count, sum, mean, minimum, maximum, and p99 reports must agree with the reference results on fresh captures. The verifier will generate additional captures with independent corruption patterns; on those inputs the command must recover at least 99.5% of valid samples, introduce no invalid samples, and process at least 450 pages per second on the one-CPU container.",
+  "requirements": [
+   "Implement the missing metric-log recovery feature in `/opt/metriclab`.",
+   "Make `metricctl recover` create a usable SQLite result database from metric-log captures.",
+   "Preserve metric identity, sequence, timestamp, value, and source page for every recovered sample.",
+   "Reject damaged or unverifiable records.",
+   "Tolerate truncated pages and pages arriving out of order.",
+   "Populate the existing recovery and corruption statistics tables.",
+   "Produce exactly one canonical row for every valid input sample.",
+   "Do not produce duplicate sequence numbers or invalid samples.",
+   "Produce hourly count, sum, mean, minimum, maximum, and p99 reports matching the reference results.",
+   "Recover at least 99.5% of valid samples on verifier-generated captures.",
+   "Introduce no invalid samples on verifier-generated captures.",
+   "Process at least 450 pages per second on the one-CPU container."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt packages, and pinned Python packages, with no network access required at runtime.",
+   "The image contains an approximately 1,500-line Python/SQLite application under `/opt/metriclab`, including a CLI, schema migrations, report queries, logging, metrics export, and test fixtures.",
+   "The intended implementation language for the missing component is SQL; the application registers only low-level deterministic SQLite scalar functions for byte extraction, unsigned-varint decoding, zigzag decoding, IEEE-754 conversion, and CRC-16 checking.",
+   "Metric captures are fixed-size page files with a header, page sequence number, payload length, and CRC. Payloads contain length-delimited records whose metric ID is varint encoded, timestamps use signed delta-of-delta encoding, values are little-endian binary64 values, and each record has a checksum and sequence number.",
+   "Pages may be truncated, duplicated, reordered, or contain byte corruption. A damaged record must not poison later records in the same page; valid records after corruption can be found by the format's documented synchronization markers.",
+   "The repository contains a format note, a small clean capture, a damaged sample capture, SQL schemas for `raw_pages`, `samples`, `hourly_metrics`, and `recovery_events`, and a deliberately incomplete `sql/recover_metrics.sql` used by the CLI.",
+   "The visible capture omits several difficult combinations, including a checksum failure immediately before a page boundary, multi-byte varints crossing a synchronization marker, timestamp delta overflow, duplicate page sequence numbers, and a valid record whose value is NaN.",
+   "The CLI and report code are mostly functional but currently depend on the missing SQL recovery pipeline and have consistency checks that expose mismatches between recovered samples, rollups, and recovery counters.",
+   "The verifier creates fresh deterministic captures from hidden seeds, runs the submitted CLI, compares canonical rows and aggregates with an independently written reference decoder, and measures throughput over thousands of pages."
+  ],
+  "internal_hint": "The solution requires investigating the CLI, schema, format note, and emitted recovery metrics before changing anything. The missing component should be a staged SQL pipeline: normalize and deduplicate pages by page sequence, scan payload bytes with recursive CTE state, decode varints and signed delta-of-delta timestamps while carrying per-stream history, validate length and CRC boundaries, resynchronize after rejected records, and materialize samples only after validation. A second stage must deterministically choose one copy of duplicated samples, then rebuild hourly rollups and p99 state from the canonical sample table rather than incrementally trusting damaged-page aggregates. The existing Python wrapper has a wiring defect that omits the page-order-independent normalization step and needs to invoke the completed SQL transaction. Investigation with the supplied capture, `EXPLAIN QUERY PLAN`, recovery counters, and deliberately corrupted scratch pages reveals these interactions; simply filling the obvious SELECT that returns rows does not. The reference solution is a deterministic shell script that inspects the schema, runs the sample decoder, generates targeted corruption cases, patches the SQL and wrapper, and reruns consistency and throughput checks.",
+  "trap": "A shallow implementation can pass the clean and visible damaged captures by parsing pages in file order and accepting records whose local checksum looks plausible. Hidden captures expose that approach through reordered pages, duplicate pages, stateful delta-of-delta timestamps, corruption that shifts the apparent record boundary, NaN payloads, and valid records after a bad record. Rebuilding hourly metrics before canonical deduplication also makes counts and p99 appear reasonable while disagreeing with the reference, and per-row Python callbacks or repeated SQL scans fall below the throughput threshold.",
+  "tests": [
+   "Run recovery on the supplied clean capture and compare every canonical sample, source-page attribution, recovery counter, and hourly aggregate with the reference database.",
+   "Run recovery on the supplied damaged capture and verify that truncated pages, reordered pages, duplicate pages, checksum failures, and post-corruption valid records are handled without duplicate samples.",
+   "Generate fresh hidden captures with seeded mixtures of page truncation, byte flips, dropped pages, duplicated pages, reordering, malformed varints, boundary-crossing records, and checksum failures; compare canonical sample identity, timestamp, value, and aggregate outputs against the independent decoder.",
+   "Check the invariant that every output sample has a valid page and record checksum, every valid reference sample appears at most once, and every reported recovery counter equals the classified input outcome.",
+   "Check timestamp reconstruction across multiple metric streams, including negative delta-of-delta values, large multi-byte varints, and resets at stream boundaries.",
+   "Check that NaN and non-finite encoded values are rejected while ordinary binary64 values, including signed zero and extreme finite values, are preserved.",
+   "Check hourly count, sum, mean, minimum, maximum, and p99 after canonical deduplication on hidden datasets with repeated values and sparse hours.",
+   "Generate a large deterministic capture of thousands of pages, measure end-to-end `metricctl recover` throughput, and require at least 450 pages per second on the one-CPU container.",
+   "Run the recovery twice with pages presented in different filesystem orders and require byte-equivalent canonical tables and equivalent metrics."
+  ],
+  "verifier_knob": {
+   "name": "minimum_recovery_throughput_pages_per_second",
+   "value": "450",
+   "effect": "Raising the value requires a more set-oriented SQL design with fewer recursive rescans and Python callbacks; lowering it permits slower but still correct recovery implementations. Accuracy and consistency checks remain unchanged."
+  },
+  "expected_failure_modes": [
+   "Treating the stateful timestamp encoding as independently decodable per record or per page.",
+   "Using page arrival order rather than page sequence numbers, causing different timestamps or stream state after reordering.",
+   "Accepting a record after only a superficial length check and accidentally converting corrupted bytes into plausible samples.",
+   "Stopping the scan at the first malformed record instead of resynchronizing and recovering later valid records.",
+   "Failing to deduplicate repeated pages and repeated records before constructing aggregates.",
+   "Allowing one malformed metric stream to alter decoder state for another stream.",
+   "Computing p99 with an approximate or tie-unstable method that disagrees with the specified reference percentile rule.",
+   "Updating rollups and recovery counters outside the same transaction as canonical sample materialization.",
+   "Passing visible fixtures while missing rare varint, page-boundary, non-finite-value, or negative-delta cases.",
+   "Implementing the parser through per-byte Python callbacks or repeated SQL queries and missing the throughput threshold."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "file-formats-recovery",
+  "tags": [
+   "sql",
+   "binary-format",
+   "error-recovery",
+   "metrics",
+   "recursive-cte",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/metriclab && find . -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' FORMAT* docs/* 2>/dev/null",
+   "sed -n '1,260p' sql/schema.sql sql/migrations/* 2>/dev/null",
+   "sed -n '1,320p' sql/recover_metrics.sql",
+   "sed -n '1,320p' metricctl* bin/* 2>/dev/null",
+   "grep -RniE 'recover|recovery_events|hourly_metrics|raw_pages|samples' .",
+   "sed -n '1,260p' migrations/* 2>/dev/null",
+   "metricctl --help && metricctl recover --help",
+   "metricctl recover --input fixtures/clean* --output /tmp/clean.db",
+   "metricctl recover --input fixtures/damaged* --output /tmp/damaged.db",
+   "sqlite3 /tmp/clean.db '.schema' && sqlite3 /tmp/clean.db 'select * from samples limit 10'",
+   "sqlite3 /tmp/damaged.db 'select * from recovery_events; select * from hourly_metrics'",
+   "grep -Rni 'create_function\\|register.*func\\|recover_metrics.sql' .",
+   "sqlite3 /tmp/clean.db 'explain query plan select * from samples'",
+   "prepare reordered and duplicated page copies, then run the current recovery to expose order dependence",
+   "patch sql/recover_metrics.sql with page normalization, recursive decoding, validation, resynchronization, deduplication, and rollup stages",
+   "patch the CLI wrapper to invoke normalization and the complete recovery transaction",
+   "rerun clean, damaged, reordered, and corruption fixtures and compare rows, counters, and reports with the references",
+   "run the large capture benchmark and repeat with a different filesystem order"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The p99 percentile rule, recovery-counter taxonomy, and tie behavior are referenced as existing or reference behavior rather than stated explicitly, so independently implementing the required outputs may be ambiguous.",
+   "It is unclear whether source-page attribution for duplicated or reordered pages means physical input position, page sequence number, or the selected canonical copy.",
+   "A byte-equivalence requirement for SQLite tables can be invalid if insertion order, SQLite page layout, or vacuum behavior is not normalized even when logical results are identical.",
+   "A fixed 450-pages-per-second threshold can be flaky on shared or variably provisioned verification hardware unless the benchmark protocol and timing exclusions are specified.",
+   "The 99.5% recovery target may be impossible or misleading if the corruption generator permits valid records to be destroyed rather than merely made difficult to locate."
+  ],
+  "verdict": "reject",
+  "reasons": "The behavior is mostly testable and realistic, but the task is not reasonably solvable in under an hour: it combines reverse engineering, a stateful corruption-tolerant decoder, SQL recursive state, deterministic deduplication, rollups, wrapper repair, and performance tuning. The speedrun reaches a patch only after roughly 20 commands and still omits substantial implementation and debugging work; under the stated rule, genuine difficulty is at most 2, and solvability is below the acceptance threshold.",
+  "fixes": [
+   "State the exact p99 definition, counter categories and transitions, stream-reset rules, source-page semantics, and canonical tie-breaking rules in the task or format note.",
+   "Provide a small executable reference decoder or pseudocode for synchronization, timestamp state, boundary handling, and non-finite-value rejection, plus an explicit corruption-generator contract.",
+   "Define a reproducible throughput benchmark with CPU pinning, warmup, filesystem-order normalization, and timing boundaries, or lower the threshold and allow reasonable implementation variance.",
+   "Reduce scope by supplying the page scanner/decoder primitives and asking the solver to implement only canonicalization and rollups, or split recovery and reporting into separate tasks.",
+   "Make the verifier compare logical SQLite contents rather than raw database byte layout unless deterministic schema, insertion, and vacuum procedures are guaranteed."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "Both involve recovering data from damaged binary storage, but this task reconstructs validated metric samples and aggregates from paged logs rather than transactional authoritative state from replay segments."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This task recovers metric records and computes SQLite analytics, whereas the reference authenticates and reconciles financial adjustments into a settlement report."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate performs page-level metric-log recovery and aggregation, not incident archival, alias resolution, correlation, and dependency ordering."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Although both require deterministic recovery from fragmented input, the candidate handles corrupted metric pages and samples while the reference replays committed tabular transactions into canonical JSONL."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The candidate reconstructs samples from damaged binary logs and derives statistical reports, while the reference reconciles filesystem artifacts using an authoritative scanner into an index and quarantine state."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.138
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.114
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.113
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.105
+    ],
+    [
+     "ours/official-982469e29790",
+     0.101
+    ]
+   ],
+   "cost_usd": 0.0008822
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0034962
+}

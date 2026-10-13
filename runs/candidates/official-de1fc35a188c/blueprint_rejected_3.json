@@ -1,0 +1,143 @@
+{
+ "blueprint": {
+  "slug": "edge-sensor-burst-optimizer",
+  "title": "Edge Telemetry Burst Validation & Analytics Pipeline",
+  "scenario": "An industrial IoT gateway running in a container hosts a background service (`telemetryd`) connected to a local PostgreSQL database for ingesting high-frequency vibration transducer bursts. The edge gateway has a tight compute budget (1 vCPU, 2 GB RAM) and is dropping telemetry bursts because the legacy validation script spawns an external vendor binary row-by-row and runs slow quadratic correlated queries. The developer needs a pure SQL transformation and validation pipeline that reverse-characterizes the compiled calibration binary, enforces strict transducer signal-health constraints, and computes window energy metrics within a 2.5-second runtime budget.",
+  "instruction_draft": "Hey, `telemetryd` is dropping sensor bursts on the edge gateway because the old batch script can't keep up with the queue. We need you to write a fast, pure SQL pipeline in `/opt/telemetry/sql/burst_pipeline.sql` that runs inside the database and replaces the bottleneck.\n\nThe transducer vendor only gave us a compiled calibration binary at `/opt/vendor/bin/adc_decode` without source, so probe it to figure out its transfer curve and embed the math directly into your query. Follow the signal health rules in `/opt/telemetry/SIGNAL_SPEC.md` to classify bursts from `raw_bursts`: route bad bursts into `rejected_bursts` and valid ones into `valid_burst_metrics` with their calibrated mean, RMS, and crest factor. Trigger the pipeline via `POST http://localhost:8080/api/v1/pipeline/run` and make sure it processes the full benchmark batch cleanly in under 2.5 seconds without false rejections.",
+  "requirements": [
+   "Determine the exact transfer function of the opaque binary `/opt/vendor/bin/adc_decode` by probing its output over the 16-bit ADC input domain [0, 65535], and implement this calibration curve in pure SQL without invoking external binaries.",
+   "Implement `/opt/telemetry/sql/burst_pipeline.sql` to read from table `raw_bursts(burst_id, sample_idx, timestamp_ns, raw_adc)` and populate `valid_burst_metrics` and `rejected_bursts`.",
+   "Populate `valid_burst_metrics(burst_id, sample_count, mean_voltage, rms_voltage, crest_factor)` for all bursts passing all validation rules, where `mean_voltage` is the arithmetic mean of calibrated voltages $V_i$, `rms_voltage` is $\\sqrt{\\frac{1}{N}\\sum V_i^2}$, and `crest_factor` is $\\frac{\\max(|V_i|)}{V_{\\text{rms}}}$.",
+   "Populate `rejected_bursts(burst_id)` with the `burst_id` of every burst failing at least one criterion from `SIGNAL_SPEC.md` (window length $\\ne 128$, timestamp step $\\ne 100,000$ ns, $\\ge 4$ consecutive samples at ADC rails 0 or 65535, consecutive slew $|V_i - V_{i-1}| > 1.2000$ V, or dynamic range $V_{\\max} - V_{\\min} \\le 0.0500$ V). Every burst in `raw_bursts` must appear in exactly one of the two destination tables.",
+   "Ensure `burst_pipeline.sql` executes end-to-end via `POST http://localhost:8080/api/v1/pipeline/run` on the running `telemetryd` service in under 2.50 seconds on a benchmark dataset of 2,000 bursts (256,000 sample rows) on the 1-CPU container."
+  ],
+  "environment": [
+   "Base image `python:3.13-slim-bookworm` with `postgresql` (PostgreSQL 15), `libpq-dev`, `gcc`, `curl`, and Python packages `psycopg2-binary`, `uvicorn`, `fastapi`, `numpy` pinned.",
+   "Running service 1: `postgresql` running on `localhost:5432` with database `telemetry`, initialized with tables `raw_bursts`, `valid_burst_metrics`, and `rejected_bursts`, indexed on `(burst_id, sample_idx)`.",
+   "Running service 2: `telemetryd` daemon running on port 8080 (managed via a background runner script), exposing endpoints `/health`, `/api/v1/ingest`, `/api/v1/pipeline/run`, and `/api/v1/metrics`. It executes `/opt/telemetry/sql/burst_pipeline.sql` against PostgreSQL upon `/api/v1/pipeline/run`.",
+   "Opaque compiled binary `/opt/vendor/bin/adc_decode`: a stripped x86_64 ELF binary that accepts an integer count and outputs calibrated float voltage according to a 3-stage piecewise linear curve: deadband $x \\in [0, 4096] \\to 0.0$ V; active region $x \\in (4096, 36864] \\to (x - 4096) \\times 0.000125$ V; compression region $x \\in (36864, 61440] \\to 4.096 + (x - 36864) \\times 0.0000625$ V; saturation clamp $x > 61440 \\to 5.632$ V.",
+   "Documentation file `/opt/telemetry/SIGNAL_SPEC.md` providing unambiguous mathematical specifications for window size (128), sample interval (100,000 ns), consecutive rail count threshold ($\\ge 4$), slew rate threshold (1.2000 V), and dynamic range threshold (0.0500 V).",
+   "Sample dataset preloaded into `raw_bursts` containing 20 dev bursts illustrating basic ingestion schema."
+  ],
+  "internal_hint": "The solver must investigate the opaque component by running `/opt/vendor/bin/adc_decode` across sample inputs (e.g. via a quick shell or Python probe loop). The output reveals clear rational breakpoints at 4096, 36864, and 61440 with slopes of 1/8000 and 1/16000. In SQL, this must be implemented using a `CASE` expression with floating-point arithmetic (avoiding integer truncation). To meet the 2.5-second performance threshold on 256,000 rows, the validation and metric computation must avoid correlated subqueries and multiple self-joins; single-pass window functions (`LAG(...) OVER (PARTITION BY burst_id ORDER BY sample_idx)`) allow PostgreSQL to compute slew rates, timestamp steps, and rail run-lengths in one index scan. Consecutive rail saturation requires checking run length (e.g. `raw_adc = 0 AND LAG(raw_adc, 1) = 0 AND LAG(raw_adc, 2) = 0 AND LAG(raw_adc, 3) = 0`), not a global count of rail hits.",
+  "trap": "A shallow implementation checks total rail count (`COUNT(*) FILTER (WHERE raw_adc IN (0, 65535)) >= 4`) rather than consecutive rail samples, which erroneously rejects valid bursts that touch ground or rail intermittently. Furthermore, using integer division `(raw_adc - 4096) / 8000` truncates voltages to 0 in PostgreSQL, and failing to handle `NULL` from `LAG` on sample 0 causes every burst to fail the timestamp step check. Finally, writing quadratic subqueries or self-joins for LAG and dynamic range causes the query to take >30 seconds, timing out the 2.5-second service budget.",
+  "tests": [
+   "Verify the opaque calibration transfer function: test queries that verify `CASE` expression outputs match `/opt/vendor/bin/adc_decode` across all piecewise segments and boundary points (0, 4096, 4097, 36864, 36865, 61440, 65535).",
+   "Adversarial corpus validation with hidden seed instances: generate 2,000 fresh bursts (256,000 rows) at verify time from a hidden seed, containing subtle malicious and benign inputs (intermittent vs consecutive rail hits, boundary slew transitions, uniform timestamp jitter, DC offsets, flatline dead signals, and normal valid wave bursts). Ingest via `telemetryd` and trigger `/api/v1/pipeline/run`.",
+   "Correctness check: assert zero false positives (no valid bursts in `rejected_bursts`) and zero false negatives (no corrupted bursts in `valid_burst_metrics`).",
+   "Numerical accuracy check: assert that `mean_voltage`, `rms_voltage`, and `crest_factor` match double-precision reference values within relative tolerance $10^{-4}$.",
+   "Performance benchmark check: assert that the pipeline execution duration reported by the `telemetryd` service is strictly $\\le 2.50$ seconds on the 2,000-burst dataset."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_size_and_perturbation_density",
+   "value": "2000 bursts (256,000 samples) with 25 distinct adversarial perturbation archetypes",
+   "effect": "Increasing size tightens the performance envelope and forces asymptotic $O(N)$ window execution; increasing perturbation density adds boundary-value slew rates ($1.1999$ vs $1.2001$ V) and multi-point rail run lengths (3 vs 4 samples)."
+  },
+  "expected_failure_modes": [
+   "SQL integer division bug: computing `(raw_adc - 4096) / 8000` instead of `(raw_adc - 4096.0) / 8000.0`, resulting in quantized step-zero voltages and corrupted RMS/crest factor values.",
+   "Global vs consecutive rail saturation confusion: using `COUNT(*) WHERE raw_adc IN (0, 65535) >= 4` instead of checking 4 contiguous consecutive samples, causing benign oscillating signals that touch 0 V to be falsely rejected.",
+   "Window boundary NULL propagation: checking `timestamp_ns - LAG(timestamp_ns) != 100000` without filtering out `sample_idx = 0`, causing every burst to be rejected due to three-valued SQL logic on NULL.",
+   "Quadratic query execution: using correlated subqueries or self-joins across 256,000 rows, resulting in 20-50 second runtimes that fail the 2.5-second performance bar.",
+   "Failure to probe the opaque binary accurately: guessing a linear sensor curve ($V = x / 65535 \\times 5.0$) rather than discovering the deadband, compression knee at 36864, and clamp at 61440."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "sql",
+   "postgresql",
+   "performance-optimization",
+   "embedded-systems",
+   "signal-processing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/telemetry/SIGNAL_SPEC.md",
+   "objdump -d -M intel /opt/vendor/bin/adc_decode || python3 -c 'import subprocess; [print(x, subprocess.check_output([\"/opt/vendor/bin/adc_decode\", str(x)]).decode().strip()) for x in [0, 2048, 4096, 4097, 20000, 36864, 36865, 50000, 61440, 61441, 65535]]'",
+   "psql -U postgres -d telemetry -c '\\d raw_bursts; \\d valid_burst_metrics; \\d rejected_bursts;'",
+   "cat << 'EOF' > /opt/telemetry/sql/burst_pipeline.sql\n-- Single-pass CTE with window functions: LAG for dt, slew, and 4-sample rail runlength; filter and aggregate metrics; INSERT into valid_burst_metrics and rejected_bursts\nEOF",
+   "psql -U postgres -d telemetry -f /opt/telemetry/sql/burst_pipeline.sql",
+   "curl -s -X POST http://localhost:8080/api/v1/pipeline/run",
+   "psql -U postgres -d telemetry -c 'SELECT count(*) FROM valid_burst_metrics; SELECT count(*) FROM rejected_bursts;'"
+  ],
+  "speedrun_commands": 7,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The 2.50s execution limit on a 1 vCPU container processing 256,000 rows is vulnerable to CI CPU throttling or host noisy neighbors, causing valid single-pass window queries (normally 1.2\u20131.8s) to intermittently breach 2.50s.",
+   "Unclear table state management: the instruction does not specify whether `/opt/telemetry/sql/burst_pipeline.sql` is responsible for truncating `valid_burst_metrics` and `rejected_bursts` before insertion or if `telemetryd` does this prior to invocation."
+  ],
+  "verdict": "accept",
+  "reasons": "The blueprint presents an authentic edge data engineering problem combining reverse engineering of an opaque vendor calibration binary with SQL performance optimization. The adversarial verification suite and traps (integer division, window NULL propagation, consecutive rail run vs. global count) test genuine engineering competence rather than trivia. The speedrun is concise for an agent that inspects the binary directly with objdump or probes, but traps provide solid defense against shallow attempts.",
+  "fixes": [
+   "Relax the runtime threshold slightly from 2.50s to 3.50s or 4.00s; quadratic queries take >30s, so 4.0s still reliably discriminates while avoiding flaky CI timeout failures on 1 vCPU.",
+   "Clarify in the prompt or spec whether `burst_pipeline.sql` should `TRUNCATE` the destination tables before inserting, or if `telemetryd` handles table reset between runs."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "variant",
+     "reason": "Both tasks share the core problem and trick of probing an opaque compiled ADC normalization binary to reverse-engineer its transfer curve and embedding that transformation into an SQL analytics pipeline."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference task involves debugging a Rust binary-format batch processing pipeline against a reference accumulator, rather than reverse-engineering an opaque calibration function into pure SQL."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "The reference task is a single-query SQLite optimization problem on a lexical database, lacking sensor signal processing, validation rules, or reverse engineering."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "The reference task focuses on implementing rollback logic and weighted averaging in a Node.js canary deployment service."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "The reference task is a Python chunked-CSV ETL deduplication and error-routing problem without opaque binary reverse-characterization or SQL analytics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-fa7d16d4af43",
+     0.148
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.133
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.131
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.111
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.107
+    ]
+   ],
+   "cost_usd": 0.0070425
+  },
+  "novel": false
+ },
+ "cost_usd": 0.019550249999999998
+}

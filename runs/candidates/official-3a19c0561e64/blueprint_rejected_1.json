@@ -1,0 +1,149 @@
+{
+ "blueprint": {
+  "slug": "sql-ledger-replay-filter",
+  "title": "Repair Ledger Replay Pipeline and SQL Ingestion Filter",
+  "scenario": "A financial analytics database replica relies on an ordered ingestion pipeline where raw daily SQL transaction streams pass through a compiled C validator (`/usr/local/bin/sqlsieve`) before being applied sequentially to SQLite partition databases and rolled into `/var/lib/analytics/reporting.db`. Following an upstream SQL dialect update, the validator misclassifies legitimate statements containing multi-line block comments and escaped string literals while allowing malformed schema injections through, causing the multi-stage shell replay runner (`/usr/local/bin/replay_ledger.sh`) to halt midway and leave the database in an inconsistent, partially migrated state.",
+  "instruction_draft": "Hey, our reporting numbers stopped adding up after last week's upstream dialect changes. It looks like `sqlsieve` is misfiltering transactions\u2014dropping valid adjustment batches and letting bad inputs slip past\u2014and `replay_ledger.sh` dies halfway through, leaving the replica corrupted. Could you get `sqlsieve` patched and rebuilt, fix the replay script so it recovers from errors and processes the backlog partition stages in the right order, and rebuild `/var/lib/analytics/reporting.db`? Malicious and malformed statements need to be quarantined in `/var/log/quarantine.log`, all legitimate entries must be reflected in the ledger, and the `ledger_summary` table has to match.",
+  "requirements": [
+   "Patch the C source code in `/opt/sqlsieve/src/` and recompile `/usr/local/bin/sqlsieve` so that it accurately validates SQL ledger transaction statements.",
+   "Ensure `sqlsieve` correctly accepts all valid SQL statements\u2014including multi-line comments (`/* ... */`), escaped quote literals (`''` and `\\'`), and savepoint transactions\u2014while rejecting malformed SQL syntax, unescaped quote injections, and prohibited DDL operations (e.g., unauthorized `DROP`, `TRUNCATE`, or `ATTACH DATABASE`).",
+   "Update `/usr/local/bin/replay_ledger.sh` to implement proper error recovery: non-zero validator rejections must divert rejected lines into `/var/log/quarantine.log` with a timestamp and statement hash without aborting the batch replay.",
+   "Ensure `/usr/local/bin/replay_ledger.sh` executes the migration and transaction replay in strict partition dependency order (partition snapshot -> sequential daily journals -> aggregate rollup), rolling back partial transaction chunks if a runtime SQLite failure occurs within a single valid batch.",
+   "Re-run the full ledger replay pipeline so that `/var/lib/analytics/reporting.db` is completely rebuilt and consistent, populated with all valid records and an updated `ledger_summary` table."
+  ],
+  "environment": [
+   "Dockerfile installs `gcc`, `make`, `sqlite3`, `libsqlite3-dev`, `python3`, and standard shell utilities (`bash`, `coreutils`, `gawk`, `sed`).",
+   "Source code for the SQL pre-filtering engine located at `/opt/sqlsieve/` with `Makefile` and `src/validator.c` (~950 lines of C implementing a lexer/parser state machine for transaction SQL statements).",
+   "Compiled binary `/usr/local/bin/sqlsieve` pre-built during Docker build.",
+   "Shell orchestration script `/usr/local/bin/replay_ledger.sh` (~300 lines) which orchestrates unpacking compressed partition archives from `/var/backlog/`, calling `sqlsieve`, feeding valid statements into `sqlite3 /var/lib/analytics/reporting.db`, and generating summary tables.",
+   "Seed partition backlog in `/var/backlog/partition_*.sql.gz` containing hundreds of historical ledger entries with a mix of valid records, edge-case syntax, and corrupted injection statements.",
+   "Plant in C code: the tokenizer state machine resets state prematurely upon seeing `*` inside comments and fails to handle backslash escapes inside single quotes, causing false-positive rejections on valid rows and false-negative passes on split-payload comments.",
+   "Plant in shell script: lacks transaction isolation around individual batch imports, crashes on the first non-zero exit from `sqlsieve` instead of redirecting to quarantine, and processes partition files using unsorted glob expansion (`partition_*.sql.gz`) which breaks sequential foreign key and balance dependencies."
+  ],
+  "internal_hint": "Inspect `/opt/sqlsieve/src/validator.c` to locate state machine defects: (1) multi-line comment state transition in `scan_token()` terminates on any standalone `*` rather than `*/`, causing multiline comments with asterisks to be treated as malformed SQL; (2) string escape parser only checks for SQL-standard `''` doubling but ignores POSIX/C-style `\\'` escapes emitted by the new upstream service, causing single quotes to terminate string literals prematurely and trigger syntax errors on legitimate notes; (3) blocklist inspection fails to check token boundaries for `ATTACH` and `DROP` if preceded by trailing whitespace or semicolons within a multi-statement block. After fixing the C source, recompile via `make -C /opt/sqlsieve install`. Then inspect `/usr/local/bin/replay_ledger.sh`: change glob order to `sort -V` across partitions so snapshots are loaded before daily increments, wrap each day's replay in an explicit `BEGIN TRANSACTION ... COMMIT` block with rollback on failure, and redirect validator stderr/rejected statements into `/var/log/quarantine.log` so legitimate records continue processing. Finally, execute `/usr/local/bin/replay_ledger.sh` to rebuild `/var/lib/analytics/reporting.db`.",
+  "trap": "A solver might only test against the visible sample in `/var/backlog/` by patching the shell script to ignore `sqlsieve` exit codes or simply grepping for keyword `DROP`, which allows malicious statements to execute or drops complex multi-line comment adjustments; or the solver sorts partition files lexically (`partition_10.sql` before `partition_2.sql`) instead of natural version order (`sort -V`), silently corrupting cumulative balances in `ledger_summary`.",
+  "tests": [
+   "Verify `sqlsieve` binary exists and matches the newly compiled target from `/opt/sqlsieve`.",
+   "Execute `sqlsieve` against an adversarial corpus of 200 hidden statements generated at verify time from a hidden seed (100 benign statements with edge-case comments, nested quotes, escaped characters, and valid DDL/DML; 100 malicious/malformed statements containing unauthorized `ATTACH`, `DROP TABLE`, unclosed quotes, and stacked injections), verifying 100% precision and recall.",
+   "Verify `/var/log/quarantine.log` exists, is non-empty, and correctly records all rejected statements with required hash and timestamp metadata.",
+   "Execute an end-to-end replay test using a fresh, hidden partition set generated at test time, verifying that `/usr/local/bin/replay_ledger.sh` completes cleanly with exit code 0.",
+   "Query `/var/lib/analytics/reporting.db` using SQLite to check schema integrity (`PRAGMA integrity_check`), foreign key consistency (`PRAGMA foreign_key_check`), and compare computed balances in `ledger_summary` against the ground-truth reference values."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_density",
+   "value": "200 synthetic statements (100 benign edge-cases, 100 adversarial/corrupt variants)",
+   "effect": "Increasing the count and syntactic diversity (e.g., unicode escapes, mixed line endings, nested comments) demands strict conformance in the C lexer, while decreasing it allows looser regex-based parsing to slip through."
+  },
+  "expected_failure_modes": [
+   "Agent edits `/usr/local/bin/replay_ledger.sh` to pipe raw SQL directly into SQLite without fixing the C binary, causing malicious injections or broken statements to corrupt the database.",
+   "Agent patches `validator.c` for standard SQL `''` escapes but forgets backslash escaping `\\'`, failing the hidden corpus evaluation.",
+   "Agent fails to enforce ordered partition processing (`sort -V`), causing transaction snapshots to be evaluated after incremental updates, which produces negative account balances and foreign-key violations.",
+   "Agent fails to implement error quarantine in the shell script, causing the script to either crash on the first invalid entry or silently drop the rest of the batch."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "c",
+   "shell-scripting",
+   "data-pipelines",
+   "sqlite"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls -la /opt/sqlsieve /usr/local/bin/replay_ledger.sh /var/backlog",
+   "cat /usr/local/bin/replay_ledger.sh",
+   "grep -n -E '(comment|escape|DROP|ATTACH)' /opt/sqlsieve/src/validator.c",
+   "sed -i 's/case \\*:/case \\*\\/:/' /opt/sqlsieve/src/validator.c # or manual edit of comment transition",
+   "patch /opt/sqlsieve/src/validator.c <<'EOF' # add backslash escape handling in string scanner and fix token delimiter check for forbidden keywords EOF",
+   "make -C /opt/sqlsieve install",
+   "sqlsieve --test-sample /var/backlog/partition_1.sql.gz",
+   "patch /usr/local/bin/replay_ledger.sh <<'EOF' # sort partitions via sort -V, route sqlsieve non-zero to /var/log/quarantine.log with sha256/timestamp, wrap batch in BEGIN/COMMIT EOF",
+   "/usr/local/bin/replay_ledger.sh",
+   "sqlite3 /var/lib/analytics/reporting.db 'PRAGMA integrity_check; SELECT * FROM ledger_summary;'",
+   "head -n 10 /var/log/quarantine.log"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 2,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 3,
+   "realism": 3
+  },
+  "invalid_failure_risks": [
+   "Quarantine log format mismatch: The requirements and tests check for 'required hash and timestamp metadata', but the instruction only vaguely asks for statements to be quarantined in '/var/log/quarantine.log' without specifying hash algorithm (SHA256 vs MD5), timestamp format (ISO-8601 vs Unix epoch), or delimiter/field order.",
+   "Hidden corpus edge cases: Demanding 100% precision and recall on 200 hidden synthetic SQL statements against a hand-written ~950-line C tokenizer will cause false test failures on standard SQLite syntax quirks not covered by the existing codebase.",
+   "Prohibited statement scope: The instruction mentions 'malicious and malformed statements', but doesn't specify the exact set of forbidden DDL/DML rules (e.g., DROP, ATTACH, TRUNCATE)."
+  ],
+  "verdict": "reject",
+  "reasons": "The user instruction omits critical requirements that the evaluation tests enforce, particularly the exact schema, hashing algorithm, and timestamp format for `/var/log/quarantine.log`. Furthermore, evaluating a custom C SQL tokenizer against 200 hidden adversarial/benign statements with a 100% precision/recall requirement without a precise dialect grammar specification creates high risk of invalid failures due to dialect nuances.",
+  "fixes": [
+   "Specify the exact quarantine log entry format in the instruction (or pre-define a `log_quarantine` function in `replay_ledger.sh`), e.g., `<ISO8601_TIMESTAMP> <SHA256_HEX> <RAW_STATEMENT>`.",
+   "Provide an explicit rule specification or header file in `/opt/sqlsieve/include/rules.h` defining exactly what statements are forbidden (e.g., `ATTACH`, `DROP`, `TRUNCATE`) rather than leaving it to broad intuition.",
+   "Scope the hidden corpus tests to the documented subset of SQLite ledger statements supported by the C validator rather than open-ended general SQL syntax."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "The reference focuses on optimizing a single SQLite query for performance, whereas the candidate involves patching a C-based SQL validator and modifying a shell database replay pipeline."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference requires debugging a Rust fixed-point sensor data processing binary, whereas the candidate requires fixing a C SQL filter and a shell ledger replay script."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference focuses on fixing a bash telemetry aggregation build script to pass analytical qualification queries, while the candidate involves patching a C parser for SQL dialect parsing and handling replay error quarantining."
+    },
+    {
+     "ref_id": "ours/official-e431c59f65ef",
+     "verdict": "distinct",
+     "reason": "The reference deals with reconstructing PostgreSQL network session fragments from a binary log in Python, whereas the candidate focuses on C SQL statement validation and SQLite ledger replay orchestration."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The reference is a pure SQL reporting query bug fix involving window functions, completely distinct from debugging a C validator and pipeline shell runner."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.141
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.132
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.132
+    ],
+    [
+     "ours/official-e431c59f65ef",
+     0.123
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.118
+    ]
+   ],
+   "cost_usd": 0.00397575
+  },
+  "novel": true
+ },
+ "cost_usd": 0.02033025
+}

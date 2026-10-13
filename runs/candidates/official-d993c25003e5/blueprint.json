@@ -1,0 +1,52 @@
+{
+ "slug": "ddsketch-telemetry-aggregator-repair",
+ "title": "Telemetry Log Metric Aggregator Deployment and Accuracy Repair",
+ "scenario": "A research scientist is reproducing the empirical evaluation of an adaptive logarithmic quantile sketch service (`log-metricd`) written in Go (~1,400 lines across 5 packages). The service is intended to run as a systemd daemon, ingest structured application access log streams, and serve high-percentile latency queries over an HTTP protocol while operating under strict memory budget constraints. In the evaluation environment, systemd fails to keep the daemon active, high-percentile quantile estimates violate the theoretical relative error bound on heavy-tailed distributions, and concurrent query latencies under load exceed the target SLA.",
+ "instruction_draft": "Hey, I'm trying to reproduce the paper's benchmarks against `log-metricd`, but the test harness is failing across the board. The service won't stay active under systemd, query percentiles drift outside our relative error tolerances on heavy-tailed latency distributions, and query response times spike way past the 35ms SLA under load. Could you inspect `/opt/log-metricd`, fix the service so it meets the mathematical error bounds and latency threshold, and make sure it's properly deployed and running under systemd on port 9090? You can check our sample run with `/opt/bench/run_sample.sh`.",
+ "requirements": [
+  "The `log-metricd` daemon must be built and running as an active systemd service (`systemctl is-active log-metricd` returns active) listening on `0.0.0.0:9090`.",
+  "For all valid quantile queries $q \\in (0, 1)$ against ingested latency streams, the estimated quantile $\\hat{v}_q$ must satisfy the theoretical relative error bound $|\\hat{v}_q - v_q^*| / v_q^* \\le \\alpha$, where $\\alpha$ is the configured maximum relative error (e.g., $\\alpha = 0.01$).",
+  "Stream bucket budget allocation via `POST /v1/streams/register` must satisfy the global bucket capacity constraint $\\sum B_i \\le B_{total}$ without dropping latency samples within configured value ranges $[x_{min}, x_{max}]$.",
+  "Under concurrent load (an ingestion burst of at least 8,000 events/sec with concurrent query workers), the p99 response latency for `/v1/query` requests must remain below 35 milliseconds.",
+  "The service must correctly implement and respond to the HTTP protocol endpoints: `GET /healthz`, `POST /v1/ingest`, `POST /v1/query`, and `POST /v1/streams/register`."
+ ],
+ "environment": [
+  "Debian-based container with Go 1.22+ toolchain, Python 3.13, and systemd init/service management support.",
+  "/opt/log-metricd: Go source repository (~1,400 LOC) containing `cmd/log-metricd/main.go`, `pkg/sketch/ddsketch.go`, `pkg/planner/budget.go`, `pkg/storage/store.go`, and `pkg/api/handlers.go`.",
+  "/opt/log-metricd/doc/algorithm.md: mathematical specification of the logarithmic quantile sketch, the theoretical error base derivation $\\gamma = (1+\\alpha)/(1-\\alpha)$, bucket representative selection, and compaction constraints.",
+  "/etc/systemd/system/log-metricd.service: misconfigured systemd unit (`Type=notify` with no notification mechanism, uncompiled binary path, and user permission mismatch).",
+  "/var/log/log-metricd: service log directory owned by root:root with mode 0755, blocking daemon startup when running as user `metricd`.",
+  "/etc/log-metricd/config.yaml: configuration setting listen address to `:9090`, global bucket budget to 2048, and default $\\alpha = 0.01$.",
+  "/opt/bench: benchmark test harness containing `run_sample.sh` and python workload generator scripts."
+ ],
+ "internal_hint": "Difficulty comes from four distinct interacting areas: (1) Deployment: The systemd service fails to start because `/var/log/log-metricd` is not writable by user `metricd`, the binary is unbuilt, and `Type=notify` expects a readiness notification that the Go binary never dispatches (must send `READY=1` via systemd notification or adjust service configuration and reload). (2) Mathematical Derivation: In `pkg/sketch/ddsketch.go`, base $\\gamma$ is approximated as $1+\\alpha$ and quantile reconstruction returns bucket lower bound $L_k$. To guarantee relative error $\\le \\alpha$, base must be derived as $\\gamma = (1+\\alpha)/(1-\\alpha)$ and representative value chosen as the geometric midpoint $L_k \\sqrt{\\gamma}$ or arithmetic midpoint $L_k (1+\\gamma)/2$, with floating-point epsilon handling on boundaries. (3) Constraint Satisfaction: In `pkg/planner/budget.go`, allocating bucket counts $B_i = \\lceil \\ln(x_{max}/x_{min})/\\ln(\\gamma_i) \\rceil$ across streams under a shared budget $\\sum B_i \\le B_{total}$ requires compacting lower-priority streams by integer multipliers $m \\in \\{2, 3, 4\\}$ while keeping error $\\le \\alpha_{max,i}$; the existing code truncates with floor and drops high values. (4) Performance Threshold: In `pkg/storage/store.go`, a coarse global `sync.Mutex` wraps all log ingestions and queries; queries stall behind bulk ingest. Replacing this with per-stream fine-grained `sync.RWMutex` drops p99 query latency from ~140ms to <10ms.",
+ "trap": "A solver reading only `/opt/bench/run_sample.sh` will see a trivial 500-event uniform workload where the flawed $\\gamma = 1+\\alpha$ lower-bound estimate appears to pass loose error thresholds. If the solver only compiles the code and bypasses systemd or leaves the representative calculation at $L_k$, hidden tests running heavy-tailed Pareto and bimodal distributions will fail the relative error check, and concurrent ingest bursts will blow past the 35ms query latency limit.",
+ "tests": [
+  "test_service_deployment_and_lifecycle: asserts that `log-metricd` is active and healthy under systemd (`systemctl is-active log-metricd`), survives a clean `systemctl restart log-metricd`, and responds 200 OK to `GET /healthz`.",
+  "test_quantile_accuracy_hidden_seeds: generates 50,000 log events across 3 hidden seeds (log-normal, heavy-tailed Pareto, bimodal); queries p50, p90, p99, p99.9 and verifies relative error $\\le \\alpha = 0.01$ against exact ground-truth values.",
+  "test_budget_constraint_satisfaction: registers 8 dynamic streams with conflicting dynamic ranges and priorities under a tight total bucket limit (1024 buckets); verifies total allocated buckets $\\le 1024$, all streams are admitted, and no sample values within $[x_{min}, x_{max}]$ are dropped or truncated.",
+  "test_burst_query_latency_performance: sustains 8,000 ingest events/sec across 10 concurrent clients while 5 workers continuously query percentiles over a 10-second window; measures query response times and asserts p99 latency < 35ms.",
+  "test_boundary_value_handling: ingests boundary values at $x_{min}$, $x_{max}$, and exact power boundaries $\\gamma^k$; verifies values fall into correct bins without indexing panics or NaN return values."
+ ],
+ "verifier_knob": {
+  "name": "num_request_scenarios",
+  "value": "5 scenarios (service lifecycle, hidden-seed quantile accuracy, budget constraint compaction, burst p99 latency under load, boundary values)",
+  "effect": "Increasing the number of scenarios adds wider dynamic range distributions ($10^7$ span), higher concurrent ingest rates (15,000+ events/sec), and stricter latency thresholds (20ms)."
+ },
+ "expected_failure_modes": [
+  "Fixing the Go compile error but failing to resolve systemd notify/permissions, causing the service to fail when systemd is queried.",
+  "Changing $\\gamma$ to $(1+\\alpha)/(1-\\alpha)$ but retaining bucket lower bound $L_k$ as the quantile estimate, which violates relative error bounds on distribution upper tails.",
+  "Using a coarse global lock in `store.go`, causing ingestion lock contention to breach the 35ms p99 query latency threshold under concurrent load.",
+  "Failing to handle floating-point precision loss at exact boundary powers $val = x_{min}\\gamma^k$, causing off-by-one bin placement and NaN percentiles."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "go",
+  "telemetry",
+  "systemd",
+  "performance",
+  "algorithms"
+ ]
+}

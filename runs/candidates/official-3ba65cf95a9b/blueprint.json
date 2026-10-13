@@ -1,0 +1,54 @@
+{
+ "slug": "release-telemetry-sql-aggregator-repair",
+ "title": "Repair CI Release Telemetry SQL Catalog Aggregator",
+ "scenario": "A release engineer is unblocking a broken nightly CI build where the artifact packaging pipeline aggregates raw test execution shards into a standalone SQLite analytical catalog (`release_catalog.db`). The generated database powers downstream release qualification queries but currently fails the CI verification gate on metric accuracy, query latency, and artifact file size. The environment contains 32 raw runner telemetry data files, an opaque decoder binary, analytical SQL queries, the schema definition, and the verification harness.",
+ "instruction_draft": "Our nightly release build is blocked because the telemetry aggregation step (`scripts/build_release_catalog.sh`) fails the release verification gate (`scripts/check_release_metrics.sh`). The step is responsible for decoding raw runner telemetry shards from `/var/lib/build_data/shards/` into `/var/lib/build_data/release_catalog.db` to serve downstream release qualification queries in `queries/`.\n\nFix `scripts/build_release_catalog.sh` (and any associated SQL queries or schemas in the repository) so that running `scripts/check_release_metrics.sh` passes all checks. To pass, the generated `/var/lib/build_data/release_catalog.db` must achieve an analytical query parity score of at least 0.999 against ground truth, complete the benchmark query suite in under 1.80 seconds total execution time on this system, and maintain a final database file size of 25.0 MB or less.",
+ "requirements": [
+  "`scripts/build_release_catalog.sh` must execute successfully and produce `/var/lib/build_data/release_catalog.db` from all shards in `/var/lib/build_data/shards/`.",
+  "`/var/lib/build_data/release_catalog.db` must achieve an analytical query parity score of at least 0.999 (measuring flake rates, runner pool P95 durations, and failure attribution against reference ground truth).",
+  "The analytical query benchmark suite executed by `scripts/check_release_metrics.sh` must finish in under 1.80 seconds total execution time.",
+  "The final file size of `/var/lib/build_data/release_catalog.db` must not exceed 25.0 MB (26,214,400 bytes)."
+ ],
+ "environment": [
+  "Base image `python:3.13-slim-bookworm` with `sqlite3`, `binutils`, `gdb`, `gawk`, and standard coreutils installed.",
+  "`/var/lib/build_data/shards/`: 32 binary telemetry data files (`shard_00.dat` to `shard_31.dat`, ~85 MB total) containing ~180,000 serialized test execution records across two runner agent generations.",
+  "`sample_data/`: A lightweight sample shard (`sample_01.dat`, ~2,000 records) and `scripts/test_sample.sh` which exercises only legacy records.",
+  "`bin/decode_shard`: A stripped ELF 64-bit binary compiled from C that parses binary shard files and outputs tab-separated records: `(record_id, commit_hash, test_name, runner_pool, outcome, duration_us, flags, timestamp)`.",
+  "`schema/catalog_schema.sql`: Initial DDL defining table `test_events` and rollup views.",
+  "`queries/`: Four analytical SQL queries (`q1_flaky_tests.sql`, `q2_runner_p95.sql`, `q3_slowdown_regression.sql`, `q4_stage_attribution.sql`).",
+  "`scripts/build_release_catalog.sh`: The broken aggregation script that uses per-shard subshells, lacks transaction batching, drops staging tables without vacuuming, and applies an incorrect naive status filter.",
+  "`scripts/check_release_metrics.sh`: The CI verification script that checks output parity against precalculated ground truth, times the query benchmark across multiple iterations, and checks file size."
+ ],
+ "internal_hint": "The pipeline has three interacting defects across systems, SQL, and data representation: 1) Reverse Engineering & Data Edge Cases: Running `strings bin/decode_shard` or analyzing flag bits reveals bitmask flags: `0x01` (INFRA_FAULT), `0x02` (SPECULATIVE_EXECUTION), and `0x04` (SUPERSEDED/ABORTED). The naive script counts superseded speculative runs (`flags & 0x04 != 0`) and infrastructure drops (`flags & 0x01 != 0`), corrupting P95 latencies and flake calculations. Furthermore, observing the real data in `shard_16.dat` onward shows runner v2 records emit 16-digit microsecond timestamps instead of 13-digit millisecond timestamps; without normalizing (`CASE WHEN timestamp > 10000000000000 THEN timestamp / 1000 ELSE timestamp END`), v2 events fall outside the 7-day query window into year 56000. 2) Systems Freelist Bloat: `build_release_catalog.sh` creates and drops an unindexed staging table directly in the catalog database; SQLite retains deleted pages in the freelist, ballooning the DB to 58 MB. Using `CREATE TEMP TABLE` or issuing `VACUUM;` brings the size down to ~20 MB. 3) Systems Query & Transaction Optimization: Ingesting shards sequentially in separate `sqlite3` invocations without a single transaction takes >40s. Streaming all decoded output through `sqlite3` inside a single `BEGIN TRANSACTION; ... COMMIT;` (or `.import`) finishes ingestion in <3s. Adding two targeted composite covering indexes (`CREATE INDEX idx_pool_dur ON test_events(runner_pool, duration_us)` and `CREATE INDEX idx_test_commit ON test_events(test_name, commit_hash, outcome)`) plus running `ANALYZE;` reduces query benchmark latency from >20s to ~0.8s.",
+ "trap": "The provided `scripts/test_sample.sh` and `sample_data/` only contain 2,000 legacy records with 13-digit millisecond timestamps, no speculative execution duplicates, and no infrastructure faults. A naive fix (such as merely fixing bash syntax or adding an index without addressing timestamp scaling, flag bitmasks, freelist vacuuming, or composite indexing) will pass `test_sample.sh` with 100% sample parity, but fail all three thresholds on the full 32 shards during verification.",
+ "tests": [
+  "Verify `/var/lib/build_data/release_catalog.db` exists, is a valid SQLite 3 database, and integrity check (`PRAGMA integrity_check`) returns 'ok'.",
+  "Verify the database file size is strictly <= 25,000,000 bytes.",
+  "Execute `scripts/check_release_metrics.sh` and assert that the benchmark execution time of the 4 release qualification queries across 5 warm runs averages strictly under 1.80 seconds.",
+  "Verify analytical query parity against hidden ground-truth metrics (flakiness rate per test, P95 runner latency, commit regression delta) achieves a parity score >= 0.999 (exact floating-point match within 1e-4 tolerance).",
+  "Run verification against fresh hidden evaluation shards generated at verify time with random seed, confirming that v2 microsecond timestamps and speculative flags (0x01, 0x04) are correctly filtered and normalized."
+ ],
+ "verifier_knob": {
+  "name": "benchmark_latency_and_size_ceilings",
+  "value": "latency_max_sec=1.80, size_max_mb=25.0, parity_min=0.999",
+  "effect": "Lowering latency_max_sec to 1.20s requires optimal covering indexes and memory-mapped PRAGMAs; lowering size_max_mb to 20.0MB forces exact column type affinity and lean indexing; raising parity_min to 1.0 requires zero tolerance for any misclassified speculative or infra-fault record."
+ },
+ "expected_failure_modes": [
+  "Shallow verification trap: The agent runs `scripts/test_sample.sh`, sees that it passes on the sample shard, and submits without testing against the full 32 production shards in `/var/lib/build_data/shards/`.",
+  "Ignoring freelist retention: The agent drops intermediate staging tables but neglects to run `VACUUM` or use temporary tables, leaving the file size at ~58 MB and failing the 25 MB threshold.",
+  "Failure to observe real data timestamp shift: The agent assumes all timestamps are milliseconds because the schema definition says `INTEGER`, failing to inspect the 16-digit numbers in v2 shards that cause 40% of records to vanish from time-windowed rollups.",
+  "Over-indexing: The agent adds separate indexes on every column mentioned in `WHERE` clauses, which balloons the database file size beyond 35 MB.",
+  "SQLite lock contention: The agent attempts to parallelize the bash ingestion with `xargs -P` or background `&` jobs without WAL mode or proper busy timeouts, causing silent insert failures and corrupted row counts."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "systems",
+ "tags": [
+  "sqlite",
+  "devops",
+  "bash",
+  "performance-optimization",
+  "reverse-engineering",
+  "data-pipelines"
+ ]
+}

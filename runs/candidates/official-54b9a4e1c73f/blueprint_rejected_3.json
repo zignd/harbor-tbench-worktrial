@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "resolver-cache-accounting",
+  "title": "Repair Resolver Cache Accounting",
+  "scenario": "The DNS platform team's cache-hit dashboard stopped matching the resolver's upstream-query counters after a configuration rollout. I left a small `resolver-audit` service in the container with packet-capture logs, counter snapshots, configuration, and a few example reports; please make its replayed numbers trustworthy again.",
+  "instruction_draft": "Please get `/opt/resolver-audit/bin/resolver-audit` working again. Given a capture, resolver configuration, and counter snapshots, it must emit the documented JSON report with the correct request, cache-hit, upstream-query, negative-answer, and per-zone byte totals, including out-of-order traffic, transaction-ID reuse, retries, truncated responses, and configuration changes. It must be deterministic and achieve at least 98.5% event-classification accuracy and 99.0% relative accuracy for every aggregate metric on fresh captures, not just the checked-in example; keep the existing command-line interface and do not hard-code the example values.",
+  "requirements": [
+   "Repair or complete `/opt/resolver-audit/bin/resolver-audit` rather than changing the verifier or its invocation.",
+   "Accept the existing capture, configuration, and counter-snapshot command-line inputs and produce the documented JSON report.",
+   "Correctly report total client requests, cache hits, upstream queries, negative answers, and upstream bytes, plus the documented per-zone breakdown.",
+   "Handle out-of-order packets, reused DNS transaction IDs, retries, truncated responses, and resolver configuration changes.",
+   "Produce deterministic output without relying on wall-clock time, network access, or unseeded randomness.",
+   "Reach at least 98.5% event-classification accuracy on fresh verifier-generated captures.",
+   "Reach at least 99.0% relative accuracy for every reported aggregate metric on fresh verifier-generated captures.",
+   "Preserve the existing command-line interface and report schema."
+  ],
+  "environment": [
+   "A Debian-bookworm Python 3.13 container with pinned standard packages, one CPU, and 2 GB RAM.",
+   "A roughly 1,500-line in-house Python service under `/opt/resolver-audit`, including a CLI, configuration loader, report writer, metrics dashboard helper, tests, and unrelated operational code.",
+   "The main input is a binary `.wlog` resolver capture containing framed DNS request, response, timeout, and counter records. The framing uses a compact variable-length timestamp and length encoding, and DNS payloads include name compression, EDNS options, truncated replies, and negative answers.",
+   "The repository contains a thin Python wrapper around an opaque compiled `/opt/resolver-audit/lib/libwlog.so` helper used by the old collector; its source is not present. The wrapper, a format note, hex fixtures, and the consumer's partial implementation provide enough observable behavior to reconstruct the decoder, but the helper is not used by the verifier as an oracle.",
+   "The missing decoder/replay component is deliberately incomplete, with a few passing fixtures but no general implementation for all frame types.",
+   "Configuration files describe cache scope, negative-TTL policy, retry windows, upstream pools, and reload epochs. Counter snapshots are periodic and can straddle a reload.",
+   "Checked-in data contains a misleadingly clean single-client example. Verifier-time data is generated from a hidden seed with thousands of events, packet reordering, transaction-ID reuse, retries, cache expiry boundaries, mixed query types, malformed-but-skippable padding frames, and several configuration reloads.",
+   "A deterministic reference generator and verifier are outside the solver-visible tree. They compare classifications and all report aggregates from newly generated captures."
+  ],
+  "internal_hint": "The shortest reliable investigation is to run the existing CLI on the fixtures, inspect the report alongside raw hex and counter snapshots, then use the opaque helper and wrapper under strace or small generated probes to establish frame boundaries, signed timestamp deltas, and record variants. Implement a streaming WLOG decoder, DNS-name/question/EDNS parser, and replay state keyed by resolver epoch, client transaction identity, question tuple, and retry window; match responses by constraints rather than by the first same-ID record, and classify truncation followed by a full retry as one logical request. Reconcile cache state using the effective configuration at each event, including distinct positive and negative expiry rules, and count bytes from the selected upstream response rather than every observed retry packet. The two planted runtime causes interact: a signed timestamp-delta decoding error moves events across reload and TTL boundaries, while the analyzer's cache key omits DNS type/class and the EDNS validation mode. Fixing either alone makes the visible example and many simple captures look correct while misclassifying hidden boundary cases. Validate by generating captures with reordered records and comparing replay classifications to the counter snapshots before changing the report formatter.",
+  "trap": "A shallow implementation that groups packets by transaction ID and uses the current configuration will pass the checked-in example and ordinary sequential traffic. It fails when IDs are reused after reordering, when a truncated UDP answer is followed by a TCP retry, and when a timestamp-delta or cache-expiry boundary crosses a configuration reload; fixing only packet matching or only cache-key construction causes the other error to remain hidden in aggregate totals.",
+  "tests": [
+   "Run the unchanged CLI on the visible fixture and verify the exact documented JSON schema and expected values.",
+   "Generate a fresh seeded capture with several thousand mixed DNS events, decode and replay it, and require at least 98.5% agreement with the reference event classifications.",
+   "Generate captures with packet reordering and transaction-ID reuse, then check request, hit, retry, negative-answer, and per-zone classifications.",
+   "Generate UDP truncated-response followed by TCP/full-response sequences and verify that logical request and upstream-byte totals do not double count the retry.",
+   "Generate positive and negative cache entries with exact TTL-expiry boundaries, mixed A/AAAA/CNAME questions, and EDNS variants, then compare all cache and upstream classifications.",
+   "Generate configuration reloads that occur between timestamp-delta records and cache expiry events, then verify that the epoch-specific policy is applied.",
+   "Check every aggregate field, including per-zone byte totals, against the reference with a maximum relative error of 1.0%.",
+   "Run the same generated input twice with different process environments and verify byte-for-byte deterministic JSON output.",
+   "Include malformed padding and unknown optional frame records to ensure they are skipped without shifting subsequent decoding."
+  ],
+  "verifier_knob": {
+   "name": "minimum_event_accuracy",
+   "value": "98.5%",
+   "effect": "Raising the threshold makes rare decoder, ordering, and expiry mistakes fail even when aggregate totals look good; lowering it permits partial replay implementations. The aggregate relative-error threshold remains 1.0%."
+  },
+  "expected_failure_modes": [
+   "Assuming the visible hex examples fully describe the variable-length framing and mishandling signed timestamp or length values.",
+   "Using transaction ID alone, or a greedy first-match algorithm, instead of resolving ambiguous requests and responses under timing, source, question, and retry constraints.",
+   "Treating truncated and full retries as independent requests or counting both upstream packets in byte totals.",
+   "Using one global cache key or the latest configuration for events that belong to different reload epochs.",
+   "Implementing a DNS parser that handles ordinary names but not compression pointers, root names, EDNS options, or negative-answer authority records.",
+   "Checking only the final dashboard totals and missing a small classification error that is amplified by hidden per-zone and counter consistency checks.",
+   "Replacing the report schema or CLI with a one-off script that works on the supplied fixture but is incompatible with verifier-generated inputs."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "networking-services",
+  "tags": [
+   "dns",
+   "binary-parser",
+   "constraint-satisfaction",
+   "logs-metrics",
+   "reverse-engineering"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/resolver-audit && find . -maxdepth 3 -type f -printf '%p\\n' | sort",
+   "sed -n '1,240p' bin/resolver-audit",
+   "grep -RInE 'wlog|report|snapshot|cache|zone' . --exclude-dir=.git",
+   "find . -type f \\( -name '*.wlog' -o -name '*.json' -o -name '*.conf' -o -name '*.hex' \\) -print",
+   "bin/resolver-audit --help",
+   "bin/resolver-audit <visible-capture> <visible-config> <visible-snapshot> > /tmp/baseline.json",
+   "cat /tmp/baseline.json && xxd -g1 <visible-capture> | head -100",
+   "sed -n '1,260p' <wrapper-and-format-note-files>",
+   "sed -n '1,320p' <partial-decoder-and-replay-files>",
+   "strace -f -e read,write,openat <opaque-helper-probe> <fixture> 2>/tmp/helper.strace",
+   "write small helper probes for single-frame timestamps, lengths, padding, and each record variant",
+   "compare probe outputs, wrapper behavior, and hex fixtures to infer framing and signed timestamp deltas",
+   "inspect configuration loaders, snapshot parsing, and the documented report writer",
+   "inspect existing tests and run the current test suite",
+   "implement a streaming WLOG decoder that skips malformed padding and unknown optional records",
+   "implement DNS question/name compression, EDNS, truncation, and negative-answer parsing",
+   "implement replay state keyed by epoch, client identity, transaction identity, question tuple, and retry window",
+   "implement constraint-based response matching for reordering, ID reuse, retries, and TCP completion",
+   "implement epoch-specific positive and negative cache expiry and configuration reload handling",
+   "implement upstream byte accounting from the selected logical response and preserve the existing report schema",
+   "run the visible fixture and compare every field with the documented expected JSON",
+   "create local reordered, ID-reuse, truncated-retry, negative-TTL, and reload-boundary fixtures",
+   "run the existing tests plus the new local edge-case fixtures",
+   "run the deterministic replay twice under different environment variables and byte-compare JSON output",
+   "run available capture-generation and verifier commands on fresh seeded inputs",
+   "inspect classification mismatches and counter reconciliation failures",
+   "fix parser, matching, cache, or epoch-boundary defects revealed by fresh captures",
+   "rerun visible, malformed-frame, hidden-like, accuracy, aggregate, and determinism checks"
+  ],
+  "speedrun_commands": 27,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The documented JSON schema, exact CLI argument forms, and event-classification semantics are referenced but not included in the blueprint, so an otherwise correct implementation could be judged against undocumented behavior.",
+   "The expected cache-key semantics, DNS negative-answer rules, retry identity rules, and counter reconciliation policy may admit multiple reasonable interpretations unless the repository documentation fully specifies them.",
+   "The hidden generator and verifier are outside the solver-visible tree; if they are unavailable or nondeterministic in the build environment, the stated accuracy checks are not independently reproducible.",
+   "Relative-error checks are problematic for metrics whose reference value can be zero, and the blueprint does not define the denominator or tolerance behavior in that case.",
+   "A reverse-engineering dependency on an opaque helper and strace behavior could vary across container builds, making the task fail for environmental reasons rather than implementation quality.",
+   "The requirement to achieve accuracy on fresh captures may be overreaching if the hidden generator uses protocol or resolver behaviors not represented by the visible format note and fixtures."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic, difficult, and mostly verifiable, but the required decoder, DNS parser, constraint-based replay engine, epoch-aware cache model, and byte accounting are unlikely to be solvable by a skilled engineer in under an hour, especially while reverse-engineering an opaque helper. Solvability therefore scores below the acceptance threshold, and several key semantics are only implicitly documented.",
+  "fixes": [
+   "Provide a complete WLOG framing and record-variant specification, or expose a deterministic decoder oracle/API instead of requiring opaque-helper reverse engineering.",
+   "Include the exact report schema, CLI invocation examples, event-classification definitions, cache-key rules, retry matching rules, and zero-reference relative-error policy in the task materials.",
+   "Reduce scope to either decoder-plus-parser or replay-plus-accounting, or provide a substantially more complete implementation scaffold for the other component.",
+   "Ship a visible deterministic mini-generator covering reordering, ID reuse, truncation, negative answers, and reload boundaries so the solver can validate inferred semantics before hidden verification.",
+   "Specify the supported DNS and configuration behavior explicitly and ensure hidden captures stay within that documented subset."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "This concerns DNS packet replay and resolver accounting, whereas the reference concerns cryptographic session-key derivation for encrypted audit logs."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "This requires DNS traffic classification and aggregate metric reconstruction, not WAL record canonicalization, refund resolution, or HMAC service behavior."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Although both aggregate network telemetry, the candidate reconstructs DNS resolver events from packets and configuration changes while the reference aggregates NetFlow records through a network service."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The candidate repairs offline DNS capture accounting, while the reference implements an HTTP time-series query service backed by a metrics database and aggregation engine."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The candidate focuses on deterministic DNS event classification and byte accounting, not quantile-sketch accuracy, latency, or systemd deployment."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-b95cd2e90ca2",
+     0.142
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.131
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.101
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.073
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.068
+    ]
+   ],
+   "cost_usd": 0.0008098000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0033610000000000003
+}

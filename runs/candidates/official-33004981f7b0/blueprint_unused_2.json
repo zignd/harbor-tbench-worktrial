@@ -1,0 +1,191 @@
+{
+ "blueprint": {
+  "slug": "repair-encrypted-settlement-reconciliation",
+  "title": "Repair Encrypted Settlement Reconciliation",
+  "scenario": "A finance-ops team is reconciling encrypted settlement exports produced during a key rotation, but the rebuilt reconciliation report disagrees with the custodian's record. The container contains a roughly 1,500-line C reconciliation service, a prebuilt command-line binary, documented settlement fixtures, and a proprietary cryptographic shared library supplied only as a binary and header.",
+  "instruction_draft": "$ ./bin/settle-reconcile fixtures/sample.sbx --out /tmp/sample.json\nframes=6 accepted=6 rejected=0 balance_cents=184230 chain_root=8f1b...\n\nRepair and complete the settlement reconciliation utility in this repository. It must read the documented SBX1 and SBX2 encrypted frame formats, authenticate and decrypt every valid frame with the supplied cryptographic component, and continue past malformed or unauthenticated frames while counting them as rejected. For accepted records, preserve the specified file order, decode all documented record types, construct the specified domain-separated SHA-256 event chain, match each refund to its referenced charge, and calculate per-account signed balances. Produce the exact canonical JSON report format documented in the repository, including accepted and rejected counts, rejected frame indexes, account balances, the final chain root, and the Merkle root of accepted event digests. Key epochs, sequence gaps, empty authenticated payloads, binary metadata, duplicate event IDs, and refunds that reference events in another frame must behave exactly as specified. Do not weaken authentication or silently coerce malformed input. Rebuild the executable as `bin/settle-reconcile`; it must produce byte-for-byte identical reports to the reference on hidden generated exports and process at least 75,000 frames per second on the benchmark corpus on the allotted single CPU.",
+  "requirements": [
+   "Build a working executable at bin/settle-reconcile.",
+   "Read both documented SBX1 and SBX2 encrypted frame formats.",
+   "Authenticate and decrypt valid frames using the supplied cryptographic component.",
+   "Reject malformed or unauthenticated frames without terminating the batch, and report their frame indexes and count.",
+   "Correctly handle key epochs, sequence gaps, empty authenticated payloads, binary metadata, duplicate event IDs, and cross-frame refund references.",
+   "Preserve the specified input order for accepted records.",
+   "Decode every documented settlement record type.",
+   "Construct the documented domain-separated SHA-256 event chain exactly.",
+   "Match every refund to its referenced charge rather than merely matching amounts or accounts.",
+   "Calculate exact signed balances per account.",
+   "Calculate the documented Merkle root over accepted event digests.",
+   "Emit the documented canonical JSON report with all required counts, balances, rejected indexes, chain root, and Merkle root.",
+   "Do not accept unauthenticated or malformed records through coercion or fallback parsing.",
+   "Match the reference output byte-for-byte on hidden generated exports.",
+   "Process at least 75,000 frames per second on the hidden benchmark corpus using one CPU."
+  ],
+  "environment": [
+   "Use a Dockerfile based on FROM python:3.13-slim-bookworm with pinned apt and pip dependencies and no network requirement at solve time.",
+   "Install a C toolchain, OpenSSL development headers, and the repository's pinned build dependencies.",
+   "Provide approximately 1,500 lines of C across parser, report, reconciliation, and command-line components, with unrelated logging and configuration code mixed in realistically.",
+   "Ship an initially built bin/settle-reconcile and its source/build files; the solver must modify the source and rebuild it.",
+   "Ship an opaque /opt/settlement/lib/libsettlecrypto.so and public header only. The library is built during the Docker image build from author-controlled private code that is not present in the container.",
+   "The cryptographic library exposes authenticated decryption for the SBX key epochs and a batch-friendly context API; its behavior, error distinctions, key material, and binary-safe length handling are documented but its implementation is unavailable.",
+   "Provide /opt/settlement/docs/SBX_FORMAT.md, REPORT_FORMAT.md, and CRYPTO_API.md describing frame layouts, canonical record encoding, domain separators, chain initialization, Merkle construction, error policy, and JSON canonicalization.",
+   "Provide small visible fixtures that cover ordinary charges, ordinary refunds, one key rotation, and one rejected frame, but do not cover all edge cases.",
+   "Provide a visible sample command and expected abbreviated terminal output matching the opening dump.",
+   "Seed the repository with a partial implementation that handles the visible legacy path but has incomplete v2 parsing, stateful key-epoch handling, binary-safe record decoding, cross-frame reference resolution, and the final report pipeline.",
+   "Include a deterministic fixture generator used by verification but not exposing hidden expected reports; generated files contain tens of thousands of frames, multiple epochs, adversarial ordering, rare malformed frames, duplicate IDs, empty authenticated payloads, and long metadata fields.",
+   "Set the container to one CPU and 2 GB RAM and make the benchmark deterministic."
+  ],
+  "internal_hint": "The reference shell script first inventories the tree and reads all three format/API documents, then runs the visible fixture and a small generator corpus while tracing library calls and allocation failures. It probes the opaque library through the supplied header and a tiny C harness rather than attempting to reimplement cryptography, identifies that the existing code assumes one key epoch, treats decrypted bytes as NUL-terminated text, and finalizes reconciliation before all cross-frame references are known. It replaces the parser with length-delimited binary-safe decoding, maintains an epoch-aware decrypt context and an indexed event table, performs validation and digest construction in input order, resolves refunds in a later pass, and only then computes balances and the dependent chain/Merkle roots. It finishes by replacing quadratic reference scans and per-frame allocations with hash tables and reusable buffers, rebuilds, compares reports against generated independent cases, and benchmarks the resulting binary. The hard parts are substantial construction and runtime/data-dependent behavior: the visible source does not reveal how key rotation, authenticated empty payloads, malformed frames, or history-dependent references interact, and the performance bar exposes implementations that repeatedly shell out or rescan prior records.",
+  "trap": "A shallow solution can pass the visible six-frame fixture while using strlen on decrypted payloads, selecting keys from the first frame, matching refunds by amount, or computing the chain and Merkle root before rejected-frame and cross-frame state is settled. Such a solution fails hidden cases with embedded NUL bytes, sequence gaps around an epoch transition, empty authenticated records, refunds preceding their charges, duplicate identifiers, and sparse malformed frames. A correct but subprocess-heavy implementation also fails the 75,000-frame-per-second threshold.",
+  "tests": [
+   "Run the rebuilt executable on the supplied visible fixture and compare its complete canonical JSON report and exit behavior.",
+   "Generate deterministic hidden SBX1-only batches with ordinary charges and refunds, then compare accepted counts, balances, event chain, and Merkle root to an independent reference.",
+   "Generate SBX2 batches with several key epochs, nonconsecutive sequence numbers, epoch transitions at arbitrary frame boundaries, and authenticated empty payloads.",
+   "Inject truncated headers, invalid lengths, bad tags, unknown record types, duplicate IDs, invalid UTF-8 where required, and binary metadata; verify that only the specified frames are rejected and all later frames are still processed.",
+   "Generate records whose payloads contain NUL bytes and high-bit binary metadata; verify length-delimited decoding and exact digest construction.",
+   "Generate refunds before their charges and across frame boundaries, including same-amount charges on different accounts; verify reference-based matching and the documented unmatched-refund result.",
+   "Generate duplicate event IDs and conflicting references; verify the specified rejection and accounting behavior rather than first-match behavior.",
+   "Compare byte-for-byte canonical JSON output, including ordering, integer formatting, rejected index arrays, and hexadecimal roots, on multiple fresh seeds.",
+   "Run a hidden corpus of at least 250,000 frames and require throughput of at least 75,000 frames per second on one CPU while keeping memory within the container limit.",
+   "Run a second large corpus with a different seed and key-epoch layout to prevent hardcoded fixture assumptions."
+  ],
+  "verifier_knob": {
+   "name": "performance_threshold",
+   "value": "75000 frames per second on a deterministic 250000-frame, one-CPU corpus",
+   "effect": "Raising the threshold excludes implementations with excessive allocations, repeated scans, or per-frame process/library setup; lowering it permits slower but functionally correct implementations."
+  },
+  "expected_failure_modes": [
+   "Treating decrypted records as C strings and truncating binary metadata or empty payloads.",
+   "Using the first frame's key or a stateless key lookup instead of maintaining epoch state across the stream.",
+   "Computing hashes with the wrong domain separator, byte order, length prefix, or chain initialization.",
+   "Resolving refunds only against previously seen charges or matching by amount instead of the explicit reference.",
+   "Finalizing balances or Merkle state before the required validation and cross-frame reconciliation stages.",
+   "Dropping malformed frames without recording their indexes, or aborting the entire batch on one authentication failure.",
+   "Implementing the opaque crypto API through a subprocess per frame and missing the throughput threshold.",
+   "Passing the visible fixture while assuming ASCII, unique IDs, contiguous sequences, or a single key epoch.",
+   "Using quadratic searches for references or duplicate detection and exhausting the time budget on hidden large inputs.",
+   "Misreading canonical JSON ordering or numeric formatting despite otherwise correct reconciliation."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "cryptography",
+  "tags": [
+   "c",
+   "authenticated-encryption",
+   "stream-reconciliation",
+   "hash-chain",
+   "performance",
+   "binary-format"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "find . -maxdepth 3 -type f -print | sort",
+   "cat /opt/settlement/docs/SBX_FORMAT.md /opt/settlement/docs/REPORT_FORMAT.md /opt/settlement/docs/CRYPTO_API.md",
+   "sed -n '1,240p' src/*.c src/*.h",
+   "cat Makefile CMakeLists.txt 2>/dev/null; grep -R \"epoch\\|strlen\\|refund\\|merkle\\|chain\" -n src",
+   "make -j2 && ./bin/settle-reconcile fixtures/sample.sbx --out /tmp/baseline.json",
+   "sed -n '1,240p' /opt/settlement/include/*.h; nm -D /opt/settlement/lib/libsettlecrypto.so",
+   "write and compile a small C harness exercising the crypto context, epoch selection, empty plaintext, and error codes",
+   "run the harness and trace the visible executable's crypto calls",
+   "inspect the complete parser and frame-validation control flow",
+   "inspect reconciliation, event indexing, hash construction, and JSON emission",
+   "replace text-oriented frame and plaintext parsing with length-delimited binary-safe parsing",
+   "add epoch-aware reusable crypto contexts and correct sequence/key-transition handling",
+   "implement all documented record types, UTF-8 checks, metadata handling, and duplicate-ID validation",
+   "add indexed event storage and deferred reference resolution for cross-frame refunds",
+   "implement documented event digests, domain-separated chain, balances, and Merkle construction in the required order",
+   "implement rejected-frame accounting, indexes, and canonical JSON serialization",
+   "make -j2 and rebuild bin/settle-reconcile",
+   "compare the complete visible JSON report and exit behavior with the expected result",
+   "run the deterministic generator on a small corpus and compare against the independent checker",
+   "exercise malformed frames, NUL metadata, empty payloads, duplicate IDs, and refunds preceding charges",
+   "benchmark a representative generated corpus and profile allocations and reference lookups",
+   "replace remaining per-frame allocations or quadratic scans with reusable buffers and hash tables",
+   "make clean && make -j2",
+   "run both large seeded corpora and verify byte-for-byte reports and the throughput threshold",
+   "perform a final visible-fixture, error-exit, and output-path check"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "A fixed 75000-frames-per-second threshold can be flaky across different host CPU models, virtualization, or container scheduling even with a one-CPU limit; calibration or a generous margin is needed.",
+   "The opaque shared library must have a stable ABI and deterministic behavior matching the supplied header and documentation; an author-build/runtime mismatch would make failures invalid for the solver.",
+   "The format documents must explicitly define every edge-case outcome, especially duplicate IDs, unknown record types, invalid UTF-8, and unmatched refunds; otherwise byte-for-byte hidden expectations would be ambiguous.",
+   "The Docker build must actually make all pinned packages and the proprietary library available before solve time; requiring network access or unavailable private build inputs would invalidate the task."
+  ],
+  "verdict": "accept",
+  "reasons": "The end state and tested behaviors are unusually well specified, and independent generated corpora plus canonical byte-for-byte reports make shallow implementations unlikely to pass. The task is substantial but the repository contains a partial implementation, complete documents, and a batch-oriented crypto API, making an under-an-hour solution plausible for a skilled engineer; its difficulty comes from real state, binary parsing, dependency ordering, and performance issues rather than cosmetic traps.",
+  "fixes": [
+   "Pin the benchmark host/container CPU characteristics or define a calibrated performance margin to reduce threshold flakiness.",
+   "Include an explicit documentation checklist for duplicate-ID, unknown-type, malformed-frame, and unmatched-refund semantics.",
+   "Verify the shipped shared-library ABI during image construction and provide a deterministic fallback build artifact if the private build step cannot be reproduced."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This is an encrypted frame authentication, settlement decoding, event-chain, and accounting problem rather than transactional replication-log replay."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate reconciles authenticated encrypted settlement frames and computes financial aggregates, not incident-event migration and state reconstruction."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "Although both involve event histories and refunds, the candidate's core problem is cryptographic frame processing and reconciliation rather than campaign attribution reporting."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "The candidate does not implement configurable SQL report execution or release-audit materialization, but encrypted settlement parsing and verification."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "Despite shared cryptographic chains and key rotation, this candidate centers on decrypting settlement frames, decoding records, matching refunds, and calculating balances rather than classifying authoritative audit-chain events."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.211
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.186
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.161
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.151
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.149
+    ]
+   ],
+   "cost_usd": 0.000963
+  },
+  "novel": true
+ },
+ "cost_usd": 0.00425
+}

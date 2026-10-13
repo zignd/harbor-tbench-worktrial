@@ -1,0 +1,54 @@
+{
+ "slug": "telemetry-pipeline-reproduction-repair",
+ "title": "Repair Multi-Stage Telemetry Trace Reproduction Pipeline",
+ "scenario": "A research scientist is attempting to reproduce benchmark figures from a distributed systems experiment. The container runs a background telemetry service (`traced`) that spools high-frequency binary execution traces from multi-threaded workers into chunked spool files. The scientist's reproduction pipeline (`/opt/bench-pipeline`) consists of shell orchestration scripts and an in-house Rust processing engine (`trace-engine`), but recent protocol updates to the daemon broke the multi-stage pipeline, causing extraction failures, timestamp drift, and corrupted latency percentiles.",
+ "instruction_draft": "root@bench-host:/opt/bench-pipeline# ./scripts/run_pipeline.sh --input-dir /var/log/traced/run_01 --output /results/summary.json\n[stage 1: spool-extract] extracted 18420 binary frames across 8 channels.\n[stage 2: rust-demux] thread 'main' panicked at src/demux.rs:88: invalid frame flags 0x08 for protocol v2: unexpected chunk boundary\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\npipeline failed at stage 2: exit code 101\n\nFix the reproduction pipeline in `/opt/bench-pipeline` so that `./scripts/run_pipeline.sh` executes cleanly and outputs exact metrics matching `docs/SPEC.md`.\n\nThe pipeline must:\n1. Accept `--input-dir <DIR> --output <FILE>` (and support `--stream-socket <SOCK>` when pointed directly at the daemon's live UNIX domain socket).\n2. Correctly extract binary spool frames across arbitrary worker channels in Stage 1, respecting protocol v2 16-byte frame headers (magic `0x54524143`, 2-byte channel ID, 2-byte flags, 4-byte chunk sequence, 4-byte payload length) and skipping padded frame alignments.\n3. Resolve timestamp synchronization across channels in Stage 2 (`trace-engine demux`), converting per-worker 32-bit microsecond counter deltas against each channel's 64-bit base anchor and accounting for counter wrap-around.\n4. Correlate RPC request-response spans across channel boundaries by matching 64-bit span IDs.\n5. Write a JSON summary to the specified `--output` file containing overall span count, dropped frame count, and the exact $P_{50}$, $P_{95}$, and $P_{99}$ latency (in microseconds, rounded to 2 decimal places) partitioned into the three experimental phases (`warmup`, `measurement`, `cooldown`) designated by daemon lifecycle marker events.",
+ "requirements": [
+  "`./scripts/run_pipeline.sh --input-dir <DIR> --output <FILE>` executes through all stages without panics or non-zero exits on valid v2 trace directories.",
+  "`./scripts/run_pipeline.sh --stream-socket <SOCK> --output <FILE>` drains and processes live streams from the daemon's UNIX domain socket.",
+  "Stage 1 correctly parses v2 16-byte frame headers (`0x54524143` magic, channel ID, flags including continuation flag `0x08`, sequence, length) and handles 8-byte boundary alignment padding.",
+  "Stage 2 timestamp normalization reconstructs monotonic 64-bit microsecond timestamps per channel, properly handling 32-bit counter overflow relative to the channel anchor.",
+  "Stage 2 cross-channel span reconciliation matches request spans with corresponding response spans across differing worker channels without dropping unmatched spans from incomplete windows.",
+  "Stage 3 generates a validated JSON file at `--output` with keys `total_spans`, `dropped_frames`, and `phases` containing `warmup`, `measurement`, and `cooldown`, each with `span_count`, `p50`, `p95`, and `p99` microsecond latencies matching the specification reference."
+ ],
+ "environment": [
+  "Base image `python:3.13-slim-bookworm` with Rust toolchain (stable `rustc`/`cargo`), `bash`, `jq`, `coreutils`, `procps`, `bc`, and `libssl-dev` installed.",
+  "A background service `traced` running via a system script listening on `/run/traced/live.sock` and spooling traces to `/var/log/traced/run_01`.",
+  "Codebase at `/opt/bench-pipeline/` containing: `scripts/run_pipeline.sh`, `scripts/extract_spool.sh`, `scripts/calc_percentiles.sh`, `Cargo.toml`, `src/main.rs`, `src/demux.rs`, `src/spans.rs`, and `docs/SPEC.md`.",
+  "Planted bug 1: `scripts/extract_spool.sh` assumes fixed 12-byte v1 frame headers and hardcoded 4-byte alignment, failing on v2 16-byte headers and corrupting payload chunk splits when continuation flag `0x08` is set.",
+  "Planted bug 2: `src/demux.rs` panics on flag `0x08` rather than reassembling split payload buffers across chunk sequences.",
+  "Planted bug 3: `src/demux.rs` computes delta timestamps as signed 32-bit offsets without handling unsigned 32-bit integer overflow, causing backwards time jumps and causal inversion in spans when worker runtimes exceed ~71 minutes or when counter ticks wrap.",
+  "Planted bug 4: `scripts/calc_percentiles.sh` uses integer percentile rank indexing (`(N * P) / 100`) rather than linear interpolation / nearest-rank method defined in `docs/SPEC.md`."
+ ],
+ "internal_hint": "Difficulty source: Multi-stage dependency combined with modality translation and scale. A bug in Stage 1 framing silently truncates chunked binary payloads; Stage 2 panic on flag `0x08` is the immediate blocker, but fixing only the panic triggers silent timestamp skew because 32-bit microsecond counter deltas wrap around without modulo arithmetic against the base anchor. When timestamps jump backwards, request-response span durations become negative or misattributed across channels. Finally, Stage 3 shell aggregation must properly slice the lifecycle marker events (`EVENT_TYPE_PHASE = 0xAA`) into warmup, measurement, and cooldown windows and compute exact percentiles using standard linear interpolation as specified in the docs. The solver must inspect `docs/SPEC.md`, trace the data flow through shell scripts and Rust modules, align the binary framing, fix chunk reassembly, fix delta math, and ensure the percentile calculation matches reference specifications on large scale trace sets (20,000+ events across 16 channels).",
+ "trap": "A solver who only fixes the visible panic in `src/demux.rs` (by ignoring flag `0x08` or treating it as a no-op) will cause multi-chunk payloads to be truncated or lost. The pipeline will run without crashing on small test samples that fit in a single chunk, but on verify-time inputs with multi-chunk spans, span reconciliation fails. Furthermore, naive testing on short traces hides the 32-bit counter wraparound and cross-channel causal ordering bugs, producing wildly inaccurate p95/p99 values.",
+ "tests": [
+  "test_static_run: Executes `./scripts/run_pipeline.sh --input-dir /var/log/traced/run_01 --output /tmp/test1.json`, validating exit code 0 and checking structure against schema.",
+  "test_live_socket: Directs pipeline to `--stream-socket /run/traced/live.sock --output /tmp/live.json` while `traced` emits live traces, ensuring continuous stream decoding and clean shutdown.",
+  "test_fuzz_equivalence_small: Generates 5 randomized trace directories (varying channel counts 2-8, small payloads, with and without continuation flags) and verifies exact field equality against internal reference engine.",
+  "test_fuzz_equivalence_scale: Generates a large-scale trace set (32 channels, 50,000+ events, forced 32-bit counter rollovers, chunk splits across page boundaries, out-of-order channel flushes) and asserts absolute equivalence of `total_spans`, `dropped_frames`, and all percentile metrics within 0.01 tolerance."
+ ],
+ "verifier_knob": {
+  "name": "num_fuzz_streams_and_rollover_density",
+  "value": "10 generated runs with 16-32 channels, 15% continuation flag frequency, and 3 forced rollover boundaries per run",
+  "effect": "Increasing the number of runs and rollover frequency catches subtle edge cases in multi-chunk reassembly and 64-bit integer wraparound math, forcing a completely general implementation."
+ },
+ "expected_failure_modes": [
+  "Shallow verification: solver runs against the small initial `run_01` sample without testing multi-chunk continuation frames, missing corrupted payload boundaries.",
+  "Partial fix of the panic: solver masks the unrecognized flag `0x08` instead of implementing payload reassembly across consecutive sequence chunks.",
+  "Timestamp wraparound negligence: treating the 32-bit delta as a plain signed offset, resulting in negative span latencies during high-uptime or counter-overflow trace segments.",
+  "Modality translation error: shell pipeline corrupts null bytes or binary alignments when piping raw spool data between `dd`/`cat` and the Rust binary.",
+  "Incorrect percentile formula: using integer truncating rank rather than linear rank interpolation specified in the benchmark paper's specification."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "sysadmin",
+ "tags": [
+  "rust",
+  "bash",
+  "binary-protocols",
+  "multi-stage-pipeline",
+  "telemetry",
+  "fuzz-equivalence"
+ ]
+}

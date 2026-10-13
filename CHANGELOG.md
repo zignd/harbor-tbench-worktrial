@@ -4,6 +4,17 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 18:45 -03:00 · Final audited result: three quality-clean tasks, zero approved, output/ empty on purpose
+- **The result.** After the verification-first audit, `output/` contains **no approved task**, and `docs/result/verification.json` records `overall_status: "failed"`. This is a measured negative, not an unfinished step. Three packages pass *every* gate — strict `harbor check` quality, structural validator, oracle 3/3, nop 0 — and none lands in the 1–3/5 band against GPT-5.4-mini:
+  - `repair-attributed-funnel-service` — quality with **zero blocking and zero advisory findings**; calibration **2 honest passes, 2 valid failures (`partial_implementation`), 1 trial that exhausted the 100-turn cap (invalid by rule)**; two replacement attempts under identical settings also failed to yield a valid trial, so the record is `invalid`, not back-filled.
+  - `repair-reproducible-release-packager` — **0/5, too hard** (one failure invalid).
+  - `optimize-policy-decision-audit` — **4/5, too easy**.
+- **Why.** The lever that produced in-band results (a stated wall-clock budget) is exactly what the rubric forbids as an environment-dependent invalid failure mode. Removing it from the policy task moved it from 3/5 to 4/5 — validity and the band moved in opposite directions. The pipeline currently has no admissible difficulty lever that reliably lands 1–3/5.
+- **Rejected alternatives, and why:** shipping a package with a recorded advisory override (forbidden by the plan); counting a turn-cap trial as a failure (it is invalid by rule, which the code now enforces); weakening the expanded test suite or the band to obtain a result (forbidden). Each would have reproduced the exact defects this audit removed.
+- **Spend.** Account key $215.96 of the $500 ceiling, $284.04 remaining, $4.71 of new spend in this goal (cap $40). The audit window reconciles to within 5% ($0.4778 of independently priced steps vs a $0.4551 key delta); the $332.43 ledger-vs-key residual is isolated to the unlabeled historical era and **remains open** — per-event token and cache data was never retained, so it cannot be recomputed. Raw snapshots, per-scope estimates and the residual are published; no raw ledger event was rewritten.
+- **Deliverables.** `docs/result/report.md` (self-contained, §7 carries the full negative result and the reason), `presentation.pptx` (11 slides, schema-validated and visually inspected), `presentation.html` (offline, arrow-key), `README.md`, and `verification.json` listing the three quarantined candidates with hashes, verdicts and evidence paths.
+- **Tests/lint:** 169 passed, `make lint` clean.
+
 ### 17:25 -03:00 · Funnel task repaired offline; two calibration outcomes land out of band
 - **What changed:** `runs/audit-20261013/funnel-final` is the candidate funnel package with verification made fully offline (pinned `uv==0.9.5` and a pre-warmed `uvx --offline` pytest cache) and with the validation coverage the strict rubric demanded added to `tests/test_outputs.py`: malformed JSON, unsupported kinds, every missing required field, non-numeric `ingest_seq`, four unparsable timestamp forms, invalid report requests, idempotent replay with `(direct)` attribution, row shape/type/sort order, and a late event that moves a session boundary. Suite: 6 → 13 tests. Also fixed a stale `README.md` typo in the environment.
 - **Measured:** oracle **3/3**, nop **0**, all 13 tests green under the oracle.

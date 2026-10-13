@@ -1,0 +1,190 @@
+{
+ "blueprint": {
+  "slug": "repair-device-policy-replay",
+  "title": "Repair the Device Policy Replay Service",
+  "scenario": "An embedded gateway with very limited storage runs a Go service that turns recorded USB and GPIO security events into the device's effective capability policy. A firmware update added a shell-based recovery/replay workflow, but field reports show that policy state, audit counters, and the generated allowlist diverge after long event histories. The container contains the service, its recovery scripts, a deterministic event corpus, and a small control client; no network or external packages are needed.",
+  "instruction_draft": "boardguard-replay: replayed 12000 records: accepted=11743 rejected=257\nboardguard-check: devices=184 grants=91 revocations=88 effective=37\nboardguard-check: ERROR generated allowlist differs from state\n\nYou are maintaining this embedded security gateway on a tight budget. Repair the installed BoardGuard replay and recovery feature so that `/opt/boardguard/bin/recover.sh` can be run repeatedly against the event spool and leaves a correct, deterministic installation. You may change the Go source, build files, configuration, and shell scripts, but do not remove the service or replace it with a one-off verifier.\n\nThe observable contract is:\n- `recover.sh` must stop or quiesce the running service safely, replay `/var/lib/boardguard/events.bgr`, regenerate all derived state, install the result atomically, and bring the service back up. It must work when invoked from any directory, with event paths and temporary paths containing spaces, tabs, quotes, newlines, and leading dashes.\n- The event stream consists of concatenated BoardGuard frames. Each frame has the documented `BGR1` magic, a little-endian uint32 payload length, a UTF-8 JSON payload, and a little-endian CRC32-IEEE of the payload. A bad, truncated, or oversized frame is rejected and counted, and replay must continue at the next recoverable frame boundary rather than aborting the whole import. Valid records must be processed in file order; duplicate records are still counted but must not change state twice.\n- A valid record has `seq`, `device`, `kind`, and `at` fields. `kind` is one of `attach`, `detach`, `grant`, `revoke`, or `policy`. Device identity is the exact device string. `attach` and `detach` change presence. A grant is effective only for an attached device and contains a capability, policy generation, and expiration timestamp; a revoke removes only the matching device/capability grant. A policy record changes the maximum allowed capability set for its generation. Grants referring to an unknown generation, an expired timestamp, a detached device, or a capability outside that generation are rejected. A later attach does not resurrect old grants. Records with a sequence number already committed are duplicates and have no state effect; otherwise sequence numbers are committed in replay order, including gaps.\n- The final state must contain the effective attached devices and grants, the highest committed sequence, counts for accepted, duplicate, and each rejection reason, and the complete policy generations needed to explain the result. Ordering in every JSON array and in the generated allowlist must be canonical: devices, capabilities, and records sort by their bytewise UTF-8 representation, with no dependence on Go map iteration.\n- `/var/lib/boardguard/effective.allow` must contain exactly one `device<TAB>capability` line for each effective grant, in canonical order, with a final newline. It must never expose a grant rejected during replay. `/var/lib/boardguard/state.json` and the allowlist must be replaced atomically as one recovery generation; interrupted recovery must leave the previous committed generation usable.\n- The running Unix-socket control service must serve `status` and `check` requests using the committed generation, return the same effective grants and counters as the files, reject malformed requests without crashing, and reload a newly committed generation without requiring a process restart. Its responses must be deterministic JSON.\n- Replaying the same spool twice must produce byte-for-byte equivalent state, allowlist, and audit summary. Do not use wall-clock time, process timing, random values, locale-dependent sorting, or network access.\n- Preserve unrelated configuration and existing service behavior. Finish by building the service and running the supplied checks; the final state, not source-code similarity, is graded.",
+  "requirements": [
+   "Repair `/opt/boardguard/bin/recover.sh` so it works from any current directory and safely handles hostile filenames and paths.",
+   "Quiesce and restart the running service safely during recovery.",
+   "Parse concatenated BGR1 frames with little-endian length and CRC32-IEEE validation.",
+   "Reject malformed, truncated, oversized, and corrupt frames while continuing at recoverable frame boundaries.",
+   "Process valid records in file order and make duplicate sequence numbers state-idempotent while counting them.",
+   "Implement the specified attach, detach, grant, revoke, and policy state transitions.",
+   "Reject unknown generations, expired grants, detached-device grants, and capabilities outside the referenced generation.",
+   "Persist effective devices, effective grants, policy generations, committed sequence information, and rejection counters.",
+   "Generate a canonical, exact `/var/lib/boardguard/effective.allow` file.",
+   "Sort all externally visible collections deterministically by bytewise UTF-8 order.",
+   "Atomically install state and allowlist as a recoverable generation.",
+   "Make repeated recovery idempotent and byte-for-byte deterministic.",
+   "Make the running Unix-socket service report the committed state through deterministic `status` and `check` responses.",
+   "Reload a newly committed generation without restarting the service.",
+   "Keep malformed control requests from crashing the service.",
+   "Avoid wall-clock time, randomness, locale-dependent ordering, and network access.",
+   "Preserve unrelated configuration and existing service behavior."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm` with pinned build utilities and Go installed; all required dependencies are local.",
+   "The repository under `/opt/boardguard/src` contains roughly 1,500 lines of Go split among a frame reader, reducer, Unix-socket daemon, JSON persistence layer, and control client, plus unrelated health and metrics code.",
+   "`/opt/boardguard/bin/recover.sh` is the operational entry point and currently uses fragile temporary-file, process, and path handling.",
+   "`/var/lib/boardguard/events.bgr` contains a visible deterministic corpus of roughly 12,000 frames, including valid records, duplicates, corrupt CRCs, truncated tails, policy changes, detach/reattach sequences, and unusual device names.",
+   "`/etc/boardguard/policies.json` contains multiple policy generations and capabilities, including capabilities that differ only by punctuation and case.",
+   "A compiled helper at `/opt/boardguard/bin/framefeed` emits replay input in chunks and is intentionally supplied without source; it exposes the real stream-fragmentation behavior used by the daemon and recovery script.",
+   "The service runs as `boardguardd` on `/run/boardguard/control.sock`, with initial state and an audit summary under `/var/lib/boardguard`.",
+   "Several thousand small seed files and generated event variants are available under `/opt/boardguard/seeds` for the supplied test harness; they include whitespace-heavy names and rare malformed-frame placements.",
+   "The planted defects include buffered-reader assumptions that lose bytes across chunk boundaries, a reducer that treats duplicate sequence numbers as fresh transitions, stale policy-generation caching, time-based expiry during replay, nondeterministic map serialization, inconsistent detach cleanup, and a recovery script that can expose a partially written allowlist.",
+   "The verifier replaces the event spool and policy fixture with fresh deterministic instances derived from a hidden seed before invoking the recovery workflow."
+  ],
+  "internal_hint": "The shortest reliable investigation is to inspect the service layout and run the supplied replay/check commands while tracing frame counts, then compare a reference-style independent reducer against state.json and effective.allow on several prefixes. The key failures only appear on long generated streams: the frame reader assumes reads align with frames, the reducer applies duplicate sequences twice and leaves grants behind detach events, policy data is cached across a generation update, and expiry consults wall-clock time instead of the record timestamp. The daemon also serializes maps directly and keeps an old in-memory generation after recovery. Implement a streaming frame decoder with bounded length validation and controlled resynchronization, make the reducer explicit and idempotent, use event timestamps for all validity decisions, canonicalize every output, and switch recovery to a same-directory temporary generation plus atomic rename/manifest update with cleanup and service reload. Exercise generated streams containing fragmentation, duplicate transitions, rare rejection causes, and hostile device names before trusting the visible corpus.",
+  "trap": "A shallow fix that makes the visible replay counts look correct usually still fails hidden seeds containing a duplicate detach or revoke, a policy update after an earlier grant, a frame split at every possible byte boundary, a corrupt length followed by a valid frame, or a device name that breaks shell word splitting. Another natural implementation passes a quick run but uses `time.Now()`, Go map iteration, or independently renamed state and allowlist files, causing nondeterministic results, expired-grant drift, or a mismatched generation after interruption. Checking only the first few devices also misses grants that survive an early detach and the rare rejection categories tested in the generated corpus.",
+  "tests": [
+   "Builds the submitted Go components and starts the Unix-socket service in the container.",
+   "For each hidden seed, generates thousands of policy records and BGR1 frames with deterministic fragmentation, duplicates, gaps, corrupt CRCs, invalid lengths, truncated tails, policy changes, attach/detach sequences, expirations, and unusual UTF-8 device and capability strings.",
+   "Runs `recover.sh` from several unrelated working directories with temporary directories and event paths containing shell metacharacters, whitespace, newlines, and leading dashes.",
+   "Independently decodes the generated stream and computes the specified reducer result, then checks every state property: effective devices, effective grants, policy generations, committed sequence information, accepted count, duplicate count, every rejection counter, and canonical ordering.",
+   "Checks that `effective.allow` has exactly the expected lines, byte ordering, escaping behavior, and final newline, with no rejected or stale grants.",
+   "Runs recovery twice and compares state.json, effective.allow, and the audit summary byte-for-byte.",
+   "Sends status and check requests over the Unix socket before and after a second recovery and compares responses with the committed files.",
+   "Sends malformed and partial control requests and verifies that the service remains available.",
+   "Simulates an interrupted recovery at several filesystem-operation boundaries and verifies that the prior committed generation remains internally consistent and usable.",
+   "Checks that a successful recovery reloads the new generation without a daemon restart and that unrelated configuration files remain unchanged."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "12 independent deterministic event/policy seeds, each producing 8,000-30,000 frames and 100-500 devices",
+   "effect": "Raising this value increases the chance of rare fragmentation, duplicate-transition, policy-interaction, hostile-name, and interruption cases and prevents fitting the visible corpus. Lowering it makes shallow replay fixes more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads the reducer and patches only the obvious visible transition bug without testing stream fragmentation or malformed-frame recovery.",
+   "The parser assumes one read equals one frame, so valid records disappear when the compiled feeder splits headers, payloads, or CRCs differently.",
+   "Duplicate sequence numbers are counted but still mutate grants, producing plausible totals with incorrect effective state.",
+   "Detach cleanup is incomplete, or a later attach incorrectly resurrects grants from the earlier attachment.",
+   "Policy generations are cached or looked up with the wrong generation, so visible simple policies pass while hidden updates invalidate grants.",
+   "Replay validity uses wall-clock time, making outputs drift between runs.",
+   "Map serialization or map-based allowlist generation produces nondeterministic ordering.",
+   "The shell recovery path breaks on newline-containing names or leaves state and allowlist from different generations after a failure.",
+   "The daemon continues serving an old in-memory snapshot after files are replaced.",
+   "The agent validates only aggregate counts and misses exact rejection reasons, rare effective grants, or malformed control-request behavior."
+  ],
+  "predicted_pass_rate": 0.23,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "go",
+   "shell-scripting",
+   "stream-parser",
+   "state-replay",
+   "atomic-recovery",
+   "determinism"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the repository layout, README, and any protocol/schema documentation.",
+   "Read recover.sh, its service-management helpers, and build configuration.",
+   "Read the frame reader and identify buffering, length bounds, CRC, and resynchronization behavior.",
+   "Read the reducer and enumerate sequence, attachment, grant, revoke, policy, and expiry transitions.",
+   "Read persistence and allowlist generation code for map iteration and generation handling.",
+   "Read the daemon and control client for snapshot loading, reload behavior, and malformed-request handling.",
+   "Inspect policy fixtures, event-generation utilities, and supplied replay/check commands.",
+   "Build and run the existing replay, recovery, and control checks to capture baseline failures.",
+   "Determine the exact JSON record and persisted-state schemas from source and fixtures.",
+   "Implement a streaming bounded frame decoder with byte-wise buffering, CRC validation, and documented resynchronization.",
+   "Make the reducer explicitly idempotent by committed sequence, timestamp-deterministic, and complete for detach and policy transitions.",
+   "Canonicalize all externally visible arrays, records, grants, policies, and allowlist lines.",
+   "Implement generation-directory persistence with a committed manifest and same-directory temporary files.",
+   "Update the daemon to load the committed generation, atomically switch snapshots, and tolerate malformed control requests.",
+   "Rewrite recover.sh using absolute paths, safe quoting, service quiescing, cleanup traps, and reload handling.",
+   "Run gofmt and build every Go component.",
+   "Run recovery against the visible corpus and compare state, counters, and allowlist with an independent reducer.",
+   "Exercise fragmented frames, corrupt and oversized frames, duplicate transitions, policy changes, unusual names, and repeated recovery.",
+   "Test control status/check before and after reload, including partial and malformed requests.",
+   "Test interrupted installation points and verify the previous committed generation remains usable, then run all supplied checks."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The allowlist format is ambiguous when device or capability strings contain tabs or newlines: the contract requires literal device<TAB>capability lines but does not define escaping, while the tests mention escaping behavior.",
+   "The required resynchronization point after an invalid length, corrupt frame, or truncated payload is not precisely defined, so different conforming decoders can produce different rejection counts and subsequent records.",
+   "The JSON schema and exact types for timestamps, expiration, policy generations, rejection categories, persisted records, and status/check responses are not specified in the instruction.",
+   "Atomic replacement of two files as one generation is not defined: the manifest, directory, symlink, daemon-read protocol, and crash-injection semantics are left to inference.",
+   "The requirement to test temporary and event paths containing hostile names lacks a specified configuration or command-line interface for supplying those paths, since the contract hardcodes the event spool path."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and largely deterministic, but several externally graded behaviors are underspecified, especially allowlist escaping, frame resynchronization, JSON schemas, and the atomic-generation protocol. The speedrun is also a broad multi-component rewrite rather than a reliably under-an-hour repair, while the planted defects are sufficiently obvious that the stated difficulty criterion is not met.",
+  "fixes": [
+   "Specify the complete input, persisted-state, audit, and status/check JSON schemas, including timestamp and expiration types and every rejection reason.",
+   "Define a precise frame recovery algorithm, including how invalid lengths, CRC failures, and truncated tails advance to the next candidate magic boundary.",
+   "Define a reversible allowlist escaping format for tabs, newlines, quotes, invalid UTF-8 handling, and leading dashes, then use it consistently in the oracle and tests.",
+   "Specify the atomic-generation layout and reader protocol, such as immutable generation directories plus an atomically renamed CURRENT manifest, including crash points and daemon reload behavior.",
+   "Provide an explicit recovery interface for alternate spool and temporary paths, or remove the hostile-path requirement for the fixed system paths.",
+   "Reduce the scope or provide conformance fixtures and a reference reducer so the task tests engineering repair rather than guessing undocumented semantics."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both are deterministic, idempotent recovery services that replay event history into authoritative persistent state and expose consistent service responses, but the candidate uses a distinct binary frame format and device-policy state machine."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "This is an incident archival and correlation database transformation problem, whereas the candidate repairs a live embedded policy replay service and its recovery workflow."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "This task hardens stateless request-target classification in an HTTP gateway, not historical event replay, policy reconstruction, or atomic recovery installation."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This task reconciles authenticated financial binary records and adjustments, while the candidate replays device events into policy state and controls a running service."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both reconstruct deterministic state from replayed event records, deduplicate repeated history, and atomically publish outputs, though the candidate centers on device-policy transitions and live-service reload rather than database row reconstruction."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.256
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.199
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.195
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.168
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.166
+    ]
+   ],
+   "cost_usd": 0.0011443999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0045715999999999994
+}

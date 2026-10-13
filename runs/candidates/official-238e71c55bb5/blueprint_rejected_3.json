@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "deploy-wfx-recovery-service",
+  "title": "Deploy the WFX Recovery Service",
+  "scenario": "A colleague is triaging a regression in our open-source waveform container reader: after the last release, some damaged WFX recordings appear to recover with checksum errors even though small sample files still look fine. The container has a small C daemon, its deployment wrapper, opaque codec shared objects, format notes, and a collection of real-looking WFX data files; your job is to make the deployed service reliable rather than just producing a one-off conversion.",
+  "instruction_draft": "Can you get the WFX recovery daemon deployed and fix the regression? It must speak the documented line-oriented JSON protocol on stdin/stdout, recover valid frames from every supplied recording, and keep serving after an individual bad request or corrupt file. Please preserve frame ordering and metadata exactly, report damaged frames instead of inventing samples, and make sure the installed command works from a clean shell. The checker will send additional WFX files and requests, so don't tune it only for the recordings already in the tree.",
+  "requirements": [
+   "A clean-shell invocation of the installed WFX daemon must start successfully without requiring the caller to set private environment variables.",
+   "The daemon must accept every documented JSON request from stdin and emit exactly one valid JSON response per request on stdout.",
+   "For summary requests, it must report the recording metadata, frame count, channel count, sample rate, and damaged-frame count represented by the file.",
+   "For frame and range extraction requests, it must return decoded samples in original frame order with the exact stored metadata and must not return samples for frames that fail validation.",
+   "For recovery requests, it must use valid redundant/indexed data when available, identify unrecoverable frames explicitly, and never fabricate replacement samples.",
+   "Malformed requests, nonexistent paths, truncated containers, and corrupt individual frames must produce documented error or damage responses while the daemon remains available for later requests.",
+   "The daemon must handle both little-endian and big-endian WFX recordings and all format features documented in the supplied format notes.",
+   "The deployment must use the codec implementation intended for the current WFX format, and the result must work on fresh verifier-generated recordings rather than only the supplied examples."
+  ],
+  "environment": [
+   "A Dockerfile based on python:3.13-slim-bookworm installs pinned build/runtime packages including gcc, make, zlib1g-dev, and jq, then places an approximately 1,600-line C project under /opt/wfx.",
+   "The project contains wfxd, a line-oriented JSON service with a protocol README, a launcher, configuration files, a test utility, unrelated logging and metrics components, and format documentation.",
+   "WFX is a custom binary waveform container with a header, mirrored metadata, endian-marked indexed chunks, per-frame CRCs, optional predictor decoding, and a compact variable-width offset table. A recording may contain valid and damaged frames independently.",
+   "The tree includes several supplied recordings: simple little-endian and big-endian examples, a truncated file, and a larger recording with a mixture of valid, damaged, predicted, and unpredicted frames. The small examples do not exercise the regression.",
+   "The actual codec is supplied only as opaque shared libraries: /opt/wfx/lib/libwfxcodec.so and /opt/wfx/compat/libwfxcodec.so. Their source is not present. Both export the same ABI and produce plausible results on basic files; the compat build predates the current WFX v3 offset and predictor extensions.",
+   "The deployment wrapper currently constructs LD_LIBRARY_PATH with /opt/wfx/compat before /opt/wfx/lib and also contains an old fallback configuration selected when no explicit codec path is supplied. This is the planted deployment regression, but its effect appears only on data using v3 offsets, large chunk locations, or predictor mode.",
+   "A service manifest and sample client document the protocol, including summary, extract, recover, and health operations, but do not disclose which shared object is being loaded.",
+   "Verification creates fresh deterministic WFX files from hidden seeds, varying byte order, chunk placement, frame counts, corruption locations, predictor usage, sparse gaps, and request order. The daemon is launched through the installed command in a clean environment."
+  ],
+  "internal_hint": "The key difficulty is not visible by reading the obvious C parser: the wrong ABI-compatible codec is selected at runtime. A skilled engineer should build and launch the service, exercise health and summary/extract requests against all supplied files, compare failures by file feature, inspect loader diagnostics or instrument the launcher/process, and notice that only recordings using v3 offsets or prediction fail while the parser's validation reports misleading CRC/decompression errors. Running ldd/readelf/LD_DEBUG or temporarily logging the loaded library identifies /opt/wfx/compat/libwfxcodec.so. The deterministic reference investigates the request matrix and loaded object before fixing the deployment wrapper/configuration so /opt/wfx/lib/libwfxcodec.so is selected first (or is loaded by absolute path), then rebuilds/reinstalls and rechecks mixed requests, corruption handling, and a fresh clean-shell launch.",
+  "trap": "A shallow solution can patch CRC handling, skip failed frames, force the supplied sample recordings to pass, or rewrite the visible parser while leaving the compat codec selected. Those changes appear successful on simple files and may even make the obvious checksum symptom disappear, but hidden recordings exercise big-endian v3 offsets, large file positions, and predictor blocks where the old codec silently decodes wrong samples or misclassifies valid frames. Another common failure is fixing the interactive shell environment but not the installed launcher used by verification.",
+  "tests": [
+   "Launches the installed daemon with an empty environment and sends health, summary, extract, recover, and invalid-request scenarios in one persistent session; checks one valid response per line and continued service availability.",
+   "Runs summary requests for every supplied fixture and compares metadata, valid-frame counts, damaged-frame counts, and recovery status against a deterministic reference.",
+   "Generates fresh little-endian and big-endian WFX files with hidden seeds, including v3 variable-width offsets and predictor/non-predictor frame mixtures, then checks exact decoded samples and metadata for individual and range extraction.",
+   "Generates files with independently corrupted payloads, CRCs, index entries, mirrored metadata, and truncated tails; verifies that valid frames are recovered in order, damaged frames are reported, and no fabricated samples are returned.",
+   "Places valid chunks beyond the compat codec's signed-offset boundary and checks that the service finds and decodes them rather than reporting misleading checksum or decompression failures.",
+   "Sends requests in mixed order, repeats the same file after failures, and tests nonexistent paths and malformed JSON to ensure errors are isolated and the daemon remains alive.",
+   "Runs the service through the deployment command from a clean working directory and verifies that no undeclared current-directory libraries, shell variables, or sample-specific configuration are required.",
+   "Checks a generated corpus containing thousands of frames and sparse chunk gaps, with exact reference responses and a bounded completion time, to catch solutions that scan only visible examples or special-case filenames."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "8",
+   "effect": "Increasing this adds more persistent-session sequences combining health, summary, single-frame extraction, ranges, recovery, malformed requests, and repeated failures across independently generated files, making shallow sample-based fixes less likely to pass. Lowering it to 3 mostly checks startup plus one summary and one extraction path."
+  },
+  "expected_failure_modes": [
+   "The agent reads the parser and patches the reported CRC or decompression symptom without determining which shared library is loaded.",
+   "The agent tests only the small supplied recordings, which are intentionally decoded identically by both codec builds.",
+   "The agent exports LD_LIBRARY_PATH in its own shell or edits a development Makefile but leaves the installed launcher selecting the compatibility library.",
+   "The agent treats any codec error as frame corruption and drops valid frames, violating exact recovery semantics.",
+   "The agent replaces the opaque codec with a partial reimplementation that handles ordinary files but misses endian handling, predictor state, or variable-width offsets.",
+   "The agent starts a new process for each request or exits after malformed input, failing the persistent service protocol.",
+   "The agent assumes the first valid metadata/index copy is authoritative and mishandles generated files with damaged primary metadata but valid mirrored metadata."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "file-format-recovery",
+  "tags": [
+   "c",
+   "deployment",
+   "binary-format",
+   "opaque-library",
+   "service-protocol",
+   "data-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, supplied recordings, and build/install entry points.",
+   "Read the protocol README, format notes, service manifest, launcher, and configuration files.",
+   "Build and install the daemon with the documented command.",
+   "Inspect the installed launcher and codec-loading configuration for library search order and fallback behavior.",
+   "Run ldd/readelf on the daemon and both codec shared objects to confirm ABI and current resolution.",
+   "Launch the installed command with an empty environment and send health plus summary requests for all supplied recordings.",
+   "Send extract and recover requests for the larger mixed-feature recording and compare failures by endian mode, predictor use, and offset layout.",
+   "Run the supplied test utility or sample client to exercise persistent mixed requests and malformed input.",
+   "Change the installed deployment wrapper/configuration so /opt/wfx/lib/libwfxcodec.so is selected before compat, preferably by absolute path.",
+   "Rebuild or reinstall the deployment artifacts.",
+   "Launch again from a clean working directory and empty environment.",
+   "Recheck all supplied recordings, corruption cases, persistent error handling, and exact extraction responses.",
+   "Generate or run the available fresh-recording corpus, including big-endian, v3-offset, predictor, sparse, and large-position cases.",
+   "Inspect the final installed command and perform a final clean-shell protocol smoke test."
+  ],
+  "speedrun_commands": 14,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The protocol schemas and the precise authority rules for conflicting primary and mirrored metadata are delegated to files in the environment; if those documents are incomplete or inconsistent, exact response checking could be ambiguous.",
+   "The requirement to report damaged frames and the expected recovery status for files with simultaneously damaged metadata, indexes, and tails must be defined precisely in the format notes or reference implementation.",
+   "A bounded-time test over thousands of sparse frames could be flaky if the verifier's timeout is not calibrated for the 1-CPU container.",
+   "If the installed command name or installation target is not specified by the manifest, a solution can be functionally correct but fail a deployment-path check."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear operational end state and strong deterministic tests, and the planted ABI-compatible library selection bug is realistic and meaningfully exercises deployment diagnosis. However, the requested speedrun is about 14 commands for a strong engineer, so under the stated rubric the genuine-difficulty score is capped at 2 despite the hidden-feature coverage. The remaining scores are sufficient for acceptance.",
+  "fixes": [
+   "State the installed command name and required installation location explicitly in the instruction or manifest.",
+   "Add an explicit protocol table or reference examples for malformed requests, damaged-frame responses, and recovery status.",
+   "Document precedence rules when primary and mirrored metadata disagree, especially when one copy is damaged.",
+   "Publish the verifier timeout or calibrate it against a baseline implementation to avoid resource-dependent failures."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This task concerns deploying and repairing a waveform-container recovery daemon, whereas the reference concerns authenticated settlement-stream reconciliation and deterministic financial reports."
+    },
+    {
+     "ref_id": "ours/official-aac910462208",
+     "verdict": "distinct",
+     "reason": "Although both involve a broken binary-processing service, this task requires WFX format recovery, redundant data handling, corruption tolerance, and stdin/stdout JSON rather than simple frame encode/decode over HTTP."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference reconstructs and persists transactional replay state from segments and SQLite, while this task decodes and recovers audio-like waveform frames without fabricating damaged samples."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "This task repairs a standalone waveform codec daemon and deployment, not a multi-stage telemetry trace extraction and metrics reproduction pipeline."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The reference is about security classification of HTTP route targets, whereas this task is about binary WFX parsing, codec selection, frame recovery, and a line-oriented JSON daemon."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.193
+    ],
+    [
+     "ours/official-aac910462208",
+     0.174
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.149
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.121
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.118
+    ]
+   ],
+   "cost_usd": 0.0009109999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0026737999999999996
+}

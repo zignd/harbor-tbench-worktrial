@@ -1,0 +1,63 @@
+{
+ "slug": "quant-risk-batch-reconciler-deployment",
+ "title": "Deploy Monte Carlo Risk Simulation Ledger Reconciler",
+ "scenario": "A finance-ops quantitative cluster runs distributed Monte Carlo pricing simulations and outputs binary checkpoint spools containing trade drift surfaces and variance bounds. The staging deployment orchestrator at `/opt/quant-reconcile/deploy.sh` repeatedly crashes during pre-flight reconciliation, citing fatal SQLite database corruption and worker segmentation faults. The environment contains the orchestration bash scripts, configuration templates, a compiled binary accumulator (`stat_accumulator`), and sample simulation batches in `/opt/quant-reconcile/staging/`.",
+ "instruction_draft": "Our overnight quantitative batch runs for portfolio risk simulations are failing to reconcile into the central SQLite database, blocking the morning risk sign-off. The deployment runner at `/opt/quant-reconcile/deploy.sh` aborts during staging verification with fatal SQLite corruption and worker crash errors, leaving `/var/lib/quant-reconcile/reconcile.db` unusable and the systemd-style runner `/usr/local/bin/quant-reconcile-service` undeployed.\n\nResolve the underlying pipeline and deployment defects so that running `/opt/quant-reconcile/deploy.sh` completes cleanly with exit code 0 and deploys the service. The service configuration in `/etc/quant-reconcile/reconcile.env` and the ingestion pipeline must correctly process worker spool batches into `/var/lib/quant-reconcile/reconcile.db`: every batch must be recorded in `batch_reconcile`, anomalous trades exceeding the configured tolerances must be flagged and logged in `anomaly_records`, worker node tallies must populate `worker_audit`, and the database must pass SQLite integrity checks without WAL shared-memory corruption.",
+ "requirements": [
+  "Running `/opt/quant-reconcile/deploy.sh` must execute to completion with exit code 0.",
+  "The deployment must install and configure the service executable at `/usr/local/bin/quant-reconcile-service` with execute permissions.",
+  "The configuration file at `/etc/quant-reconcile/reconcile.env` must configure SQLite concurrency safely (`PRAGMA journal_mode = WAL`, `PRAGMA busy_timeout >= 5000`, `PRAGMA synchronous = NORMAL`).",
+  "`/var/lib/quant-reconcile/reconcile.db` must exist and pass `PRAGMA integrity_check;` returning `ok`.",
+  "The ingestion pipeline must correctly slice binary scientific records without corrupting float streams or triggering SIGSEGV in `stat_accumulator`.",
+  "Error traps in the ingestion scripts must not wipe active POSIX shared-memory files (`/dev/shm/*`) or issue unconditional `SIGKILL` against SQLite processes.",
+  "The `batch_reconcile` table must store all processed batch records with correct calculated `mean_drift`, `var_surface`, and status ('MATCHED' or 'DISCREPANCY').",
+  "Individual simulation trades exceeding `MAX_DRIFT` or `VAR_LIMIT` defined in `reconcile.env` must be detected using accurate floating-point evaluation and inserted into `anomaly_records`.",
+  "The `worker_audit` table must record each worker node's total processed batches, record counts, and input spool checksums.",
+  "When `/usr/local/bin/quant-reconcile-service --batch-dir <DIR>` is invoked on fresh, unseen batch spools, it must process all spools cleanly without error and record accurate reconciliation results."
+ ],
+ "environment": [
+  "Base image: python:3.13-slim-bookworm with sqlite3, bsdmainutils, gawk, bc, and procps installed.",
+  "System paths created: `/var/lib/quant-reconcile/` (mode 0770), `/var/spool/quant-reconcile/incoming/`, `/etc/quant-reconcile/`.",
+  "A compiled x86_64 C binary `/opt/quant-reconcile/bin/stat_accumulator` that reads 64-byte aligned IEEE 754 double precision structs via AVX instructions; segfaults if passed unaligned or truncated text-mangled streams.",
+  "Shell script `/opt/quant-reconcile/bin/ingest_batch.sh` (~220 lines) containing: (1) `sed -n '/^---END-HEADER---$/,$p'` that mangles binary records containing 0x0A bytes; (2) a destructive `ERR` trap `pkill -9 -f sqlite3; rm -f /dev/shm/*quant*` that destroys active SQLite WAL `-shm` mapping; (3) integer truncation `printf '%.0f'` on floating-point drift/variance metrics for anomaly detection.",
+  "Shell script `/opt/quant-reconcile/bin/reconcile_all.sh` (~90 lines) that dispatches parallel worker ingest jobs with inadequate lock timeout.",
+  "Deployment script `/opt/quant-reconcile/deploy.sh` (~110 lines) with flawed pre-flight checks, schema bootstrap (`schema.sql`), and service installation logic.",
+  "Config template `/etc/quant-reconcile/reconcile.env` containing unsafe defaults (`SQLITE_JOURNAL_MODE=MEMORY`, `BUSY_TIMEOUT=0`).",
+  "Staging spools in `/opt/quant-reconcile/staging/` to reproduce the pre-flight crash."
+ ],
+ "internal_hint": "Main difficulty: Not visible by reading (interacting systems and runtime data corruption). When `deploy.sh` runs, the visible error is `SQLITE_CORRUPT: database disk image is malformed` and `stat_accumulator returned exit code 139 (SIGSEGV)`. Agents will intuitively assume either SQLite file corruption or a memory bug in the compiled binary. The actual chain of defects is: 1) `ingest_batch.sh` strips the ASCII metadata header from the spool file using line-oriented `sed` instead of byte-offset extraction (`tail -c +$((HEADER_BYTES + 1))`), which strips or alters newline bytes (0x0A) within the binary IEEE 754 float records, misaligning AVX instructions in `stat_accumulator` and causing SIGSEGV; 2) when `stat_accumulator` crashes, bash's `ERR` trap executes `rm -f /dev/shm/*quant*` and `pkill -9 -f sqlite3`, unlinking active POSIX shared-memory segments while other concurrent worker subshells are mid-transaction, causing SQLite B-tree corruption at offset 4096; 3) in `reconcile.env`, `journal_mode=MEMORY` and `busy_timeout=0` prevent multi-process concurrency, which must be shifted to `WAL` mode with a positive busy timeout; 4) anomaly drift detection in bash uses `printf '%.0f'` instead of `bc -l` or `awk`, rounding fractional drift values to 0.",
+ "trap": "A solver might attempt to 'fix' SQLite by repeatedly wiping `/var/lib/quant-reconcile/reconcile.db` or patching `schema.sql`, or might conclude `stat_accumulator` is broken and attempt to replace it or bypass it. If they only fix the header slicing on the sample batch, the bash floating-point truncation trap will silently pass the visible samples but fail the hidden seed verification tests where drift values are subtle fractional amounts (e.g. 0.041 vs threshold 0.035).",
+ "tests": [
+  "Verify `/opt/quant-reconcile/deploy.sh` runs cleanly with exit code 0.",
+  "Verify `/usr/local/bin/quant-reconcile-service` exists, is executable, and `/etc/quant-reconcile/reconcile.env` sets WAL mode and busy_timeout >= 5000.",
+  "Verify `sqlite3 /var/lib/quant-reconcile/reconcile.db 'PRAGMA integrity_check;'` returns exactly 'ok'.",
+  "Hidden seed instance test: Generate 6 fresh simulation spools using a hidden pseudo-random seed into a temporary directory (containing 4 normal batches and 2 batches with controlled variance and drift anomalies across 3 simulated compute nodes).",
+  "Run `/usr/local/bin/quant-reconcile-service --batch-dir <TEMP_DIR>` and verify exit code 0.",
+  "Query `batch_reconcile` in `reconcile.db` and assert row count, batch statuses ('MATCHED' vs 'DISCREPANCY'), and numerical aggregates match the reference values within 1e-4 tolerance.",
+  "Query `anomaly_records` in `reconcile.db` and assert exactly the expected trade IDs and flag reasons are logged.",
+  "Query `worker_audit` and verify record counts and file checksums match reference values for each worker node.",
+  "Verify `/dev/shm` contains no orphan unlinked file descriptors or locked SQLite shm files."
+ ],
+ "verifier_knob": {
+  "name": "number_of_independent_state_properties_checked",
+  "value": "9 independent state properties",
+  "effect": "Increasing the knob adds additional stress-testing on concurrent worker batch collisions and edge-case float precision boundaries; decreasing checks only basic deployment exit status and table row counts."
+ },
+ "expected_failure_modes": [
+  "Agent gets misled by the SQLite malformed error and focuses on SQLite recovery commands (.recover, VACUUM) rather than fixing the destructive ERR trap.",
+  "Agent suspects `stat_accumulator` has a C memory leak or buffer overflow and wastes time reverse-engineering the binary with objdump/gdb without realizing the input binary stream was corrupted by line-oriented text parsing.",
+  "Agent uses integer comparisons in bash for drift thresholds, causing subtle float anomalies generated by the hidden seed to be classified as 'MATCHED' instead of 'DISCREPANCY'.",
+  "Agent fixes the staging batch manually or hardcodes answers, failing the verify-time fresh batch spools generated from the hidden seed."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "systems-programming",
+ "tags": [
+  "bash",
+  "sqlite",
+  "scientific-computing",
+  "deployment",
+  "concurrency",
+  "systems-programming"
+ ]
+}

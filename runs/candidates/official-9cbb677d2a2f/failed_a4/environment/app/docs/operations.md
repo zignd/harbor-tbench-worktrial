@@ -1,0 +1,3 @@
+Replay operations use a destination in the same filesystem as the input. The command reads source tables before creating a temporary SQLite file and renames that file only after all canonical tables and audit digests commit. Diagnostics may inspect source counts without changing data. Fixture generation accepts a fixed seed and insertion order is intentionally randomized.
+
+The archival table is an immutable record of source values. Canonical tables are derived from timestamp-normalized events and are safe to compare with ordinary SQL row ordering. A failed command reports a nonzero status and leaves an existing destination untouched.

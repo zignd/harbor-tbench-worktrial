@@ -1,0 +1,179 @@
+{
+ "blueprint": {
+  "slug": "repair-latency-snapshot-queryd",
+  "title": "Repair Latency Snapshot Query Service",
+  "scenario": "At 03:00 an on-call SRE is paged because the latency SLO dashboard returns 500s for some tenants, while the health check remains green. The container contains a small telemetry platform: a loader reads compact latency snapshots into SQLite, and an HTTP SQL query service exposes tenant and percentile reports; several unrelated ingestion, auth, and metrics components are also present.",
+  "instruction_draft": "```\nqueryd[184]: POST /query 500\nsqlite3.OperationalError: user-defined aggregate raised exception\nslo-report: tenant=checkout window=2025-02-14T03:00Z p99=unavailable\nhealth: ok\n```\n\nRestore the service in this container. Keep the documented HTTP protocol and SQL interface working, including `/health`, `/query`, and `/reload`. Queries over the loaded latency snapshots must return correct weighted quantiles and merged results for every valid snapshot accepted by the format documentation; malformed input must produce the documented client error rather than corrupting state. Preserve tenant/window isolation, deterministic JSON output, and behavior across reloads and service restarts. Validate the result with more than the supplied example, including empty snapshots, duplicate values, large varints, zero-weight records, quantiles at 0 and 1, and multiple shards for the same tenant and window. Do not weaken the protocol or replace the database with a hard-coded report.",
+  "requirements": [
+   "The service starts successfully in the supplied container and listens on the documented HTTP endpoint.",
+   "`GET /health` returns the documented healthy response without requiring a query or reload.",
+   "`POST /query` accepts the documented JSON SQL request and returns deterministic JSON rows, column metadata, and errors using the documented response schema.",
+   "`POST /reload` atomically reloads the configured snapshot directory and makes the new data visible to subsequent queries without mixing it with the previous generation.",
+   "Valid snapshot files conforming to the documented SLAT format are decoded completely, including multi-byte unsigned varints, signed zigzag values, delta reconstruction, and all records in a file.",
+   "A valid snapshot with no records is represented as an empty input rather than as a decoding failure.",
+   "The SQL aggregate used by the reports combines all rows supplied to it, while keeping different tenants and windows separate through normal SQL grouping.",
+   "Weighted quantiles use the documented interpolation and boundary rules exactly, including q=0, q=1, duplicate values, zero weights, and a total weight of zero.",
+   "Large weights and cumulative totals are handled without 32-bit overflow or loss of integer precision.",
+   "Malformed magic, unsupported versions, truncated varints, invalid ordering, impossible deltas, and checksum failures are rejected with the documented client-facing error and do not partially change loaded state.",
+   "Results remain correct after a reload and after stopping and restarting the service.",
+   "The implementation handles the documented scale of thousands of snapshots and hundreds of thousands of records within the service timeout and memory budget."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with all apt and pip dependencies pinned and no network requirement.",
+   "A roughly 1,300-line Python service split across HTTP routing, SQLite schema/query execution, snapshot loading, authentication, metrics, logging, and unrelated maintenance code.",
+   "A supervisor or entrypoint that runs the loader and HTTP query service in the same container, with configuration under `/etc/queryd` and data under `/var/lib/queryd/snapshots`.",
+   "A README and format document describing the HTTP protocol, SQL tables, SLAT v2 binary layout, CRC rule, weighted-quantile definition, and error schema.",
+   "A deliberately incomplete or incorrect snapshot/quantile component used by the live service; the missing behavior includes a real varint/delta decoder, snapshot validation, shard merging, and the weighted quantile aggregate.",
+   "A small visible fixture set containing ordinary one-byte varints and a tempting single-shard p99 example that does not exercise the difficult cases.",
+   "Unrelated healthy components and logs that mention SQLite errors, cache generations, and loader retries, creating a plausible but misleading database/cache diagnosis.",
+   "A deterministic fixture generator and an administrative upload/reload path available through the documented protocol, allowing verification to install fresh generated snapshots without modifying the verifier.",
+   "No source for any external public project is cloned or vendored; every file in the image is authored for this task."
+  ],
+  "internal_hint": "The live failure is in the snapshot-to-SQL aggregate path, not SQLite locking or the HTTP cache. Investigation should start by reproducing `/query`, inspecting the service logs and schema, tracing one request through the loader and aggregate registration, and reading the SLAT document plus the binary fixtures. The fix is to build a real decoder for magic/version/header, unsigned varints, zigzag signed deltas, timestamp/value reconstruction, record validation, and CRC; then implement the documented weighted order-statistic quantile over all decoded records supplied to the SQLite aggregate. The reference solution should first inspect the tree, protocol, logs, and fixture bytes, run baseline requests, generate edge cases, patch the component, restart, and exercise reload, restart, malformed-input, and grouped multi-shard queries. The central difficulty is substantial construction and domain reasoning: ordinary examples pass while state-dependent and data-dependent paths expose truncation, overflow, ordering, zero-weight, and interpolation errors.",
+  "trap": "A shallow solution can special-case the visible p99 fixture, use `int.from_bytes` or a one-byte varint decoder, calculate an unweighted percentile, or only decode the first record. It will appear fixed for the supplied dashboard query but fail verify-time snapshots containing continuation bytes, negative value deltas, duplicate values, zero weights, extreme weights, empty shards, and grouped tenants. Another common failure is updating the in-memory rows without atomic generation replacement, causing old shards to contaminate results after `/reload` or restart.",
+  "tests": [
+   "Start the container, call `/health`, submit the supplied example SQL query, and verify the response schema and expected visible rows.",
+   "Generate fresh valid SLAT files from a hidden seed with thousands of records, multi-byte varints, signed deltas, duplicate values, and multiple files per tenant/window; reload them and compare grouped SQL aggregate results with an independent exact reference implementation.",
+   "Exercise q values 0, 0.01, 0.5, 0.99, and 1, including records with unequal weights and total weight zero, and compare the exact documented interpolation and boundary behavior.",
+   "Generate records with weights and cumulative byte lengths beyond 32-bit ranges, plus values near the documented integer limits, and verify no overflow or precision-induced row mismatch.",
+   "Query several tenants and windows in one SQL request and verify no cross-group shard leakage, including identical timestamps and values in different groups.",
+   "Submit truncated headers, unterminated varints, bad versions, invalid delta ordering, bad CRCs, and trailing garbage; verify the documented 4xx error and that a subsequent query still sees the prior valid generation.",
+   "Perform two reloads with disjoint generated datasets and verify the second result contains neither rows nor aggregate contributions from the first; restart the service and repeat the query.",
+   "Run a scale case with roughly 1,000 snapshot files and hundreds of thousands of records, checking completion within the documented timeout and bounded memory rather than accepting a hard-coded or fixture-specific answer.",
+   "Send malformed and concurrent read/reload requests in a deterministic schedule and verify readers observe either the old complete generation or the new complete generation, never a partially loaded mixture."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9",
+   "effect": "Increasing the number of generated protocol scenarios adds more quantiles, tenant/window groupings, malformed frames, reload generations, restarts, and scale cases, making partial decoder or aggregate implementations fail more often. Lowering it to 3 mostly checks health, the visible query, and one ordinary reload, which makes fixture-specific fixes substantially easier."
+  },
+  "expected_failure_modes": [
+   "The agent follows the misleading SQLite or cache error and changes locking, cache invalidation, or SQL text without repairing binary decoding.",
+   "The agent implements only ordinary one-byte varints and misses continuation bytes, zigzag negatives, or delta reconstruction.",
+   "The agent computes an unweighted percentile or uses the wrong interpolation convention, which is invisible when all weights are one or values are evenly spaced.",
+   "The agent stops after the visible fixture passes and never tests empty, malformed, duplicate, zero-weight, or multi-shard inputs.",
+   "The agent stores decoded records in a global accumulator and leaks them across tenants, windows, reload generations, or service restarts.",
+   "The agent rejects valid trailing records or silently accepts checksum and truncation errors, causing hidden protocol and state-integrity tests to fail.",
+   "The agent writes a slow list-expansion implementation that exhausts memory or times out on the generated weighted snapshots.",
+   "The agent patches the running process or a generated data file instead of making the container's startup and reload behavior reproducible."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "binary-format",
+   "quantiles",
+   "service-protocol",
+   "reverse-engineering"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, configuration, processes, and entrypoint files.",
+   "Read the README and SLAT format document, including protocol schemas, quantile rules, CRC, and reload semantics.",
+   "Locate HTTP routes, loader startup, SQLite schema, aggregate registration, and snapshot/quantile modules.",
+   "Call /health and submit the supplied example /query request to capture baseline failures and response shapes.",
+   "Inspect service logs and trace the failing query through loader and aggregate registration.",
+   "Inspect visible fixture bytes with a hex dump and compare them with the format document.",
+   "Read the schema and all code handling snapshot generations, reloads, and restart persistence.",
+   "Run the fixture generator or administrative upload path to create one small valid multi-record snapshot.",
+   "Patch the decoder for header/version checks, unsigned varints, zigzag values, deltas, record validation, CRC, and empty files.",
+   "Patch loading to decode every shard and replace the active generation atomically only after all files validate.",
+   "Patch the SQLite aggregate to retain all supplied rows, ignore zero-weight records as documented, and compute exact weighted quantiles without list expansion or 32-bit arithmetic.",
+   "Preserve tenant/window grouping through normal SQL aggregation and deterministic response serialization.",
+   "Restart the supervisor and verify /health, the supplied query, and the new generated dataset.",
+   "Generate and reload datasets covering multi-byte varints, negative deltas, duplicate values, multiple shards, and empty files.",
+   "Query q=0, 0.01, 0.5, 0.99, and 1, including unequal weights and zero total weight, against an independent reference calculation.",
+   "Submit truncated, bad-version, invalid-ordering, bad-CRC, and trailing-garbage files and verify documented 4xx errors with the prior generation intact.",
+   "Perform two disjoint reloads and a restart, checking that no rows or aggregate contributions leak between generations.",
+   "Run grouped tenant/window queries and concurrent scheduled reads during reload to check complete-generation visibility.",
+   "Run the scale generator with roughly 1,000 files and hundreds of thousands of records, checking timeout and memory behavior.",
+   "Run the supplied and generated protocol checks again and inspect logs for residual errors."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact weighted-quantile interpolation, zero-total-weight result, trailing-garbage policy, and CRC coverage must be specified unambiguously in the supplied format document; otherwise failures could reflect an underspecified contract.",
+   "The claimed scale and timeout may be unrealistic on one CPU and 2 GB for Python, SQLite, CRC validation, and hundreds of thousands of records unless benchmarked and bounded.",
+   "Concurrent read/reload expectations can be flaky unless the deterministic schedule, synchronization points, and permitted response timing are precisely defined.",
+   "Administrative upload and reload authentication, persistence location, and restart ordering could make otherwise valid solutions fail if the protocol documentation does not fully specify them.",
+   "A hidden generator must not produce values, deltas, weights, or file sizes outside the documented limits, and the independent reference implementation must use integer-exact arithmetic matching the service contract."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly verifiable, but the central implementation is substantially visible from the source and the proposed speedrun reaches a plausible fix in about 20 commands. Under the stated rubric that caps genuine difficulty at 2 for this shape, the score is below the required minimum and the overall average is only 3.4.",
+  "fixes": [
+   "Move the core defect behind a less obvious interaction, such as a documented compatibility path or state-dependent failure not identifiable by a single source inspection.",
+   "Add a required semantic behavior whose correct implementation demands investigation across components, while avoiding arbitrary hidden limits or undocumented conventions.",
+   "Publish exact definitions for interpolation, zero-weight and zero-total behavior, trailing bytes, CRC scope, reload errors, and concurrent request visibility.",
+   "Benchmark the scale case on the target 1 CPU/2 GB environment and set a documented timeout and memory budget with margin.",
+   "Provide a deterministic reload barrier or request-generation contract so concurrency tests cannot fail due to scheduler timing."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "This is a release-audit pipeline involving configuration merging, manifest parsing, SQL translation, and deterministic report artifacts rather than repairing a telemetry query service."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "variant",
+     "reason": "Both tasks repair a service that computes weighted percentile results and must preserve correctness across malformed input, persistence or recovery, and restart, although their protocols and storage models differ."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task implements an HTTP wrapper around a compiled log aggregation engine and live SQLite state, without the candidate's snapshot format decoding, SQL aggregate, or quantile semantics."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "This is an event-segment and catalog recovery system with transactional replay, tombstones, and object listings rather than a latency snapshot quantile query service."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "This repairs canary promotion and rollback decisions based on weighted error telemetry, not snapshot loading, SQL querying, or weighted latency quantiles."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9a13d7fca5c9",
+     0.2
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.195
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.191
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.183
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.182
+    ]
+   ],
+   "cost_usd": 0.0014168
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0038436
+}

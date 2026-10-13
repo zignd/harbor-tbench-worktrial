@@ -1,0 +1,176 @@
+{
+ "blueprint": {
+  "slug": "repair-sketch-query-service",
+  "title": "Repair the Quantile Sketch Query Service",
+  "scenario": "You are the on-call SRE for a capacity-reporting service that answers SQL-like analytics requests over a catalog of service metrics. At 03:00, dashboards began reporting HTTP 502s and implausible p99 latency values after a metrics compaction rollout. The container includes the running Python service, a SQLite catalog, sharded binary quantile-sketch files, a small opaque producer utility, deployment scripts, and several unrelated health-check components.",
+  "instruction_draft": "2025-02-17T03:07:41Z queryd[214]: POST /v1/query 502 upstream timeout\n2025-02-17T03:07:41Z queryd[214]: quantile decode warning: unsupported record\n2025-02-17T03:07:42Z dashboard: api p99 changed from 412ms to 0ms\n\nRestore the service in this container. It must remain available through its documented HTTP JSON protocol and return correct results for all supported requests, including fresh sketch files loaded after startup. Preserve the documented response and error shapes, do not replace the query service with a hard-coded fixture, and ensure that quantile results are mathematically correct for weighted observations, including duplicate values, zero weights, boundary probabilities, and groups whose data spans multiple shards. A reload must atomically make the new catalog and sketch data visible without exposing partially loaded results.",
+  "requirements": [
+   "The service must start using the repository's documented launch command and answer the documented HTTP JSON protocol on its configured port.",
+   "Valid query requests must return the documented rows, column metadata, and deterministic ordering for supported SELECT queries over the metric catalog.",
+   "Quantile aggregation must use weighted-observation rank semantics documented in the repository, including duplicate values, zero-weight records, p=0, p=1, and groups with no positive total weight.",
+   "A query over multiple shards must merge all relevant sketch contents exactly according to the sketch format rather than selecting one shard or using only the catalog summary.",
+   "Grouped queries must calculate each group's aggregate independently and must not allow state from one group or request to leak into another.",
+   "Reload requests must validate the complete new dataset before publishing it, atomically switch readers to the new snapshot, and leave the previous snapshot usable if validation fails.",
+   "The service must correctly process newly generated sketch files and catalog rows introduced after the original process starts.",
+   "Malformed requests, unsupported SQL, missing metrics, invalid probabilities, and corrupt sketch files must produce the documented stable JSON errors and must not crash or poison later requests.",
+   "The implementation must retain the existing service protocol and must not solve the supplied examples with hard-coded values."
+  ],
+  "environment": [
+   "The Docker image is built from python:3.13-slim-bookworm with pinned apt and pip dependencies and no network requirement at runtime.",
+   "The application is approximately 1,300 lines across an HTTP server, SQL validation layer, catalog/reload manager, reporting code, health checks, deployment scripts, and test utilities; only part of it is defective.",
+   "A SQLite catalog maps metric names and shard IDs to binary files under /srv/queryd/shards. The service exposes a restricted SQL dialect supporting SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, parameters, and the aggregate quantile(value, probability, weight).",
+   "Metric observations are stored in a documented but unusual QSK2 binary format: a header, versioned blocks, unsigned varint and zigzag-delta encoded values, run-length encoded weights, block checksums, and a footer containing a merge index. Files may contain empty blocks and repeated values.",
+   "The repository contains a compiled, source-free qskpack utility that creates deterministic QSK2 fixtures and a small black-box inspection command. It is intentionally not sufficient as a runtime decoder and has several files produced by different format versions.",
+   "The missing or stubbed decoder/merger component is required by the loader. The visible incident data exercises only one block shape and makes a fallback that ignores some records appear to work for one dashboard query.",
+   "The initial dataset contains roughly 1,100 catalog rows and 280 shards, with skewed group sizes, duplicate observations, empty partitions, and a few deliberately late-arriving shards. Deployment configuration, logs, and protocol documentation are present in /opt/queryd.",
+   "A supervisor script starts queryd and a separate health endpoint in the same container. Verification can write a fresh catalog and QSK2 files into a staging directory, invoke the reload protocol, and issue requests over HTTP."
+  ],
+  "internal_hint": "First start the service, exercise the health and query endpoints, and inspect reload logs rather than trusting the initial 502. Trace the request path into the catalog snapshot and shard loader, then use the qskpack inspector and controlled files to compare encoded records with decoded output. The root cause is a partial QSK2 decoder that accepts the first visible block but mishandles versioned delta resets, run-length weight continuations, and footer-indexed blocks; the fallback also publishes a partially constructed snapshot after a decode exception. Implement a streaming decoder with bounds/checksum validation, correct varint and zigzag handling, block-independent state, and a weighted order-statistic merge. Apply the repository's rank rule consistently, keep aggregate state per group/request, and build the reload path as stage-validate-then-swap. Exercise generated files containing every block variant, then verify failed reloads and concurrent reads before finalizing.",
+  "trap": "A shallow fix can make the supplied p99 request nonzero by reading only the first block or by expanding a few visible samples into memory. Hidden files use delta resets, repeated values split across blocks, zero-weight runs, and alternate footer index ordering; such a decoder returns plausible but wrong percentiles. Another tempting fix publishes the new catalog before all shards decode, so one bad shard causes intermittent empty results or corrupts subsequent requests. Tests also use two simultaneous grouped requests and a reload between them, exposing global aggregate state and non-atomic snapshot replacement.",
+  "tests": [
+   "Start-up and protocol smoke test: checks health, a valid single-metric query, response schema, deterministic row ordering, and the documented error for malformed JSON.",
+   "Reference-data correctness test: compares several scalar and grouped quantile queries against a deterministic Python reference over the supplied catalog, including p=0, p=1, duplicate values, empty groups, and zero-weight observations.",
+   "Fresh-format generation test: uses the opaque qskpack utility with a hidden seed to create new QSK2 files containing all block encodings, late footer indexes, split runs, and mixed format versions; writes a matching catalog, reloads it, and compares multiple SQL requests with the reference.",
+   "Shard merge test: generates thousands of weighted records across many shards and verifies that results equal the global weighted rank calculation, not a shard-local percentile or an unweighted percentile.",
+   "Reload atomicity test: stages a valid replacement and concurrently issues reads while reloading; every response must correspond wholly to either the old or new snapshot, never a mixture.",
+   "Failed-reload recovery test: includes one bad checksum and one malformed varint, expects the documented error, then confirms that old data remains queryable and that a later valid reload succeeds.",
+   "Isolation test: sends interleaved grouped requests with different probabilities and metric sets, checking that aggregate state, caches, and temporary files do not cross request boundaries.",
+   "Protocol edge test: checks parameter binding, unsupported SQL, nonexistent metrics, invalid probability values, LIMIT/ORDER BY behavior, and stable JSON error status without process termination.",
+   "Scale test: loads a hidden deterministic dataset of approximately 1,500 shards and verifies completion within the configured service timeout and bounded memory, preventing solutions that materialize every decoded observation unnecessarily."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9",
+   "effect": "Increasing the number of generated query, reload, corruption, concurrency, and protocol scenarios increases coverage of decoder state transitions and lifecycle bugs; lowering it permits a solution that handles only the initial dashboard query or a single sketch layout."
+  },
+  "expected_failure_modes": [
+   "The agent patches the HTTP timeout or health check because the visible symptom is a 502, without tracing the binary loader.",
+   "The agent implements only the first QSK2 block encoding and misses delta resets, continuation runs, or footer-indexed blocks.",
+   "The agent computes an ordinary unweighted percentile or averages shard-local percentiles instead of merging weighted observations by global rank.",
+   "The agent uses a global mutable aggregate or cache, causing cross-request and cross-group contamination.",
+   "The agent makes reload appear to work but exposes a partially validated snapshot or destroys the previous snapshot after a corrupt-file failure.",
+   "The agent validates only the supplied data and misses rare generated layouts, checksum errors, boundary probabilities, or zero-weight records.",
+   "The agent materializes all observations and passes small examples but times out or exceeds memory on the generated scale dataset."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "quantiles",
+   "binary-format",
+   "reverse-engineering",
+   "reload-atomicity",
+   "service-protocol"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List repository files and locate README, protocol documentation, launch scripts, decoder, reload manager, and tests.",
+   "Read the documented launch, query, reload, error, and quantile semantics.",
+   "Start the documented supervisor/service command.",
+   "Call the health endpoint and issue one valid query plus malformed JSON.",
+   "Trace the query path from HTTP parsing through SQL validation, snapshot lookup, shard loading, and aggregation.",
+   "Search for TODOs, stubs, fallback decoding, global aggregate state, and reload publication points.",
+   "Read the QSK2 format documentation and existing encoder/inspector usage.",
+   "Inspect the decoder, checksum, varint, delta, weight-run, block, and footer-index code.",
+   "Run the supplied inspection utility on representative initial shards and compare its records with loader output.",
+   "Inspect catalog snapshot construction and determine how all shards for a metric/group are selected.",
+   "Read existing tests and reference helpers for weighted rank and boundary-probability semantics.",
+   "Implement the missing streaming QSK2 decoder with bounds checks, checksum validation, independent block state, version handling, and footer-index traversal.",
+   "Implement weighted order-statistic merging across shards, ignoring zero-weight observations and preserving duplicate values.",
+   "Remove shared mutable aggregate state and make grouping/request accumulation local to each query.",
+   "Change reload to stage the catalog and fully decode/validate every referenced shard before an atomic snapshot swap.",
+   "Run the existing unit and protocol tests.",
+   "Generate fresh files with qskpack, stage matching catalog data, invoke reload, and query scalar and grouped results.",
+   "Exercise corrupt checksum, malformed varint, invalid SQL, missing metric, invalid probability, and malformed JSON paths.",
+   "Run concurrent reads during valid and failed reloads and verify old-or-new snapshot consistency.",
+   "Run the full verification suite and the scale case, then inspect logs for decoder warnings, timeouts, or memory growth."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The weighted rank rule is deferred to repository documentation; if that documentation is absent, inconsistent, or unclear about exact boundary and zero-total-weight behavior, failures would be invalid.",
+   "The scale test requires bounded memory and completion within a configured timeout, but the blueprint does not state the actual memory or time budgets, making borderline implementations difficult to judge fairly.",
+   "Concurrency tests need a deterministic synchronization point; without one, a response observed during reload may be flaky rather than evidence of non-atomic publication.",
+   "Hidden QSK2 files must be generated by the stated utility and remain compatible with the documented format versions; otherwise failures could reflect an undocumented producer behavior.",
+   "The meaning of empty groups and whether they should appear as rows is not explicit in the instruction and could make otherwise correct results appear wrong.",
+   "The service launch and reload commands, configured port, and staging-directory contract must actually match the documentation present in the built image."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements are mostly clear and the protocol, generated inputs, and failure-path tests are realistic and verifiable. However, the missing decoder and reload defects are discoverable directly by source inspection, and a strong agent can plausibly locate the stubs, patch the obvious paths, and run the available tests in about 20 commands; under the stated rubric this makes genuine difficulty at most 2. Since every score must be at least 3, the task should not be accepted as written.",
+  "fixes": [
+   "Make the decoder defect less directly exposed by separating the format implementation from an obvious stub and require reconstruction from controlled producer/inspector observations, while still providing enough documentation for solvability.",
+   "Add deterministic synchronization hooks or barriers to the concurrent reload verifier so atomicity failures cannot be timing-dependent.",
+   "Specify exact timeout, peak-memory, and response-consistency budgets for the scale and reload tests.",
+   "State the weighted-rank convention, empty-group row behavior, and zero-total-weight result/error shape directly in the task or guarantee those details in stable repository documentation.",
+   "Provide a deterministic verifier-side fixture manifest describing supported QSK2 versions and generated block variants, avoiding failures caused by undocumented utility behavior."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "This is a persistent event-log reconstruction and CRUD consistency problem, whereas the candidate repairs weighted quantile-sketch decoding, merging, querying, and atomic reloads."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Both involve HTTP metric query services, but this reference centers on windowed database aggregations through a compiled engine rather than quantile-sketch format correctness and weighted percentile semantics."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "variant",
+     "reason": "Both are repairs of metric services whose central correctness problem is computing weighted percentiles using an opaque or deployed histogram/sketch implementation, despite different protocols and persistence models."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "variant",
+     "reason": "Both center on restoring a quantile-sketch metric service and correcting percentile behavior, although the reference emphasizes approximation bounds, throughput, and deployment while the candidate emphasizes exact shard merging and reload isolation."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "This is a deterministic release-report build and SQL/config processing task with no corresponding quantile-service or sketch-repair problem."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.222
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.216
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.214
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.194
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.132
+    ]
+   ],
+   "cost_usd": 0.0012652
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0038474
+}

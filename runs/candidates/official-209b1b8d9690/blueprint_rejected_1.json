@@ -1,0 +1,145 @@
+{
+ "blueprint": {
+  "slug": "flashlog-telemetry-pipeline-repair",
+  "title": "Repair Embedded FlashLog Ingestion and SQL Rollup Pipeline",
+  "scenario": "An embedded systems developer maintains an edge telemetry pipeline running on low-resource VPS nodes (1 vCPU, 2 GB RAM). Microcontroller sensor nodes periodically dump binary SPI flash logs into segmented `.flog` archives under `/var/data/sensor_dumps/`. The pipeline script `/opt/sensor-pipeline/bin/pipeline-run.sh` orchestrates three stages: batch decoding raw flash segments using a stripped C binary (`/usr/local/bin/flashlog-decode`), streaming records into a SQLite database (`/var/data/telemetry.db`), and computing session and daily energy rollups via SQL. The nightly batch job recently started crashing due to firmware v2.4 changes and corrupt flash tails, and when forced past the crash, the resulting SQL rollups report corrupted energy metrics and broken session sequences.",
+  "instruction_draft": "$ /opt/sensor-pipeline/bin/pipeline-run.sh /var/data/sensor_dumps /var/data/telemetry.db\n[stage 1] decoding flash dump segments...\nflashlog-decode: error in /var/data/sensor_dumps/node_04/part_0019.flog at offset 0x01a0: crc check failed\n[stage 1] decoder terminated with exit code 2 on file /var/data/sensor_dumps/node_04/part_0019.flog\n[FATAL] pipeline aborted at stage 1\n\nOur nightly telemetry pipeline is failing on the backlog of flash dumps. Fix `/opt/sensor-pipeline/bin/pipeline-run.sh` and its associated ingestion and SQL scripts so that running `/opt/sensor-pipeline/bin/pipeline-run.sh <dumps_dir> <output_sqlite_db>` reliably processes any directory of flash dumps end-to-end within resource limits (under 90 seconds on 4,000 files).\n\nObservable requirements:\n1. Stage 1 must process all `.flog` files per node in strict lexical path order. The compiled decoder `/usr/local/bin/flashlog-decode` must be configured to tolerate corrupt/unwritten tail frames rather than aborting on CRC errors.\n2. The decoder outputs both `DATA` frames and `SYNC` frames (which denote MCU watchdog/power reboots). Do not drop `SYNC` records. For each node, sessions must start at `session_id = 1` and increment by 1 on every `SYNC` record encountered. All subsequent `DATA` frames belong to that incremented `session_id`.\n3. The SQLite database at `<output_sqlite_db>` must contain the table `raw_telemetry` populated with columns: `(node_id TEXT, session_id INTEGER, seq_num INTEGER, timestamp_s INTEGER, voltage_mv INTEGER, current_ma INTEGER, power_mw INTEGER)`. Duplicates of `(node_id, session_id, seq_num)` must not cause insertion failure; the latest occurrence by processing order replaces prior values.\n4. Stage 3 must compute and populate the rollup table `session_rollups` in the SQLite database with exact schema:\n   - `node_id` (TEXT)\n   - `session_id` (INTEGER)\n   - `start_s` (INTEGER: minimum timestamp_s in session)\n   - `end_s` (INTEGER: maximum timestamp_s in session)\n   - `duration_s` (INTEGER: `end_s - start_s`)\n   - `sample_count` (INTEGER: count of data records in session)\n   - `missing_samples` (INTEGER: `(MAX(seq_num) - MIN(seq_num) + 1) - sample_count`)\n   - `peak_power_mw` (INTEGER: maximum power_mw in session)\n   - `avg_voltage_mv` (REAL: average voltage_mv rounded to 2 decimal places)\n   - `energy_mwh` (REAL: trapezoidal numerical integration of power over time within each session converted from milliwatt-seconds to milliwatt-hours via `sum((t_i - t_{i-1}) * (p_i + p_{i-1}) / 2.0) / 3600.0`, rounded to 4 decimal places. Single-sample sessions or sessions with duration 0 evaluate to 0.0000 mWh).\n5. Execution must run cleanly without spawning an unbatched process per file or exceeding system memory.",
+  "requirements": [
+   "Execute `/opt/sensor-pipeline/bin/pipeline-run.sh <dumps_dir> <output_db>` successfully with exit code 0.",
+   "Decode all `.flog` files using `/usr/local/bin/flashlog-decode` with tolerance for corrupted or unwritten trailing frames (`-t` / `--tolerant`), skipping corrupted tail records without aborting.",
+   "Preserve segment ordering by sorting filenames per node lexicographically prior to decoding.",
+   "Track session increments correctly from `SYNC` records: session IDs start at 1 for each node and increase by 1 per `SYNC` frame. `raw_telemetry` stores records with their corresponding `session_id`.",
+   "Populate `raw_telemetry` table in the target SQLite database adhering to uniqueness on `(node_id, session_id, seq_num)` using upsert/replace semantics.",
+   "Populate `session_rollups` table in the target SQLite database with exact column types and names (`node_id`, `session_id`, `start_s`, `end_s`, `duration_s`, `sample_count`, `missing_samples`, `peak_power_mw`, `avg_voltage_mv`, `energy_mwh`).",
+   "Calculate `energy_mwh` using trapezoidal numerical integration strictly partitioned by `(node_id, session_id)` in temporal order, divided by 3600.0 and rounded to 4 decimal places.",
+   "Complete pipeline execution on the 4,000+ backlog files in under 90 seconds without exceeding the 2 GB memory ceiling."
+  ],
+  "environment": [
+   "Dockerfile based on `python:3.13-slim-bookworm` with `sqlite3`, `gcc`, `make`, `procps` installed.",
+   "Compiled C binary `/usr/local/bin/flashlog-decode` built during Dockerfile image build, stripped, with original source deleted. The binary parses `.flog` files containing 15-byte DATA frames and 9-byte SYNC frames. It supports `-t`/`--tolerant` to ignore partial tail frames and outputs CSV lines: `DATA,<node_id>,<seq>,<epoch_s>,<v_mv>,<i_ma>,<p_mw>` and `SYNC,<node_id>,<reset_reason>,<epoch_s>`.",
+   "Directory `/var/data/sensor_dumps` containing ~4,200 `.flog` files across 20 node subdirectories (`node_01` to `node_20`), including fragmented segments, power-loss corrupted page tails, and intermittent watchdog reboots.",
+   "Directory `/opt/sensor-pipeline/` with `bin/pipeline-run.sh`, `scripts/ingest.py`, and `sql/rollups.sql` containing initial buggy implementations: shell globbing without sorting, `grep '^DATA'` filtering that strips `SYNC` lines, row-by-row unindexed SQLite inserts, and energy SQL with unit conversion errors and cross-session window leakage."
+  ],
+  "internal_hint": "Inspect `/usr/local/bin/flashlog-decode` by running it with `-h` or checking strings; it accepts `-t` / `--tolerant` to ignore corrupted tail blocks. Examine why session metrics drift: the existing shell script pipes decoder output through `grep '^DATA'`, discarding `SYNC` lines emitted during MCU watchdog restarts. When sequence numbers restart at 0 after a reboot, discarding `SYNC` causes either `UNIQUE(node_id, session_id, seq)` crashes or treats discontinuous reboots as a single session with negative or massive time steps. Update the shell pipeline to feed decoded streams without filtering out `SYNC` into `scripts/ingest.py`. Update `scripts/ingest.py` to maintain a per-node session counter (incremented on `SYNC`), buffer records for batch `executemany` into SQLite inside a transaction, and ensure an index on `(node_id, session_id, timestamp_s)` exists. Fix `sql/rollups.sql` to compute trapezoidal integration partitioned by `(node_id, session_id)` ordered by `timestamp_s, seq_num`: `(timestamp_s - LAG(timestamp_s)) * (power_mw + LAG(power_mw)) / 7200.0`, convert to mWh, and handle edge cases where `LAG` is NULL or duration is 0.",
+  "trap": "A naive solver tests on a few sampled files, discovers the decoder crash, and simply adds `-t` to `flashlog-decode`. They leave `grep '^DATA'` in the shell script to avoid modifying `ingest.py`. On the surface, the script runs and inserts rows, but all `session_id` values default to 1, causing sequence wrap-arounds. In SQL, the window function `LAG(timestamp_s)` without partitioning on real sessions spans across reboots (which may be separated by days), multiplying huge time deltas by power and blowing up `energy_mwh` to astronomical numbers. Additionally, sorting files via `ls` or unsorted `find` delivers segments out of chronological order, scrambling sequence tracking.",
+  "tests": [
+   "Backlog integrity test: Runs `/opt/sensor-pipeline/bin/pipeline-run.sh /var/data/sensor_dumps /tmp/test_output.db`, verifies zero exit code, execution time < 90s, and checks row counts and exact numerical aggregates on `/var/data/sensor_dumps` against ground truth.",
+   "Fuzz equivalence test: Generates 50 fresh, randomized sensor dump sessions (~15,000 frames) with varying reboot intervals, corrupt tail lengths, clock jitter, and dropped sequence numbers into `/tmp/fuzz_dumps/`. Executes `/opt/sensor-pipeline/bin/pipeline-run.sh /tmp/fuzz_dumps/ /tmp/fuzz_output.db` and compares every row in `raw_telemetry` and `session_rollups` against a verified in-memory reference computation.",
+   "Stress/edge test: Generates edge-case dumps (segments with only SYNC records, single-frame sessions, duplicate sequences, and 100% corrupted files) to verify schema robustness, exact NULL/zero handling in duration and energy calculations, and transaction rollback resilience."
+  ],
+  "verifier_knob": {
+   "name": "num_fuzz_sessions",
+   "value": "50",
+   "effect": "Controls the number of synthetic flash dump sessions and rare fault distributions (reboots, tail corruptions, dropped packets) generated at verify time to test equivalence."
+  },
+  "expected_failure_modes": [
+   "Suppression of SYNC records: Keeping `grep '^DATA'` in the shell pipeline to satisfy `ingest.py` schema, causing session collapse and failed monotonic timestamp assertions.",
+   "Unsorted file processing: Using `find ... -exec` or `find` without `sort`, resulting in non-deterministic frame ingestion order and wrong start/end session metrics.",
+   "Energy integration unit errors: Using `/ 1000.0` or `/ 3600000.0` instead of `/ 3600.0` for converting $\\text{mW} \\cdot \\text{s}$ to $\\text{mWh}$, or failing to partition the trapezoid window by `session_id`.",
+   "Process spawning / OOM bottlenecks: Spawning `python3` per `.flog` file in a shell loop instead of streaming batches, hitting test timeouts (>90 seconds).",
+   "Uniqueness violation crashes: Failing to use SQLite `INSERT OR REPLACE` or `ON CONFLICT` when identical `(node_id, session_id, seq_num)` records appear across overlapping segments."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "sqlite",
+   "shell-scripting",
+   "reverse-engineering",
+   "devops",
+   "etl-pipeline"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "head -n 50 /opt/sensor-pipeline/bin/pipeline-run.sh /opt/sensor-pipeline/scripts/ingest.py /opt/sensor-pipeline/sql/rollups.sql",
+   "/usr/local/bin/flashlog-decode --help",
+   "cat << 'EOF' > /opt/sensor-pipeline/bin/pipeline-run.sh\n#!/usr/bin/env bash\nset -euo pipefail\nDUMPS_DIR=\"$1\"\nDB_FILE=\"$2\"\n# find nodes, sort .flog files per node lexically, pass -t to decoder without filtering SYNC\nfind \"$DUMPS_DIR\" -mindepth 1 -maxdepth 1 -type d | sort | while read -r nodedir; do\n  find \"$nodedir\" -name '*.flog' | sort | while read -r flog; do\n    /usr/local/bin/flashlog-decode -t \"$flog\"\n  done\ndone | python3 /opt/sensor-pipeline/scripts/ingest.py \"$DB_FILE\"\nsqlite3 \"$DB_FILE\" < /opt/sensor-pipeline/sql/rollups.sql\nEOF",
+   "cat << 'EOF' > /opt/sensor-pipeline/scripts/ingest.py\n# Read DATA and SYNC lines from stdin; track session_id starting at 1 per node incrementing on SYNC;\n# batch insert or replace into raw_telemetry in chunks of 5000\nEOF",
+   "cat << 'EOF' > /opt/sensor-pipeline/sql/rollups.sql\n# SQLite rollup computing duration, sample_count, missing_samples, peak_power, avg_voltage,\n# and trapezoidal energy_mwh using LAG() partitioned by (node_id, session_id)\nEOF",
+   "chmod +x /opt/sensor-pipeline/bin/pipeline-run.sh",
+   "time /opt/sensor-pipeline/bin/pipeline-run.sh /var/data/sensor_dumps /tmp/test_out.db",
+   "sqlite3 /tmp/test_out.db 'SELECT COUNT(*) FROM raw_telemetry; SELECT COUNT(*) FROM session_rollups; SELECT * FROM session_rollups LIMIT 5;'"
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 5,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Per-file decoding overhead: piping 4,200 separate subshell invocations of `flashlog-decode` across a shell pipe on a single vCPU can easily run up against the 90-second timeout unless batching (e.g. passing file lists or `xargs`) is handled efficiently.",
+   "Timestamp collisions: if two samples within the same session share the exact same integer timestamp, ordering by `timestamp_s` alone makes `LAG()` non-deterministic unless tie-broken by `seq_num`."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint spoon-feeds every single root cause and implementation detail in the prompt instruction (explicitly telling the agent to pass `-t`, not drop `SYNC` records, sort files lexically, increment session_id on SYNC, and providing the exact trapezoidal SQL math). As a result, there is zero diagnosis required, and any competent LLM will resolve the task in under 10 straightforward commands.",
+  "fixes": [
+   "Remove the bug diagnosis and implementation hints from the instruction prompt. Present the high-level symptom (pipeline crashes on corrupt tails, and rollups report massive energy spikes due to reboot discontinuities), forcing the agent to inspect the scripts, examine decoder output, and discover that `SYNC` frames are being stripped by `grep`.",
+   "Move schema definitions and business logic specifications into an on-disk design doc or existing comments in `/opt/sensor-pipeline/` rather than delivering a checklist in the user prompt.",
+   "Ensure `flashlog-decode` accepts multiple file arguments or reads file paths from stdin so solvers are not penalized by shell process spawning overhead on 1 vCPU."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference focuses on fixing fixed-point arithmetic and checksum calculations in a Rust accumulator binary, whereas the candidate focuses on shell orchestration, decoder error-tolerance flags, session state tracking, and SQL trapezoidal energy rollups."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference requires debugging a Rust trace demuxing engine's frame handling and unix socket streaming, while the candidate requires fixing a shell ingestion pipeline, invoking a C decoder with corrupt-tail tolerance, and computing SQL aggregations."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference centers on characterizing an opaque normalization binary through black-box experimentation, whereas the candidate deals with decoding segmented flash logs, handling sync-frame session boundaries, and SQL numerical integration."
+    },
+    {
+     "ref_id": "ours/official-e431c59f65ef",
+     "verdict": "distinct",
+     "reason": "The reference involves reconstructing multi-fragment database query sessions from a proxy binlog in Python, while the candidate involves sensor telemetry decoding, batch processing, and database rollups."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "The reference diagnoses a silent drop bug in a sliding-window rate-limiting C extension, which is unrelated to the candidate's telemetry ingestion and SQL rollup pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-c396920d769d",
+     0.277
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.188
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.172
+    ],
+    [
+     "ours/official-e431c59f65ef",
+     0.143
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.118
+    ]
+   ],
+   "cost_usd": 0.006309
+  },
+  "novel": true
+ },
+ "cost_usd": 0.023425500000000002
+}

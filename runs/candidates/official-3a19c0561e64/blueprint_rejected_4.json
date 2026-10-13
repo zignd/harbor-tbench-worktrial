@@ -1,0 +1,150 @@
+{
+ "blueprint": {
+  "slug": "sql-query-audit-pipeline-repair",
+  "title": "Repair Corrupted SQL Query Audit Filter and Recovery Pipeline",
+  "scenario": "An internal query audit service tracks data lake usage by filtering incoming SQL telemetry, logging valid analytical statements to SQLite, and computing user rollups. Following an unvetted update to support Common Table Expressions (CTEs), the compiled C query filter (`/usr/local/bin/query_filter`) began dropping valid analytical queries while letting through mutation statements and comment-based injections, corrupting `/var/data/audit.db`. The analyst's daily reconciliation script (`/opt/query-audit/reconcile.sh`) also fails during replay due to unhandled transaction ordering and escaping bugs.",
+  "instruction_draft": "Hey, our daily metrics stopped adding up after the query audit pipeline choked on some malformed logs. Can you patch `query_filter.c` so `/usr/local/bin/query_filter` strictly enforces the query safety rules in `README.md` (no dropped CTEs/subqueries, zero tolerance for mutations or comment tricks), and fix `reconcile.sh` so it properly repairs `/var/data/audit.db` without corrupting the historical rollups? Run a full reconciliation pass when you're done so the database is back in sync.",
+  "requirements": [
+   "Compile and install the repaired filter to `/usr/local/bin/query_filter` built from `/opt/query-audit/src/query_filter.c`.",
+   "Ensure `/usr/local/bin/query_filter` accepts only analytical queries starting with `SELECT` or `WITH`, permitting balanced CTE definitions and nested subqueries on allowed tables (`metrics`, `logs`, `events`).",
+   "Ensure `/usr/local/bin/query_filter` rejects any statement containing data modifications (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `CREATE`, `ATTACH`, `DETACH`, `PRAGMA`), system table queries, comments (`--` or `/* ... */`), stacked queries (multiple semicolon-delimited statements), or unbalanced parentheses/quotes.",
+   "Ensure `/usr/local/bin/query_filter` correctly parses string literals delimited by single quotes, handling escaped single quotes (`''`) without false positives on keywords enclosed inside literals.",
+   "Fix `/opt/query-audit/reconcile.sh` to execute the ordered recovery workflow: quarantine invalid queries into table `quarantine` with reason and ISO-8601 UTC timestamp, ingest valid queries into `audit_records`, purge corrupted current-partition records from `daily_rollups`, and recalculate `daily_rollups` from the clean `audit_records` partition.",
+   "Run `/opt/query-audit/reconcile.sh` so `/var/data/audit.db` is completely reconciled against the backlog in `/var/data/staged_queries.tsv` without leaving orphan rollup aggregates or unhandled queries."
+  ],
+  "environment": [
+   "Base image: `python:3.13-slim-bookworm` with `gcc`, `make`, `sqlite3`, `libsqlite3-dev`, and coreutils installed.",
+   "Source directory `/opt/query-audit/src` with `query_filter.c` and a `Makefile` that compiles and installs the binary to `/usr/local/bin/query_filter`.",
+   "Buggy `query_filter.c`: uses a brittle token scan that treats any `WITH` keyword as an illegal command unless `SELECT` is the first token, mishandles nested parentheses inside CTEs `WITH ... AS (...)`, fails on SQL string literals containing SQL keywords (e.g. `WHERE action = 'DROP TABLE'`), and misses comments hidden after subquery closing parentheses.",
+   "Corrupted database `/var/data/audit.db` containing `audit_records`, `quarantine`, `daily_rollups`, and `pipeline_state` tables, currently polluted with erroneous rolled-up mutation statements and un-quarantined entries.",
+   "Backlog file `/var/data/staged_queries.tsv` with tab-separated query execution logs (timestamp, user_id, execution_ms, query_text).",
+   "Faulty shell script `/opt/query-audit/reconcile.sh` that attempts to re-aggregate before quarantining, corrupts multiline/escaped SQL strings when passing them to `sqlite3`, and fails to handle transaction rollbacks.",
+   "Documentation in `/opt/query-audit/README.md` specifying the query grammar constraints, output status codes (0 for accepted query printed to stdout, 1 for rejected with stderr diagnostic), database schema, and ordered recovery protocol."
+  ],
+  "internal_hint": "Inspect `src/query_filter.c` to see how the tokenizer state machine handles CTEs, nested parentheses, and string literal quoting. Replace the naive substring checks with a robust linear token scanner in C that tracks quotation state (including `''` escapes), nesting depth, and disallows comments/stacked statements outside of string literals. In `reconcile.sh`, ensure staged TSV records are read safely (preserving tabs and quotes), piped through `query_filter`, segregated into valid and quarantined sets, and loaded into SQLite via temporary staging tables or parameterized `.import` within an explicit transaction. Recompute `daily_rollups` for affected dates after deleting contaminated date rows, rather than performing broken additive updates.",
+  "trap": "A naive filter fix often passes visible test queries by allowing 'WITH' prefixes but fails to check that parentheses in `WITH name AS (...)` actually balance before the outer `SELECT`, or it breaks on strings containing apostrophes (`'O''Reilly'`). In the shell script, using a naive `while read -r timestamp user ms sql; do sqlite3 ... \"INSERT ... '$sql'\"; done` will break on SQL quotes or semicolons inside valid queries, corrupting the database during replay.",
+  "tests": [
+   "adversarial_corpus_test: generates 250 fresh queries from a hidden seed (125 valid analytical queries including nested CTEs, string literals with SQL keywords, formatted whitespace; 125 adversarial queries including comment injections, stacked statements, PRAGMA leaks, unbalanced CTE parens). Asserts 100% precision and 100% recall from `/usr/local/bin/query_filter`.",
+   "database_state_test: verifies `/var/data/audit.db` contains zero prohibited queries in `audit_records`, all rejected queries from `/var/data/staged_queries.tsv` are present in `quarantine` with valid timestamps, and `daily_rollups` matches reference aggregations exactly.",
+   "ordered_replay_test: builds a brand-new dirty database and backlog from a randomized hidden seed, runs `/opt/query-audit/reconcile.sh`, and validates that the multi-step recovery runs to completion without transaction deadlocks, duplicate key errors, or orphan aggregations."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size_and_adversarial_complexity",
+   "value": "250 queries covering 18 distinct syntactic edge cases (CTE aliases, quote escaping, inline comments, subquery projections, trailing whitespace)",
+   "effect": "Increasing the corpus size and adding trickier obfuscations (e.g. hex constants, unicode whitespace, deeply nested CTEs) forces a complete and correct lexical state machine in C rather than ad-hoc regex or string replacements."
+  },
+  "expected_failure_modes": [
+   "Agent modifies `query_filter.c` with ad-hoc checks that pass the backlog samples but reject valid queries containing keywords inside string literals (e.g., `WHERE status = 'SELECT'`).",
+   "Agent fails to properly count parentheses nesting depth for CTEs, falsely classifying unbalanced or malformed CTE queries as benign.",
+   "Agent's shell script interpolates raw SQL strings directly into `sqlite3` command strings without escaping, causing syntax errors on queries containing quotes.",
+   "Agent runs the rollup aggregation step before clearing contaminated rollup records, resulting in double-counted totals.",
+   "Agent fixes the C code but forgets to compile and install the binary to `/usr/local/bin/query_filter`."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "database-engineering",
+  "tags": [
+   "sql",
+   "c",
+   "shell-scripting",
+   "sqlite",
+   "data-pipelines",
+   "security-filter"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /opt/query-audit/README.md",
+   "cat /opt/query-audit/src/query_filter.c",
+   "cat /opt/query-audit/reconcile.sh",
+   "sqlite3 /var/data/audit.db '.schema'",
+   "head -n 20 /var/data/staged_queries.tsv",
+   "patch /opt/query-audit/src/query_filter.c to fix CTE paren balancing, quote escaping, and comment detection",
+   "make -C /opt/query-audit/src install",
+   "/usr/local/bin/query_filter <<< 'WITH cte AS (SELECT * FROM metrics) SELECT * FROM cte;'",
+   "patch /opt/query-audit/reconcile.sh to properly quote SQL params, handle transaction rollbacks, purge dirty rollup dates, and recompute daily rollups",
+   "/opt/query-audit/reconcile.sh",
+   "sqlite3 /var/data/audit.db 'SELECT count(*) FROM quarantine; SELECT count(*) FROM audit_records;'"
+  ],
+  "speedrun_commands": 11,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 2
+  },
+  "invalid_failure_risks": [
+   "100% precision and 100% recall requirement across 250 randomized queries: SQL grammar is inherently complex; distinguishing table references from CTE aliases, column aliases, or subqueries in a C token scanner without a full AST parser will almost certainly fail on corner cases (e.g. CTE aliases not in the allowed table list, qualified table names, recursive CTEs, quoted identifiers).",
+   "Disallowing comments via a custom C scanner while using SQLite: in SQLite, comments are syntactically valid SQL; if the C filter rejects `--` or `/*` naively, it may misidentify them inside strings or operators, or conversely miss unusual comment placements.",
+   "TSV query ingestion in bash: staged queries containing multiline SQL, tabs, or quotes frequently cause line-splitting bugs when processed via shell loops, creating brittle test failures unrelated to the core database logic."
+  ],
+  "verdict": "reject",
+  "reasons": "Building a custom C token scanner that achieves 100% precision and recall across 250 queries with nested CTEs and table allowlisting is essentially writing a bespoke SQL parser in C, which is nearly impossible to make robust in under an hour without false positives. Furthermore, using a brittle C string scanner alongside a bash ETL script in an environment where Python 3.13 and SQLite are available is highly un-idiomatic and creates an artificial, error-prone challenge.",
+  "fixes": [
+   "Leverage SQLite's native authorizer (`sqlite3_set_authorizer` in C) to enforce table allowlists and statement type restrictions rather than demanding a hand-rolled string-scanning parser in C.",
+   "Relax the 100% precision/recall requirement on the 250-query corpus to focus on a concrete, well-defined set of regression queries and explicit syntax patterns documented in the README.",
+   "Narrow the scope: either focus purely on the C query filter utility or focus on the SQLite ETL pipeline/reconciliation in Python/shell, rather than coupling a custom C SQL parser with a multi-step bash database repair workflow."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The reference task involves translating JSON filter specs into SQLite queries via a bash script to match reference output, whereas the candidate task focuses on parsing/lexing SQL in C to enforce safety rules and repairing a database reconciliation script."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference task concerns decoding telemetry shards into SQLite and optimizing catalog build metrics, while the candidate task requires fixing a C query validation filter and resolving transaction/replay issues in a recovery script."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "The reference task requires optimizing the execution time of a single SQLite query, whereas the candidate task involves writing a C parser/filter for SQL queries and running a database reconciliation workflow."
+    },
+    {
+     "ref_id": "ours/official-b95cd2e90ca2",
+     "verdict": "distinct",
+     "reason": "The reference task debugs an ECDH cryptographic session key derivation issue in JavaScript, whereas the candidate task deals with SQL syntax validation in C and database data reconciliation."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference task requires developing a Python HTTP service interfacing with a native metric aggregation library, whereas the candidate task fixes a C SQL safety filter and executes a database replay/repair script."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-18899524e171",
+     0.144
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.144
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.139
+    ],
+    [
+     "ours/official-b95cd2e90ca2",
+     0.139
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.138
+    ]
+   ],
+   "cost_usd": 0.00495225
+  },
+  "novel": true
+ },
+ "cost_usd": 0.021316500000000002
+}

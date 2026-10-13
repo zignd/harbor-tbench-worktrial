@@ -1,0 +1,176 @@
+{
+ "blueprint": {
+  "slug": "repair-webhook-admission-gateway",
+  "title": "Repair the Webhook Admission Gateway",
+  "scenario": "You are the on-call SRE for a small outbound webhook relay that began accepting requests for internal addresses after a configuration rollout. The container contains a Node.js HTTP service, a SQLite policy database, deployment configuration, logs, and several unrelated support modules; the target-policy component is incomplete and the deployed configuration is also wrong. The relay must make deterministic admission decisions without contacting the network.",
+  "instruction_draft": "Make the webhook relay start with the supplied deployment configuration and expose its documented admission endpoint. It must accept every valid configured HTTPS target and reject malformed, ambiguous, credential-bearing, control-character, private-network, and otherwise unauthorized targets, including equivalent representations not shown in the examples.",
+  "requirements": [
+   "The relay starts using the supplied deployment configuration and remains available on its configured loopback HTTP port.",
+   "The documented admission endpoint returns a deterministic allow or reject decision for each JSON request without making network or DNS calls.",
+   "Valid HTTPS targets whose normalized host is present in the SQLite allowlist are accepted.",
+   "Targets using non-HTTPS schemes, malformed URLs, credentials, control characters, ambiguous authority syntax, or disallowed ports are rejected.",
+   "Loopback, private, link-local, multicast, unspecified, and otherwise reserved numeric destinations are rejected even when expressed using alternate IPv4, IPv6, or IPv4-mapped forms.",
+   "Hostname and IP normalization handles case, a trailing dot, Unicode/IDNA behavior, percent encoding, backslashes, and equivalent numeric address spellings consistently with the configured policy.",
+   "A hostname that is not an exact configured host or an explicitly configured subdomain is rejected; suffix lookalikes and unrelated subdomains are not accepted.",
+   "The service uses the configured SQLite database and policy settings rather than silently falling back to an embedded permissive policy.",
+   "The endpoint preserves its documented response schema and returns an explicit rejection reason suitable for operational logs.",
+   "The implementation continues to make correct decisions for fresh verifier-generated inputs rather than only the visible sample requests."
+  ],
+  "environment": [
+   "The Dockerfile is based on python:3.13-slim-bookworm, installs pinned nodejs/npm, sqlite3, curl, and basic diagnostic tools, and contains no network dependency at runtime.",
+   "A roughly 1,300-line Node.js application is installed under /opt/webhook-relay, split across an HTTP server, SQLite repository, configuration loader, logging/metrics code, CLI tools, and unrelated retry and health-check modules.",
+   "The service is launched by /opt/webhook-relay/bin/webhook-relayd using /etc/webhook-relay/config.json and listens on a configured loopback port.",
+   "The SQLite database contains allowlisted webhook hosts, explicit allowed ports, policy flags, and audit rows. The schema and seed data include ordinary domains, nested approved subdomains, IDN examples, and hosts with misleading suffixes.",
+   "A documented JSON endpoint accepts POST /v1/admit with a target URL and returns a stable decision object; visible fixtures cover only ordinary HTTPS domains, simple localhost rejection, and one malformed URL.",
+   "The target-policy module is missing its real parser and classifier: the server has a permissive compatibility path that allows requests when the module is absent or returns an incomplete result.",
+   "The deployment configuration contains an incorrect database path and a permissive compatibility setting that must be diagnosed and corrected rather than bypassed.",
+   "Logs and a small diagnostic CLI expose enough information to discover the active configuration, database contents, request grammar, and service startup behavior.",
+   "No published repository or external code is used; every application file, fixture, database, and configuration file is authored for the task."
+  ],
+  "internal_hint": "The solver should first inspect the service entrypoint, deployment files, startup logs, endpoint documentation, and SQLite schema/data, then run the daemon and exercise it with curl while tracing which database and policy mode are actually active. They must correct the config path and disable the permissive fallback, then build a real target-policy component: parse URLs with a strict absolute-HTTPS grammar, reject userinfo/control characters/backslash and ambiguous encodings, canonicalize hostnames with URL/IDNA rules, parse all IPv4 and IPv6 spellings, classify reserved address ranges including IPv4-mapped IPv6, and perform label-boundary allowlist matching against SQLite policy rows. The key difficulty is not visible in the source alone: behavior emerges from parser, configuration, and accumulated SQLite policy interactions, while hidden generated inputs exercise rare representations and policy combinations.",
+  "trap": "A shallow fix that checks url.startsWith('https://'), rejects strings containing 'localhost', or compares the parsed hostname with a simple suffix will pass the visible examples but admit userinfo tricks, encoded delimiters, numeric IPv4 forms, IPv4-mapped IPv6, suffix lookalikes, and hosts whose policy changes in the SQLite database. Leaving the compatibility mode enabled also makes a few endpoint tests pass while hidden tests detect that the configured database is ignored.",
+  "tests": [
+   "Start the service with the installed configuration and verify health, listening address, and successful use of the configured SQLite database.",
+   "Submit the visible benign and malicious fixtures and verify the exact decision schema, deterministic rejection behavior, and operational reason fields.",
+   "Generate a fresh corpus of thousands of benign URLs from seeded allowlisted hosts, approved subdomains, permitted ports, case/trailing-dot variants, and valid IDN forms; require every expected allow.",
+   "Generate a fresh corpus of malicious URLs containing unsupported schemes, malformed authorities, userinfo, control characters, backslashes, encoded separators, fragments that alter interpretation, ambiguous ports, and invalid percent encodings; require every expected reject.",
+   "Generate alternate numeric representations of loopback, RFC1918, link-local, multicast, unspecified, reserved, and IPv4-mapped IPv6 addresses; require every expected reject regardless of textual spelling.",
+   "Generate near-miss hostnames such as approved.example.evil, evilapproved.example, unrelated nested domains, and Unicode/punycode confusables; compare decisions with the reference classifier.",
+   "Create temporary seeded SQLite policy databases with different exact hosts, subdomain permissions, and port sets, point the service at each through its documented configuration, and verify that decisions change accordingly without code or embedded-policy assumptions.",
+   "Send requests in batches and in varied JSON field order, including repeated and adversarially long targets within the documented limit, to ensure no state leak, accidental caching, or permissive error path.",
+   "Inspect only observable service behavior and database effects; no source-code pattern matching is used by the verifier."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_coverage",
+   "value": "4,000 verify-time URLs spanning 30 parser and policy interaction classes, with roughly 8% rare edge cases",
+   "effect": "Lowering the corpus size or removing rare URL/address classes makes shallow prefix, suffix, or localhost-string fixes more likely to pass. Increasing the size and adding cross-product cases involving SQLite policy changes, IDNA, encoded authority syntax, numeric addresses, and mapped IPv6 makes incomplete parsers and fallback configurations fail reliably."
+  },
+  "expected_failure_modes": [
+   "The agent reads the obvious server code and patches the visible localhost check without exercising the running service or inspecting the effective configuration.",
+   "The agent implements hostname suffix matching without label boundaries, IDNA normalization, or correct handling of trailing dots and encoded authority syntax.",
+   "The agent relies on the JavaScript URL parser while failing to reject backslashes, userinfo, invalid percent encodings, ambiguous ports, or parser recovery behavior.",
+   "The agent blocks only dotted decimal private addresses and misses hexadecimal, octal, integer, IPv4-mapped IPv6, or other equivalent numeric forms.",
+   "The agent fixes the policy module but leaves the bad SQLite path or permissive compatibility flag active, so tests still use fallback policy.",
+   "The agent validates only the supplied examples and never generates or probes rare inputs, leaving hidden data-dependent failures undiscovered.",
+   "The agent accidentally introduces network DNS lookups or nondeterministic behavior, causing verifier-time requests to hang or produce inconsistent decisions.",
+   "The agent changes the endpoint schema or emits HTTP errors where the documented rejection object is required."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "networking-services",
+  "tags": [
+   "nodejs",
+   "sqlite",
+   "url-parsing",
+   "ssrf-defense",
+   "configuration",
+   "adversarial-testing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `find /opt/webhook-relay /etc/webhook-relay -maxdepth 3 -type f -print` and inspect the directory layout.",
+   "2. `sed -n '1,240p' /opt/webhook-relay/bin/webhook-relayd` to identify startup behavior and configuration loading.",
+   "3. `cat /etc/webhook-relay/config.json` and inspect deployment defaults.",
+   "4. `grep -RniE 'admit|policy|sqlite|compat|fallback|port|database' /opt/webhook-relay /etc/webhook-relay` to locate the request path and permissive branch.",
+   "5. Inspect the target-policy module, HTTP server, configuration loader, and endpoint documentation.",
+   "6. `sqlite3 <configured-db> '.schema'` and query policy, port, settings, and audit tables.",
+   "7. Start the service with `/opt/webhook-relay/bin/webhook-relayd` and observe startup logs.",
+   "8. Use `curl` against the health endpoint and `/v1/admit` with the visible fixtures.",
+   "9. Confirm from logs or the diagnostic CLI which database and compatibility mode are active.",
+   "10. Read the server-to-policy result contract and documented response schema.",
+   "11. Replace the incomplete policy implementation with strict absolute-HTTPS parsing, rejecting controls, credentials, backslashes, bad escapes, ambiguous authorities, invalid ports, and unsupported schemes.",
+   "12. Canonicalize hostnames using the service's URL/IDNA rules, remove only an allowed trailing dot, and enforce label-boundary exact/subdomain matching against SQLite rows.",
+   "13. Parse and classify all supported IPv4/IPv6 spellings, including mapped IPv4, against loopback, private, link-local, multicast, unspecified, and reserved ranges without DNS.",
+   "14. Patch the deployment configuration to the supplied SQLite path and disable the permissive compatibility setting.",
+   "15. Restart the daemon and verify that it binds the configured loopback address and uses the configured database.",
+   "16. Exercise visible fixtures plus hand-written cases for userinfo, encoded delimiters, backslashes, numeric IP forms, mapped IPv6, IDN, trailing dots, and suffix lookalikes.",
+   "17. Run a small local generated corpus against the endpoint and compare decisions with the SQLite policy.",
+   "18. Check logs and repeated/batched requests for deterministic schemas, explicit rejection reasons, and absence of network/DNS activity."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The expected IDNA behavior is not fully specified: Unicode normalization, transitional versus non-transitional processing, and invalid-label handling could make a correct implementation disagree with the verifier.",
+   "The treatment of fragments, queries, percent-encoded host characters, and encoded separators is not stated precisely enough to determine which syntactically valid URLs should be accepted.",
+   "The definition of every reserved numeric range and accepted IPv4 integer/octal/hex syntax may differ between the reference classifier and standard URL-library behavior.",
+   "Temporary SQLite database tests could be invalid if the documented configuration does not define reload semantics, required schema/versioning, or how policy changes become visible.",
+   "The verifier's claim that no DNS or network calls occur may be difficult to establish deterministically without a sandbox or explicit syscall/network interception."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is fairly clear and realistically testable, but the shortest plausible path is about 18 commands and the core defects are discoverable directly from the source and configuration. Under the stated rubric, that makes genuine_difficulty a 2, so the task fails the minimum-score and average-score acceptance rule despite strong adversarial coverage.",
+  "fixes": [
+   "Specify the URL grammar and canonicalization algorithm explicitly, including IDNA mode, trailing dots, fragments, queries, percent encoding, backslashes, and all accepted numeric IPv4 forms.",
+   "Define the exact policy-row schema, configuration reload behavior, and required response/rejection-reason values so verifier expectations are not inferred from hidden fixtures.",
+   "Make the real challenge depend on interactions that cannot be solved by a short source inspection, such as policy updates, multiple configuration profiles, and stateful-but-deterministic database behavior.",
+   "Add an explicit network/DNS prohibition test mechanism, such as a syscall or resolver stub, rather than relying only on observed outcomes.",
+   "Increase genuine difficulty without ambiguity by providing a small contract test suite for syntax while reserving cross-layer configuration/database interactions and generated policy combinations for hidden tests."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "same",
+     "reason": "Both require repairing a deployed gateway to deterministically allow policy-valid targets and reject malformed or adversarially encoded targets without network access."
+    },
+    {
+     "ref_id": "ours/official-3a04e2577db1",
+     "verdict": "distinct",
+     "reason": "The candidate validates outbound URL destinations against an allowlist, whereas this task authorizes SQL fragments for SQLite execution and focuses on policy-generation correctness and performance."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "The reference translates high-rate binary sensor streams into JSON events and addresses deployment and throughput, not URL admission or destination security."
+    },
+    {
+     "ref_id": "ours/official-df18f32a069b",
+     "verdict": "distinct",
+     "reason": "The reference compiles inherited data contracts into schemas and diagnostics, which is unrelated to validating and authorizing webhook target URLs."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference enforces concurrent per-user rolling CPU budgets and persistent accounting, not network-target normalization or allowlist enforcement."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.262
+    ],
+    [
+     "ours/official-3a04e2577db1",
+     0.196
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.187
+    ],
+    [
+     "ours/official-df18f32a069b",
+     0.146
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.121
+    ]
+   ],
+   "cost_usd": 0.0008969999999999999
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0033957999999999996
+}

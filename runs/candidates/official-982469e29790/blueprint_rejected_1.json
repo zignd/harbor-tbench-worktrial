@@ -1,0 +1,176 @@
+{
+ "blueprint": {
+  "slug": "repair-artifact-reconciliation",
+  "title": "Repair Artifact Reconciliation",
+  "scenario": "An open-source release maintainer is triaging a regression in the repository's artifact-index rebuild job. The container contains several shell components, a large historical event store, an SQLite-backed catalog, and an opaque compiled `packscan` utility that extracts normalized artifact events from the store; the current Bash rebuild path has been producing plausible but incomplete catalogs.",
+  "instruction_draft": "Repair `/opt/release/bin/rebuild-catalog` so that rebuilding `/srv/release/events` produces the complete canonical catalog, quarantine, and generation metadata under `/srv/release/state`, including unusual names, deletions, repeated revisions, and malformed events, and is safe to run repeatedly. The rebuild must finish within 5 seconds on the supplied store and must preserve the same results when verification supplies a freshly generated store.",
+  "requirements": [
+   "Rebuilding `/srv/release/events` must create the canonical SQLite catalog at `/srv/release/state/catalog.sqlite`.",
+   "The catalog must contain exactly one current row for each artifact whose latest valid event is not a deletion.",
+   "Revision ordering must use the event revision number, with deterministic source-order tie breaking rather than relying on filesystem or lexical filename order.",
+   "All valid artifact metadata and payload paths, including spaces, tabs, Unicode, quotes, backslashes, and embedded newlines, must survive unchanged.",
+   "Malformed events must not enter the catalog and must be recorded once in the quarantine output with their source and a deterministic reason.",
+   "Deletion events must remove prior catalog entries without leaving stale payload rows or current-state files.",
+   "The rebuild must write generation metadata containing the input event count, accepted count, quarantined count, catalog row count, and a deterministic digest of the canonical current catalog.",
+   "Catalog and generation updates must be atomic from the perspective of a concurrent reader, and a failed rebuild must not replace a previously valid state.",
+   "Running the rebuild twice over identical input must produce byte-for-byte equivalent state files and identical SQLite contents.",
+   "The supplied dataset and verify-time generated datasets must complete in under 5 seconds using no network access and no process per individual event."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, installs pinned versions of bash, sqlite3, jq, coreutils, findutils, and a small set of pinned Python packages, and builds an opaque C utility named `/usr/local/libexec/packscan` during image construction; its source and build intermediates are removed from the final image.",
+   "The image contains roughly 1,400 lines across `/opt/release/bin`, `/opt/release/lib`, configuration files, test fixtures, and decoy maintenance tools, including the broken `/opt/release/bin/rebuild-catalog` entry point.",
+   "`packscan` reads the event-store format and emits one JSON object per record, with a documented `--nul` mode and a documented source ordinal; it performs normalization and payload digesting that the rebuild script is expected to use, but its implementation is available only as a compiled binary.",
+   "`/srv/release/events` initially contains approximately 14,000 event records spread across hundreds of files, including repeated revisions, deletion events, malformed records, ties, and rare path names containing whitespace, Unicode, quoting characters, and newlines.",
+   "The planted regression combines unsafe word splitting of scanner output, lexical rather than numeric revision selection, accidental dependence on directory traversal order, failure to account for deletions, and non-atomic replacement of the SQLite catalog; each defect is masked for many ordinary records.",
+   "Configuration and documentation describe the event schema, scanner options, state layout, and generation fields, but do not reveal the complete expected catalog. Several unrelated shell utilities and historical logs are present to require repository exploration.",
+   "Verification can replace `/srv/release/events` with a newly generated store using the same documented format and can invoke the repaired entry point with its normal arguments."
+  ],
+  "internal_hint": "The reference solution first inventories the repository, reads the rebuild documentation and scanner help, and probes `packscan` on hand-built records in temporary directories, including NUL mode and malformed inputs. It then replaces per-line shell iteration with a single bulk extraction/parsing path, preserves scanner source ordinals, performs numeric latest-valid-event reduction with explicit deletion handling, validates records before insertion, and loads a temporary SQLite database inside a transaction before atomically renaming it and writing canonical quarantine and metadata files. The hard part is not visible in the script alone: scanner output and accumulated history expose interactions between opaque normalization, duplicate revisions, tie ordering, deletions, and hostile filenames; performance requires batching rather than spawning tools per record.",
+  "trap": "A shallow fix that merely changes `for x in $(...)` to `while read` passes the ordinary sample but loses records containing embedded newlines or scanner framing, and a solution that sorts filenames or keeps the last seen record fails when a lower-numbered file contains a later revision, when revisions tie, or when a deletion is followed by an invalid event. Sampling the catalog also misses the rare malformed and unusual-name records, while rebuilding directly in place fails atomicity and idempotence checks.",
+  "tests": [
+   "Inspect the final SQLite schema and rows against a deterministic reference reducer for the supplied 14,000-record store, including exact metadata, payload paths, deletion handling, and numeric revision ordering.",
+   "Compare quarantine records and deterministic reasons against the reference for every malformed event, including malformed records mixed with otherwise valid files.",
+   "Check that names containing whitespace, tabs, Unicode, quotes, backslashes, and embedded newlines round-trip exactly through the catalog and generated state files.",
+   "Run the rebuild twice and compare SQLite contents, canonical files, generation metadata, and digests for deterministic idempotence.",
+   "Simulate a failed or interrupted rebuild and verify that an existing valid catalog remains readable and unchanged rather than being partially replaced.",
+   "Generate fresh event stores at verify time from hidden seeds with thousands of records, rare malformed records, revision ties, cross-file ordering inversions, deletions, and unusual names, then compare all final state properties with the reference implementation.",
+   "Measure wall-clock duration on the large generated store and fail implementations exceeding 5 seconds or launching a separate process per record at a scale that makes such implementations exceed the limit."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "12",
+   "effect": "Raising this adds checks for additional catalog columns, quarantine ordering, digest inputs, atomic-generation markers, and edge-case rows; lowering it permits more partial rebuilds to pass while leaving the performance and fresh-input checks unchanged."
+  },
+  "expected_failure_modes": [
+   "The agent edits only the obvious read loop and does not discover the opaque scanner's framing and source-order behavior.",
+   "The implementation uses filesystem order or textual sorting instead of numeric revision and explicit tie rules.",
+   "The parser is not NUL-safe and corrupts records with embedded newlines, tabs, or shell metacharacters.",
+   "The solution handles accepted records but omits tombstones, malformed-event quarantine, or generation statistics.",
+   "The agent validates only the supplied fixture and misses hidden distributions containing rare malformed records and cross-file revision inversions.",
+   "A correct-looking implementation performs SQLite or subprocess work once per event and misses the stated throughput bar.",
+   "The catalog is rebuilt in place, leaving partial state after an error or exposing inconsistent metadata during replacement.",
+   "The agent relies on a visible binary behavior without testing scanner options and therefore mishandles normalization or source ordinals on verify-time inputs."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "system-administration",
+  "tags": [
+   "bash",
+   "opaque-binary",
+   "sqlite",
+   "large-state",
+   "performance",
+   "reconciliation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository and release-related files with `find`, `ls`, and `file`.",
+   "Read `/opt/release/bin/rebuild-catalog` and all nearby library/configuration files.",
+   "Read the rebuild, event-schema, state-layout, and generation-metadata documentation.",
+   "Search the repository for `packscan`, quarantine fields, revision handling, and catalog schema references.",
+   "Run `/usr/local/libexec/packscan --help` and record its framing, normalization, and source-ordinal options.",
+   "Inspect representative fixtures and existing state files, including unusual filenames and malformed-event examples.",
+   "Create a temporary hand-built event store containing valid, malformed, deletion, tied-revision, and unusual-name records.",
+   "Run `packscan` on that store in normal and `--nul` modes and inspect the exact emitted records and ordinals.",
+   "Inspect the existing SQLite schema and current rebuild outputs.",
+   "Replace the per-record shell pipeline with a single bulk extraction/parsing implementation, preferably a Python helper invoked once by the entry point.",
+   "Preserve scanner source ordinals, validate records, and implement numeric revision reduction with explicit tie and deletion handling.",
+   "Implement canonical quarantine output, deterministic generation statistics, and canonical catalog digest computation.",
+   "Build the SQLite database in a temporary location and atomically install the complete generation/state representation only after success.",
+   "Run shell syntax checks and scanner/parser unit probes.",
+   "Run the repaired rebuild on the supplied event store.",
+   "Query the resulting SQLite catalog and inspect quarantine and generation metadata against documented invariants.",
+   "Run the rebuild a second time and compare all canonical files and SQLite contents for deterministic idempotence.",
+   "Inject a parsing or SQLite failure during a rebuild and verify that the previous valid state remains readable and unchanged.",
+   "Exercise concurrent reads during replacement and confirm readers see only complete old or new state.",
+   "Measure runtime and process behavior on the large store, then fix any batching or serialization bottlenecks.",
+   "Repeat the checks with several generated stores containing cross-file ordering inversions, ties, deletions, malformed records, and hostile names.",
+   "Review the final diff and rerun the complete validation suite."
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Atomicity across the SQLite database, quarantine, and generation files is underspecified unless the existing reader protocol or a generation-directory/symlink convention is documented; independently renaming several files cannot provide one atomic multi-file snapshot.",
+   "The exact malformed-event validation rules and deterministic quarantine reason vocabulary must be fully documented; otherwise hidden tests could require behavior not inferable from the instruction.",
+   "A five-second wall-clock limit and process-count expectation can be flaky on shared or variable hardware, especially with SQLite durability settings and generated-store size.",
+   "If tests require byte-for-byte identity of SQLite database files rather than identical schema and contents, SQLite page layout, journal settings, or version differences could make a correct implementation fail.",
+   "The instruction says payload paths and metadata survive unchanged while also requiring scanner normalization; the boundary between scanner-normalized values and values that must remain byte-for-byte unchanged should be explicit."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a concrete end state, strong deterministic hidden verification, and realistic systems-engineering failure modes involving framing, reduction, tombstones, atomic replacement, and throughput. It is difficult for substantive reasons rather than merely obscure syntax, although the atomic multi-file state protocol and validation vocabulary need sharper documentation before implementation.",
+  "fixes": [
+   "Document the precise atomic publication protocol expected for catalog, quarantine, and generation metadata, including how concurrent readers select a generation.",
+   "Specify the complete event-validation rules and canonical quarantine serialization/reason strings.",
+   "Clarify whether SQLite identity means logical contents or byte-for-byte database files, and state the required SQLite pragmas if byte identity matters.",
+   "Define exactly which fields are scanner-normalized and which must preserve their original representation, especially payload paths and unusual names.",
+   "State the generated verify-time dataset size range and timing methodology or provide a modest performance margin to reduce environmental flakiness."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "same",
+     "reason": "Both tasks require repairing a deterministic event-replay rebuild that reconstructs authoritative current state from historical files, handles revisions/deletions and malformed input, and atomically publishes consistent catalog metadata."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both produce canonical SQLite state from events, this candidate performs latest-revision artifact indexing, whereas the reference centers on actor resolution, incident correlation, dependency ordering, and policy-based SLA transitions."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The reference is an online funnel analytics engine with deduplication, sessionization, attribution, refunds, and range reporting rather than an event-store replay and catalog rebuild."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The reference validates and translates recursive JSON filter specifications into SQLite queries, with no comparable event reconciliation or state reconstruction problem."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "same",
+     "reason": "Both tasks repair an event-file replay utility that parses difficult records, applies deterministic revision or transaction ordering and deletion semantics, emits canonical state and digests, and publishes outputs atomically."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.296
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.173
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.165
+    ],
+    [
+     "ours/official-18899524e171",
+     0.121
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.11
+    ]
+   ],
+   "cost_usd": 0.0013939999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.004035
+}

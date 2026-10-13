@@ -1,0 +1,194 @@
+{
+ "blueprint": {
+  "slug": "repair-temporal-slo-queryd",
+  "title": "Repair the Temporal SLO Query Service",
+  "scenario": "At 03:00 an on-call SRE is paged because the SLO dashboard is returning intermittent 502s and, after retries, materially different burn-rate values for the same incident window. The container runs a small internal Python query service, a SQLite-backed telemetry store with historical partitions, a compiled SQLite extension, and a dashboard-side HTTP client; several unrelated deployment and logging components are present to make the fault non-obvious.",
+  "instruction_draft": "3am pager output:\n```\nqueryd: GET /healthz 200\nqueryd: POST /v1/query 502 upstream timeout\nsqlite: database is locked (retry 3/3)\nportal: burn_rate(api, 30m)=6.00, then 4.73 for the identical request\n```\n\nRestore the service in this container. It must listen on `127.0.0.1:8090` and correctly answer the documented `/healthz` and `/v1/query` HTTP requests using the supplied SQLite telemetry database. Preserve the documented JSON response shape, HTTP status behavior, parameter binding, NULL behavior, ordering, and error responses. The SQL dialect must support the documented temporal functions, `PERCENTILE_CONT(...) WITHIN GROUP`, CTEs, quoted identifiers, comments, positional and named parameters, and queries spanning any combination of the historical partitions. Temporal intervals are half-open `[start,end)`, timestamps are integer milliseconds, and all reported durations and rates must be deterministic and mathematically exact according to the semantics in the local protocol documentation. The service must remain correct across repeated requests, process restarts, concurrent requests, empty result sets, duplicate timestamps, NULL latencies, boundary-touching intervals, and newly loaded telemetry; do not hard-code the supplied dashboard examples. Verify the live HTTP protocol yourself before finishing.",
+  "requirements": [
+   "A process started by the supplied service entrypoint listens on 127.0.0.1:8090.",
+   "`GET /healthz` returns the documented successful JSON response without requiring a query database lock.",
+   "`POST /v1/query` accepts the documented JSON query and parameter fields and returns the exact documented row, column, and error JSON shape.",
+   "Both positional and named SQL parameters are bound without string interpolation and retain their documented SQLite types.",
+   "The supported SQL dialect handles ordinary SELECT statements, CTEs, aliases, quoted identifiers, SQL comments, nested expressions, and queries against multiple historical partitions.",
+   "`PERCENTILE_CONT(p) WITHIN GROUP (ORDER BY expression)` follows the documented continuous percentile definition: NULL expressions are excluded, p=0 and p=1 select the extrema, and intermediate ranks use linear interpolation.",
+   "Temporal overlap calculations use integer millisecond arithmetic and half-open intervals, so touching intervals have zero overlap and no millisecond is counted twice.",
+   "Temporal bucketing uses the documented origin and floor semantics, including timestamps before the origin and intervals crossing bucket boundaries.",
+   "Queries return stable documented ordering and numeric serialization, including empty aggregates, NULL aggregates, duplicate timestamps, and zero denominators.",
+   "Repeated identical requests produce identical results, and parameter changes cannot reuse an incompatible cached plan or result.",
+   "Concurrent requests and requests after a restart do not leak cursors, transactions, temporary tables, or SQLite locks.",
+   "New telemetry loaded through the documented loader is visible to subsequent queries without rebuilding hard-coded query results.",
+   "Malformed SQL, unsupported syntax, invalid percentile values, and missing parameters return the documented client error rather than a 500 or a hung request."
+  ],
+  "environment": [
+   "Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt and pip dependencies, one CPU, and no network requirement at runtime.",
+   "The container contains roughly 1,500 lines across a Python HTTP daemon, request validation, SQLite storage/partition management, query planning/cache code, a dashboard client, loaders, and unrelated deployment utilities.",
+   "The service is configured by `/etc/queryd/queryd.toml` and is started by `/opt/queryd/bin/queryd`; the protocol and dialect specification are in `/opt/queryd/docs/protocol.md` and `/opt/queryd/docs/sql-dialect.md`.",
+   "The database contains several historical telemetry partitions with request spans, outages, maintenance intervals, and NULL or duplicate latency values. Partition boundaries deliberately do not align with dashboard windows.",
+   "A prebuilt `/opt/queryd/lib/libtelemetry_sqlite.so` is loaded by SQLite and has no shipped source. It implements the low-level interval and aggregate primitives described in the documentation; its ABI and behavior must be discovered from the existing service, documentation, and controlled protocol experiments rather than source inspection.",
+   "The supplied implementation includes a partially stubbed SQL dialect/planning component and a plan-cache/connection path that works for a few simple examples but fails with combinations of temporal expressions, aggregate rewrites, historical partitions, and concurrent requests.",
+   "Startup logs and the dashboard intentionally emphasize SQLite lock retries and upstream timeouts. Those symptoms are downstream of query compilation and connection-state interactions rather than being solved by merely increasing SQLite busy timeouts.",
+   "A deterministic loader can replace or append generated telemetry in the service database. The verifier uses it to install fresh seeded datasets containing rare boundary, NULL, duplicate, pre-origin, and cross-partition cases.",
+   "No public repository is cloned or vendored; every source file, database, configuration, compiled helper, and fixture is authored for this task."
+  ],
+  "internal_hint": "The reference solution first reads the protocol and dialect documents, inventories the daemon and loader, starts the service, and captures requests at the HTTP and SQLite boundaries. Controlled queries reveal that the supplied extension's interval primitives are correct, while the Python dialect layer performs fragile textual rewrites and caches compiled plans using insufficient request state. A robust fix builds a tokenizer and small recursive expression/aggregate rewriter rather than adding regex cases: it must preserve quoted strings and identifiers, comments, nested parentheses, aliases, placeholders, and CTEs while lowering continuous percentile syntax into a deterministic SQLite-compatible aggregate path. The fix also makes each request use an isolated read transaction/connection, keys or invalidates plans by SQL plus parameter shape and schema generation, and closes all cursors. Investigation with generated rows is needed to establish the exact percentile rank, floor bucketing, half-open overlap, NULL, and pre-origin semantics; the visible dashboard query does not exercise most of them. The deterministic reference is a shell script that inspects files, runs protocol probes and loader-generated cases, patches the implementation, restarts the daemon, and runs a concurrency/restart check.",
+  "trap": "A shallow solution raises SQLite's busy timeout, serializes requests, or patches the visible burn-rate query. That can make the dashboard sample return 200 and can hide the lock symptom, but hidden requests expose stale plan reuse, regex corruption inside quoted SQL or CTEs, incorrect percentile interpolation, truncation instead of floor for pre-origin timestamps, double-counted boundary milliseconds, and NULL/empty-group errors. A solution that implements only percentile or only the HTTP lock fix also fails when fresh data crosses a partition boundary or when two parameterized queries run concurrently.",
+  "tests": [
+   "Starts the repaired daemon and checks `/healthz`, startup behavior, and documented status/JSON fields.",
+   "Sends the supplied simple dashboard query and verifies exact rows, numeric values, and column metadata.",
+   "Generates fresh seeded telemetry with thousands of spans and outages, including NULL latencies, duplicate timestamps, zero-length intervals, touching intervals, negative/pre-origin timestamps, and partition-boundary crossings; compares query results with an independent Python reference implementation.",
+   "Exercises continuous percentiles at p=0, p=1, fractional ranks, singleton sets, tied values, NULL-only groups, and empty groups.",
+   "Tests temporal overlap and bucket queries at every boundary, including intervals spanning multiple buckets and timestamps before the configured origin.",
+   "Sends semantically equivalent SQL containing CTEs, nested expressions, comments, quoted identifiers, aliases, reordered whitespace, positional parameters, and named parameters.",
+   "Runs parameterized queries with the same SQL text but different values and types to detect unsafe plan or result reuse.",
+   "Loads a second generated dataset after the first query and verifies that subsequent results reflect the new data without restarting or rebuilding the image.",
+   "Runs concurrent mixed requests, including long multi-partition aggregates and invalid requests, then verifies no 500s, hangs, leaked transaction state, or incorrect cross-request results.",
+   "Restarts the service between requests and verifies persistence, deterministic output, and absence of stale temporary state.",
+   "Checks documented client errors for malformed SQL, missing parameters, invalid percentile values, unsupported syntax, and malformed JSON.",
+   "Repeats the generated scenario with several hidden seeds and compares every response against the verifier's reference query engine rather than against a fixed fixture."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "14 protocol scenarios plus 5 hidden generated datasets",
+   "effect": "Lowering this to a handful of fixed requests makes a lock workaround or visible-query patch appear correct. Raising it adds more SQL-shape combinations, concurrent interleavings, fresh partition layouts, and rare mathematical boundary cases, substantially increasing the chance of exposing incomplete parsing, caching, or temporal arithmetic."
+  },
+  "expected_failure_modes": [
+   "Treating the lock message as the root cause and only increasing busy timeouts or serializing all requests.",
+   "Implementing percentile with nearest-rank, integer truncation, or inclusion of NULL values instead of continuous linear interpolation.",
+   "Using regular expressions that rewrite function names inside quoted strings, comments, nested CTEs, or identifiers.",
+   "Using integer truncation toward zero for bucket indices before the origin instead of mathematical floor.",
+   "Treating temporal endpoints as closed intervals and double-counting milliseconds at adjacent boundaries.",
+   "Caching a rewritten query without including parameter shape, schema generation, or partition selection in the cache key.",
+   "Using one shared SQLite cursor or transaction across concurrent HTTP requests.",
+   "Returning correct values for the supplied dashboard example while failing empty groups, NULL-only groups, duplicate values, or cross-partition queries.",
+   "Hard-coding the supplied database's partition names or dashboard query.",
+   "Fixing the daemon without testing the documented loader, restart path, or protocol error behavior."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "temporal-arithmetic",
+   "reverse-engineering",
+   "http-service",
+   "sqlite",
+   "sre"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the container layout and locate daemon, configuration, database, loader, and tests.",
+   "Read /opt/queryd/docs/protocol.md end to end.",
+   "Read /opt/queryd/docs/sql-dialect.md end to end.",
+   "Inspect /etc/queryd/queryd.toml and /opt/queryd/bin/queryd.",
+   "Inventory Python sources for TODOs, stubs, query rewriting, cache keys, connection handling, and partition logic.",
+   "Inspect loader behavior and database schema/partition metadata.",
+   "Start the service and capture startup logs.",
+   "Probe GET /healthz with and without database contention.",
+   "Send the documented dashboard query and record exact response shape and values.",
+   "Probe malformed JSON, malformed SQL, missing parameters, and unsupported syntax.",
+   "Run controlled percentile queries for p=0, p=1, fractional p, NULLs, ties, singleton sets, and empty inputs.",
+   "Run controlled interval-overlap and pre-origin bucketing queries against generated rows.",
+   "Inspect the compiled extension's exposed functions and exercise them through the documented SQL interface.",
+   "Run concurrent identical and parameter-varying requests to reproduce stale plans, shared state, and lock behavior.",
+   "Implement a tokenizer/parser-aware SQL rewrite path that preserves strings, identifiers, comments, placeholders, aliases, nesting, and CTEs.",
+   "Implement the documented continuous percentile lowering with NULL exclusion and linear interpolation.",
+   "Fix partition expansion so arbitrary partition combinations are queried with correct ordering and aliases.",
+   "Make each request use an isolated connection/read transaction and close cursors and transactions on every path.",
+   "Fix plan-cache keys or invalidate plans using SQL, parameter shape/types, partition selection, and schema generation.",
+   "Implement documented validation and client-error mapping for SQL, parameters, percentile values, and JSON.",
+   "Run the loader to append a fresh seeded dataset and verify it is visible without restart.",
+   "Restart the daemon and verify persistence, health behavior, and absence of temporary state.",
+   "Run the supplied dashboard query and all documented protocol examples.",
+   "Run generated boundary, NULL, duplicate, percentile, bucket, and cross-partition cases against an independent Python reference.",
+   "Run concurrent mixed valid and invalid requests, then inspect logs and SQLite state for leaks or locks.",
+   "Repeat the scenario across hidden-like seeds and verify deterministic JSON, ordering, and numeric serialization."
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact protocol and dialect documents are not included in the blueprint, so reviewers cannot determine whether the stated status codes, JSON fields, parameter typing, NULL serialization, or error taxonomy are internally consistent.",
+   "The requirement to discover the ABI and semantics of a compiled extension may be unsolvable if the existing service and documentation do not expose enough callable examples or introspection.",
+   "The loader's append/replace and schema-generation behavior could make tests flaky if it races with the daemon or does not define when newly loaded data becomes visible.",
+   "Exact numeric serialization and percentile behavior can differ between SQLite, Python, and JSON encoders unless the documents specify precision and representation rules precisely.",
+   "A test requiring support for an open-ended SQL dialect may overreach the documented supported grammar, particularly for arbitrary nested expressions and unsupported SQLite syntax.",
+   "Concurrent verification can become timing-sensitive on a one-CPU, 2 GB container if request timeouts and dataset sizes are not bounded.",
+   "The requirement that all behavior remain correct after arbitrary process restarts is invalid if the verifier does not ensure the daemon has fully exited and released its socket and database handles."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint is realistic and strongly verifiable, but the implementation scope is too broad for the stated under-an-hour solvability criterion: it combines reverse engineering, a parser-aware SQL compiler, aggregate semantics, partition planning, cache invalidation, concurrency isolation, loader integration, and restart/error handling. A strong agent would need substantially more than the roughly 20-command threshold and could fail from integration complexity rather than the intended reasoning challenge.",
+  "fixes": [
+   "Reduce the task to one primary fault family, such as parser-aware percentile/temporal rewriting plus connection isolation, and move loader, restart, and cache-generation requirements into a separate task.",
+   "Provide a small executable protocol conformance suite and an explicit supported grammar so the solver can target a finite dialect rather than reverse-engineer broad SQL behavior.",
+   "Ship a documented extension introspection/query harness and explicit numeric serialization examples for percentile, empty, NULL, and zero-denominator cases.",
+   "Add deterministic loader synchronization and verifier timeouts, and specify how the verifier waits for database visibility and daemon restart completion.",
+   "If retaining the full scope, increase the expected solve time and provide a starter implementation skeleton with clear integration points rather than a partially stubbed 1,500-line service."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "This is an offline release-audit pipeline that parses manifests and writes deterministic SQLite reports, not a persistent HTTP telemetry query service."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This is a Rust stdin JSON-lines event replay and journal-recovery service with weighted percentiles, rather than an HTTP SQLite query service."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "This task only optimizes one static SQLite query file and does not repair or implement a live query service."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "same",
+     "reason": "Both tasks require repairing a persistent HTTP query service backed by SQLite and a compiled aggregation extension while preserving a documented JSON protocol and reflecting newly loaded telemetry."
+    },
+    {
+     "ref_id": "ours/official-f821c68cb15f",
+     "verdict": "distinct",
+     "reason": "Although it exposes telemetry HTTP endpoints and percentiles, its core problem is log-based trace attribution and continuous ingestion rather than general SQL querying over SQLite partitions."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9a13d7fca5c9",
+     0.241
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.223
+    ],
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.211
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.205
+    ],
+    [
+     "ours/official-f821c68cb15f",
+     0.201
+    ]
+   ],
+   "cost_usd": 0.0009716
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0032611999999999997
+}

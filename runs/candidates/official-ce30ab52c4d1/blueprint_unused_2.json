@@ -1,0 +1,185 @@
+{
+ "blueprint": {
+  "slug": "repair-experiment-cohort-query",
+  "title": "Repair Experiment Cohort Queries",
+  "scenario": "A backend teammate is chasing a production discrepancy in the experiment dashboard: conversion numbers are correct for small demos but drift after several days of event history and late corrections. The container contains a small Python HTTP service backed by SQLite, a replay/import worker, seeded event history, and a query pipeline that builds sessions, assigns experiment exposures, and computes conversion reports.",
+  "instruction_draft": "Hey, can you repair the cohort-report service in this container? Keep the existing HTTP protocol, and make every report correct after importing arbitrary event histories, including duplicate revisions, late-arriving records, tied timestamps, users with multiple sessions, and events outside the requested range. The report must deterministically return the documented session, exposure, conversion, and revenue metrics, and results must be the same whether the database is rebuilt incrementally or from scratch; please verify it with several imports and report requests before you finish.",
+  "requirements": [
+   "The existing service must start successfully using the repository's documented command and retain its existing HTTP/JSON protocol.",
+   "Importing an arbitrary valid event history must be accepted without crashing, including late-arriving records, duplicate revisions, tied timestamps, and events outside report ranges.",
+   "For each logical event identity, only the highest revision must contribute to reports, regardless of import order.",
+   "Session boundaries must be computed deterministically from the canonical event stream using the documented inactivity rule and event-id tie-breaker.",
+   "Each session must be assigned to the exposure that was effective for that user at the session start, with the documented handling of exposure changes and removals.",
+   "Conversions and revenue must be attributed to the correct session and experiment variant according to the documented attribution window, without double-counting users or purchases.",
+   "Date and variant filters must apply to the documented stage of the pipeline and must not allow out-of-range events to affect a report.",
+   "Incremental rebuilds and full rebuilds over the same imported history must produce byte-for-byte equivalent JSON results.",
+   "Report output must preserve the documented deterministic ordering and numeric formatting.",
+   "The service must handle the hidden verify-time datasets within the container's CPU and memory limits."
+  ],
+  "environment": [
+   "A Docker image based on python:3.13-slim-bookworm with pinned Python packages and no network dependency.",
+   "A roughly 1,300-line Python codebase split among an HTTP server, SQLite schema/migrations, an import worker, report query modules, JSON validation, logging, and unrelated health/admin code.",
+   "A SQLite database containing approximately 70,000 event rows, including logical event revisions, late-arriving exposure changes, tied timestamps, abandoned sessions, repeated purchases, refunds, and users crossing the seeded report boundaries.",
+   "A README and protocol comments documenting POST /v1/import, POST /v1/rebuild, and POST /v1/report, including the event schema, revision semantics, 30-minute session gap, exposure validity rules, seven-day conversion window, output schema, and ordering rules.",
+   "The import endpoint accepts batches of user_activity, exposure, purchase, and refund records with stable logical ids, revision numbers, event timestamps, arrival sequence, and optional experiment metadata.",
+   "The report endpoint accepts project, experiment, start, end, optional variant, and rebuild mode fields, and returns session_count, exposed_session_count, converted_session_count, conversion_rate, gross_revenue, refund_amount, and net_revenue grouped by variant.",
+   "The planted implementation contains a multi-stage SQL pipeline whose materialized intermediate tables are valid on simple fixtures but mishandle revision history before sessionization, use an incorrect temporal exposure join for some session starts, and attribute conversions through an overly broad user-level join.",
+   "The service has a background incremental rebuild path and a full rebuild path. Both are reachable through the documented protocol and initially produce plausible but divergent answers only after state has accumulated.",
+   "Several thousand lines of plausible but irrelevant code and seeded logs make it necessary to locate the report path and observe the service on historical data rather than relying on a single source-file inspection."
+  ],
+  "internal_hint": "The correct resolution is to investigate with imports and reports before editing. Canonicalize each logical event to its greatest revision using deterministic arrival/id ordering, then sessionize only that canonical stream with an ordered cumulative break marker; revisions must not themselves create activity or reset a session. Resolve the exposure in effect at the session start using the latest applicable exposure transition, including explicit removals, rather than joining every event in the session or merely using the latest exposure at query time. Attribute each purchase and refund to the unique eligible session according to the documented seven-day window and deterministic nearest/session-start rule, preventing one purchase from joining multiple sessions. Rebuild or invalidate all dependent materializations whenever imported history changes, and make incremental and full rebuilds use the same stages. The causes are primarily observable only after replaying accumulated revisions and boundary cases; the seeded data and verify-time imports are designed so a clean-looking sample does not expose them.",
+  "trap": "A shallow fix usually deduplicates the visible rows or changes one JOIN and passes the seeded happy-path report, but leaves sessionization over raw revisions, exposure selection based on event time instead of session start, or a many-to-many purchase join. Hidden histories with a superseded event, a late exposure removal, two sessions inside the attribution window, and a tied timestamp then compound these errors across all later aggregates. Another common failure is fixing full rebuilds while leaving the incremental materialized tables stale, so the same data produces different answers depending on request order.",
+  "tests": [
+   "Start the service, issue the documented health request, import a small baseline fixture, and verify the report schema, ordering, and exact baseline metrics.",
+   "Generate fresh histories containing multiple revisions of the same logical activity event in different import batches and orders; compare reports against a reference implementation and verify that superseded revisions never affect sessions or metrics.",
+   "Generate events exactly at the 30-minute boundary and with equal timestamps but different event ids; verify deterministic session counts and session assignment.",
+   "Generate exposure additions, changes, and removals before, at, and after session starts; verify that each session receives the exposure effective at its start and that variant filters agree with unfiltered reports.",
+   "Generate users with adjacent sessions, purchases in overlapping seven-day windows, repeated purchases, and refunds; verify unique attribution, gross/refund/net revenue, and no double counting.",
+   "Import records outside the requested report interval and verify that they cannot alter results except where the documented attribution or exposure history explicitly requires prior context.",
+   "Run imports followed by incremental rebuild reports, then reset/rebuild the same database from the complete history and compare every response byte-for-byte.",
+   "Run at least eight hidden generated scenarios with 500-5,000 records each, including sparse and highly duplicated histories, and compare all grouped metrics with the deterministic reference.",
+   "Exercise malformed-but-schema-valid edge cases such as empty variants, no sessions, no conversions, and all-refunded purchases, checking documented zero values and stable JSON formatting.",
+   "Issue multiple report requests in different orders and with different filters to ensure cached/materialized state from one request cannot contaminate another."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "10 generated protocol scenarios, with 500-5,000 imported records each and both incremental and full rebuild modes",
+   "effect": "Lowering it leaves more chance that a partial SQL fix passes the happy path; raising it adds more revision permutations, temporal boundaries, filters, and request-order sequences, making stateful and attribution mistakes increasingly likely to surface while increasing verification time."
+  },
+  "expected_failure_modes": [
+   "The agent reads the obvious report query, patches one join, and does not replay enough historical data to discover the dependent-stage errors.",
+   "Revision deduplication is implemented after sessionization, allowing superseded activity to create false session boundaries.",
+   "Exposure assignment uses the latest exposure globally or joins exposure to every event rather than resolving one effective exposure at session start.",
+   "Purchases are joined by user and time without selecting one eligible session, causing duplicate conversions and revenue when sessions overlap the attribution window.",
+   "The agent fixes the full rebuild path but misses stale incremental materializations or cache invalidation.",
+   "Boundary handling differs between SQLite window functions and the agent's assumed ordering, especially for equal timestamps and exactly 30-minute gaps.",
+   "The service is tested only with the supplied seed report, which lacks the rare revision, removal, and overlapping-session combinations used by verification.",
+   "A solution recomputes everything in Python and passes tiny examples but exceeds the hidden dataset time or memory budget.",
+   "The agent changes the HTTP response shape or numeric formatting while correcting the underlying metrics.",
+   "The agent assumes import order is chronological, so late-arriving records silently produce order-dependent reports."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "sqlite",
+   "stateful-service",
+   "temporal-joins",
+   "event-sourcing",
+   "debugging"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "List the repository and locate the README, service entry point, migrations, importer, rebuild logic, and report modules.",
+   "Read the README and protocol comments for event revisions, session boundaries, exposure validity, attribution, output ordering, and rebuild modes.",
+   "Search for the /v1/health, /v1/import, /v1/rebuild, and /v1/report handlers and their call paths.",
+   "Inspect the SQLite schema, indexes, materialized tables, and migration code.",
+   "Inspect import persistence and revision handling, including arrival-sequence and logical-identity columns.",
+   "Inspect the report SQL pipeline and identify where canonical events, sessions, exposures, and conversions are materialized.",
+   "Inspect incremental and full rebuild implementations and cache or invalidation behavior.",
+   "Start the service using the documented command.",
+   "Issue the health request and confirm the existing protocol.",
+   "Import the supplied baseline fixture and request a baseline report.",
+   "Inspect service logs and database contents to confirm which stages populated the report.",
+   "Create a small adversarial fixture with revisions, tied timestamps, an exposure removal, two sessions, and overlapping purchases.",
+   "Import that fixture in multiple batches and orders and compare reports.",
+   "Patch event canonicalization to select the greatest revision with deterministic arrival/id ordering before sessionization.",
+   "Patch sessionization to use the canonical stream, deterministic event-id ordering, and the documented 30-minute boundary rule.",
+   "Patch exposure assignment to resolve the latest effective transition at session start, including removals.",
+   "Patch purchase and refund attribution to select one eligible session using the documented seven-day and nearest/session-start rule.",
+   "Make incremental and full rebuilds invoke the same dependent stages and invalidate or rebuild all affected materializations after imports.",
+   "Run protocol and repository tests, including malformed-but-schema-valid empty and all-refunded cases.",
+   "Generate several 500-5,000-record histories and compare incremental reports with full-rebuild reports and a reference calculation.",
+   "Benchmark the generated scenarios under the container limits and check byte-for-byte response stability across request orders.",
+   "Perform final health, import, rebuild, filtered-report, and JSON-format checks."
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The task depends on README documentation that is only described here; if the actual repository does not precisely define exposure removals, tie handling, filter stage, or attribution tie-breaking, failures can reflect ambiguity rather than implementation error.",
+   "A requirement for byte-for-byte JSON equality is invalid if the existing protocol does not explicitly define numeric serialization, key ordering, and treatment of floating-point zero values.",
+   "Reports involving events outside the requested interval may legitimately require prior exposure or attribution context, so tests must distinguish permitted context from events that must have no effect.",
+   "Generated histories must obey the documented event schema and resource limits; otherwise rejection or timeout may be an invalid failure.",
+   "Resetting or rebuilding the database must be specified precisely; comparing databases with different imported histories or persistent nondeterministic arrival metadata would be unfair.",
+   "The stated request_scenarios knob and hidden reference implementation must use stable seeds and deterministic ordering, or failures may be flaky."
+  ],
+  "verdict": "accept",
+  "reasons": "The end state, protocol preservation, temporal rules, revision semantics, rebuild equivalence, and deterministic output requirements are substantially specified, and the tests exercise the important failure modes. The task is difficult because correctness spans several dependent stages and requires replaying adversarial histories, though a focused engineer can plausibly solve it in the described container. It reads like a realistic production debugging task rather than a synthetic format challenge.",
+  "fixes": [
+   "Include the exact documented definitions of exposure additions, changes, and removals, including whether an exposure remains effective until an explicit removal and how equal-time transitions are ordered.",
+   "State the precise purchase/refund attribution tie-break rule and whether refunds can be attributed independently or only through an already attributed purchase.",
+   "Define the report interval inclusivity, the exact stage at which date and variant filters apply, and the permitted prior-context lookback for exposures and conversions.",
+   "Specify the canonical revision tie-break completely, including behavior when revisions and arrival sequences are both equal.",
+   "Document exact JSON serialization requirements, especially decimal precision, integer-versus-float zero values, key ordering, and empty groups.",
+   "Provide a deterministic reset/rebuild protocol or fixture procedure so incremental-versus-full comparisons are unambiguous."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e431c59f65ef",
+     "verdict": "distinct",
+     "reason": "This repairs a revision-aware event-history cohort and attribution pipeline, whereas the reference reconstructs fragmented database query sessions from binary logs."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "This concerns deterministic experiment sessions, exposures, conversions, and revenue, not rolling-window log rate limiting and metric export."
+    },
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The candidate repairs analytical cohort queries and rebuild consistency, while the reference implements a TCP HMAC service with binary record canonicalization and refund resolution."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "Although both involve HTTP query services, the candidate's core problem is event revision handling and experiment attribution rather than windowed telemetry aggregation through a compiled engine."
+    },
+    {
+     "ref_id": "ours/official-f821c68cb15f",
+     "verdict": "distinct",
+     "reason": "The candidate computes experiment cohorts from canonical event histories, whereas the reference matches frontend requests to backend tasks and reports telemetry attribution statistics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e431c59f65ef",
+     0.147
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.129
+    ],
+    [
+     "ours/official-2f505f92f1c8",
+     0.116
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.115
+    ],
+    [
+     "ours/official-f821c68cb15f",
+     0.1
+    ]
+   ],
+   "cost_usd": 0.0008416
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0029846
+}

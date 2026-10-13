@@ -1,0 +1,142 @@
+{
+ "blueprint": {
+  "slug": "streaming-sla-quantile-rollup-repair",
+  "title": "Repair Streaming SLA Quantile Rollup Engine",
+  "scenario": "An on-call SRE is paged at 3am because the nightly SLA rollup verification job crashed across production service metrics. The metrics service (/srv/sla-monitor, ~1,100 lines of Python) uses an in-house logarithmic-bucket quantile sketch to aggregate latency distributions across tens of thousands of streaming RPC records while maintaining bounded memory. The rollup validation script fails because relative error tolerances are breached on tail quantiles and sub-millisecond endpoints.",
+  "instruction_draft": "$ python3 -m monitor.rollup --input /var/log/traffic/daily_traffic.jsonl --threshold 0.005 --report /var/reports/sla_summary.json\n[2025-04-12 03:14:02] INFO monitor.reader: Loaded 50000 records from /var/log/traffic/daily_traffic.jsonl\n[2025-04-12 03:14:03] INFO monitor.aggregator: Aggregated metrics across 12 service pools\n[2025-04-12 03:14:04] ERROR monitor.rollup: Validation failed: relative error threshold breached!\n  Service 'checkout-api' (p99): ground_truth=412.8000ms, sketch=448.1250ms, rel_err=0.08558 (threshold: <= 0.00500)\n  Service 'auth-cache' (p50): ground_truth=0.4500ms, sketch=1.8200ms, rel_err=3.04444 (threshold: <= 0.00500)\n  Service 'payment-svc' (p95): ground_truth=890.1000ms, sketch=894.6500ms, rel_err=0.00511 (threshold: <= 0.00500)\nFAILED: max relative error across services was 3.04444 (allowed: <= 0.00500).\n\nI was paged at 3am because the nightly SLA rollup job failed. Fix the pipeline in /srv/sla-monitor so that running:\n  python3 -m monitor.rollup --input <log_file> --threshold <max_rel_err> --report <report_path>\nruns to completion without error and satisfies the following:\n1. For every service pool in the input log, the estimated quantiles (p50, p90, p95, p99) must satisfy relative error <= the specified threshold when compared against exact ground-truth values (relative error defined as |estimated - actual| / actual).\n2. The aggregated output must be written to <report_path> with schema:\n   {\"services\": {<name>: {\"count\": int, \"p50\": float, \"p90\": float, \"p95\": float, \"p99\": float, \"max_relative_error\": float}}, \"overall_status\": \"PASS\"}\n3. The process must exit with return code 0 on success and non-zero when the threshold cannot be met.\n4. Sketches must remain strictly memory-bounded (streaming logarithmic buckets): do not buffer or retain raw sample lists in memory.",
+  "requirements": [
+   "Running 'python3 -m monitor.rollup --input /var/log/traffic/daily_traffic.jsonl --threshold 0.005 --report /var/reports/sla_summary.json' exits with returncode 0.",
+   "Every monitored service pool in the generated summary report has max_relative_error <= 0.005 across p50, p90, p95, and p99.",
+   "The output JSON report matches the required schema and contains overall_status equal to 'PASS'.",
+   "The sketch implementation handles sub-millisecond latencies (values in (0, 1) ms) without corrupting bucket offsets or indexing.",
+   "The sketch implementation accounts for zero-duration events (duration_ms == 0.0) without shifting quantile rank calculations for positive buckets.",
+   "The quantile value reconstruction uses the mathematically optimal representative bucket value guaranteeing relative error <= alpha across the entire bucket interval.",
+   "Sketches retain a bounded number of bins per service (no buffering of raw floating-point event streams in memory)."
+  ],
+  "environment": [
+   "Base image: python:3.13-slim-bookworm with standard build tools and pytest pinned.",
+   "Directory /srv/sla-monitor containing pyproject.toml, monitor/__init__.py, monitor/config.py, monitor/reader.py, monitor/sketch.py, monitor/aggregator.py, monitor/rollup.py, and tests/test_sketch.py.",
+   "/var/log/traffic/daily_traffic.jsonl containing 50,000 JSON lines with keys: timestamp, service, duration_ms, status_code, trace_id.",
+   "In monitor/sketch.py: LogBucketSketch implements a logarithmic bucket accumulator with three planted bugs: (1) quantile() fails to subtract zero_count from rank before scanning positive buckets, skewing tail percentiles whenever cache hits (0.0ms) occur; (2) add_key() executes `self.bins[key - self.offset] += count` before updating `self.offset = key` when key < self.offset, causing negative indexing in Python that overwrites elements at the end of the array; (3) bucket value reconstruction calculates arithmetic midpoint (low + high) / 2.0, whose relative error at the lower bound is alpha / (1 - alpha) > alpha, breaching the 0.00500 bar.",
+   "In tests/test_sketch.py: existing unit tests only check synthetic integers [10, 50, 100] without zero values, sub-millisecond floats, or tight error boundaries, masking all three defects."
+  ],
+  "internal_hint": "Investigation requires inspecting the failed error output and correlating with the data characteristics: (1) 'auth-cache' fails drastically because durations are < 1.0ms, yielding negative bucket keys (math.ceil(ln(v)/ln(gamma)) < 0). In sketch.py:add_key, prepending zeros without updating self.offset before indexing causes self.bins[negative_index] to silently wrap around and corrupt tail buckets. (2) 'checkout-api' P99 drifts by 8.5% because ~1.8% of requests have duration_ms == 0.0. The sketch tracks zero_count, but in quantile(q), if rank >= zero_count, it searches positive buckets with the unadjusted rank, evaluating at rank instead of (rank - zero_count). (3) 'payment-svc' breaches 0.005 by a tiny margin (0.00511) because arithmetic midpoint (low + high)/2 gives max relative error alpha/(1-alpha) = 0.005025. Deriving the minimax relative error over [low, high] where high = gamma * low and gamma = (1+alpha)/(1-alpha) yields the optimal reconstruction val = low * (1 + alpha) = 2*low*high / (low + high) (harmonic mean), which strictly guarantees relative error <= alpha.",
+  "trap": "A naive solver tests against small synthetic data or visible unit tests where all numbers are positive integers > 1. They may also simply decrease alpha in config without fixing the downward array expansion or zero-offset bugs; decreasing alpha actually increases bucket resolution and causes negative indexing to overwrite completely different bins, while the unadjusted zero_count continues to displace P99 past the 100th percentile.",
+  "tests": [
+   "test_daily_traffic_verification: executes monitor.rollup on /var/log/traffic/daily_traffic.jsonl with threshold 0.005; checks returncode 0 and verifies /var/reports/sla_summary.json contains overall_status == 'PASS' with max_relative_error <= 0.005 for all 12 services.",
+   "test_hidden_seed_edge_cases: generates a fresh 80,000-line traffic log from a hidden PRNG seed featuring heavy Pareto tails, 5% zero-latency cache hits, sub-millisecond microsecond traces, and bimodal timeout spikes; runs rollup with threshold 0.005 and verifies accuracy against an independent numpy quantile baseline.",
+   "test_memory_boundedness: verifies that LogBucketSketch instances do not store raw sample lists and that bin count per sketch is strictly capped under 2,048 bins even after ingesting 100,000 extreme values."
+  ],
+  "verifier_knob": {
+   "name": "threshold",
+   "value": "0.005",
+   "effect": "Lowering to 0.002 requires higher bucket count and tighter interpolation precision; raising to 0.02 allows arithmetic midpoint to pass but still fails if the zero-count or negative-index bugs are unfixed."
+  },
+  "expected_failure_modes": [
+   "Fixing only the arithmetic midpoint without investigating the sub-millisecond negative key indexing bug, causing auth-cache to continue failing with >300% error.",
+   "Attempting to bypass the sketch by accumulating all raw floats into a Python list, failing the memory-boundedness check.",
+   "Decreasing alpha in config without fixing the zero_count subtraction in quantile(), causing P99 on zero-heavy workloads to remain inaccurate.",
+   "Testing only against the provided unit test cases rather than running on the real dataset or generating edge cases with 0.0ms durations."
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "software-engineering",
+  "tags": [
+   "python",
+   "data-processing",
+   "debugging",
+   "telemetry",
+   "numerics",
+   "sre"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /srv/sla-monitor",
+   "cat monitor/sketch.py",
+   "python3 -m monitor.rollup --input /var/log/traffic/daily_traffic.jsonl --threshold 0.005 --report /var/reports/sla_summary.json",
+   "python3 -c \"import monitor.sketch; print(dir(monitor.sketch))\"",
+   "sed -i or python script to patch monitor/sketch.py: fix downward array expansion order in add_key, subtract zero_count in quantile(), and update bucket value reconstruction from arithmetic mean to 2*low*high/(low+high)",
+   "python3 -m monitor.rollup --input /var/log/traffic/daily_traffic.jsonl --threshold 0.005 --report /var/reports/sla_summary.json",
+   "pytest tests/"
+  ],
+  "speedrun_commands": 7,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "Potential test overreach if tests strictly assert the exact closed-form reconstruction formula (e.g. harmonic mean vs geometric mean vs 2*gamma^k/(1+gamma)) rather than testing empirical relative error against the threshold.",
+   "Ambiguity over whether alpha in config is meant to be dynamically configured from the CLI --threshold flag or left static, which could cause valid architectural fixes to fail if unit tests expect static constants."
+  ],
+  "verdict": "reject",
+  "reasons": "All three bugs are localized to a single file (monitor/sketch.py) and directly map to the three error lines shown in the task description. An agent can read sketch.py, diagnose the negative index wraparound, rank offset, and bucket midpoint formula, and fix all three in under 10 commands. Because the bugs are immediately visible upon reading the single relevant module, genuine difficulty scores at most 2.",
+  "fixes": [
+   "Distribute the defect across the pipeline rather than isolating all three in monitor/sketch.py (e.g., have reader/aggregator streaming chunk aggregation issues, multi-sketch merge/serialization bugs in aggregator.py, or concurrency/generator pipeline bugs).",
+   "Remove the explicit error breakdown for auth-cache, checkout-api, and payment-svc from the instruction prompt, leaving only the summary failure message so the agent must reproduce and inspect the failures itself."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "The candidate involves fixing mathematical error bounds and bucket indexing in a streaming logarithmic quantile sketch, whereas the reference focuses on debugging a C extension rate-limiter sliding-window eviction bug."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The candidate is about repairing algorithmic percentile estimation logic in Python, whereas the reference requires writing a new HTTP query service wrapping a compiled shared library."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/hf-model-inference",
+     "verdict": "distinct",
+     "reason": "The reference sets up a Flask inference server for a Hugging Face transformer model, which has no connection to streaming quantile sketch algorithms."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference addresses schema validation and throughput performance in a Node.js log ingestion pipeline, which is completely distinct from quantile sketch estimation math."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "The reference requires black-box reverse engineering of a closed-source sensor normalization binary and SQL rollup pipeline, whereas the candidate requires fixing Python algorithmic code for logarithmic bucket quantile sketches."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6a588ca66d21",
+     0.166
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.127
+    ],
+    [
+     "terminal-bench-2-1/hf-model-inference",
+     0.114
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.086
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.085
+    ]
+   ],
+   "cost_usd": 0.00450975
+  },
+  "novel": true
+ },
+ "cost_usd": 0.015681
+}

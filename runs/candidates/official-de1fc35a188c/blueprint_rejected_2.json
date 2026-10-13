@@ -1,0 +1,153 @@
+{
+ "blueprint": {
+  "slug": "edge-telemetry-polynomial-filter",
+  "title": "Edge Telemetry Polynomial Filter & Outlier Gate",
+  "scenario": "An embedded telemetry gateway running a local SQLite-based logging daemon is dropping frames under heavy burst loads on a single-core edge device. Incoming high-frequency sensor readings must be cleansed of adversarial corruption, dynamically filtered against an undocumented hardware calibration daemon running over a UNIX socket, and compressed into degree-2 orthogonal polynomial coefficients (Chebyshev/least-squares fit) per epoch window using a high-throughput SQL pipeline. The current naive ingestion script does unindexed cross-joins and crashes on malformed telemetry packets.",
+  "instruction_draft": "Hey, the gateway is dropping packets during sensor bursts because the ingestion queries are chewing through our 1 CPU limit, and corrupted frames keep wedging the pipeline. Can you wire up the new windowed polynomial reduction feature in `/opt/gateway/pipeline.sql`? You'll need to filter out the garbage packets before they hit the vendor's black-box validator (`/opt/gateway/bin/hw_oracle`, no source unfortunately, but you can probe its socket), then compute the quadratic trend coefficients ($a_0, a_1, a_2$) for each valid 100-sample window directly in SQL. Make sure it recovers cleanly from malformed packets, rejects adversarial noise, keeps legitimate readings, and stays under our 250ms batch latency budget. The daemon service is already running under systemd/supervisor in the container.",
+  "requirements": [
+   "Identify and characterize the black-box `/opt/gateway/bin/hw_oracle` UNIX socket protocol and valid sensor envelope via systematic experimentation",
+   "Implement `/opt/gateway/pipeline.sql` to filter out corrupted, out-of-order, and out-of-envelope sensor frames before processing",
+   "Compute degree-2 orthogonal polynomial regression coefficients (least-squares: constant $a_0$, linear $a_1$, quadratic $a_2$) per 100-sample non-overlapping epoch window entirely within SQL (using window functions / CTEs)",
+   "Implement error recovery so malformed telemetry packets in batch inserts log an audit entry in `ingest_errors` and do not crash or abort the ingestion transaction for valid frames",
+   "Optimize query execution plan and SQLite pragmas (`temp_store = MEMORY`, indexing, avoid correlated subqueries) to complete a 5,000-row batch reduction within 250 ms without temporary disk spills",
+   "Maintain high precision: computed polynomial coefficients must match analytical least-squares ground truth within $10^{-4}$ relative tolerance",
+   "Pass the adversarial validation corpus: reject 100% of adversarial spikes, NaN/Inf injections, and invalid socket-rejected telemetry, while retaining >= 99.5% of valid signal epochs"
+  ],
+  "environment": [
+   "Debian Bookworm container (1 CPU, 2 GB RAM) with Python 3.13 and SQLite 3.40+ installed",
+   "Supervisord managing `hw_oracle` (an opaque compiled stripped C binary listening on `/run/hw_oracle.sock`) and `gatewayd` (a Python-based daemon invoking the SQLite pipeline)",
+   "`/opt/gateway/bin/hw_oracle`: stripped ELF binary implementing an undisclosed polynomial curvature and dynamic range acceptance check; returns binary 1-byte status codes (0x00 OK, 0x01 Clipping, 0x02 Non-monotonic curvature, 0xFF Malformed)",
+   "`/opt/gateway/pipeline.sql.template`: partially populated SQL template with naive quadratic calculations that trigger full table scans and fails on corrupted payloads",
+   "`/opt/gateway/data/sample_burst.csv`: small sample trace for local sanity testing (contains typical benign data, omitting the adversarial boundary conditions)",
+   "SQLite database configured at `/var/lib/gateway/telemetry.db` with base tables `raw_telemetry`, `calibrated_epochs`, and `ingest_errors`"
+  ],
+  "internal_hint": "Difficulty stems from: (1) Opaque component characterization: the solver must probe `/run/hw_oracle.sock` to discover packet format (a packed struct: 4-byte int timestamp, 4-byte float reading, 4-byte float d_dt) and its rejection boundaries (clipping when |val| > 120.0 or acceleration |d2_dt2| > 45.0); (2) Mathematical formulation: computing quadratic least-squares fit $(X^T X)^{-1} X^T Y$ for discrete equidistant grids $t \\in [0, 99]$ in pure SQL using closed-form discrete Chebyshev polynomial summations: $\\sum t, \\sum t^2, \\sum t^3, \\sum t^4$, avoiding numeric overflow by centering the time coordinate $u = t - 49.5$; (3) Performance tuning: rewriting naive correlated subqueries into single-pass SQLite window functions (`OVER (PARTITION BY epoch_id)`) with composite indexes on `(epoch_id, seq)` and memory temp storage; (4) Error recovery: parsing raw packets with guarded `CASE` statements and `INSERT OR IGNORE`/transaction savepoints to record bad frames in `ingest_errors` without aborting the batch.",
+  "trap": "A naive implementation uses standard uncentered time indices $t \\in [t_{start}, t_{end}]$ for least-squares equations, which overflows standard 64-bit float mantissa precision when accumulating sums of $t^4$, producing completely corrupted quadratic coefficients on long-running streams. Additionally, naive self-checks on `sample_burst.csv` pass without testing high-frequency oscillatory noise or edge-case boundary frames that `hw_oracle` flags.",
+  "tests": [
+   "Opaque oracle contract verification: sends synthetic probes across valid/invalid envelopes and verifies SQL pipeline filters match oracle specifications exactly",
+   "Mathematical accuracy test: generates fresh synthetic sinusoidal, parabolic, and piecewise linear trajectories from a hidden seed; compares computed ($a_0, a_1, a_2$) against reference NumPy least-squares fit across 100 random epochs",
+   "Adversarial corpus evaluation: feeds a hidden 10,000-record mixed corpus containing NaN injections, out-of-order sequence IDs, step-function impulse spikes, and high-curvature artifacts; checks that 100% of corrupt inputs are routed to `ingest_errors` while valid signal windows pass cleanly into `calibrated_epochs`",
+   "Performance and resource benchmark: measures execution time of a 5,000-reading batch under 1 CPU constraint; asserts wall-clock execution is <= 250 ms and zero disk temp files are created in `/var/lib/gateway/`",
+   "Error recovery test: injects truncated binary frames mid-transaction; verifies `gatewayd` does not crash, transaction commits valid preceding frames, and an audit row is written to `ingest_errors`"
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_density",
+   "value": "10000 records across 14 boundary anomaly classes",
+   "effect": "Increasing the corpus size and adding multi-frequency harmonic perturbations forces stricter windowed validation and prevents heuristic or hardcoded thresholds."
+  },
+  "expected_failure_modes": [
+   "Numerical instability and floating point loss of significance by calculating least-squares over raw Unix epoch timestamps instead of window-centered indices",
+   "Failing to experiment with and reverse-engineer the `/run/hw_oracle.sock` protocol, causing SQL pre-filters to mismatch oracle criteria and reject valid readings or pass illegal curvatures",
+   "Query execution timeout (>250ms) due to missing window functions or using multiple correlated subqueries that perform repeated scans over `raw_telemetry`",
+   "Pipeline crash on encountering malformed types (e.g. text or NULL in numeric columns) instead of safely trapping and writing to `ingest_errors`",
+   "Off-by-one window partitioning that computes coefficients across overlapping windows or drops the tail window"
+  ],
+  "predicted_pass_rate": 0.25,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "sql",
+   "performance-optimization",
+   "numerical-methods",
+   "reverse-engineering",
+   "embedded-systems"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat /etc/supervisor/conf.d/* /opt/gateway/pipeline.sql.template",
+   "cat /opt/gateway/gatewayd.py",
+   "sqlite3 /var/lib/gateway/telemetry.db '.schema'",
+   "objdump -d -M intel /opt/gateway/bin/hw_oracle || gdb -batch -ex 'disas main' /opt/gateway/bin/hw_oracle",
+   "python3 -c \"import socket, struct; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect('/run/hw_oracle.sock'); s.sendall(struct.pack('<Iff', 0, 10.0, 0.0)); print(s.recv(10))\"",
+   "python3 probe_oracle.py # systematically fuzzing oracle boundaries (|val| <= 120, |d2_dt2| <= 45)",
+   "cat /opt/gateway/data/sample_burst.csv | head -n 20",
+   "sqlite3 /var/lib/gateway/telemetry.db 'EXPLAIN QUERY PLAN SELECT ...'",
+   "python3 -c 'import sympy as sp; # derive discrete orthogonal polynomial closed forms for N=100'",
+   "cat << 'EOF' > /opt/gateway/pipeline.sql\n-- SQLite CTEs with window functions for window centering u = t - 49.5\n-- Filtering |val| > 120 and |d2_dt2| > 45\n-- INSERT INTO calibrated_epochs ... INSERT INTO ingest_errors ...\nEOF",
+   "sqlite3 /var/lib/gateway/telemetry.db < /opt/gateway/pipeline.sql",
+   "supervisorctl restart gatewayd",
+   "tail -n 50 /var/log/gatewayd.log"
+  ],
+  "speedrun_commands": 13,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 4,
+   "realism": 2
+  },
+  "invalid_failure_risks": [
+   "Coordinate basis ambiguity: The instruction does not specify the time coordinate definition for (a0, a1, a2) (e.g. absolute timestamp, index t in 0..99, or centered index u = t - 49.5). Any mismatch against the verifier's chosen basis will cause 100% test failures on the 10^-4 tolerance test.",
+   "Reverse engineering scope blowout: Reversing an undocumented stripped C binary over a UNIX socket to deduce second-derivative envelope thresholds (|d2_dt2| <= 45.0) in addition to packet framing inside a 60-minute task is prone to false deductions and time expiration.",
+   "Target schema ambiguity: Exact schema requirements, column names, and error codes for `ingest_errors` and `calibrated_epochs` are not provided in the prompt."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint is an overloaded 'kitchen-sink' task conflating binary protocol reverse engineering, pure SQL discrete orthogonal polynomial mathematics, and latency performance optimization. Critical ground-truth specifications\u2014such as the exact coordinate frame for the polynomial fit and the schema contract for `calibrated_epochs` and `ingest_errors`\u2014are omitted from the prompt, making valid implementations fail the verifier.",
+  "fixes": [
+   "Decouple the opaque binary reverse engineering: provide the socket protocol spec and validation rules explicitly in a vendor datasheet or header file, focusing the task on the SQL performance and mathematical reduction.",
+   "Explicitly define the regression coordinate frame in the prompt (e.g., 't is normalized sample index 0..99' or centered 'u = sample_index - 49.5') and provide the exact polynomial formulation y(t) = a0 + a1*t + a2*t^2.",
+   "Provide the explicit table schema and expected error codes for `ingest_errors` and `calibrated_epochs` directly in the prompt or repository documentation."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference task involves debugging fixed-point statistics calculation in a Rust binary, whereas the candidate requires implementing a windowed polynomial regression pipeline and error recovery directly in SQL with UNIX socket probing."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The reference focuses on translating a JSON AST predicate tree into SQLite queries via a bash script, whereas the candidate focuses on analytical polynomial regression and SQLite query performance optimization."
+    },
+    {
+     "ref_id": "ours/official-fa7d16d4af43",
+     "verdict": "distinct",
+     "reason": "While both involve characterizing a black-box binary on sensor data, the candidate's core problem requires writing pure SQL windowed degree-2 least-squares regression and optimizing SQLite execution under tight latency budgets."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "The reference centers on troubleshooting sliding-window eviction logic in a Python/C Prometheus alerting pipeline, whereas the candidate is a SQL-based telemetry reduction and socket calibration task."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "The reference involves resolving classification mismatches across a WAF compiler and deployment pipeline, which shares no core mechanics with telemetry regression in SQLite."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-c396920d769d",
+     0.119
+    ],
+    [
+     "ours/official-18899524e171",
+     0.119
+    ],
+    [
+     "ours/official-fa7d16d4af43",
+     0.113
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.103
+    ],
+    [
+     "ours/official-10912a593843",
+     0.086
+    ]
+   ],
+   "cost_usd": 0.004980750000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.017319750000000002
+}

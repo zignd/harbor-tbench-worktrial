@@ -1,0 +1,70 @@
+{
+ "slug": "optimize-policy-decision-audit",
+ "title": "Optimize Policy Decision Auditing",
+ "scenario": "The security platform team is auditing an internal SQL-backed authorization service after audit exports began timing out and occasionally disagreeing with the policy simulator. The repository contains the service, schema migrations, fixtures, query-history commits, and a command-line export path; the current implementation performs expensive per-request policy resolution over large tenant datasets.",
+ "instruction_draft": "Refactor the authorization audit query so that exporting decisions for large databases completes within the configured performance budget while preserving the service\u2019s exact behavior. Every request must produce the same decision, matched policy revision, and reason as the reference semantics, including overlapping policies, policy revisions with equal timestamps, open-ended validity intervals, tenant isolation, duplicate event identifiers, and requests with no applicable policy; validate the result against varied data rather than only the checked-in fixture.",
+ "requirements": [
+  "Refactor the authorization audit SQL used by the export command.",
+  "Preserve the exact decision, matched policy revision, and reason for every request.",
+  "Respect tenant isolation.",
+  "Handle overlapping policies according to the repository's precedence rules.",
+  "Apply deterministic ordering when policy revisions have equal timestamps.",
+  "Correctly handle open-ended policy validity intervals.",
+  "Preserve duplicate request or event identifiers as separate rows.",
+  "Return the required result for requests with no applicable policy.",
+  "Meet the export performance budget on the large benchmark database.",
+  "Leave the command-line interface and output schema compatible with existing callers."
+ ],
+ "environment": [
+  "A Docker image based on FROM python:3.13-slim-bookworm with pinned apt and pip dependencies, SQLite, pytest, and no network access.",
+  "A synthetic Git repository of approximately 1,500 lines across Python modules, SQL files, migrations, fixtures, CLI code, and tests, with roughly 25 commits documenting several historical query implementations.",
+  "A command such as `python -m policy_audit export --db PATH --since N --until N` that emits canonical JSON-lines records containing request sequence, tenant, decision, matched policy revision, and reason.",
+  "SQLite schema containing tenants, policy definitions, policy revisions, policy bindings, and access requests. Policies have tenant scope, resource-prefix scope, action, allow/deny effect, priority, validity start and nullable validity end, revision timestamp, and revision sequence.",
+  "The checked-in fixture is intentionally small and does not exercise all combinations of ties, duplicates, open intervals, or overlapping scopes.",
+  "The current SQL contains correlated candidate searches and repeated policy-resolution work, with a historical optimization branch that was reverted after a correctness incident.",
+  "The repository includes comments, migration notes, and old commits describing the externally observable precedence contract without presenting a complete standalone specification.",
+  "A deterministic benchmark database with tens of thousands of requests and thousands of policy revisions, plus a normal-sized visible fixture.",
+  "Verifier-side generators create fresh SQLite databases with randomized tenants, policies, revisions, resource paths, actions, timestamps, nullable interval ends, duplicate request IDs, equal timestamps, and overlapping policy scopes. The verifier computes expected rows using an independent reference implementation and compares canonicalized output.",
+  "The verifier invokes the public CLI rather than checking source text."
+ ],
+ "internal_hint": "The intended resolution is to investigate the Git history, schema, migrations, and callers, then generate exploratory databases to reconstruct the actual precedence contract. The semantic order is tenant match, action match, validity at request time using a half-open interval with NULL end meaning infinity, most-specific resource scope, highest priority, newest revision timestamp, highest revision sequence, and finally stable policy/revision identity; a deny is not globally dominant once a more-specific applicable binding wins. Requests are ordered by ingestion sequence, not request ID. The current query repeatedly evaluates correlated subqueries and also mishandles a data-dependent tie involving equal timestamps and duplicate bindings. Build a staged relational pipeline using filtered candidate rows, normalized scope specificity, window ranking or equivalent set-based elimination, and a separate left-preserving request result. Compare intermediate and final results against independently generated small databases before applying the refactor. The reference solution script first inspects history and schema, runs the existing CLI on crafted and generated databases to expose the interval and tie behavior, profiles the large fixture, edits the SQL and supporting indexes, and runs fuzz and benchmark checks.",
+ "trap": "A shallow solution that merely replaces the correlated subquery with a window function often ranks policy rows globally instead of per request, treats a NULL validity end as non-matching, lets a less-specific deny override a more-specific allow, collapses duplicate request IDs, or uses request ID rather than ingestion sequence for output. The visible fixture and a hand-written example generally pass, while verify-time data containing equal revision timestamps, duplicate bindings, open intervals, and overlapping prefixes exposes the mismatch. A semantically correct but still pairwise query also fails the large benchmark.",
+ "tests": [
+  "Run the existing visible fixture and compare the complete canonical JSON-lines export, including ordering and null fields.",
+  "Generate many small fresh databases with seeded randomized tenants, requests, policies, intervals, scopes, effects, priorities, revision ties, duplicate identifiers, and empty candidate sets; compare every emitted row against an independent Python reference computation.",
+  "Generate larger fresh databases with thousands of requests and policy rows, compare all results against the reference, and require completion within the deterministic CPU-time budget.",
+  "Exercise requests on validity boundaries to verify the half-open interval behavior and NULL-ended intervals.",
+  "Exercise equal timestamps and duplicate policy bindings to verify the full deterministic tie-break chain.",
+  "Exercise overlapping resource scopes and mixed allow/deny effects to verify specificity and precedence.",
+  "Verify that identical request IDs remain distinct and retain ingestion order.",
+  "Verify that one tenant's policies never affect another tenant's requests.",
+  "Run the public CLI through its documented arguments and reject changes that only work through an internal test helper."
+ ],
+ "verifier_knob": {
+  "name": "generated_case_count_and_policy_density",
+  "value": "240 randomized correctness databases plus 4 large databases containing 8,000-20,000 requests and 1,000-4,000 policy revisions",
+  "effect": "Lower values make accidental window-query solutions more likely to pass; increasing the number, size, overlap density, and frequency of tie cases exposes semantic shortcuts and increases runtime pressure."
+ },
+ "expected_failure_modes": [
+  "The agent reads only the current SQL and misses semantics encoded in migrations, callers, or Git history.",
+  "The agent optimizes the obvious correlated subquery but does not reconstruct the complete precedence order.",
+  "The agent assumes policy effects are globally deny-overrides-allow instead of discovering specificity-based selection.",
+  "The agent uses a window partition that loses duplicate requests or duplicate policy bindings.",
+  "The agent mishandles NULL interval ends or treats endpoint timestamps as inclusive.",
+  "The agent uses an unstable tie-breaker and passes ordinary fixtures but fails generated equal-timestamp cases.",
+  "The agent validates only the checked-in sample and never creates adversarial data.",
+  "The agent produces correct results but misses the performance budget on dense candidate sets.",
+  "The agent changes output ordering or CLI behavior while focusing on the SQL plan."
+ ],
+ "predicted_pass_rate": 0.24,
+ "difficulty": "hard",
+ "category": "performance-optimization",
+ "tags": [
+  "sql",
+  "sqlite",
+  "query-optimization",
+  "fuzz-equivalence",
+  "git-history",
+  "authorization"
+ ]
+}

@@ -1,0 +1,3 @@
+The nightly release aggregation step in /repo/scripts/build_release_catalog.sh fails the verification gate in /repo/scripts/check_release_metrics.sh. The script decodes runner telemetry shards from /var/lib/build_data/shards/ into /var/lib/build_data/release_catalog.db to serve release qualification queries in /repo/queries/.
+
+Fix /repo/scripts/build_release_catalog.sh and any repository schema or queries so that /repo/scripts/check_release_metrics.sh passes all checks. The resulting /var/lib/build_data/release_catalog.db must achieve an analytical query parity score of at least 0.999 against reference ground truth, the benchmark query suite must complete in under 1.80 seconds total execution time on this system, and the database file size must not exceed 25.0 MB.

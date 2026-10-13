@@ -1,0 +1,75 @@
+{
+ "slug": "deploy-log-replay-materializer",
+ "title": "Deploy the Incident Log Replay Materializer",
+ "scenario": "db-prod lost its read replica during an incident, and the only complete recovery source is a directory of sharded replication-event files exported by the log collector. The container contains an unfinished Node.js recovery utility, deployment configuration, format notes, and several thousand representative event files; the existing smoke test reports success while producing a subtly incomplete snapshot. You must finish and deploy the utility so the recovery team can run it against fresh event bundles.",
+ "instruction_draft": "replayd: snapshot written successfully (18,442 rows), but the DBA checksum differs from the primary\nreplayd: warning: 3,107 records were skipped during recovery\n\nFinish and deploy the JavaScript log-replay utility in this container. The installed command must be available as `db-replay` regardless of the caller's working directory and must support `db-replay --config PATH`, `db-replay --input DIR --output PATH`, and `db-replay --check`. It must recursively process every event file selected by the manifest, translate the documented text event format into the canonical JSONL snapshot, and never depend on fixture filenames or ordering.\n\nA transaction contributes changes only after a valid commit event; aborted, incomplete, and invalid-checksum transactions contribute nothing. Apply committed operations in commit-LSN order, use the operation sequence within each transaction, and make replay idempotent when the same committed transaction appears in more than one shard. Transactions and records may cross file boundaries, files may be physically out of order, and quoted fields may contain tabs, quotes, Unicode, and newlines. Preserve the documented distinction between deleting a missing key, deleting an existing key, and upserting an existing key.\n\nWrite exactly one canonical JSON object per live row, with the fields and stable ordering specified by the format notes, sorted by table name and then primary key. Write a separate deterministic report containing input-record count, committed-transaction count, ignored-transaction count, live-row count, and the SHA-256 of the canonical JSONL bytes. Do not publish partial output: a failed run must leave the previous snapshot and report untouched, while a successful run must replace both atomically. `--check` must validate the deployment, configuration, manifest, and output checksum without modifying data.\n\nThe command must achieve at least 99.9% row accuracy against the reference replay on hidden generated bundles and process at least 25,000 physical event records per second on the verifier's one-CPU corpus. It must remain correct when the verifier generates thousands of shards, duplicate deliveries, cross-file transactions, malformed records, and rare escaped-field cases.",
+ "requirements": [
+  "Install an executable command named `db-replay` that works from any current working directory.",
+  "Support `db-replay --config PATH`, `db-replay --input DIR --output PATH`, and `db-replay --check`.",
+  "Recursively process every event file selected by the manifest rather than relying on fixture names or directory order.",
+  "Parse the documented text event format, including quoted tabs, quotes, Unicode, embedded newlines, and records split across files.",
+  "Include a transaction's operations only when its commit event is valid and its checksum is correct.",
+  "Ignore aborted, incomplete, malformed, and invalid-checksum transactions.",
+  "Apply committed transactions in commit-LSN order and operations in their recorded transaction sequence.",
+  "Treat duplicate appearances of the same committed transaction as one transaction.",
+  "Preserve distinct behavior for deleting a missing key, deleting an existing key, and upserting an existing key.",
+  "Emit exactly one canonical JSON object per live row.",
+  "Emit rows sorted by table name and primary key with the documented field names and stable JSON formatting.",
+  "Emit a deterministic report containing physical input-record count, committed-transaction count, ignored-transaction count, live-row count, and the SHA-256 of the canonical JSONL bytes.",
+  "Publish snapshot and report files atomically, leaving prior outputs untouched after a failed run.",
+  "`--check` validates deployment, configuration, manifest, and output checksum without modifying inputs or outputs.",
+  "Achieve at least 99.9% row accuracy on hidden generated replay bundles.",
+  "Process at least 25,000 physical event records per second on the verifier corpus using one CPU."
+ ],
+ "environment": [
+  "A Docker image based on `python:3.13-slim-bookworm`, with pinned Debian packages including Node.js 18 and no network access at verification time.",
+  "A roughly 1,500-line in-house JavaScript application under `/opt/replayd`, containing a CLI scaffold, configuration loader, metrics code, unrelated log rotation code, and a deliberately incomplete replay stage.",
+  "A legacy launcher currently assumes a particular working directory and only discovers files matching the visible fixture prefix; it is not a valid deployment for hidden bundles.",
+  "A format manual and manifest examples describing header, transaction, operation, commit, abort, continuation, quoting, checksum, logical table, primary-key, and canonical-output rules.",
+  "A data corpus of several thousand sharded event files with ordinary transactions plus rare cross-file transactions, duplicate transaction delivery, out-of-order shard contents, deletes of absent keys, Unicode values, multiline quoted values, and deliberately invalid records.",
+  "Visible fixtures include a small clean bundle and a smoke-test script that does not exercise duplicate delivery, transaction spanning, or escaped multiline fields.",
+  "Deployment files include an example `/etc/db-replay/config.json`, a broken service wrapper, and a report schema used by the verifier.",
+  "The image includes only standard Node.js modules and Python utilities; no package download or external service is required."
+ ],
+ "internal_hint": "The shortest reliable resolution is to inspect the manifest, format manual, launcher, and corpus statistics before editing. The key issue is not a single readable bug: the supplied stage conflates physical record order with logical commit order and treats shard-local transaction state as complete, so the smoke bundle passes while accumulated replay state loses rare cross-file transactions and duplicate deliveries. Implement a streaming physical-record scanner with continuation handling, an indexed transaction assembly phase keyed by transaction ID, checksum validation, deduplication, and a commit-LSN-ordered apply phase; use maps rather than repeated full-table scans. Then replace the working-directory-dependent launcher with an absolute-path deployment, stage snapshot and report in a temporary directory, fsync/rename them, and exercise generated bundles containing split records, duplicates, and malformed input before measuring throughput.",
+ "trap": "A shallow solution can parse the visible fixture and appear correct, or simply concatenate files and apply events as encountered. It fails when a transaction begins in one shard and commits in another, when a duplicate copy has a different physical position, when a multiline quoted field resembles several records, or when a later commit-LSN must be applied before an earlier-read shard. A solution that writes the snapshot before validation also leaves mixed-generation outputs after a malformed hidden bundle, and an implementation using repeated scans commonly misses the throughput threshold.",
+ "tests": [
+  "Run the installed command from a directory unrelated to `/opt/replayd` and verify that both supported invocation forms produce the expected snapshot and report.",
+  "Generate a fresh seeded bundle with thousands of files, shuffled physical file order, transactions split across files, duplicate transaction deliveries, aborts, malformed records, and invalid checksums; compare canonical rows and every report field with an independent reference replay.",
+  "Generate records containing tabs, quotes, Unicode, and embedded newlines inside quoted values and verify exact canonical JSONL bytes and SHA-256.",
+  "Generate operations that delete absent keys, delete existing keys, and upsert the same key repeatedly; verify final live rows and operation counts.",
+  "Generate commits whose physical appearance is out of order relative to commit LSN and verify that final state follows LSN order and transaction sequence.",
+  "Run two successful replays over the same bundle and verify byte-identical snapshot and report output.",
+  "Force a malformed or checksum-invalid bundle after an existing successful snapshot exists and verify that both previous output files remain byte-identical.",
+  "Run `db-replay --check` on a valid deployment and on altered configuration, missing input, and checksum-mismatched output; verify status and that the command performs no writes.",
+  "Measure processing on a fresh one-CPU corpus of at least 250,000 physical records and require a median rate of at least 25,000 records per second.",
+  "Inspect that the report's physical-record and ignored-transaction counts include rare and invalid records rather than only rows present in the final snapshot."
+ ],
+ "verifier_knob": {
+  "name": "minimum_physical_records_per_second",
+  "value": "25000",
+  "effect": "Raising the value makes inefficient multi-pass or quadratic replay implementations fail despite correct output; lowering it allows slower implementations while leaving semantic difficulty unchanged."
+ },
+ "expected_failure_modes": [
+  "Treating file or line order as commit order.",
+  "Keeping transaction assembly state separately for each shard and discarding transactions that span files.",
+  "Failing to deduplicate a transaction delivered in multiple shards.",
+  "Splitting embedded newlines or escaped delimiters as physical record boundaries.",
+  "Using JavaScript object key coercion or unstable JSON serialization, causing collisions or noncanonical output.",
+  "Counting only successfully applied rows and omitting malformed or ignored physical records from the report.",
+  "Writing output directly and leaving a new snapshot with an old report after a failed run.",
+  "Implementing correct replay with repeated full-table scans that misses the throughput threshold.",
+  "Fixing the visible launcher but leaving the installed command dependent on the caller's working directory.",
+  "Testing only the clean fixture and never generating or inspecting cross-file and duplicate-delivery cases."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "deployment",
+ "tags": [
+  "javascript",
+  "log-replay",
+  "transaction-ordering",
+  "data-files",
+  "atomic-deployment"
+ ]
+}

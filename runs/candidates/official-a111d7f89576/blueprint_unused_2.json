@@ -1,0 +1,177 @@
+{
+ "blueprint": {
+  "slug": "optimize-policy-snapshot-sql",
+  "title": "Accelerate the Policy Snapshot Query",
+  "scenario": "A security engineer is auditing an internal authorization service whose SQLite policy snapshot endpoint has begun timing out during large audit replays. The repository contains the service, migrations, fixtures, benchmark tooling, and several historical optimization attempts across Git commits; some unrelated reporting code is present to make the change require investigation.",
+  "instruction_draft": "The authorization service must produce policy snapshots with exactly the same decisions and JSON ordering as the repository's documented behavior, including inherited scopes, wildcard principals and actions, revocations, expiration, policy precedence, and audit-event ordering. Preserve the existing command-line interface and output contract, and ensure requests with no applicable policy remain represented correctly.\n\nRefactor the SQL-backed snapshot path so that a fresh audit replay containing tens of thousands of policy events and requests completes within the benchmark budget on the provided one-CPU container. Validate the result against varied inputs rather than relying on the checked-in fixture, do not weaken authorization semantics to improve timing, and leave the repository in a runnable state with the existing tests and tooling passing.",
+  "requirements": [
+   "Preserve the existing snapshot command-line interface.",
+   "Produce exactly the reference authorization decision for every generated request.",
+   "Preserve the documented handling of inherited resource scopes.",
+   "Preserve wildcard principal and wildcard action matching.",
+   "Honor revocations and expiration at the requested snapshot time.",
+   "Honor the repository's policy-precedence and audit-event ordering rules, including deterministic ties.",
+   "Retain requests with no applicable policy in the output using the existing representation.",
+   "Preserve the exact JSON schema and ordering expected by callers.",
+   "Improve the snapshot path enough for the large replay benchmark to complete within its time budget on one CPU.",
+   "Keep the service and existing repository tests runnable after the refactor.",
+   "Do not change authorization semantics merely to meet the performance target."
+  ],
+  "environment": [
+   "A Docker image based on FROM python:3.13-slim-bookworm with pinned apt and pip packages, SQLite, pytest, and no network dependency.",
+   "A roughly 1,400-line Git repository containing a Python CLI, SQLite schema and migrations, SQL templates, benchmark scripts, fixtures, documentation, and unrelated audit-report modules.",
+   "The public entry point is a command such as `python -m policyctl snapshot --db PATH --at INTEGER --requests PATH`, which emits newline-delimited JSON decisions.",
+   "The central SQL implementation evaluates an append-only policy event log against a request relation. It currently uses nested correlated lookups and repeated matching work that becomes superlinear on realistic replays.",
+   "Policy events include updates and revocations, effective timestamps, expiration, tenant and principal scope, action scope, hierarchical resource patterns, sequence metadata, and a stable event identifier used for deterministic ordering.",
+   "The repository documents non-obvious semantics: resource inheritance is segment-aware rather than a raw string prefix, wildcard fields participate in precedence, a later revocation can hide an earlier rule, and equal ordering keys are resolved by event identifier.",
+   "The checked-in fixtures are small and intentionally avoid several combinations of duplicate ordering keys, boundary-sensitive resource paths, expired rules, wildcard precedence, and requests with no match.",
+   "Git history contains a prior attempted set-based optimization, a later schema change affecting event ordering, and a recovery commit that restores part of the intended behavior. The current working tree contains the production regression.",
+   "A hidden verifier creates fresh deterministic SQLite databases and request batches from multiple seeds, runs the modified CLI, compares every result against an independent reference computation, and measures the large-case runtime."
+  ],
+  "internal_hint": "A skilled engineer should first run the CLI and benchmark, inspect schema migrations and `git log --stat`/diffs, then generate small databases to probe duplicate sequence values, revocation chains, wildcard combinations, resource-segment boundaries, expiration edges, and empty matches. The intended repair is a multi-stage relational refactor: materialize the effective latest state of each policy stream using the repository's complete ordering tuple; discard inactive and expired states; normalize request and policy scope components; generate only valid scope candidates using indexed joins rather than per-request correlated scans; rank matching candidates with the documented specificity and deny-tie rules; and left-join the winner back to all requests before applying the existing JSON ordering. The historical fast query incorrectly collapses rows before event ordering is fully resolved and treats textual prefixes as resource inheritance, so it passes the fixture but fails after state has accumulated. Add or restore composite indexes and use `EXPLAIN QUERY PLAN` plus generated workloads to confirm the performance improvement. The reference solution is a deterministic shell script that investigates history, exercises adversarial generated cases, identifies the ordering and boundary regressions, and then edits the SQL and index migration.",
+  "trap": "A shallow solution can replace the correlated subqueries with a simple GROUP BY or window over policy keys and appear correct on the fixture, but it will select the wrong survivor when equal sequence values or a later revocation are present. Another tempting optimization uses `LIKE 'pattern%'`, which incorrectly makes `/prod-east` inherit `/prod` and mishandles wildcard precedence. Filtering unmatched requests out of the candidate CTE also produces a fast but contract-breaking result. Hidden large cases combine all of these with many irrelevant policies, so sampling output or benchmarking only the checked-in database is insufficient.",
+  "tests": [
+   "Run the existing smoke suite and verify the CLI still accepts the documented arguments and emits valid newline-delimited JSON.",
+   "For each of several hidden seeds, generate tenants, policy streams, updates, revocations, expiration times, wildcard principals/actions, hierarchical resource patterns, duplicate sequence metadata, and request batches. Compare the complete output, including rows for unmatched requests and ordering, with an independent reference implementation.",
+   "Generate boundary cases where resource names differ only by a path-segment boundary, contain empty or repeated segments, or match a wildcard at different depths; verify exact decisions.",
+   "Generate histories in which events arrive with non-monotonic insertion order, equal timestamps or sequence values, chained revocations, and rules that become expired exactly at the query time; verify deterministic survivor selection.",
+   "Generate mixed wildcard and exact scopes whose specificity differs across principal, action, and resource dimensions; verify the documented precedence and deny tie behavior.",
+   "Run a large generated replay containing tens of thousands of policy events and requests and fail if the snapshot command exceeds the configured one-CPU time budget or exhibits the old superlinear behavior.",
+   "Run a second large case with mostly irrelevant tenants and policies to ensure the implementation avoids scanning every policy for every request while retaining all requested output rows."
+  ],
+  "verifier_knob": {
+   "name": "generated_input_count_and_scope_mix",
+   "value": "9 hidden seeds: 5 medium cases with 1,000-8,000 events and 500-3,000 requests, plus 4 large cases with 30,000-80,000 events and 8,000-20,000 requests; each large case includes at least 20% boundary, revocation, duplicate-order, or wildcard interactions.",
+   "effect": "Lowering the count or removing rare scope and ordering combinations makes fixture-oriented SQL rewrites more likely to pass and reduces runtime pressure. Raising the number of events and requests, especially the fraction of adversarial combinations and irrelevant policies, exposes incorrect grouping and prefix matching while amplifying inefficient correlated plans."
+  },
+  "expected_failure_modes": [
+   "The agent reads the current SQL and performs a local window-function substitution without reconstructing semantics from migrations and Git history.",
+   "The agent validates only the checked-in fixture, which lacks the hidden combinations that distinguish event ordering and resource-boundary behavior.",
+   "The agent resolves latest rows using incomplete ordering columns, causing nondeterministic or incorrect results on tied events.",
+   "The agent models hierarchical resources with raw string prefix matching instead of segment-aware matching.",
+   "The agent mishandles revocation or expiration by filtering events before determining the effective stream state.",
+   "The agent returns only matched requests and silently changes the JSON contract.",
+   "The agent improves correctness but leaves a request-by-policy nested join that times out on the generated large cases.",
+   "The agent adds indexes that help one fixture but does not refactor the repeated candidate generation, so the benchmark still fails.",
+   "The agent changes Python post-processing or output ordering while trying to hide SQL discrepancies.",
+   "The agent partially applies a historical migration or optimization and leaves the repository in an inconsistent schema state."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "performance-optimization",
+  "tags": [
+   "sql",
+   "sqlite",
+   "algorithmic",
+   "git-history",
+   "fuzz-equivalence",
+   "authorization"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "Run `pwd`, `find`, and inspect the repository layout.",
+   "Read the README, schema documentation, and snapshot behavior documentation.",
+   "Run the smoke tests and the documented snapshot CLI on the checked-in fixture.",
+   "Run the existing benchmark to establish a baseline.",
+   "Inspect `git log --stat` and the historical optimization, schema-ordering, and recovery commits.",
+   "Read migrations and the complete current snapshot SQL, including ordering and serialization code.",
+   "Inspect benchmark data generation and index definitions.",
+   "Create small adversarial databases covering tied sequence values, revocations, expiration boundaries, wildcard precedence, segment boundaries, and unmatched requests.",
+   "Run those probes through the current CLI and record the semantic failures.",
+   "Run `EXPLAIN QUERY PLAN` on the current query and identify repeated correlated scans.",
+   "Refactor policy-stream reduction to rank the complete event ordering tuple before applying active, expiration, and revocation state.",
+   "Normalize resource, principal, and action scopes and replace per-request correlated matching with indexed candidate joins.",
+   "Rank matching candidates using the documented specificity, deny-tie, and deterministic event rules.",
+   "Left-join winners back to the complete request relation and preserve existing JSON and row ordering.",
+   "Add or restore the required composite indexes and migration/schema setup.",
+   "Run fresh-database migrations and the smoke suite.",
+   "Rerun all adversarial probes and compare complete output, including unmatched requests.",
+   "Use generated medium workloads and `EXPLAIN QUERY PLAN` to check candidate-generation behavior.",
+   "Run the large benchmark on the one-CPU container.",
+   "Run the full test/tooling suite and inspect the final diff for schema or CLI regressions."
+  ],
+  "speedrun_commands": 21,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The performance threshold could be flaky if it is not calibrated with margin across the specified SQLite, Python, and container environments.",
+   "If behavior for empty or repeated resource segments, JSON object-key ordering, or unusual wildcard combinations is not explicitly documented in the repository, the independent reference may test an ambiguous contract.",
+   "Generated cases could create a candidate-match explosion even for a semantically correct indexed design, making the large benchmark depend on undocumented data-distribution assumptions.",
+   "A migration-only index change may be invalid if hidden databases are created without running the repository's migration path or if the verifier expects the CLI to work directly against legacy schemas."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a realistic performance/correctness tradeoff, strong hidden fuzz-equivalence coverage, and meaningful historical and adversarial investigation requirements. The speedrun is just over the stated 20-command threshold, and the main failure modes require genuinely reconstructing ordering, scope, revocation, and unmatched-request semantics rather than applying a superficial SQL rewrite.",
+  "fixes": [
+   "State the exact benchmark budget and acceptable variance, preferably with a calibrated reference runtime or a generous multiplier.",
+   "Explicitly define the semantics of empty and repeated resource segments and whether ordering means NDJSON row order, JSON object-key order, or both.",
+   "Document how hidden databases are initialized so index migrations and legacy-schema compatibility are unambiguous.",
+   "Ensure generated workload sizes and wildcard distributions are bounded so the intended indexed candidate strategy is measurable without pathological candidate explosion."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The candidate optimizes a SQLite authorization-policy snapshot query with temporal and inheritance semantics, whereas this task hardens a route-classification gateway against malformed inputs and state-dependent failures."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The candidate concerns correctness and performance of policy snapshot reconstruction, while this task enforces concurrent per-user rolling CPU budgets, ledger consistency, and request throughput."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The candidate refactors an authorization snapshot query, whereas this task repairs a SQLite incident-replay utility involving actor resolution, event correlation, ordering, and transitions."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The candidate accelerates policy evaluation over audit events, while this task implements manifest-driven transactional log replay into canonical JSONL with atomic outputs and checksums."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate is a read-path authorization snapshot optimization, whereas this task reconstructs and mutates persistent replay state from segments and a catalog with CRUD and recovery semantics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.301
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.191
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.177
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.162
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.132
+    ]
+   ],
+   "cost_usd": 0.000816
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0032887999999999997
+}

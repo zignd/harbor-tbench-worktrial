@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "reconcile-nat-flow-metrics",
+  "title": "Repair NAT Flow Reconciliation",
+  "scenario": "The edge-analytics team says the request-success and latency numbers in `netpulse` no longer agree with the client dashboard. The container contains a small report service, captured client/edge logs, Prometheus-style metric snapshots, and a stripped helper binary used by the edge collector. The report command is currently usable on the supplied incident capture but is unreliable on captures produced by newer NAT gateways.",
+  "instruction_draft": "Can you get `netpulse report` producing trustworthy numbers again? It must correlate the client and edge observations into transactions despite retries, NAT port reuse, dropped observations, and a bounded clock skew, then write the documented JSON report with totals, success rate, and p50/p95 latency. Please keep the command-line interface and output schema compatible, and make the result reach at least 99.2% transaction-classification accuracy and 98.5% relative accuracy for the latency metrics on fresh generated captures, not just the example capture.",
+  "requirements": [
+   "The existing `netpulse report` command and its documented command-line arguments must continue to work.",
+   "The report must correlate client-side and edge-side observations into logical transactions.",
+   "Correlation must handle retries, NAT source-port reuse, dropped observations, and bounded clock skew.",
+   "The report JSON must preserve the existing documented schema, including transaction totals, successful transactions, success rate, p50 latency, and p95 latency.",
+   "Each logical transaction must be counted once even when it has multiple retry or observation records.",
+   "The implementation must achieve at least 99.2% transaction-classification accuracy on fresh hidden captures.",
+   "The resulting p50 and p95 latency values must each be within 1.5% of the reference values on fresh hidden captures.",
+   "The implementation must not rely on the supplied example capture or hard-coded identifiers."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned apt packages and no network dependency, containing roughly 1,500 lines of Python across a CLI, log readers, metric exporters, configuration handling, and unrelated operational utilities.",
+   "The service is installed under `/opt/netpulse`; `/usr/local/bin/netpulse` invokes `python3 -m netpulse.cli report`.",
+   "A TOML configuration file defines observation windows, maximum clock skew, retry timing, and the edge collector command.",
+   "The incident fixture contains several thousand newline-delimited client and edge records, a small Prometheus snapshot, and an expected-looking dashboard export. Records include request IDs that are locally generated and therefore are not globally reliable.",
+   "Client records describe request start, retry, response, and timeout events. Edge records use a compact hexadecimal payload produced by a stripped, statically linked helper at `/opt/netpulse/bin/edgehint`; the helper has no shipped source but has a `--help` message and accepts deterministic probe input.",
+   "The missing or damaged component is the transaction correlator. A deliberately incomplete module is wired into the report path, but the intended implementation requires parsing the edge-hint representation, constructing candidate matches, and solving one-to-one assignment under timing, sequence, NAT, and retry constraints.",
+   "The supplied capture is intentionally friendly: most NAT mappings are stable and the greedy matching order happens to produce plausible totals.",
+   "The planted production failures are data-dependent. One collector configuration causes a per-batch clock offset to be applied in the wrong direction, while another path treats a reused NAT tuple as a stable identity. Retries can make either defect conceal the other in aggregate metrics.",
+   "Several decoy modules cover dashboard formatting, histogram rendering, and log rotation so the relevant behavior must be located by running the service and comparing intermediate observations.",
+   "A deterministic hidden-test harness creates new captures from seeded generators with different retry rates, NAT reuse patterns, dropped records, clock offsets, and ambiguous candidate sets, then invokes the installed report command."
+  ],
+  "internal_hint": "The resolution path is to run the report on the incident fixture, inspect intermediate candidate and rejection metrics, and query `edgehint` with controlled inputs to recover its field layout and epoch/sequence semantics. The correct implementation decodes the hint records, normalizes each batch using the signed clock relationship rather than assuming one global offset, and builds candidate client-edge pairs using request nonce, route token, sequence continuity, and timing bounds. It then performs a global constrained assignment: retries belonging to one logical request are grouped before counting, edge observations are used at most once, and an observation with a reused NAT tuple cannot establish identity by tuple alone. The two interacting causes are the reversed batch-clock correction and tuple-only retry/flow identity; fixing either makes the supplied capture look mostly correct, but both are needed for generated captures. The reference solution is a deterministic shell script that first probes the CLI and helper, generates diagnostic reports, inspects the logs and configuration, and only then installs the corrected correlator and regression checks.",
+  "trap": "A shallow solution can decode the visible records and greedily pair the nearest timestamps, which reproduces the supplied dashboard and often passes a single retry-free test. It fails when two clients reuse a NAT port, when a retry crosses a collector batch boundary, or when the clock offset changes sign: the wrong pairing still has plausible latency and causes later observations to be unavailable, so independently fixing timestamp conversion or duplicate suppression is insufficient.",
+  "tests": [
+   "Run the report against the supplied incident capture and check that it produces valid JSON with the documented keys, internally consistent totals, and no malformed or negative latency values.",
+   "Generate fresh seeded captures with no retries and stable NAT mappings; compare transaction identities, success counts, and quantiles against the reference implementation.",
+   "Generate captures with retry chains, dropped client or edge observations, and NAT source-port reuse; require at least 99.2% correct logical-transaction classification.",
+   "Generate captures where each collector batch has a different positive or negative clock offset and where several candidate matches satisfy the local timing bound; require the global assignment to match the reference.",
+   "Generate captures containing ambiguous same-route requests, delayed responses, timeout-then-success sequences, and reused locally generated request IDs; verify one-count-per-logical-transaction behavior.",
+   "Compare p50 and p95 latency on each hidden capture and require both to be within 1.5% of the reference values.",
+   "Run the command from a clean working directory with regenerated inputs and verify that results do not depend on fixture names, fixed IDs, wall-clock time, network access, or unseeded randomness.",
+   "Exercise the existing metric-export and JSON formatting paths to ensure the correlator fix does not break the service's CLI contract."
+  ],
+  "verifier_knob": {
+   "name": "transaction_accuracy_threshold",
+   "value": "99.2% classification accuracy, with p50/p95 latency within 1.5%",
+   "effect": "Raising the classification threshold or tightening the latency tolerance makes approximate greedy correlators fail and requires more complete constraint handling; lowering them permits solutions that handle ordinary retries but miss rare NAT reuse, clock-boundary, and ambiguous-assignment cases."
+  },
+  "expected_failure_modes": [
+   "The solver reads the visible sample and patches output arithmetic without exercising generated captures.",
+   "The solver reverse-engineers only the obvious fields of the opaque edge helper and ignores sequence or epoch semantics.",
+   "The solver applies one global clock offset even though offsets change per collector batch.",
+   "The solver uses nearest timestamp or a client request ID as the primary identity and mishandles NAT port reuse.",
+   "The solver removes duplicate records independently before resolving retries, causing one defect to hide the other.",
+   "The solver implements local greedy matching rather than a global one-to-one constraint assignment, producing plausible but systematically wrong p95 values.",
+   "The solver fixes the supplied configuration instead of making the report robust to the hidden generator's configuration and data combinations.",
+   "The solver produces correct totals but changes the CLI or JSON schema used by the metric exporter."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "networking-services",
+  "tags": [
+   "constraint-satisfaction",
+   "reverse-engineering",
+   "logs",
+   "metrics",
+   "NAT",
+   "feature-iteration"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `find /opt/netpulse -maxdepth 3 -type f -printf '%p\\n' | sort`",
+   "2. `sed -n '1,240p' /opt/netpulse/netpulse/cli.py`",
+   "3. `grep -RIn \"report\\|correlat\\|latency\\|success_rate\" /opt/netpulse/netpulse`",
+   "4. `cat /opt/netpulse/*.toml /opt/netpulse/config*.toml 2>/dev/null`",
+   "5. `find /opt/netpulse -type f | grep -E 'correl|report|log|metric'`",
+   "6. `sed -n '1,320p' /opt/netpulse/netpulse/correlator.py`",
+   "7. `netpulse report --help`",
+   "8. `netpulse report <documented incident arguments> > /tmp/baseline.json`",
+   "9. `find /opt/netpulse -type f | grep -E 'capture|fixture|client|edge|snapshot'`",
+   "10. `head -n 30 <client log>`",
+   "11. `head -n 30 <edge log>`",
+   "12. `strings /opt/netpulse/bin/edgehint | head -n 80`",
+   "13. `/opt/netpulse/bin/edgehint --help`",
+   "14. `/opt/netpulse/bin/edgehint <minimal deterministic probe>`",
+   "15. `/opt/netpulse/bin/edgehint <probe variants covering sequence, epoch, nonce, and route fields>`",
+   "16. `grep -RIn \"candidate\\|rejection\\|batch\\|clock\\|edgehint\" /opt/netpulse/netpulse`",
+   "17. `netpulse report <incident arguments with diagnostic logging enabled> > /tmp/diagnostic.json`",
+   "18. `python3 - <<'PY' ... decode representative hints and print candidate/rejection distributions ... PY`",
+   "19. `cat > /opt/netpulse/netpulse/correlator.py` and implement per-batch signed clock normalization, hint decoding, retry grouping, candidate scoring, and global one-to-one assignment",
+   "20. `python3 -m py_compile /opt/netpulse/netpulse/correlator.py`",
+   "21. `netpulse report <incident arguments> > /tmp/fixed.json`",
+   "22. `python3 - <<'PY' ... validate schema, totals, success rate, and nonnegative quantiles ... PY`",
+   "23. `find /opt/netpulse -type f | grep -E 'generator|hidden|test'` and run the available seeded-capture checks",
+   "24. `netpulse report <regenerated capture arguments>` from a clean working directory, then compare classifications and p50/p95 with the reference"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The meaning of transaction-classification accuracy is not fully specified, especially how the verifier obtains canonical identities when request IDs are local and observations may be dropped.",
+   "The quantile definition, treatment of unsuccessful transactions, and behavior when a reference p50 or p95 is zero are unspecified; relative-error checks can otherwise be undefined or implementation-dependent.",
+   "The stripped helper's probe contract and the exact documented report arguments/schema are assumed to be discoverable in the image; a build or architecture mismatch for the binary would make the task invalid rather than difficult.",
+   "A hidden generator or reference implementation that is not available at verify time, or nondeterministic input ordering despite the deterministic claim, could make the accuracy thresholds flaky."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a concrete compatibility target, deterministic hidden-input thresholds, and interacting failure modes that defeat superficial timestamp or deduplication patches. The intended investigation and implementation are substantial enough to require more than a short source-reading speedrun, although the opaque decoder and global assignment make the under-an-hour solvability borderline.",
+  "fixes": [
+   "Define transaction-classification accuracy formally, including the canonical identity representation and how partially observed or entirely unmatched transactions are scored.",
+   "Document the quantile algorithm, the population used for latency metrics, and explicit handling for zero or missing reference quantiles.",
+   "State the exact report invocation and JSON schema, or provide a small contract excerpt in the task description so failures cannot arise from undiscoverable interface details.",
+   "Add a deterministic verifier self-check for helper architecture, input ordering, and reference-capture availability before applying the metric thresholds."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "variant",
+     "reason": "Both tasks reconcile records from multiple observations into unique logical transactions while preventing duplicate counting, but the candidate adds cross-perspective correlation, NAT reuse, retries, clock skew, and latency estimation rather than provider ledger/refund matching."
+    },
+    {
+     "ref_id": "ours/official-d993c25003e5",
+     "verdict": "distinct",
+     "reason": "The reference repairs a quantile-sketch service's deployment, percentile error bounds, and query performance, whereas the candidate performs transaction identity correlation and latency reporting from distributed observations."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4d",
+     "verdict": "distinct",
+     "reason": "Although both involve network telemetry, the reference is a NetFlow v9 protocol parser and flow aggregator, while the candidate reconstructs logical client transactions across NAT and unreliable observations."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference implements an HTTP time-window aggregation query service over SQLite and a native engine, not cross-source transaction reconciliation with retries, NAT reuse, and clock skew."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "The reference classifies and aggregates NetFlow records by ASN and traffic class with template-state handling, whereas the candidate correlates client and edge events into transactions and computes outcome and latency statistics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.095
+    ],
+    [
+     "ours/official-d993c25003e5",
+     0.093
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.091
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.076
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.06
+    ]
+   ],
+   "cost_usd": 0.0012282
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0038225999999999998
+}

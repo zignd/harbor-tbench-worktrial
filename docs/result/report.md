@@ -24,13 +24,15 @@ What is limited, and must not be overstated:
 
 ---
 
+**Outcome:** the pipeline, its gates, its accounting and its evidence discipline are finished and audited. Three task packages pass every quality, structural and functional gate, and **none of them lands in the 1–3/5 learnable band on honest measurement**, so `output/` is empty and the verification manifest records `overall_status: "failed"`. That negative result, and the reason the band became unreachable at the same time as validity was enforced, is the central finding of this report (§7).
+
 ## 2. Requirement status matrix
 
 | # | Requirement | Status | Evidence |
 |---|---|---|---|
 | 1.1 | Generated tasks pass the structural validator | Achieved | `validator/validate.py` + `scripts/validate.sh`; gate results in ledger |
 | 1.2 | Functionally correct: oracle passes, nop fails | Achieved | `gate_functional` events; independent re-runs saved in `docs/result/evidence/` |
-| 2 | Produce tasks in the 1–3/5 learnable band | Partial | Bimodal yield; see §6.4 and `docs/result/verification.json` |
+| 2 | Produce tasks in the 1–3/5 learnable band | **Not demonstrated in the audited set** | 3 quality-clean packages measured at 0/5, 4/5 and 4-real+1-invalid; see §7 and `docs/result/verification.json` |
 | 3 | Batch of 10+ candidates with Part-3 metrics | Achieved | 22 candidate records; `reports/summary.md` |
 | 4 | Source, `CHANGELOG.md`, git history | Achieved | this repo |
 | A | Cost-efficient evaluation | Achieved (with caveats) | §9.1 |
@@ -110,7 +112,19 @@ Two audit candidates were brought to full quality approval; approval also requir
 - **`releaseforge` (repaired):** quality approved after removing the timing gate and expanding to 15 deterministic tests; structure, oracle 3/3 and nop pass. **Calibration: 0/5 — too hard** for GPT-5.4-mini, with one failure judged invalid (`evidence/packager-final-calibration.json`). **Not approved** — out of band.
 - **`optimize-policy-decision-audit` (repaired):** quality approved after removing the wall-clock gate and making verification offline; structure, oracle 3/3 and nop pass. Its original five trials were 3/5, but on the **repaired** package a fresh five-attempt calibration returned **4/5 — too easy** (`evidence/policyfinal-calibration.json`). The single valid failure is `partial_implementation`: *"Requests with no applicable policy must still …"*; all four passes audited honest, none hit the 100-turn cap. **Not approved** — out of band, and the honest reading is that deleting the performance requirement removed most of the difficulty.
 
-This is the central empirical result of the audit: **the performance lever was doing the work**, and the rubric is right that a wall-clock gate is an invalid failure mode. Fixing validity therefore cost the band, and the task cannot be re-difficultied without reintroducing an invalid failure mode or unstated requirements.
+- **`repair-attributed-funnel-service` (repaired):** quality approved with **zero blocking and zero advisory findings** after making verification offline and expanding the suite from 6 to 13 deterministic tests (malformed JSON, unsupported kinds, every missing required field, non-numeric `ingest_seq`, unparsable timestamps, invalid report requests, idempotent replay with `(direct)` attribution, row shape/type/sort order, and a late event that moves a session boundary). Structure, **oracle 3/3** and **nop 0** all pass. Calibration: **2 honest passes, 2 valid failures (`partial_implementation`, both quoting *"Retain exactly the event with the greatest `ingest_seq`…"*), and 1 trial that exhausted the 100-turn cap**, which is invalid by rule. Two replacement attempts under identical settings also failed to yield a valid trial within the cap, so the run was stopped. **Verdict: invalid — not approved**, because a five-attempt record could not be completed.
+
+### 7.1 Result: no task is approved, and why that is the honest answer
+
+| Candidate | Quality | Structure/oracle/nop | Five judged attempts | 1–3 band | Shipped |
+|---|---|---|---|---|---|
+| `releaseforge` | pass (2 advice) | pass | 0 passes / 5, 1 invalid | no (too hard) | no |
+| `optimize-policy-decision-audit` | pass (1 advice) | pass | 4 passes / 5 | no (too easy) | no |
+| `repair-attributed-funnel-service` | pass (0 findings) | pass | 4 real + 1 turn-cap invalid | incomplete | no |
+
+`output/` is therefore **empty**, and `docs/result/verification.json` records `overall_status: "failed"` rather than `"passed"`. Three quality-clean, functionally-correct packages exist, and each fails the *learnable band* on honest measurement. Two candidate explanations, both supported by the evidence: (a) the difficulty levers that produced in-band results — chiefly a stated wall-clock budget — are exactly the ones the rubric forbids, so the pipeline currently has no admissible lever that reliably lands 1–3/5; and (b) the calibration solver's outcome distribution for these packages is bimodal and, at `max_turns = 100`, occasionally lands in a turn-cap regime that the rules correctly discard.
+
+The alternative — shipping one of these three with a recorded advisory override, or with the turn-cap trial counted as a failure — would reproduce precisely the defects this audit exists to eliminate, so it was rejected.
 
 The final per-task verdict, package hashes and check results are in `docs/result/verification.json`. If neither lands 1–3 with valid failures after repair, **no task is approved** and this document states that plainly rather than shipping a weak task.
 

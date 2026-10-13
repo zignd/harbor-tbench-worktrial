@@ -1,0 +1,186 @@
+{
+ "blueprint": {
+  "slug": "repair-contract-exporter",
+  "title": "Repair the Contract Exporter",
+  "scenario": "A data engineer has inherited StreamForge, a Go batch pipeline that turns newline-delimited telemetry records into contract-specific export partitions for downstream warehouses. The repository contains several historical configuration formats, a partially implemented v2 contract feature, realistic fixtures spanning thousands of records, and an interrupted production run whose recovery behavior is currently unreliable.",
+  "instruction_draft": "Repair and complete StreamForge so it accepts the documented v2 contract configuration and deterministically exports every valid input record to the first matching configured route, applying inheritance, projection, casting, defaults, and redaction exactly as specified while writing malformed or unmatched records to the documented quarantine output. Runs must be byte-for-byte reproducible, preserve source order within partitions, produce a complete manifest and rejection report, and safely resume or repeat after an interrupted run without duplicate records or corrupted final files.",
+  "requirements": [
+   "The command-line exporter must accept the documented v2 configuration format and reject invalid configurations without modifying the output directory.",
+   "Included configuration fragments must be resolved in declared order, with later scalar values overriding earlier values and route lists merged according to the documented rules.",
+   "Route defaults must apply before route-specific settings, while explicit null and empty values must retain their documented meaning rather than being treated as absent.",
+   "Each input record must be evaluated against routes in configuration order and emitted to at most the first matching route.",
+   "Configured projections, aliases, type casts, default values, nested-field access, and redaction operations must be applied in the documented order.",
+   "Records with malformed JSON, failed required casts, missing required fields, or no matching route must be written to the correct quarantine stream with the source file, byte offset, stable reason code, and original record.",
+   "Valid records must be written to deterministic route and partition files in source order, including records with Unicode, nulls, large integer values, escaped strings, and timestamps near partition boundaries.",
+   "Output JSON must use canonical formatting and stable key ordering so two successful runs over the same inputs produce identical bytes.",
+   "The exporter must write a manifest containing every final output and quarantine file, row counts, byte counts, content hashes, configuration hash, and input hash.",
+   "An interrupted run may leave temporary files and a journal; a subsequent run must validate and reuse only complete prefixes, discard invalid suffixes, and finish without duplicate or missing records.",
+   "Repeating a completed run with the same inputs and configuration must leave the final output state unchanged.",
+   "The implementation must handle the documented large-input workload without relying on loading the complete input dataset into memory."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned Go tooling and Python test dependencies installed without network access at solve time.",
+   "A hand-authored Git repository contains approximately 1,700 lines of Go across `cmd/streamforge`, configuration loading, expression evaluation, partition writing, journaling, hashing, and reporting packages, plus unrelated metrics and CLI code.",
+   "Git history contains the original v1 exporter, a v2 configuration migration, a failed recovery hotfix, and fixture-generation commits; the current checkout is a realistic partially merged state rather than a minimal toy project.",
+   "The repository includes a README and configuration reference documenting JSON v2 configs, include resolution, route matching expressions, transformations, quarantine records, partition naming, journal records, and manifest fields.",
+   "The current implementation handles simple one-route examples but contains a broken v2 merge path, incomplete transformation support, unsafe recovery behavior, and a missing implementation for one documented nested-field operation.",
+   "Fixtures contain roughly 18,000 records across multiple input files and routes, with rare malformed lines, duplicate-looking records from different offsets, null-versus-absent fields, Unicode keys and values, 64-bit integers, escaped JSON, and records that match overlapping routes.",
+   "Several unrelated packages and old v1 fixtures are present to make repository-wide reading noisy; existing visible examples cover only simple configurations and do not exercise recovery or rare data-dependent cases.",
+   "A deterministic reference generator and hidden verification harness are installed outside the repository. The harness can create fresh input shards and v2 configurations, invoke the candidate binary, and inspect the resulting directory state."
+  ],
+  "internal_hint": "The intended resolution is investigative rather than a one-file patch: inspect the README, Git history, current fixture outputs, and journal format, then run the exporter on progressively adversarial configurations while comparing manifests and quarantine records. The merge implementation aliases slices and treats explicit empty/null values as missing; the evaluator loses integer precision through an intermediate floating-point representation and mishandles absent nested paths; the writer derives partition order from map iteration; and recovery trusts a journal offset before validating the corresponding temporary-file hash. The missing feature is the documented nested projection/redaction operation, which must be implemented with the same absent-versus-null semantics as existing operations. A correct solution centralizes canonical encoding and source-position tracking, makes route and transform evaluation deterministic, validates journal prefixes before resuming, and uses streaming writes rather than reconstructing state from prior outputs.",
+  "trap": "A shallow solution passes the visible single-route fixture and may even produce plausible row counts, but hidden inputs expose route overlap, explicit empty overrides, large integers, Unicode, and records split across partition boundaries. A naive resume implementation commonly appends after a stale journal offset, while a map-based writer produces nondeterministic manifests; either can look correct when only a few output files are inspected but fails byte-level state checks and duplicate/missing-row checks.",
+  "tests": [
+   "Run the exporter against the supplied small fixture and verify canonical output rows, quarantine reasons, manifest fields, and expected partition names.",
+   "Generate configurations with nested includes, repeated includes, route defaults, explicit nulls, empty arrays, and overlapping routes; compare the complete output tree and manifest against the deterministic reference.",
+   "Generate fresh inputs containing approximately 20,000 records, including rare malformed JSON, absent versus null nested fields, Unicode, escaped values, 64-bit integers beyond exact IEEE-754 range, and timestamps at partition boundaries; verify every output and quarantine byte.",
+   "Generate overlapping route predicates and verify that each valid record appears in exactly one route, specifically the first matching route, while unmatched records appear once in quarantine.",
+   "Exercise every documented cast, default, alias, projection, redaction, and nested-field operation on generated records and compare both successful rows and stable rejection reason codes.",
+   "Start a run with deterministic fault injection at several journal checkpoints, leave temporary files and partial output behind, then rerun and verify that final files, hashes, counts, and row ordering equal an uninterrupted run.",
+   "Rerun a completed export and verify that no file content, modification-relevant manifest field, row count, or hash changes and that no duplicate records are introduced.",
+   "Supply invalid configurations and verify that the process fails before creating or altering final output state.",
+   "Run the large fixture under a memory observation check to ensure processing is streaming and remains within the container's 2 GB limit.",
+   "Inspect the final Git worktree state through the public command interface and verify that all expected output files, quarantine files, temporary-file cleanup, and manifest entries agree with the reference state."
+  ],
+  "verifier_knob": {
+   "name": "large_state_scale",
+   "value": "18,000 fixture records and 60 generated route/partition combinations, with 1-3% rare malformed or precision-sensitive cases",
+   "effect": "Raising the record count and number of routes makes manual inspection and accidental in-memory implementations less viable, while increasing rare-case frequency or lowering the scale makes shallow sample-based solutions more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent patches only the obvious visible fixture and never tests included configurations or overlapping routes.",
+   "Configuration merging uses shallow map replacement, losing inherited route settings or incorrectly discarding explicit empty and null values.",
+   "JSON numbers are converted through float64, silently changing large integer identifiers.",
+   "Nested-field lookup conflates an absent path with an explicit null and applies defaults or rejection rules incorrectly.",
+   "Route evaluation or manifest generation depends on Go map iteration order.",
+   "Quarantine records omit the original source offset or use unstable error text instead of documented reason codes.",
+   "Recovery trusts journal offsets without validating temporary-file contents, causing duplicates or silently skipped records after interruption.",
+   "The implementation materializes all records or all output partitions in memory and fails the large generated workload.",
+   "The agent finds a historical implementation in Git and restores v1 behavior, passing old fixtures while violating v2 configuration semantics.",
+   "The agent implements the missing nested operation but fails to integrate it with canonical encoding, error reporting, or resume checkpoints."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "go",
+   "configuration",
+   "data-pipeline",
+   "crash-recovery",
+   "determinism",
+   "large-state"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List repository files, commands, and existing outputs.",
+   "Read the README and v2 configuration reference end to end.",
+   "Inspect Git status, recent history, and migration/recovery commits.",
+   "Run the existing Go tests and visible exporter examples.",
+   "Locate and inspect configuration loading and include-merging code.",
+   "Inspect expression evaluation, nested lookup, casting, and transformation code.",
+   "Inspect partition writing, canonical encoding, quarantine, hashing, and reporting code.",
+   "Inspect journal record formats and resume/cleanup logic.",
+   "Run the small fixture and compare output files, manifest, and quarantine records.",
+   "Compare current behavior with historical v2 and failed recovery implementations.",
+   "Patch deep configuration merging, include ordering, and explicit null/empty handling.",
+   "Patch exact-number parsing, absent-versus-null nested lookup, and documented transformations.",
+   "Implement the missing nested projection/redaction operation and stable reason propagation.",
+   "Centralize canonical JSON encoding and source-position tracking.",
+   "Make route evaluation, partition creation, and manifest file ordering deterministic.",
+   "Fix quarantine serialization and byte-offset/source metadata.",
+   "Fix journal recovery to validate temporary-file prefixes and discard invalid suffixes.",
+   "Make output writing streaming and checkpoint-safe without reconstructing prior state.",
+   "Run gofmt, unit tests, and the visible exporter fixture again.",
+   "Generate adversarial configurations for includes, defaults, nulls, empty arrays, and overlapping routes.",
+   "Generate inputs covering malformed JSON, Unicode, escaped strings, large integers, and partition boundaries.",
+   "Run fault-injected interruptions at each journal checkpoint and resume to completion.",
+   "Rerun completed exports and compare complete directory trees and hashes.",
+   "Run the large fixture under memory observation and inspect cleanup and manifest completeness.",
+   "Review the final diff and worktree for unrelated changes and missing files."
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact command-line invocation, fault-injection controls, and reference-generator interface are not specified in the blueprint; if they are not discoverable in the repository, failures could reflect missing interface documentation rather than implementation defects.",
+   "The documented definitions of canonical JSON formatting, partition-boundary inclusion, byte offsets, and explicit null semantics must be fully precise; otherwise byte-level mismatches can be ambiguous.",
+   "Memory-observation results may be noisy in a shared or constrained container, especially with a 2 GB limit and only one CPU.",
+   "The requirement that a completed rerun leave no modification-relevant state changed should explicitly exclude filesystem timestamps or define which manifest fields are allowed to change.",
+   "The invalid-configuration requirement should clarify whether an existing output directory must remain byte-for-byte unchanged, including temporary files and journals."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a precise, deterministic end state and unusually strong verification against generated inputs, recovery faults, hashes, and complete output trees. It is broad and difficult to solve within an hour, but the repository is intentionally prepared with documented behavior and localized implementation gaps; the speedrun is above twenty commands, while the main difficulty is integration rather than opaque infrastructure. The source-visible nature of several defects limits genuine difficulty under the stated scoring rule, but the overall score still meets the acceptance threshold.",
+  "fixes": [
+   "Document the exact exporter invocation, fault-injection mechanism, reference-generator command, and memory-observation procedure in the task environment.",
+   "Specify canonical JSON formatting, manifest serialization, byte-offset encoding, partition-boundary rules, and whether filesystem timestamps are ignored.",
+   "Add an explicit atomic-output contract for invalid configurations and completed reruns, including treatment of pre-existing temporary files and journals.",
+   "Provide a small public recovery fixture and one documented checkpoint-failure example so agents can validate journal semantics without relying on hidden harness behavior."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This task is a configuration-driven telemetry routing and export pipeline, whereas the reference replays database transaction logs into a canonical snapshot."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "Although both require configuration merging and deterministic artifacts, this task transforms and partitions telemetry records while the reference audits SQL report execution into SQLite and error outputs."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This task performs JSON route selection, projection, casting, and resumable file export, unlike the reference's authenticated binary settlement reconciliation."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The shared notion of ordered route classification is superficial because this task is a batch transformation and partitioning system, not a stateful HTTP security gateway."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "This task exports records according to configurable routes and schemas, whereas the reference reconstructs incidents and actor relationships in a relational database."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.21
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.198
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.197
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.19
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.177
+    ]
+   ],
+   "cost_usd": 0.0009024
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0042812
+}

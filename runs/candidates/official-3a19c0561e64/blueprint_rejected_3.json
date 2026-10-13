@@ -1,0 +1,156 @@
+{
+ "blueprint": {
+  "slug": "sql-analytics-pipeline-recovery",
+  "title": "Repair Analytics SQL Aggregation Pipeline and Recovery Gate",
+  "scenario": "A business intelligence analyst notices daily query telemetry rollups in the SQLite warehouse have stopped matching raw query volumes after a mid-batch pipeline crash. The analytics pipeline processes query log dumps through a compiled C validator (`query_gate`) to filter malformed and malicious queries before executing a multi-stage aggregation in SQLite. The crash left the staging warehouse in an uncommitted lock state, the recovery shell script lacks idempotent rollback and deduplication logic, and `query_gate` contains naive substring checks that falsely reject valid analytical queries with keywords in string literals while letting commented SQL injection payloads bypass validation.",
+  "instruction_draft": "Hey, can you take a look at the analytics aggregation pipeline? The daily KPI numbers in SQLite have been completely off since the batch runner crashed mid-run on Tuesday. It turns out corrupted queries from client logs slipped past `query_gate` and poisoned the staging tables, and re-running `scripts/run_aggregation.sh` right now just double-counts transactions because the recovery cleanup is broken. We need `query_gate` fixed per the specs in `docs/query_policy.md`, and the recovery script in `scripts/run_aggregation.sh` repaired so dirty runs are rolled back cleanly, bad queries are quarantined, and the KPI tables in `/var/lib/analytics/warehouse.db` are accurately rebuilt. The verification test suite in `tests/` should pass completely.",
+  "requirements": [
+   "Fix `src/query_gate.c` so it strictly enforces the security and validation rules specified in `docs/query_policy.md`: accept read-only queries (`SELECT` or `WITH ... SELECT`), reject all DDL/DML (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `CREATE`, `ALTER`, `ATTACH`, `DETACH`, `PRAGMA`), ignore SQL comments (`--` and `/* ... */`) during statement validation, treat single-quoted strings `'...'` atomically so keywords inside literals do not trigger false rejections, reject semicolon-separated multi-statement queries, and reject queries targeting SQLite internal schema tables (`sqlite_%`).",
+   "Ensure `query_gate` compiles cleanly using `make -C /opt/analytics` and produces `/opt/analytics/bin/query_gate` with exit code 0 for valid queries and exit code 1 for rejected queries.",
+   "Repair `scripts/run_aggregation.sh` to make the recovery process idempotent: detect and roll back any dirty `staging_queries` table or dangling WAL state from previous aborted runs before ingestion begins.",
+   "In `scripts/run_aggregation.sh`, process incoming log files from `/var/lib/analytics/incoming/*.log` through `query_gate`, appending rejected queries and their `query_id` to `/var/lib/analytics/quarantine.log` with format `<query_id>|<timestamp>|<rejection_reason>`.",
+   "In `scripts/run_aggregation.sh`, insert validated queries into `processed_queries` in `/var/lib/analytics/warehouse.db`, deduplicating by `query_id` so replayed logs never double-count.",
+   "In `scripts/run_aggregation.sh`, compute daily aggregates and replace `/var/lib/analytics/warehouse.db` table `kpi_daily_summary` with accurate columns: `date` (YYYY-MM-DD), `total_queries` (INTEGER), `unique_users` (INTEGER), `total_runtime_ms` (INTEGER), and `avg_runtime_ms` (FLOAT rounded to 2 decimal places).",
+   "Atomically move fully processed log files from `/var/lib/analytics/incoming/` to `/var/lib/analytics/archive/` upon successful completion."
+  ],
+  "environment": [
+   "Dockerfile based on `python:3.13-slim-bookworm` installing `gcc`, `make`, `sqlite3`, `libsqlite3-dev`, `valgrind`, and `diffutils`.",
+   "Repository directory `/opt/analytics` containing `src/query_gate.c`, `src/lexer.c`, `src/lexer.h`, `Makefile`, and `docs/query_policy.md` (~900 lines of total C code).",
+   "Data directory `/var/lib/analytics/` containing `warehouse.db` (seeded with historical clean data plus dirty, uncommitted staging tables from an interrupted run), `incoming/` (containing raw batch query logs), and `archive/`.",
+   "Shell script `/opt/analytics/scripts/run_aggregation.sh` containing broken rollback handling, missing quarantine redirection, and non-idempotent insert logic.",
+   "Planted C bug: `src/query_gate.c` uses `strcasestr` on the raw query buffer instead of scanning token streams from `src/lexer.c`, causing strings like `SELECT * FROM audits WHERE action = 'DELETE_ROW'` to fail validation, and multiline comments like `/* harmless */ DROP TABLE logs` to bypass validation.",
+   "Planted Shell bug: `run_aggregation.sh` does not check for dirty staging tables or verify `query_gate` exit codes, and performs an unconditional `INSERT INTO kpi_daily_summary SELECT ...` that stacks duplicate rows every time the script is executed."
+  ],
+  "internal_hint": "1. Investigate `/opt/analytics/src/query_gate.c`. Notice `lexer.c` already provides a lexical tokenizer that categorizes comments, string literals, and identifiers, but `query_gate.c` bypassed it with crude `strcasestr` checks. Connect `query_gate.c` to use `lexer_next_token()` so comments and string literal bodies are ignored when searching for forbidden statements. Recompile with `make`.\n2. Inspect `/var/lib/analytics/warehouse.db` with `sqlite3`. Notice `staging_queries` exists with half-written rows and an unfinalized transaction marker. In `run_aggregation.sh`, add a pre-flight cleanup: `DROP TABLE IF EXISTS staging_queries;` within a fresh transaction.\n3. Modify `run_aggregation.sh` to feed each candidate query from `/var/lib/analytics/incoming/*.log` through `/opt/analytics/bin/query_gate`. If validation returns non-zero, write `<query_id>|<timestamp>|<reason>` to `/var/lib/analytics/quarantine.log`. If valid, stage the query.\n4. Ensure deduplication uses `INSERT OR IGNORE INTO processed_queries (query_id, user_id, timestamp, runtime_ms, query_text) ...` against existing rows in `warehouse.db`.\n5. Recompute `kpi_daily_summary` from `processed_queries` using `DELETE FROM kpi_daily_summary; INSERT INTO kpi_daily_summary SELECT date(timestamp, 'unixepoch'), COUNT(query_id), COUNT(DISTINCT user_id), SUM(runtime_ms), ROUND(AVG(runtime_ms), 2) FROM processed_queries GROUP BY 1 ORDER BY 1;`.\n6. Move processed logs from `incoming/` to `archive/` only after the SQLite transaction commits.",
+  "trap": "A solver that tests only against the provided sample logs will see clean runs, but the test verifier executes against a randomized hidden adversarial corpus where queries contain tricky benign constructs (e.g. string literals containing SQL keywords, single-line comments ending in semicolons, nested parentheses in CTEs) and subtle evasion payloads (e.g. comments concealing DDL statements, unclosed quotes, case-mixed system table access `sQlItE_mAsTeR`). Furthermore, running `run_aggregation.sh` twice without proper staging cleanup will double the counts in `kpi_daily_summary`.",
+  "tests": [
+   "Verify `/opt/analytics/bin/query_gate` compiles and links without errors or warnings under `gcc -Wall -Werror`.",
+   "Dynamic hidden adversarial corpus test: build a synthetic test set of 200 queries (100 tricky benign, 100 malicious/malformed) generated from a fixed PRNG seed; verify `query_gate` achieves 100% precision and recall (all benign accepted, all malicious rejected).",
+   "Idempotency and dirty state recovery test: plant corrupted uncommitted staging tables and lock markers in `warehouse.db`, run `scripts/run_aggregation.sh`, verify the script completes with exit code 0 and rolls back the dirty staging state cleanly.",
+   "Re-run resilience test: execute `scripts/run_aggregation.sh` twice in succession; verify that `kpi_daily_summary` numbers remain identical and deduplication prevents duplicate row counts.",
+   "Warehouse integrity test: verify row counts, column values, and quarantine entries in `/var/lib/analytics/quarantine.log` match exact expected ground-truth values for the initial test batch.",
+   "File state test: verify that `/var/lib/analytics/incoming/` is empty and all processed logs reside in `/var/lib/analytics/archive/`."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_size_and_complexity",
+   "value": "200 generated queries with multi-token keyword masking and nested comment/quote variations",
+   "effect": "Increasing size adds rarer SQL dialect permutations (e.g. CTE aliases with escaped strings, hex-encoded string literals); decreasing tests only basic single-statement SELECT vs DROP."
+  },
+  "expected_failure_modes": [
+   "The solver patches `query_gate.c` with more regex or string replacements instead of using the provided lexical tokenizer, failing on edge cases like comments containing quote marks or strings containing comment markers.",
+   "The solver fixes `query_gate` but neglects the shell recovery logic, leaving existing dirty records in `warehouse.db` from the interrupted run so the final aggregation numbers remain doubled.",
+   "The solver forgets to deduplicate on `query_id`, causing repeated invocations of `run_aggregation.sh` to inflate `total_queries` and `total_runtime_ms` in `kpi_daily_summary`.",
+   "The solver creates `quarantine.log` but does not adhere to the expected `<query_id>|<timestamp>|<rejection_reason>` format defined in the aggregation requirements.",
+   "The solver moves files to `archive/` before verifying the SQLite transaction committed, leading to lost logs if SQLite fails on an integrity constraint."
+  ],
+  "predicted_pass_rate": 0.35,
+  "difficulty": "hard",
+  "category": "data-engineering",
+  "tags": [
+   "c",
+   "sqlite",
+   "shell-scripting",
+   "data-pipelines",
+   "adversarial-validation",
+   "state-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cat docs/query_policy.md",
+   "cat src/lexer.h",
+   "cat src/query_gate.c",
+   "cat scripts/run_aggregation.sh",
+   "head -n 5 /var/lib/analytics/incoming/*.log",
+   "sqlite3 /var/lib/analytics/warehouse.db '.schema'",
+   "Edit src/query_gate.c to iterate tokens with lexer_next_token() and reject DDL/DML, multi-statements, and sqlite_% access while permitting SELECT / WITH ... SELECT",
+   "make -C /opt/analytics",
+   "echo \"SELECT 'DROP TABLE' FROM t;\" | /opt/analytics/bin/query_gate && echo 'OK'",
+   "Edit scripts/run_aggregation.sh: add DROP TABLE IF EXISTS staging_queries pre-flight, loop over incoming logs, run query_gate, write quarantine lines on error, INSERT OR IGNORE into processed_queries, rebuild kpi_daily_summary, and mv logs to archive",
+   "bash /opt/analytics/scripts/run_aggregation.sh",
+   "sqlite3 /var/lib/analytics/warehouse.db 'SELECT * FROM kpi_daily_summary;'",
+   "cat /var/lib/analytics/quarantine.log",
+   "bash /opt/analytics/scripts/run_aggregation.sh",
+   "pytest tests/"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Quarantine reason mismatch: the instruction specifies `<query_id>|<timestamp>|<rejection_reason>`, but does not document the exact rejection reason strings expected by the verification assertions (e.g. 'FORBIDDEN_KEYWORD' vs 'FORBIDDEN_STATEMENT' vs 'SYNTAX_ERROR').",
+   "Exit code vs output channel ambiguity: the instruction specifies `query_gate` exits 0 or 1, but does not specify whether `rejection_reason` is output to stdout, stderr, or derived by the shell script.",
+   "Log file structure: incoming log format (delimiter, column positions) is not specified in the prompt, forcing the solver to deduce column mappings from broken script lines."
+  ],
+  "verdict": "reject",
+  "reasons": "The blueprint falls squarely into the pattern where planted bugs are directly visible upon reading the source files (`query_gate.c` using `strcasestr` instead of `lexer.c`, and `run_aggregation.sh` missing table drops and using basic `INSERT`). A standard agent can inspect and repair both files in approximately 15 commands. Additionally, strict verification on `quarantine.log` without explicitly specifying the rejection reason schema creates an invalid failure risk.",
+  "fixes": [
+   "Specify the exact enum / string constants for `<rejection_reason>` in `docs/query_policy.md` and clarify whether `query_gate` prints the reason to stdout or returns discrete exit status codes.",
+   "Raise genuine difficulty by making the C validator enforce structural SQL grammar constraints (such as parsing expression-level subqueries and nested CTE scoping) rather than an obvious pre-built tokenizer substitution, or make the WAL state recovery require inspecting and handling actual SQLite lock state / recovery pragmas."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference focuses on optimizing telemetry shard ingestion into SQLite to meet execution time, size, and query parity constraints, whereas the candidate requires fixing a C SQL security tokenizer/validator and implementing idempotent recovery logic in a shell ingestion script."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference requires optimizing and bug-fixing a Rust binary sensor aggregation accumulator to match a reference binary, whereas the candidate focuses on C SQL parser validation and shell/SQLite pipeline recovery."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "distinct",
+     "reason": "The reference involves translating recursive JSON filter specifications into SQL queries in bash to match a reference binary, while the candidate centers on C lexical validation of raw SQL queries and SQLite crash recovery."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference focuses on fixing a multi-stage Rust binary spool demultiplexer and extraction pipeline, whereas the candidate addresses C SQL parsing and SQLite idempotent ingestion recovery."
+    },
+    {
+     "ref_id": "ours/official-f821c68cb15f",
+     "verdict": "distinct",
+     "reason": "The reference requires building an HTTP service that unpacks binary logs and solves temporal interval matching for request attribution, which is completely different from the candidate's C SQL gate and SQLite aggregation recovery."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-3ba65cf95a9b",
+     0.257
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.117
+    ],
+    [
+     "ours/official-18899524e171",
+     0.113
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.105
+    ],
+    [
+     "ours/official-f821c68cb15f",
+     0.097
+    ]
+   ],
+   "cost_usd": 0.005019000000000001
+  },
+  "novel": true
+ },
+ "cost_usd": 0.018819000000000002
+}

@@ -1,0 +1,165 @@
+{
+ "blueprint": {
+  "slug": "firewall-counter-replay",
+  "title": "Repair Firewall Counter Replay",
+  "scenario": "The edge team\u2019s firewall dashboard says allowed traffic and denied traffic no longer add up after a policy rollout. The container contains a small policy-observability service, historical packet-decision logs, metrics snapshots, and a production policy matcher shipped only as an opaque executable. You need to finish the replay path so analysts can regenerate trustworthy per-rule counters from those logs.",
+  "instruction_draft": "Hey, can you get `/opt/edge/bin/replay-report` working again? Given a policy bundle and a decision-log file, it must emit the documented JSON report with packet counts and byte totals by policy generation and rule, plus the overall allow/deny totals. It needs to handle policy reloads, wrapped event sequence numbers, IPv4 and IPv6 addresses, negated CIDRs, port ranges, and rules that continue after a nonterminal match; on fresh test logs, the reported packet classification and byte totals must be at least 99.5% correct against the reference output, while keeping the existing CLI and JSON schema intact.",
+  "requirements": [
+   "Make `/opt/edge/bin/replay-report POLICY EVENT_LOG` execute successfully without network access.",
+   "Preserve the existing command-line interface and documented JSON schema.",
+   "Report packet counts and byte totals grouped by policy generation and rule.",
+   "Report overall allowed and denied packet counts and byte totals.",
+   "Correctly process policy reloads in one event log.",
+   "Correctly process event sequence numbers after their fixed-width counter wraps.",
+   "Support both IPv4 and IPv6 packet addresses, including IPv4-mapped IPv6 addresses.",
+   "Support positive and negated CIDR predicates.",
+   "Support inclusive single-port and port-range predicates.",
+   "Continue evaluating rules after a nonterminal match and stop only when the policy semantics say to stop.",
+   "On hidden generated logs, achieve at least 99.5% accuracy for packet classifications and byte totals compared with the reference report."
+  ],
+  "environment": [
+   "Use a Dockerfile based on `python:3.13-slim-bookworm`, with pinned apt packages only and no network dependency at run time.",
+   "Create roughly 1,400 lines across Python modules for policy loading, log ingestion, report aggregation, a CLI wrapper, fixtures, and unrelated health-check code.",
+   "Ship `/opt/edge/bin/replay-report` and a README describing invocation, output fields, and several ordinary examples.",
+   "Provide human-readable policy YAML containing ordered rules with action, terminal/nonterminal behavior, protocol, CIDR, port, and optional tag fields.",
+   "Provide a compact binary decision-log format whose framing and field meanings are described only partially in the README; records include generation IDs, delta-encoded sequence values, packet metadata, and byte lengths.",
+   "Ship `/opt/edge/lib/policy_matcher`, a compiled black-box reference matcher with a probe mode but no source code. Its unusual behavior includes canonicalization of IPv4-mapped IPv6 values, inclusive ranges, negated predicates, and nonterminal rule matches.",
+   "Leave the replay decoder and rule-attribution component incomplete, with a deliberately simplistic fallback that passes the visible examples but is not correct generally.",
+   "Include several static logs and expected reports for smoke testing, including one reload and one simple port range.",
+   "Plant two runtime-only failures in the surrounding path: sequence deltas are accumulated across a generation boundary when the low counter wraps, and rule counters are merged by rule number without generation identity. The failures only become observable together on logs containing a reload near a counter wrap.",
+   "Include deterministic generators used by verification to create fresh policy bundles and logs with thousands of records, rare IPv4-mapped addresses, negated CIDRs, boundary ports, reloads, and counter wraps.",
+   "Include a reference shell script that first runs the smoke examples, probes the opaque matcher, generates a diagnostic log, compares reports, and then applies the complete deterministic repair."
+  ],
+  "internal_hint": "The shortest reliable path is investigative rather than source inspection: run the supplied examples, inspect the binary framing and existing aggregator, then use the opaque matcher\u2019s probe mode on one predicate at a time and on combinations. The missing component must decode framed records with the documented magic/version, length, CRC, generation marker, and modular sequence deltas, then evaluate the ordered policy as a constraint problem rather than selecting the first syntactically matching rule. In particular, a negated CIDR is a predicate on the normalized address family, port ranges include both endpoints, and a nonterminal match contributes its tag before evaluation continues. Counters must be keyed by `(generation, rule_id)`, and sequence unwrapping must reset its baseline at reload while retaining the correct modular delta for records after the wrap. A good engineer discovers the two aggregation defects by constructing a reload-plus-wrap log and comparing per-generation totals; fixing only the sequence arithmetic or only the counter key makes the visible total look plausible but leaves hidden per-rule reports wrong.",
+  "trap": "A shallow solution can parse the visible records, use ordinary first-match firewall logic, and pass all supplied examples. It fails generated cases where an IPv4-mapped IPv6 address meets a negated CIDR, a packet hits a nonterminal rule before a later terminal rule, or a port lies exactly at a range endpoint. Another tempting solution resets all counters or sequence state on reload; that makes one hand-built report look right but loses packets around a wrapped counter and combines identically numbered rules from different generations.",
+  "tests": [
+   "Smoke execution checks that the repaired CLI accepts the documented policy and event-log paths and emits valid JSON with all required top-level and grouped fields.",
+   "Visible fixture comparison checks ordinary IPv4 matching, a simple reload, and a non-wrapped sequence range.",
+   "A generated-policy test creates fresh ordered rule sets containing positive and negated IPv4/IPv6 CIDRs, mapped IPv4 addresses, protocols, single ports, inclusive ranges, and terminal/nonterminal combinations; it compares every packet classification and per-rule count with the reference.",
+   "A generated-log test emits thousands of records with compact framing, variable record lengths, multiple policy generations, modular sequence wraps, and reloads near wraps; it compares total packets, total bytes, and all `(generation, rule)` counters.",
+   "A malformed-input test checks that truncated frames, bad CRCs, unknown versions, and impossible lengths are rejected with a nonzero exit rather than silently inflating metrics.",
+   "The metric-threshold test requires at least 99.5% agreement on packet classifications and byte totals over hidden seeded inputs; the verifier invokes the candidate repeatedly on fresh deterministic seeds rather than relying on the provided fixtures."
+  ],
+  "verifier_knob": {
+   "name": "minimum replay accuracy",
+   "value": "0.995",
+   "effect": "Raising the threshold toward 1.0 requires complete handling of rare address-family, boundary, reload, and wrap cases; lowering it allows partial decoders or implementations that miss uncommon policy combinations to pass."
+  },
+  "expected_failure_modes": [
+   "The solver implements a normal first-match firewall evaluator and misses nonterminal rule semantics.",
+   "The solver treats IPv4-mapped IPv6 addresses as ordinary IPv6 and gets negated CIDR cases wrong.",
+   "The solver treats port ranges as half-open or mishandles protocol-specific absent ports.",
+   "The solver resets sequence state at every reload instead of applying modular arithmetic around the counter wrap.",
+   "The solver aggregates rule IDs globally and silently merges equal rule numbers from separate policy generations.",
+   "The solver reverse-engineers only the visible binary records and fails on variable-length frames, CRC rejection, or rare generated fields.",
+   "The solver fixes one interacting aggregation bug, observes plausible overall totals, and does not validate the per-generation report.",
+   "The solver writes a decoder that works on the fixtures but assumes records arrive sorted or that reloads occur far from sequence wraps."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "networking",
+  "tags": [
+   "firewall",
+   "binary-logs",
+   "constraint-satisfaction",
+   "reverse-engineering",
+   "metrics",
+   "stateful-replay"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the image and inspect the README and shipped scripts.",
+   "Inspect the reference shell script to determine what it changes.",
+   "Run the reference script; as described, it applies the complete deterministic repair.",
+   "Run the smoke examples and verify that replay-report emits valid JSON.",
+   "Run the generated diagnostic comparison against the opaque matcher.",
+   "Run malformed-input checks and confirm nonzero exits.",
+   "Run the reload-plus-wrap case and inspect per-generation rule counters.",
+   "Run the full verification script on fresh seeds."
+  ],
+  "speedrun_commands": 8,
+  "scores": {
+   "clarity": 3,
+   "solvability": 5,
+   "verifiability": 1,
+   "genuine_difficulty": 1,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The shipped reference shell script is said to apply the complete repair, so a solver can likely finish by executing or copying that repair rather than implementing or investigating anything.",
+   "The requested per-packet classification comparison is not clearly representable in a report described as containing only aggregate counts and byte totals; tests may be overreaching unless the schema includes packet-level attribution.",
+   "The framing and reload/sequence-baseline semantics are intentionally only partially documented, which can make failures reflect undocumented format assumptions rather than engineering ability.",
+   "Pinned apt versions may not remain available from the configured Bookworm repositories, making image construction flaky unless the package artifacts are vendored or the base image is pinned by digest."
+  ],
+  "verdict": "reject",
+  "reasons": "The core challenge could be realistic and technically meaningful, but the explicitly shipped script that applies the complete deterministic repair makes the task trivially solvable and defeats both difficulty and verification. The aggregate-only schema also appears inconsistent with tests that compare every packet classification, so the blueprint is not currently robust enough to accept.",
+  "fixes": [
+   "Remove the repair-applying script from the solver-visible image; keep the oracle, generators, and repair procedure in an external verifier-only harness.",
+   "If a diagnostic script is shipped, make it read-only and ensure it cannot modify replay-report or reveal the reference patch.",
+   "Define where packet-level classifications are exposed, or change the generated-policy test to compare only fields actually present in the documented JSON schema.",
+   "Document the exact framing, reload marker, modular sequence baseline, and protocol/absent-port semantics, or provide a separate inspectable format contract while retaining matcher probing for policy behavior.",
+   "Vendor pinned build dependencies or pin the base image and package artifacts so Docker builds are reproducible without relying on mutable apt repositories."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The candidate reconstructs firewall policy decisions from historical event logs, whereas this task fixes concurrent per-user CPU budgeting and persistent accounting in an HTTP service."
+    },
+    {
+     "ref_id": "ours/official-e5238fcac164",
+     "verdict": "distinct",
+     "reason": "Although both aggregate network-related logs into byte counters, the candidate replays policy generations and rule semantics while this task parses NetFlow v9 templates and maps flows to ASN and DSCP classes."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "The candidate computes historical firewall counters using an opaque matcher, while this task repairs a WAF rule compiler, deployment pipeline, runtime filter, and deployment-version integrity."
+    },
+    {
+     "ref_id": "ours/official-ae2e414b859f",
+     "verdict": "distinct",
+     "reason": "This task repairs a packet codec's round-trip correctness and build configuration, not policy-log replay or counter reconstruction."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "Both involve replaying logs and producing aggregates, but the candidate requires policy-aware packet decision reconstruction with reload and matching semantics, whereas this task repairs GeoIP enrichment, database ingestion, and API statistics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-d32334dff4ab",
+     0.134
+    ],
+    [
+     "ours/official-e5238fcac164",
+     0.132
+    ],
+    [
+     "ours/official-10912a593843",
+     0.112
+    ],
+    [
+     "ours/official-ae2e414b859f",
+     0.11
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.105
+    ]
+   ],
+   "cost_usd": 0.000959
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0055915999999999995
+}

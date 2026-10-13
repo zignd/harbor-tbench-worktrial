@@ -1,0 +1,188 @@
+{
+ "blueprint": {
+  "slug": "harden-event-admission-gateway",
+  "title": "Harden the Event Admission Gateway",
+  "scenario": "A security engineer is auditing an in-house Rust event-ingestion service that runs together with a shell-based admission wrapper in one container. The service authenticates tenant envelopes through a compiled, undocumented sealing helper, maintains replay history, and writes accepted events into tenant spools; the environment contains realistic source, configuration, historical state, fixtures, and unrelated operational code.",
+  "instruction_draft": "Repair and deploy the event admission service under /opt/eventgate so that every request in the supplied and verify-time corpora is either delivered exactly once to its authenticated tenant's spool or rejected, with no other filesystem, process, or network effects. Preserve all valid requests, including unusual valid JSON and out-of-order requests, while rejecting forged, malformed, replayed, cross-tenant, and path-escaping requests, and keep the health endpoint working.",
+  "requirements": [
+   "The service must remain runnable through the supplied deployment and health-check commands.",
+   "Every valid request must be accepted and delivered to the spool belonging to its authenticated tenant.",
+   "Every invalid, forged, malformed, replayed, cross-tenant, and path-escaping request must be rejected.",
+   "Each accepted request must be delivered exactly once, including when requests arrive out of order.",
+   "Valid requests containing unusual but legal JSON values and strings must not be rejected or altered incorrectly.",
+   "Accepted events must not cause command execution, arbitrary filesystem writes, symlink traversal, or network activity.",
+   "The shell admission wrapper must safely handle hostile field contents and pipeline failures.",
+   "The service must preserve the existing tenant and replay state across restarts.",
+   "The health endpoint must remain available while the admission path is repaired."
+  ],
+  "environment": [
+   "The Dockerfile starts from python:3.13-slim-bookworm, installs pinned Rust build tooling and a small pinned Python test harness, and contains no network dependency at runtime.",
+   "The repository is approximately 1,500 lines across a Rust HTTP service, a shell admission wrapper, spool management, configuration loading, diagnostics, and unrelated maintenance utilities.",
+   "The public entry point is /opt/eventgate/bin/serve, which starts a Rust service and an admission pipeline in the same container; /health and /submit are documented by local README files and examples.",
+   "Requests are signed tenant envelopes containing tenant identity, epoch, sequence number, destination name, payload, and an opaque seal. Accepted payloads are written beneath /var/lib/eventgate/spool/<tenant>/.",
+   "A compiled binary at /opt/eventgate/libexec/sealbox is shipped without source. It supports signing and verification subcommands and is the only authority for the envelope seal and its canonical byte representation; its behavior must be learned experimentally.",
+   "The shell wrapper currently combines JSON extraction, sealbox invocation, replay-state lookup, and dispatch, with deliberately unsafe quoting and error-handling interactions.",
+   "The Rust service contains a superficially reasonable JSON parser and replay-window implementation, but its behavior diverges from sealbox for duplicate keys, escaped strings, integer boundaries, and some legal whitespace and UTF-8 forms.",
+   "Historical replay state contains multiple tenants, an epoch transition, out-of-order accepted sequences, duplicate deliveries, and sequences near unsigned integer boundaries.",
+   "Tenant destinations include ordinary names plus names containing spaces, shell metacharacters, percent escapes, Unicode, and path-like text; the spool tree includes symlinks and pre-existing files.",
+   "Visible fixtures cover ordinary valid requests, one forged seal, and one simple duplicate, while verify-time tests generate fresh signed envelopes and mutations from a hidden deterministic seed."
+  ],
+  "internal_hint": "A reference solution first inventories the process tree, fixtures, state files, and shell tracing behavior, then probes sealbox with controlled JSON permutations and boundary values rather than assuming ordinary JSON serialization. It reconstructs the exact canonical framing and learns that verification depends on raw typed values and length-delimited fields, not the Rust serializer's output. It then models the historical replay state and derives a persistent sliding-window bitmap per tenant and epoch, including epoch rollover, out-of-order arrivals, duplicates, and wide sequence values. The planted failures are an unsafe eval-like shell dispatch path, loss of distinctions during shell/JSON field extraction, a Rust replay window truncated to 32 bits and reset incorrectly on restart, validation of a decoded path before the final normalization step, and non-atomic spool/replay updates. The fix uses strict typed parsing, sealbox-compatible framing, checked tenant/path resolution beneath an opened spool directory, shell arrays or a no-shell exec boundary, lock-and-rename state updates, and crash-safe ordering so an accepted envelope cannot be delivered twice.",
+  "trap": "A shallow solution that replaces eval with a few quotes and tests the visible fixtures will appear correct, but hidden envelopes exploit shell metacharacters, duplicate JSON keys, alternate escaping, Unicode normalization, percent-decoded traversal, symlinked destinations, large or out-of-order sequence numbers, restart history, and an epoch transition. A solution that merely asks sealbox to verify the original text or uses a monotonically increasing counter rejects valid reordered traffic, while a solution that writes the spool before durable replay state produces duplicate deliveries after a forced restart.",
+  "tests": [
+   "Start the deployed service and verify that /health responds correctly after repeated wrapper failures and normal restarts.",
+   "Submit thousands of deterministic hidden valid envelopes produced by sealbox, including arbitrary legal payloads, unusual whitespace, escaped strings, duplicate-looking values, Unicode, spaces, and destination names; compare accepted spool records byte-for-byte with the reference.",
+   "Generate valid envelopes in shuffled order across each tenant's existing replay history, including sequences inside and outside the replay window, epoch rollover, duplicate sequence numbers, and values near integer-width boundaries.",
+   "Mutate valid envelopes by changing tenant, epoch, sequence, destination, payload, seal encoding, field order, truncation, length fields, and JSON types; require rejection without any spool or replay-state change.",
+   "Exercise shell-injection corpus entries in tenant and destination fields and verify that no marker file, extra process, command output, or network connection is created.",
+   "Use traversal corpus entries involving absolute paths, dot segments, repeated separators, percent escapes, backslashes, UTF-8 lookalikes, and symlink targets; require rejection and unchanged files outside the authenticated spool.",
+   "Replay accepted requests after clean and unclean service restarts and compare final spools and replay state with the deterministic reference outcome.",
+   "Inject failures between authentication, spool write, and replay-state commit; verify that retrying an envelope results in exactly one delivered record and no silent acceptance of a failed request.",
+   "Run verify-time generated corpora with fresh tenant names, keys, payloads, and mutation combinations so hard-coded fixture handling cannot pass."
+  ],
+  "verifier_knob": {
+   "name": "hidden-envelope-corpus",
+   "value": "12,000 deterministic requests with 35% valid reordered traffic and 65% structured mutations covering canonicalization, replay, shell, path, Unicode, restart, and symlink cases",
+   "effect": "Lowering the corpus size or mutation coverage makes shallow quoting and ordinary JSON implementations more likely to pass; raising it increases the chance of exercising rare canonicalization combinations, state-boundary cases, and interactions between replay, filesystem safety, and process execution."
+  },
+  "expected_failure_modes": [
+   "Assuming the opaque seal helper signs conventional sorted JSON instead of experimentally determining its framing.",
+   "Using a JSON round-trip that changes duplicate-key, escape, number, or Unicode semantics before verification.",
+   "Implementing replay as a strict high-water mark or a narrow integer counter rather than a persistent per-tenant sliding bitmap.",
+   "Updating replay state and spool files in the wrong order, causing duplicate delivery after interruption.",
+   "Fixing obvious shell quoting while leaving command substitution, word splitting, pipeline status, or an eval-equivalent dispatch path.",
+   "Checking a destination before decoding or normalization, allowing traversal through a later transformation.",
+   "Ignoring existing history and testing only a clean state.",
+   "Replacing the required shell/Rust boundary with a local implementation that does not match the opaque helper or deployment lifecycle.",
+   "Testing only the supplied examples and missing rare interactions among valid unusual inputs, replay state, and filesystem names."
+  ],
+  "predicted_pass_rate": 0.19,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "shell-scripting",
+   "rust",
+   "replay-protection",
+   "opaque-component",
+   "path-traversal",
+   "adversarial-corpus"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the repository tree, deployment scripts, README files, configuration, fixtures, state files, and existing tests.",
+   "Read the Dockerfile and verify that all Rust, Python, and test dependencies are available without network access.",
+   "Build and start /opt/eventgate/bin/serve using the supplied deployment command.",
+   "Check /health, /submit, process state, spool contents, and replay-state files.",
+   "Run the visible tests and reproduce the supplied valid, forged, and duplicate requests.",
+   "Read the Rust service, shell wrapper, spool manager, configuration loader, and diagnostics code.",
+   "Trace the wrapper with safe and hostile inputs to identify eval-like dispatch, quoting, pipeline, and error-handling behavior.",
+   "Inspect historical replay files and infer tenant, epoch, sequence, duplicate, and rollover semantics.",
+   "Run sealbox help and signing/verifying commands on a baseline envelope.",
+   "Generate controlled sealbox inputs varying field order, whitespace, escaping, duplicate keys, JSON types, Unicode, and integer boundaries.",
+   "Compare sealbox results and outputs to infer its exact typed, length-delimited canonical framing.",
+   "Probe sealbox with malformed and mutated envelopes to distinguish parsing, authentication, and semantic failures.",
+   "Implement sealbox-compatible typed parsing and framing without lossy JSON round-tripping.",
+   "Replace the replay high-water mark with a persistent per-tenant, per-epoch sliding bitmap supporting wide sequences and rollover.",
+   "Define authenticated tenant and destination resolution using decoded, normalized components beneath an opened spool directory.",
+   "Remove shell evaluation and use arrays or a no-shell exec boundary with explicit pipeline-status handling.",
+   "Implement durable replay/spool commit and recovery logic for interruption between authentication, delivery, and state update.",
+   "Preserve the existing state format or migrate it atomically while retaining historical entries.",
+   "Build the Rust service and wrapper, then redeploy through the supplied entry point.",
+   "Run visible valid, malformed, forged, duplicate, traversal, shell-injection, and unusual-JSON cases.",
+   "Exercise shuffled valid traffic, epoch transitions, large sequences, restarts, and pre-existing symlinks.",
+   "Inject failures at authentication, spool-write, and replay-commit boundaries and verify retry behavior.",
+   "Run the supplied corpus and compare spool bytes, replay state, process behavior, and health responses with the reference.",
+   "Inspect for unauthorized files, processes, command output, symlink escapes, and network connections.",
+   "Repeat clean and unclean restarts and perform a final deployment and health check."
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Exactly-once delivery across crashes between separate spool and replay-state updates is not achievable without a precisely specified durable transaction, recovery, or idempotence protocol; tests could reject otherwise reasonable implementations.",
+   "The phrase \"no other filesystem ... effects\" conflicts with required replay persistence, recovery metadata, locking, and atomic replacement unless unauthorized effects are explicitly distinguished from required state changes.",
+   "The expected spool-record naming, byte-preservation rules, duplicate-key interpretation, and crash-recovery reference behavior are not fully specified, so valid implementations may disagree with the verifier.",
+   "Tests for no network or extra processes can be flaky if the harness, health checks, compiler, or container startup performs incidental activity outside the service.",
+   "The claim that pinned packages make the environment buildable is insufficient unless all Rust crates and Python dependencies are vendored or pre-cached; otherwise a no-network build can fail before the task begins.",
+   "Fresh verify-time tenants and keys may be incompatible with fixed configuration or the undocumented sealbox interface unless the mechanism for provisioning them is explicitly defined.",
+   "The corpus size and failure-injection/restart tests may exceed practical time or storage limits on a 1 CPU, 2 GB container."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is genuinely difficult and mostly well targeted, but it is not plausibly solvable by a skilled engineer in under an hour given the opaque canonicalization, historical replay model, shell safety, path resolution, and crash-consistency requirements. It also leaves the exact-once crash protocol and some observable side-effect semantics underspecified, so a correct implementation could fail for reasons unrelated to the intended security work.",
+  "fixes": [
+   "Specify the authoritative exactly-once recovery protocol, including the allowed durable metadata, commit ordering, crash points, and reference outcome after each injected failure.",
+   "Define precisely what \"no other filesystem effects\" excludes and which locks, temporary files, journals, or recovery markers are permitted.",
+   "Provide a small sealbox probing harness and an explicit envelope/output contract while still requiring the solver to discover the framing.",
+   "State the canonical interpretation and preservation requirements for duplicate keys, numbers, Unicode normalization, escaped strings, and payload bytes.",
+   "Vendor or pre-cache every build and test dependency and document the supported offline build command.",
+   "Define tenant/key provisioning for verify-time fresh envelopes and specify spool filename, record format, and replay-state compatibility expectations.",
+   "Reduce the corpus and fault-injection workload or provide a generous explicit time and storage budget for the constrained container."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "This concerns persistent per-user rolling CPU-budget enforcement and ledger consistency, not authenticated event admission, replay protection, or filesystem-safe delivery."
+    },
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "This is a canary health-window and rollback state-machine repair, with no corresponding event authentication, replay, spool, or shell-safety problem."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "This task builds a database-backed HTTP aggregation service around a compiled query engine, unlike the candidate's security-sensitive admission and delivery pipeline."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "Although both involve event filtering and deduplication, this task centers on rolling-window log rate limiting and metrics export rather than authenticated tenant routing, replay persistence, and side-effect confinement."
+    },
+    {
+     "ref_id": "ours/official-10912a593843",
+     "verdict": "distinct",
+     "reason": "This repairs YAML rule compilation and WAF request classification, whereas the candidate requires cryptographic admission, replay handling, tenant spool delivery, and sandboxed wrapper behavior."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-d32334dff4ab",
+     0.167
+    ],
+    [
+     "ours/official-073b0a97c3b3",
+     0.107
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.105
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.104
+    ],
+    [
+     "ours/official-10912a593843",
+     0.099
+    ]
+   ],
+   "cost_usd": 0.0009544
+  },
+  "novel": true
+ },
+ "cost_usd": 0.003993
+}

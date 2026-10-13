@@ -1,0 +1,74 @@
+{
+ "slug": "repair-log-replay-sql",
+ "title": "Repair the Log Replay SQL Pipeline",
+ "scenario": "A data engineer inherited an incident-log replay job that turns sharded service logs into session and latency metrics, but the current release silently drops or invents records. The container contains the replay runner, SQLite schemas and queries, a small opaque line-decoding helper, fixtures, and operational notes; please make the existing command trustworthy for the next backfill.",
+ "instruction_draft": "Hey, can you repair `./bin/replay INPUT_DIR OUTPUT_DIR`? It must recursively process every regular `.log` file, continue past bad physical lines, and write deterministic `events.csv`, `sessions.csv`, `metrics.csv`, and `rejects.csv` outputs; rerunning over an existing or partially written output directory must produce the same result without duplicate rows. A valid line is one UTF-8 JSON object with exactly the keys `event_id`, `ts_ms`, `tenant`, `session`, `op`, `latency_us`, and `status`: `event_id` is a unique nonempty ASCII identifier of at most 80 characters, `ts_ms` is an integer from 0 through 4102444800000, `tenant` and `session` match `[A-Za-z0-9_-]+` and have lengths 1-32 and 1-64, `op` is one of `start`, `hit`, `finish`, or `error`, `latency_us` is an integer from 0 through 2147483647, and `status` is `ok` or `fail`; duplicate JSON keys, extra keys, invalid UTF-8, control characters, wrong JSON types, and constraint violations are rejects rather than partially parsed events. Keep one copy of each valid event, choosing the earliest record under `(ts_ms, relative_filename, physical_line_number, event_id)` when `event_id` repeats; accepted events must be emitted in that same order. A session is accepted only when its `(tenant, session)` group has exactly one `start` and one `finish`, the start is no later than every event and every event is no later than the finish, and all events pass validation; otherwise none of that session's events contribute to metrics. `sessions.csv` must contain one row per accepted session with tenant, session, start_ms, finish_ms, event_count, error_count, and duration_ms. `metrics.csv` must contain one row for every tenant/op pair present in accepted sessions, with event_count, ok_count, fail_count, latency_sum_us, latency_max_us, and nearest-rank p95 latency (rank `ceil(0.95*n)` after sorting accepted event latencies). CSV fields must be correctly quoted, headers must be present, rejects must include relative filename, physical line number, and a stable reason, and output must not depend on filesystem enumeration order.",
+ "requirements": [
+  "Process every regular file ending in `.log` recursively under the input directory.",
+  "Continue processing after malformed physical lines and record each rejected line with relative filename, physical line number, and a stable reason.",
+  "Reject invalid UTF-8, invalid JSON, non-object JSON, duplicate keys, extra keys, wrong JSON types, control characters, and all stated range or pattern violations.",
+  "Retain valid records while deduplicating event_id according to the specified ordering tuple.",
+  "Emit accepted events in deterministic `(ts_ms, relative_filename, physical_line_number, event_id)` order.",
+  "Accept only sessions with exactly one start and finish and with every event timestamp between those lifecycle timestamps.",
+  "Exclude all events from rejected sessions from both sessions.csv and metrics.csv.",
+  "Produce the required sessions.csv columns and exact session aggregates.",
+  "Produce the required metrics.csv columns and exact counts, sums, maxima, and nearest-rank p95 values.",
+  "Produce correctly quoted CSV files with headers.",
+  "Make output independent of filesystem enumeration order.",
+  "Make clean reruns and reruns over partial output directories idempotent and free of duplicate rows.",
+  "Write events.csv, sessions.csv, metrics.csv, and rejects.csv in the requested output directory."
+ ],
+ "environment": [
+  "A Debian-based Python 3.13 container with SQLite and pinned standard dependencies, one CPU, and 2 GB RAM.",
+  "A roughly 1,500-line in-house replay application spread across a Python runner, SQL migrations, stage queries, CSV emission code, tests, and operational notes.",
+  "`bin/replay` executes four dependent stages: line decoding and quarantine, SQLite event normalization/deduplication, session materialization, and metric aggregation.",
+  "A stripped compiled helper `bin/linegate` is shipped without its implementation source; it handles byte-to-line recovery and emits decoded candidates and byte offsets.",
+  "The visible fixtures contain ordinary JSONL, one malformed line, a simple duplicate event, and a straightforward valid session, so a superficial correction appears to work.",
+  "The planted defects include permissive SQLite JSON coercion, an ordering tie error in deduplication, lifecycle filtering applied after aggregation, and non-atomic stage reuse that appends to existing CSVs.",
+  "The helper has data-dependent behavior around CRLF boundaries, escaped control characters, and records spanning its internal block boundary; its behavior must be discovered experimentally and safely compensated for by the pipeline.",
+  "Documentation describes the intended file formats, command invocation, stage directories, and the CSV schemas, but does not identify the faulty implementation paths.",
+  "The verifier supplies fresh generated corpora containing benign records, duplicate keys, numeric-looking strings, Unicode and invalid UTF-8, CRLF and boundary-sized lines, timestamp ties, duplicate IDs across shards, malicious SQL-like strings, rejected lifecycle groups, and thousands of ordinary events."
+ ],
+ "internal_hint": "The shortest reliable resolution is investigative rather than source-only: run the supplied fixtures, inspect stage databases and manifests, probe linegate with a matrix of byte-boundary, CRLF, escaped-control, duplicate-key, and malformed-UTF-8 cases, and compare intermediate rows against a small independent Python oracle. The helper's stream protocol loses a final unterminated line after certain block boundaries and incorrectly exposes escaped control characters as decoded controls; bypass or compensate for those cases before SQLite validation. Replace JSON1 extraction that coerces strings and accepts duplicate-key last-wins objects with strict parsing and explicit key/type checks. Preserve relative paths and physical line numbers through every stage, make deduplication use the complete specified tuple rather than timestamp alone, materialize accepted sessions before metric aggregation, calculate nearest-rank p95 over the accepted event set, and rebuild stages into temporary directories followed by atomic replacement so interrupted or repeated runs cannot append stale rows.",
+ "trap": "A naive fix that only changes the visible SQL predicates passes the supplied examples but fails hidden inputs with numeric strings, duplicate JSON keys, timestamp ties across shards, malformed records near the helper's block boundary, and sessions containing one invalid event. Another common shallow solution aggregates before lifecycle filtering or appends to existing CSVs, causing small early discrepancies to compound into incorrect session counts and percentile metrics on large generated corpora.",
+ "tests": [
+  "Run the command on the visible fixture and compare all four CSV files, including headers, ordering, quoting, and reject reasons.",
+  "Generate fresh valid and invalid JSONL shards with randomized directory names and filesystem creation order, then compare every output row with an independent strict-parser oracle.",
+  "Exercise malformed UTF-8, duplicate keys, extra keys, control characters, wrong JSON types, range violations, and SQL-like tenant/session/event strings; verify bad lines are rejected without dropping unrelated good lines.",
+  "Place valid and invalid lines around CRLF boundaries, escaped characters, unterminated final lines, and the opaque helper's block boundaries; verify recovery and physical line numbering.",
+  "Generate duplicate event IDs across files and equal timestamps, checking the complete tie-breaking tuple and deterministic accepted-event order.",
+  "Generate sessions with missing or repeated lifecycle events, out-of-range timestamps, invalid members, and valid interleavings; verify rejected sessions contribute no rows to either session or metric results.",
+  "Compare metric counts, sums, maxima, and nearest-rank p95 values for thousands of generated events, including n values where percentile interpolation would differ from nearest-rank selection.",
+  "Run with randomized file enumeration order and confirm byte-identical outputs.",
+  "Interrupt or remove stage artifacts between stages, rerun into an existing output directory, and verify atomic recovery, idempotence, and absence of duplicate CSV rows.",
+  "Run a scale corpus with many shards and rare adversarial records to ensure the solution does not rely on manual inspection or sampling."
+ ],
+ "verifier_knob": {
+  "name": "hidden_corpus_coverage_and_scale",
+  "value": "240 generated corpora containing approximately 80,000 total lines, with 8 percent adversarial cases and 30 percent involving cross-file duplicates, lifecycle rejection, or decoder boundary conditions",
+  "effect": "Lowering the knob leaves mostly ordinary records and makes permissive parsing, timestamp-only deduplication, and shallow fixture testing appear correct. Raising it increases corpus size and the frequency and diversity of boundary, duplicate-key, invalid-encoding, tie-order, partial-run, and multi-stage lifecycle cases, making accidental or sample-specific fixes fail more reliably."
+ },
+ "expected_failure_modes": [
+  "The solver reads the visible SQL and patches coercion or filtering without experimentally characterizing the opaque decoder.",
+  "The implementation uses a normal JSON parser with last-key-wins behavior and cannot reject duplicate keys or distinguish integers from numeric strings.",
+  "Deduplication is performed before retaining source coordinates, so equal timestamps or cross-shard duplicates select the wrong record.",
+  "A session is marked valid while invalid members are silently discarded, rather than invalidating the entire session.",
+  "Metrics are computed in an earlier stage and are not recomputed after lifecycle validation.",
+  "The p95 implementation uses interpolation, floor ranking, or floating-point rounding instead of the specified nearest rank.",
+  "CSV writers append to existing files or trust stale stage directories after interruption.",
+  "The solver assumes normal UTF-8 newline behavior and loses records or line numbers around decoder block boundaries.",
+  "Filesystem traversal order leaks into output ordering.",
+  "A partial repair passes the small fixture but compounds tiny event-level errors into large session and percentile discrepancies in the generated corpus."
+ ],
+ "predicted_pass_rate": 0.32,
+ "difficulty": "hard",
+ "category": "systems",
+ "tags": [
+  "sql",
+  "log-processing",
+  "error-recovery",
+  "adversarial-inputs",
+  "sqlite",
+  "multi-stage-pipeline"
+ ]
+}

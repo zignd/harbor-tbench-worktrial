@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+import os,json,sqlite3,subprocess
+BASE='/work'; DB=BASE+'/state/events.sqlite'
+def helper(values):
+    p=subprocess.Popen(['/opt/security/bin/addrclass'],stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+    out,_=p.communicate((''.join(v+'\n' for v in values)).encode('utf-8'))
+    ans=[]
+    for line in out.splitlines():
+        text=line.decode('utf-8'); ans.append(text.split('\t',1) if '\t' in text else [text,''])
+    return ans
+def main():
+    files=[]; mf='/work/input/archive.manifest'
+    if os.path.exists(mf):
+        for x in open(mf,encoding='utf-8'):
+            x=x.strip()
+            if x: files.append(x if x.startswith('/') else '/work/input/'+x)
+    if not files: files=['/work/input/archive.jsonl']
+    accepted=[]; rejected=[]; line_no=0
+    for fn in files:
+        chunk=os.path.basename(fn)
+        try: stream=open(fn,encoding='utf-8')
+        except OSError: continue
+        with stream:
+            for raw in stream:
+                line_no+=1
+                try: r=json.loads(raw)
+                except Exception: rejected.append((chunk,line_no,None,None,'malformed_json')); continue
+                eid=r.get('event_id'); rev=r.get('revision')
+                if not isinstance(eid,str) or not eid or not isinstance(rev,int):
+                    rejected.append((chunk,line_no,eid,rev,'invalid_required_field')); continue
+                if not isinstance(r.get('timestamp'),str) or len(r['timestamp'])<20 or not r['timestamp'].endswith('Z'):
+                    rejected.append((chunk,line_no,eid,rev,'invalid_timestamp')); continue
+                if r.get('signature')!='valid': rejected.append((chunk,line_no,eid,rev,'signature_failed')); continue
+                if any(not isinstance(r.get(k),str) for k in ('actor','source','destination')):
+                    rejected.append((chunk,line_no,eid,rev,'invalid_required_field')); continue
+                accepted.append((chunk,line_no,r))
+    seen=set(); unique=[]
+    for c,l,r in accepted:
+        key=(r['event_id'],r['revision'])
+        if key in seen: rejected.append((c,l,r['event_id'],r['revision'],'duplicate_delivery'))
+        else: seen.add(key); unique.append((c,l,r))
+    grouped={}
+    for item in unique:
+        grouped.setdefault(item[2]['event_id'],[]).append(item)
+    latest={}
+    for eid,items in grouped.items():
+        winner=max(items,key=lambda x:x[2]['revision'])
+        latest[eid]=winner
+        for item in items:
+            if item is not winner:
+                c,l,r=item
+                rejected.append((c,l,r['event_id'],r['revision'],'superseded_revision'))
+    final=sorted(latest.values(),key=lambda x:(x[0],x[1]))
+    vals=[]
+    for _,_,r in final: vals.extend([r['source'],r['destination']])
+    classified=helper(vals); events=[]
+    for i,(chunk,line,r) in enumerate(final):
+        sc,scat=classified[2*i]; dc,dcat=classified[2*i+1]
+        risk=3+(2 if scat in ('global4','global6') else 1)+(2 if dcat in ('global4','global6') else 1)+(r['revision']%3)
+        severity='critical' if risk>=8 else 'high' if risk>=6 else 'medium' if risk>=4 else 'low'
+        events.append((r['event_id'],r['revision'],r['timestamp'],r['actor'],sc,dc,scat,dcat,risk,severity,chunk,line))
+    con=sqlite3.connect(DB); con.execute('PRAGMA foreign_keys=ON')
+    con.executescript('''DROP TABLE IF EXISTS events; DROP TABLE IF EXISTS rejections; DROP TABLE IF EXISTS daily_summary; DROP TABLE IF EXISTS actor_summary; DROP TABLE IF EXISTS indicator_summary; DROP TABLE IF EXISTS metadata;
+CREATE TABLE events(event_id TEXT NOT NULL,revision INTEGER NOT NULL,timestamp TEXT NOT NULL,actor TEXT NOT NULL,source TEXT NOT NULL,destination TEXT NOT NULL,source_class TEXT NOT NULL,destination_class TEXT NOT NULL,risk INTEGER NOT NULL,severity TEXT NOT NULL,chunk TEXT NOT NULL,line INTEGER NOT NULL,PRIMARY KEY(event_id,revision));
+CREATE TABLE rejections(chunk TEXT NOT NULL,line INTEGER NOT NULL,event_id TEXT,revision INTEGER,reason TEXT NOT NULL);
+CREATE TABLE daily_summary(day TEXT PRIMARY KEY,event_count INTEGER NOT NULL,total_risk INTEGER NOT NULL);
+CREATE TABLE actor_summary(actor TEXT PRIMARY KEY,event_count INTEGER NOT NULL,total_risk INTEGER NOT NULL);
+CREATE TABLE indicator_summary(indicator TEXT PRIMARY KEY,event_count INTEGER NOT NULL);
+CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE INDEX idx_events_actor ON events(actor); CREATE INDEX idx_events_source ON events(source); CREATE INDEX idx_rejections_event ON rejections(event_id);''')
+    con.executemany('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',events)
+    con.executemany('INSERT INTO rejections VALUES (?,?,?,?,?)',rejected)
+    con.executemany('INSERT INTO metadata VALUES (?,?)',[('format','1'),('source','archive.jsonl'),('records',str(line_no))])
+    con.execute('INSERT INTO daily_summary SELECT substr(timestamp,1,10),count(*),sum(risk) FROM events GROUP BY 1')
+    con.execute('INSERT INTO actor_summary SELECT actor,count(*),sum(risk) FROM events GROUP BY 1')
+    con.execute('INSERT INTO indicator_summary SELECT source,count(*) FROM events GROUP BY 1')
+    con.commit(); con.close()
+if __name__=='__main__': main()

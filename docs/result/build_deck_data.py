@@ -68,7 +68,7 @@ def build() -> dict:
             "examples_code": _mean(examples, "instruction_code_spans"),
             "generated_code": _mean(generated, "instruction_code_spans"),
         },
-        "spend": {"conservative": 211.35, "remaining": 288.71, "this_run_ledger": 12.48},
+        "spend": {"conservative": 215.96, "remaining": 284.04, "this_run_ledger": 16.47},
         "approved_tasks": verification.get("approved_tasks", []),
         "requirements": verification.get("requirements", {}),
     }
@@ -81,7 +81,12 @@ def slides(d: dict) -> list[str]:
     ap = (
         f"<p><span class='tag'>approved</span> {html.escape(', '.join(t['task'] for t in approved))}</p>"
         if approved
-        else "<p class='warn'>No task reached full five-attempt approval; see the report.</p>"
+        else (
+            "<p class='warn'>No task approved. Three quality-clean packages measured out of band:</p>"
+            "<ul><li>releaseforge &mdash; <b>0/5</b> too hard</li>"
+            "<li>optimize-policy-decision-audit &mdash; <b>4/5</b> too easy</li>"
+            "<li>repair-attributed-funnel-service &mdash; <b>2 passes</b>, one trial hit the turn cap (invalid)</li></ul>"
+        )
     )
     problem = (
         "<h2>The problem</h2><p>A task is useful only in the learnable band: run 5x with a solver, "

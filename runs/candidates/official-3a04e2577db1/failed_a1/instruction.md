@@ -1,0 +1,7 @@
+Maintain the SQLite policy gate in /work/sqlgate. The executable must be available as /work/sqlgate/build/sqlgate and must preserve the command-line form ./build/sqlgate --db DB --input REQUESTS [--output OUTPUT].
+
+Each input line is a JSON object containing an integer id, a SQL string sql, and an optional params array. Emit exactly one line for every input record, in input order, formatted as `id ALLOW` or `id DENY`; write to stdout unless --output is supplied. Continue after malformed records and never crash.
+
+A request may be ALLOW only when the SQLite authorizer permits the prepared statement against the database state at evaluation time. Preserve authorization behavior for malformed SQL, unsupported parameter values, writes, DDL, unauthorized tables, columns, functions, virtual tables, views, triggers, recursive queries, attached databases, and indirect access. Never execute a denied request. Correctly handle duplicate IDs, repeated and reordered SQL, empty strings, embedded NULs represented by JSON escapes, and large parameter values. Do not reuse bindings or authorization decisions across incompatible database schema or policy state, and reflect changes between batches.
+
+Keep memory bounded and deterministic. The implementation must process the supplied large mixed corpus at least 50,000 requests per second on the one-CPU benchmark machine while remaining below 256 MiB RSS. Do not weaken or bypass the policy engine. The final repository must build successfully with `make` and leave the working executable at /work/sqlgate/build/sqlgate.

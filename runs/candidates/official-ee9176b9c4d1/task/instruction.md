@@ -1,0 +1,5 @@
+Repair `/app/incident-report` so that `./incident-report INPUT.jsonl OUTPUT.tsv` remains the supported command. It must read every valid event from the JSONL stream, ignore malformed lines without aborting or corrupting later records, and emit deterministic TSV using the documented columns and stable ordering.
+
+Include spans, counters, synthetic checks, and sampled logs. Failed events must contribute to total and error fields, and zero-duration checks must remain present. Decode the hexadecimal wire payload according to the local operations note, including signed values, reordered tags, modality normalization, stream-local duplicate suppression, sequence resets, and interleaved streams. Deduplicate before aggregation, and preserve records at shard and report-window boundaries.
+
+The report must match the repository semantics on unseen generated streams, including unique traces and deterministic p50 and p95 rank selection. Do not hard-code the supplied fixture or change the command-line contract. The implementation must process at least 30,000 input events per second on the included benchmark shape.

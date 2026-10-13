@@ -1,0 +1,4 @@
+# Incident replay
+The input has raw_events(id,ts,actor,incident_key,merge_key,seq,depends_on,kind,payload,supersedes,tombstone), actor_aliases(alias,canonical,valid_from,valid_to), and policy_versions(version,effective_from,effective_to,response_minutes). Timestamps are ISO UTC strings; validity uses an inclusive start and exclusive end. An event's merge_key joins all events sharing that nonempty key. Canonical event keys are `(ts, seq, id)`.
+
+Dependencies are references by event id. A reference absent from the component is ignored. Stable Kahn ordering uses the smallest canonical key among available nodes; for a cycle, emit the smallest remaining canonical key and continue. `open`, `ack`, and `resolve` produce transitions. SLA duration is response_minutes from the policy covering the transition timestamp.

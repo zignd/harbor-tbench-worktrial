@@ -1,0 +1,199 @@
+{
+ "blueprint": {
+  "slug": "deploy-journal-snapshot-rebuilder",
+  "title": "Deploy the Incident Journal Rebuilder",
+  "scenario": "After a database failover, the DBA found that the recovery export silently omitted a small number of customer-state changes. The container contains an in-house Node.js deployment with a command wrapper, a catalog of journal segments, several competing decoders, and thousands of incident-era data files in text, compressed, and framed-binary forms. The deployed command must be repaired and installed as the stable `current` release without changing the source data.",
+  "instruction_draft": "$ journal-rebuild --catalog /var/lib/journal/catalog.json --out /var/lib/journal/recovered\ncatalog: 1847 segments, 12,406,991 records\ndecoded: 12,406,991\nsnapshots: 2,981,440\nwarning: 6,317 records could not be applied\nexit status: 0\n\nRepair and deploy the journal rebuild command. The command must accept `--catalog PATH --out DIR` and produce `snapshots.ndjson`, `stats.json`, and a zero exit status only when the rebuild is complete. Decode every segment format named by the catalog, including plain text, gzip-compressed text, and framed binary segments; preserve Unicode and embedded escaped newlines. Apply records by their stream sequence rather than input-file order, make duplicate delivery idempotent, and ensure a delete remains effective even when an older update appears later in the input. Emit exactly one final snapshot for every surviving `(tenant,key)` pair, sorted by tenant and then key using bytewise UTF-8 order, with the prescribed canonical JSON representation used by the existing deployment. `stats.json` must report decoded, applied, duplicate, deleted, rejected, and snapshot counts, and its totals must agree with the output. Install the result as `/opt/journal-rebuild/current/bin/journal-rebuild`, keep a rollback copy under `/opt/journal-rebuild/releases`, and make the installed command work from any working directory. On the supplied data and on fresh verify-time catalogs, the implementation must produce byte-for-byte correct snapshots and statistics, process at least 180,000 records per second on one CPU, and use no more than 450 MiB RSS.",
+  "requirements": [
+   "Provide an executable `/opt/journal-rebuild/current/bin/journal-rebuild`.",
+   "The executable must accept `--catalog PATH --out DIR` from any working directory.",
+   "Produce `snapshots.ndjson` and `stats.json` in the requested output directory.",
+   "Return zero only for a complete successful rebuild and nonzero for an incomplete or invalid rebuild.",
+   "Decode all segment modalities named by the catalog: plain text, gzip-compressed text, and framed binary.",
+   "Correctly preserve Unicode and escaped newlines inside records.",
+   "Apply records according to stream sequence rather than segment or input-file order.",
+   "Treat duplicate delivery idempotently.",
+   "Keep a delete effective over older updates encountered later.",
+   "Emit exactly one final snapshot for every surviving `(tenant,key)` pair.",
+   "Sort snapshots by tenant and then key using bytewise UTF-8 ordering.",
+   "Use the canonical JSON representation required by the existing deployment.",
+   "Report decoded, applied, duplicate, deleted, rejected, and snapshot counts in `stats.json`.",
+   "Make statistics internally consistent with the emitted snapshots and processed records.",
+   "Keep a rollback release under `/opt/journal-rebuild/releases`.",
+   "Match the reference snapshots and statistics byte-for-byte on supplied and verify-time generated catalogs.",
+   "Process at least 180,000 records per second on one CPU.",
+   "Use no more than 450 MiB resident memory."
+  ],
+  "environment": [
+   "Use `FROM python:3.13-slim-bookworm` with pinned apt packages and Node.js installed from a locally supplied package archive; no network is needed.",
+   "Populate roughly 1,600 lines of JavaScript across a launcher, catalog reader, state reducer, output writer, deployment helper, and unrelated maintenance utilities.",
+   "Provide `/var/lib/journal/catalog.json`, documentation fragments, configuration, and about 1,800 generated segment files totaling roughly 12 million records.",
+   "Include plain NDJSON segments, gzip NDJSON segments, and a custom little-endian framed-binary format with length, kind, sequence, payload, and CRC fields.",
+   "Include a small visible sample that exercises ordinary updates and deletes but does not contain cross-segment reordering, non-ASCII sort keys, duplicate deliveries, or records split across read buffers.",
+   "Plant a deployed implementation that assumes file order, mishandles a framing boundary near the stream buffer limit, counts duplicate tombstones as applied changes, and materializes too much intermediate state.",
+   "Include a catalog schema and operational notes that describe the accepted segment kinds, stream identifiers, sequence semantics, CRC policy, canonical JSON rules, and release layout, but distribute the relevant facts across the environment rather than placing them in one obvious source file.",
+   "Include many unrelated parsers and deployment utilities so the relevant execution path must be traced experimentally.",
+   "Provide a deterministic reference generator used only by verification to create fresh catalogs with different shard counts, record sizes, Unicode keys, duplicate patterns, and sequence interleavings.",
+   "Provide a deterministic shell reference solution that inventories the deployment, runs the sample, probes all segment modalities and boundary sizes, compares outputs with an independently generated oracle, then installs the corrected release."
+  ],
+  "internal_hint": "A skilled engineer should first inspect the installed wrapper, catalog schema, sample output, and all decoder call sites, then generate targeted records to observe behavior at gzip boundaries, binary frame boundaries, duplicate sequence numbers, tombstones, and out-of-order segments. The reliable solution is a streaming Node.js decoder that dispatches from catalog metadata, validates frame lengths and CRCs, parses newline-safe JSON, and reduces each stream by the highest valid sequence while retaining tombstone state; records with identical stream and sequence are accepted once and counted as duplicates thereafter. The reducer should avoid retaining every raw event, external-sort or chunk-sort only the final surviving keys, emit canonical JSON and bytewise UTF-8 ordering, and calculate counters from the same accepted-event path used for reduction. The deployment fix should stage a versioned release, run the full corpus plus boundary probes, atomically update `current`, and leave the previous release available for rollback.",
+  "trap": "A shallow solution passes the visible sample by sorting files and parsing line-oriented JSON, but hidden catalogs interleave segments, place a delete before an older update, repeat records across shards, split a binary frame or UTF-8 sequence across reads, and include keys whose JavaScript locale ordering differs from bytewise UTF-8 ordering. A solution that loads all events or emits snapshots incrementally also fails either the RSS limit or the exact final-state comparison, while a solution that counts duplicate tombstones incorrectly produces plausible snapshots with inconsistent statistics.",
+  "tests": [
+   "Check that the installed command exists, is executable, resolves its own assets correctly from an unrelated working directory, and leaves both `current` and a versioned rollback release.",
+   "Run the supplied corpus and compare `snapshots.ndjson` and `stats.json` byte-for-byte with the deterministic oracle.",
+   "Generate fresh catalogs with thousands of segments and millions of records, varying segment order, shard count, record size, and modality distribution, then compare all output fields and ordering with the oracle.",
+   "Generate records with updates and deletes interleaved across segments and verify reduction by stream sequence, including deletes that must dominate older updates.",
+   "Inject exact duplicate deliveries and verify idempotence plus exact duplicate statistics.",
+   "Generate Unicode tenant and key names, escaped newlines, escaped control characters, and long JSON values, then verify canonical encoding and bytewise UTF-8 sort order.",
+   "Place framed records across arbitrary read-buffer boundaries, including lengths near powers of two, and verify CRC rejection and subsequent-frame recovery behavior.",
+   "Verify that malformed or CRC-invalid records are counted as rejected without corrupting later valid records, and that incomplete catalogs return nonzero.",
+   "Run a throughput benchmark on a deterministic hidden corpus and require at least 180,000 decoded records per second on the one-CPU container.",
+   "Measure peak RSS during a large hidden rebuild and require it to remain at or below 450 MiB.",
+   "Check that statistics totals reconcile with decoded, applied, duplicate, deleted, rejected, and snapshot outcomes rather than merely checking that fields exist.",
+   "Run the command twice into different output directories and require identical bytes and identical exit behavior."
+  ],
+  "verifier_knob": {
+   "name": "minimum_records_per_second",
+   "value": "180000",
+   "effect": "Raising the threshold favors streaming parsing, low-allocation reduction, and efficient external sorting and causes otherwise correct but heavily materializing implementations to fail; lowering it makes correctness-focused implementations more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the obvious decoder and misses the catalog-dependent binary path.",
+   "The reducer uses physical file order or arrival order instead of stream sequence.",
+   "Duplicate records and duplicate tombstones are counted or applied incorrectly.",
+   "The implementation treats a delete as an ordinary update and allows an older update to resurrect state.",
+   "JSON is parsed one physical line at a time even though escaped or framed payloads can contain newline bytes.",
+   "The binary decoder mishandles frames crossing buffer boundaries or fails to resynchronize after a rejected frame.",
+   "JavaScript locale sorting or UTF-16 ordering is used instead of bytewise UTF-8 ordering.",
+   "The agent validates only the visible sample, which lacks the rare interleavings and Unicode cases.",
+   "All records are retained in memory, causing the hidden large-state run to exceed the RSS limit.",
+   "Statistics are computed in a separate pass with semantics that diverge from the state reducer.",
+   "The code works from the repository directory but the deployed wrapper uses relative paths and fails from another directory.",
+   "The agent replaces the command without staging a versioned release or preserving rollback state.",
+   "A correct but allocation-heavy implementation misses the throughput threshold on one CPU."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "javascript",
+   "log-processing",
+   "streaming",
+   "deployment",
+   "state-reduction",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. Inspect the working directory, installed wrapper, and release layout.",
+   "2. Locate the catalog, documentation, JavaScript sources, utilities, and sample data.",
+   "3. Read the launcher and deployment helper to identify the actual execution path.",
+   "4. Inspect the catalog schema and sample catalog entries.",
+   "5. Read operational notes for stream IDs, sequence semantics, CRC policy, and canonical JSON.",
+   "6. Trace decoder dispatch and all decoder call sites.",
+   "7. Inspect package metadata and Node runtime assumptions.",
+   "8. Run the deployed command on the visible sample and capture outputs.",
+   "9. Examine the sample snapshots and statistics format.",
+   "10. Read the existing text, gzip, and framed-binary decoder implementations.",
+   "11. Locate the deterministic reference generator and verification/oracle interface.",
+   "12. Create small targeted catalogs for reordering, duplicates, deletes, Unicode, and escaped newlines.",
+   "13. Run those probes against the planted implementation to confirm failure modes.",
+   "14. Replace or repair catalog-driven modality dispatch and streaming decoders.",
+   "15. Implement framed parsing with boundary-safe buffering, length checks, CRC validation, and recovery.",
+   "16. Implement sequence-based reduction with tombstone retention and idempotent duplicate handling.",
+   "17. Implement canonical JSON output and bytewise UTF-8 tenant/key ordering.",
+   "18. Compute all statistics from the same accepted-event path as reduction.",
+   "19. Add failure handling for malformed records and incomplete catalogs.",
+   "20. Update the launcher to resolve assets independently of the working directory.",
+   "21. Stage a versioned release and atomically update current while preserving rollback.",
+   "22. Run modality, boundary, malformed-frame, reorder, duplicate, delete, Unicode, and escaping probes.",
+   "23. Run the supplied corpus against the oracle, then benchmark throughput and peak RSS on the large corpus.",
+   "24. Run the installed command from an unrelated directory twice and compare outputs, exit status, and release layout."
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact canonical JSON rules and meanings of applied, deleted, rejected, and duplicate counters are not stated directly; relying on distributed documentation can make an otherwise correct implementation fail due to interpretation.",
+   "The boundary between a complete catalog containing rejected records and an incomplete or invalid catalog is not defined precisely, especially when malformed records are required to be counted rather than fatal.",
+   "The pinned local Node.js package archive, exact framed-binary schema, and reference-generator interface are not specified in the blueprint, so the stated build may not be reproducible without additional fixtures.",
+   "A 180,000-records-per-second threshold and 450 MiB RSS limit can vary with container startup, filesystem behavior, Node.js version, and benchmark methodology unless warmup, measurement scope, and sampling rules are fixed.",
+   "A requirement to match fresh verification-time catalogs byte-for-byte is only valid if the oracle's canonicalization and statistics semantics are available or fully specified to the solver."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and largely testable, but its key output semantics are underspecified in the instruction and delegated to scattered environment documentation, while the performance and memory thresholds lack measurement details. The speedrun is about 24 substantive steps and combines reverse engineering, implementation, deployment, and large-corpus tuning, making the under-one-hour solvability borderline; the resulting average score is below the acceptance threshold.",
+  "fixes": [
+   "State the canonical JSON serialization rules, field ordering, escaping behavior, newline policy, and bytewise sort algorithm explicitly in the instruction or one authoritative document.",
+   "Define each statistics counter formally, including whether deletes count as applied, how rejected records affect completion, and how duplicate tombstones are counted.",
+   "Specify the exact framed-binary header layout, CRC algorithm and coverage, resynchronization rule, and incomplete-catalog failure conditions in one authoritative schema.",
+   "Provide the local Node.js archive, package checksums, reference-generator invocation, and all required build fixtures as explicit environment inputs.",
+   "Define the benchmark protocol: warmup duration, measured interval, input location, CPU pinning, RSS measurement method, and whether startup and output-writing time are included."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-2f505f92f1c8",
+     "verdict": "distinct",
+     "reason": "The candidate rebuilds and orders heterogeneous journal segments into deduplicated final snapshots, whereas the reference serves canonical HMACs for individual WAL records over TCP."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/db-wal-recovery",
+     "verdict": "distinct",
+     "reason": "Although both recover state from database-like logs, the reference repairs one corrupted SQLite WAL and extracts a fixed table, while the candidate implements a general multi-format journal replay, deduplication, tombstone ordering, deployment, and statistics pipeline."
+    },
+    {
+     "ref_id": "ours/official-d32334dff4ab",
+     "verdict": "distinct",
+     "reason": "The reference fixes a concurrent per-user CPU budget and persistent ledger in an HTTP evaluation service, which is unrelated to journal decoding and state reconstruction."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "The reference is schema-based NDJSON validation with ingestion throughput, while the candidate requires multi-format decoding, sequence-aware replay, deduplication, deletion semantics, snapshots, and deployment."
+    },
+    {
+     "ref_id": "ours/official-8a6ed366c8a0",
+     "verdict": "distinct",
+     "reason": "The reference repairs a live log enrichment and analytics service with SQLite persistence and HTTP statistics endpoints, not a catalog-driven journal recovery command."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-2f505f92f1c8",
+     0.109
+    ],
+    [
+     "terminal-bench-2-1/db-wal-recovery",
+     0.095
+    ],
+    [
+     "ours/official-d32334dff4ab",
+     0.093
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.09
+    ],
+    [
+     "ours/official-8a6ed366c8a0",
+     0.088
+    ]
+   ],
+   "cost_usd": 0.0009494
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0042908
+}

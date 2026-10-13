@@ -1,0 +1,69 @@
+{
+ "slug": "deploy-sensor-wire-relay",
+ "title": "Deploy the Sensor Wire Relay",
+ "scenario": "A backend developer is chasing a production discrepancy in an in-container sensor-ingestion stack: binary sensor events arrive over a long-lived TCP connection, pass through a relay, and are submitted as JSON to a local event service. The container contains several intentionally plausible services, an opaque compiled wire decoder, deployment files, protocol notes, fixture traffic, and logs from a failing deployment.",
+ "instruction_draft": "Make `/opt/relay/deploy.sh` executable and use it to deploy the complete relay in this container, with all required services reachable on their documented endpoints and restart-safe cleanup. Every valid generated wire stream must produce exactly one corresponding JSON event with its identifier, sequence, timestamp, measurements, and metadata preserved, while malformed frames are rejected without stopping the connection; the deployed system must correctly process at least 99.5% of events at 1,800 events per second on the verifier workload.",
+ "requirements": [
+  "Provide an executable `/opt/relay/deploy.sh` that deploys the complete relay in the container.",
+  "Ensure all required services run concurrently in the one container and are reachable on their documented endpoints.",
+  "Make deployment restart-safe, including cleanup of stale processes, sockets, and pid files.",
+  "Translate every valid generated wire event into exactly one corresponding JSON event.",
+  "Preserve each event's identifier, sequence number, timestamp, measurements, and metadata during translation.",
+  "Reject malformed frames without terminating the long-lived input connection or corrupting subsequent valid events.",
+  "Process at least 99.5% of verifier-generated valid events correctly.",
+  "Sustain at least 1,800 correctly processed events per second on the verifier workload."
+ ],
+ "environment": [
+  "The image is built from `python:3.13-slim-bookworm` with pinned apt packages including gcc, libc6-dev, procps, and netcat; no internet access is available at verification time.",
+  "`/opt/relay/` contains deployment fragments, a broken supervisor script, sample traffic, operational notes, and approximately 1,500 lines of plausible but partly irrelevant Python, C, and shell code.",
+  "A compiled opaque `wire-ingest` service listens on TCP port 9100 and accepts a persistent byte stream. Its source is removed from the image; its `--describe` output and protocol documentation are available.",
+  "A compiled opaque `event-sink` service listens on HTTP port 9200, validates JSON events, records accepted events, and exposes health and metrics endpoints. Its source is removed from the image.",
+  "The documented wire format uses a magic prefix, big-endian length, a versioned header, unsigned varints, zig-zag signed deltas, TLV metadata, and CRC32C. Frames may be concatenated, split at arbitrary byte offsets, or contain malformed lengths and checksums.",
+  "The relay must translate binary frames to newline-delimited JSON over the sink's HTTP batch endpoint. The sink requires stable ordering within a connection, rejects duplicate event identifiers, and acknowledges batches only after durable validation.",
+  "The supplied deployment is broken in several interacting ways: it assumes one socket read equals one frame, starts the sink after the relay without readiness handling, loses partial batches on reconnect, and uses a configuration default that disagrees with the sink's schema.",
+  "A deterministic fixture generator creates ordinary examples plus long streams containing rare varint boundaries, zero and negative deltas, unknown optional TLVs, duplicate frames, injected CRC failures, reconnects, and arbitrary TCP fragmentation.",
+  "The verifier starts fresh container instances from hidden seeds, varies generated record values and fragmentation patterns, and checks service behavior and metrics rather than inspecting source files."
+ ],
+ "internal_hint": "The reference shell solution first inventories the deployment files, runs each opaque service with its help and describe modes, probes the sink health and batch semantics, and captures byte-level traffic from the supplied fixtures. It then replaces the fragile relay path with a buffered stream decoder that retains unread bytes, validates magic/version/length/CRC32C, decodes varints and zig-zag deltas, skips unknown optional TLVs, and emits canonical JSON batches with bounded retry and duplicate-safe reconnect handling. The deployment script starts the sink, waits for its health endpoint, starts the relay with explicit schema and batch settings, traps TERM/EXIT to reap the process group, and verifies readiness before returning. The root causes are only apparent when fragmented and accumulated streams exercise state across frame boundaries; the visible sample succeeds because it contains one complete frame per read and no reconnect or rare numeric cases.",
+ "trap": "A shallow solution can parse the supplied sample and pass a smoke test while assuming read boundaries are frame boundaries, treating varints as fixed-width integers, or forwarding batches before the sink is ready. Hidden streams split headers and CRCs across reads, include values requiring five or more varint bytes, contain unknown TLVs and negative deltas, and force reconnects; partial implementations then lose or duplicate events, poison the decoder after one bad frame, or fall below the throughput and 99.5% accuracy thresholds.",
+ "tests": [
+  "Launch test: run `/opt/relay/deploy.sh` twice in succession and verify that exactly one healthy ingest path and one healthy sink remain, with no stale pid or socket state.",
+  "Endpoint test: check the documented TCP ingest, HTTP sink, and health endpoints and require readiness within the allowed startup window.",
+  "Basic translation test: feed a deterministic stream of ordinary records and compare accepted sink events, including identifiers, sequence values, timestamps, measurements, metadata, and ordering.",
+  "Fragmentation test: generate the same records with every header, payload, varint, and CRC split across many TCP writes; require identical output.",
+  "Packing test: concatenate multiple frames in one write, including valid frames immediately before and after malformed ones, and verify that only valid records are emitted.",
+  "Protocol-variation test: generate hidden-seed records with long unsigned varints, negative zig-zag deltas, zero-length optional fields, unknown optional TLVs, and boundary-sized payloads.",
+  "Integrity test: inject bad magic, impossible lengths, unsupported versions, and CRC32C failures; require rejection of those frames while later valid frames on the same connection still arrive.",
+  "Reconnect and consistency test: interrupt and reconnect the input and sink paths at deterministic points, then require no duplicate event identifiers, no missing acknowledged events, and correct sequence ordering.",
+  "Metric-threshold test: generate fresh streams from hidden seeds containing thousands of events and measure the fraction accepted exactly by the sink; require at least 99.5% correctness and at least 1,800 correctly processed events per second on one CPU.",
+  "Cross-component test: independently decode the generated wire stream with the verifier reference and compare the resulting event set, sink acknowledgements, relay counters, and deployment health state."
+ ],
+ "verifier_knob": {
+  "name": "minimum_correct_events_per_second",
+  "value": "1800",
+  "effect": "Raising the value makes inefficient shell-only parsing, per-record process spawning, and overly small HTTP batches fail despite being functionally correct; lowering it permits slower but still correct implementations. The 99.5% correctness requirement remains fixed."
+ },
+ "expected_failure_modes": [
+  "Assuming TCP read boundaries correspond to protocol frame boundaries.",
+  "Implementing fixed-width integer decoding instead of the documented varint and zig-zag encoding.",
+  "Dropping buffered bytes after a malformed frame or terminating the connection on a checksum error.",
+  "Failing to skip unknown optional TLVs, causing hidden schema extensions to desynchronize the parser.",
+  "Starting the relay before the sink is healthy and losing initial batches.",
+  "Retrying acknowledged HTTP batches and creating duplicate event identifiers.",
+  "Using one subprocess per record or unbatched HTTP requests and missing the throughput threshold.",
+  "Passing the visible fixture while failing rare long values, negative deltas, reconnects, or arbitrary fragmentation.",
+  "Leaving stale processes from an earlier deployment, causing port conflicts or mixed configuration.",
+  "Preserving individual fields but emitting non-canonical JSON or incorrect accumulated timestamps that the sink rejects."
+ ],
+ "predicted_pass_rate": 0.27,
+ "difficulty": "hard",
+ "category": "networking-and-services",
+ "tags": [
+  "deployment",
+  "binary-protocol",
+  "stream-parsing",
+  "service-supervision",
+  "throughput",
+  "bash"
+ ]
+}

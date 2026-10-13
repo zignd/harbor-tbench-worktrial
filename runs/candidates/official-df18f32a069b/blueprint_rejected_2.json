@@ -1,0 +1,178 @@
+{
+ "blueprint": {
+  "slug": "repair-configured-snapshot-materializer",
+  "title": "Repair the Configured Snapshot Materializer",
+  "scenario": "A data engineer has inherited a Go event-processing repository that materializes customer snapshots from partitioned NDJSON exports. The repository has several historical commits, a partially implemented configuration-driven replay feature, a large deterministic event corpus, and a SQLite output database whose contents are consumed by downstream jobs.",
+  "instruction_draft": "Finish the Go pipeline so `./bin/snapshot --config config/pipeline.json` deterministically materializes the configured event files into `out/snapshot.db`: each entity must contain the correctly ordered field-level state, including patches and tombstones, and the database must contain accurate reject, manifest, and run metadata. The command must honor configuration includes and environment overrides, recover safely from interrupted or repeated runs without duplicate or stale rows, and produce the same final state when processing equivalent inputs in a different file order.",
+  "requirements": [
+   "The configured command must successfully materialize all configured input files into `out/snapshot.db`.",
+   "For every entity, records must be ordered by event time, then source sequence, then the documented deterministic source tie-breaker.",
+   "Patch events must update only the fields they specify and must retain all unaffected fields from the prior entity state.",
+   "Tombstone events must remove the entity from the live snapshot while preserving the corresponding event and accounting information.",
+   "Malformed records and records with invalid required fields must be written to the rejects table with their source identity and reason rather than aborting the run.",
+   "The manifest and run metadata must report accurate input, accepted, rejected, patched, tombstoned, and live-entity counts.",
+   "Configuration includes must resolve relative paths correctly, merge nested settings according to the repository's documented precedence rules, and allow environment-variable overrides.",
+   "A rerun over the same inputs must be idempotent and must not create duplicate snapshot, event, reject, manifest, or run rows.",
+   "Recovery after an interrupted run must resume or rebuild safely without leaving stale live entities or partially committed metadata.",
+   "Changing only the order of equivalent input files must produce the same logical SQLite state and identical deterministic manifest values.",
+   "The implementation must continue to work for large inputs containing thousands of events and entities without relying on manually enumerated records."
+  ],
+  "environment": [
+   "The Dockerfile starts from `python:3.13-slim-bookworm`, installs a pinned Debian Go toolchain, SQLite utilities, Git, and small pinned Python helper packages without requiring network access at test time.",
+   "The repository contains roughly 1,600 lines of Go across `cmd/snapshot`, configuration loading, event decoding, checkpointing, SQLite persistence, and reporting packages, plus unrelated operational code.",
+   "The working tree is checked out at a deliberately regressed commit; Git history contains an earlier schema migration, a reverted replay feature, and design notes that document ordering, configuration precedence, and recovery semantics.",
+   "The repository includes a deterministic corpus of approximately 14,000 NDJSON events spread across dozens of source files, with duplicate entity histories, rare same-timestamp events, patches, tombstones, malformed lines, rotated files, and records whose ordering differs from lexical file order.",
+   "The supplied configuration uses an include chain, nested source and output settings, a relative include path, and environment substitutions. A small sample dataset appears correct under a single clean run.",
+   "The SQLite schema includes `events`, `snapshots`, `rejects`, `manifests`, `runs`, and checkpoint tables. Some migration and cleanup code is present but incomplete.",
+   "The existing implementation contains planted configuration and recovery regressions: nested include merging is shallow in one path, source identity is inconsistently normalized, checkpoint replay can retain stale rows, and conflict resolution depends on an unstable iteration path for rare ties.",
+   "A deterministic interruption harness can terminate the process after selected batches and then rerun it, allowing recovery behavior to be tested without wall-clock dependence.",
+   "The verifier can generate fresh event files and configurations from a fixed hidden seed, compile the modified Go repository, and inspect SQLite state rather than checking source text."
+  ],
+  "internal_hint": "First inspect Git history, the schema, configuration documentation, and the command's actual behavior on the large corpus; do not trust the passing small sample. Instrument or query the database after runs, shuffled-file runs, and forced interruptions. The key fixes are to implement a canonical source identity and total event ordering, perform recursive configuration merging with the documented precedence and path normalization, make event application and checkpoint advancement transactional, and make recovery rebuild or reconcile all derived tables rather than merely continuing from the last offset. Verify counts and row identities with SQL across the full corpus, including rare same-time conflicts, patches after tombstones, malformed records, and reruns.",
+  "trap": "A shallow solution that fixes the obvious sample or merely adds `INSERT OR REPLACE` appears correct on a clean run but fails when a later batch is interrupted, when a source file is renamed or reordered, or when two records share an event timestamp. Such a solution commonly leaves stale snapshots after tombstones, double-counts rejects and runs, loses fields during nested config merges, or chooses different winners because Go map iteration and lexical paths are not deterministic.",
+  "tests": [
+   "Build and execute the configured command against the supplied corpus, then compare every live snapshot row, event row, reject row, manifest field, and run field with the deterministic reference state.",
+   "Generate a fresh hidden corpus of thousands of entities and events containing rare equal timestamps, sequence ties, patches, tombstones, malformed records, and duplicate source deliveries; compare the complete SQLite state with the reference implementation.",
+   "Run the same generated inputs with source files presented in several different orders and verify identical logical rows, winner selection, and manifest values.",
+   "Create hidden configurations with multiple levels of relative includes, nested source/output settings, absent and overridden environment variables, and alternate output paths; verify the resolved behavior and persisted configuration metadata.",
+   "Terminate the process at deterministic batch boundaries, restart it, and verify that recovery produces exactly the uninterrupted reference state with no duplicate or stale rows.",
+   "Run the successful pipeline two or more additional times and verify idempotence of all tables, including run accounting and checkpoint state.",
+   "Exercise a recovery case where an interrupted run had already materialized an entity that is later tombstoned or patched, and verify that no obsolete live row remains.",
+   "Check reject reasons, source identities, and line numbers for malformed records while ensuring valid records later in the same file are still processed.",
+   "Check scalability and bounded behavior on a hidden corpus several times larger than the supplied corpus under the one-CPU, 2-GB environment."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "9",
+   "effect": "Increasing the number of checked table contents, configuration variants, interruption points, ordering permutations, and accounting invariants makes partial fixes fail more often; lowering it to two or three clean-run checks allows shallow implementations that do not handle recovery, precedence, or rare ordering cases."
+  },
+  "expected_failure_modes": [
+   "The agent reads the main processing file, patches one visible SQL conflict, and never observes the stale-state behavior caused by interrupted historical runs.",
+   "The agent validates only the small sample, missing rare same-timestamp ordering conflicts and patch-after-tombstone cases in the large corpus.",
+   "The agent implements configuration includes with a shallow map merge, silently discarding nested source or output settings in hidden configurations.",
+   "The agent uses input filename or Go map iteration order as an implicit tie-breaker, producing different snapshots after file reordering.",
+   "The agent makes individual SQLite writes idempotent but advances checkpoints outside the transaction, causing lost or duplicated events after interruption.",
+   "The agent clears live snapshots during recovery but forgets rejects, manifests, event identities, or run metadata, so the final database is only superficially correct.",
+   "The agent changes the schema or output format instead of preserving the documented state contract used by downstream consumers.",
+   "The agent adds a rebuild flag that passes the supplied clean run but does not make ordinary reruns and automatic recovery safe."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "go",
+   "configuration",
+   "sqlite",
+   "event-replay",
+   "recovery",
+   "large-state"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the checkout, status, recent commits, and repository layout.",
+   "Locate and read configuration, ordering, recovery, schema, and design documentation.",
+   "Inspect the command entry point and the configuration-loading, decoding, persistence, checkpoint, and reporting packages.",
+   "Review Git history and diffs for the reverted replay feature and earlier schema migration.",
+   "Build and run existing tests, then execute the supplied configuration once.",
+   "Query the resulting SQLite schema, counts, source identities, ordering, checkpoints, and metadata.",
+   "Patch configuration loading to recursively merge nested maps, normalize relative include paths, and apply documented environment precedence.",
+   "Patch canonical source identity and replace unstable iteration-based event conflict resolution with the documented total ordering.",
+   "Patch event application, derived-table updates, and checkpoint advancement to use a single transaction.",
+   "Patch rerun and recovery handling to reconcile or rebuild events, snapshots, rejects, manifests, runs, and checkpoints without stale rows.",
+   "Add or correct uniqueness and deterministic upsert logic for all persisted identities.",
+   "Run gofmt, unit tests, and compile the snapshot binary.",
+   "Run the full supplied corpus and compare SQL counts, rows, ordering, rejects, and metadata against the documented expectations.",
+   "Run equivalent inputs in shuffled file orders and compare normalized SQLite state and manifest values.",
+   "Use the interruption harness at several batch boundaries, restart, and compare the recovered database with an uninterrupted run.",
+   "Run repeated successful invocations and inspect every table for duplicates or stale state.",
+   "Exercise patches after tombstones, malformed lines followed by valid lines, and same-timestamp ties.",
+   "Run the larger generated corpus and inspect the final diff and resource behavior."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The definition of canonical source identity is not stated directly; a renamed file may legitimately have a different identity while the tests may expect it to remain equivalent.",
+   "The requirement that reruns create no run rows conflicts with common run-accounting semantics unless the run identity and reuse rules are explicitly documented.",
+   "Exact comparison of complete SQLite state can be invalid if run timestamps, generated IDs, checkpoint details, or SQLite-specific ordering are nondeterministic.",
+   "The interruption harness contract and termination mechanism are not described, so a correct implementation could fail because it cannot discover how interruption is requested.",
+   "The documented precedence and tie-breaker rules are external to the instruction; if the referenced repository documentation is incomplete or inconsistent, the hidden tests become ambiguous.",
+   "The scalability test could be flaky under a one-CPU, 2-GB environment if it imposes an unstated wall-clock or memory threshold."
+  ],
+  "verdict": "reject",
+  "reasons": "The end state is mostly clear and the result is realistically testable, but the speedrun is only about 18 substantive steps and the blueprint explicitly identifies the principal fixes. A strong agent can locate the regressions from the source and history and apply focused patches, so under the stated rubric genuine_difficulty is at most 2; the broad multi-table recovery work also makes under-an-hour solvability doubtful. Because not every score is at least 3, this must be rejected.",
+  "fixes": [
+   "Split this into separate configuration/ordering and transactional recovery tasks, or reduce the persistence surface and corpus for a single under-an-hour task.",
+   "If keeping the combined task, provide an explicit recovery-injection interface, run identity contract, canonical source-identity definition, and deterministic metadata rules.",
+   "Define exactly which SQLite rows and fields are part of logical state and exclude nondeterministic timestamps, generated IDs, and engine-internal artifacts from equality checks.",
+   "Make the documented precedence, tie-breaker, and rename semantics part of the task contract rather than relying on possibly inconsistent repository notes.",
+   "Add a deterministic resource bound and state the expected interruption environment variable or command so failures cannot be caused by harness discovery."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both are deterministic replay pipelines that materialize state from partitioned event files with idempotent output, but the candidate adds entity patches, tombstones, rejects, configuration merging, and SQLite accounting rather than transaction-log replay."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both reconstruct a deterministic persistent snapshot from event history while preserving deletes, tolerating reruns, and recovering safely, but one is a batch-configured NDJSON materializer and the other is a multi-operation replay service with a JSON protocol."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The reference is a campaign analytics service involving deduplication, sessions, attribution, and reporting, whereas the candidate is generic event-sourced entity snapshot materialization."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The reference reconciles scanner-authoritative filesystem artifacts into an index and quarantine tree, with filename handling and performance constraints, not event replay or entity-state reconstruction."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both archive events deterministically, the reference centers on timestamped alias resolution, correlation components, and incident graph ordering rather than configurable snapshot replay with patches and tombstones."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.238
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.198
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.178
+    ],
+    [
+     "ours/official-982469e29790",
+     0.172
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.164
+    ]
+   ],
+   "cost_usd": 0.0014148
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0053152
+}

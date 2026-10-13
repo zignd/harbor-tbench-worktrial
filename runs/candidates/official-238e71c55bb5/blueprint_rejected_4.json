@@ -1,0 +1,177 @@
+{
+ "blueprint": {
+  "slug": "recover-loom-bundles",
+  "title": "Deploy the Loom Bundle Recovery Service",
+  "scenario": "A colleague has found a regression in our small C utility for opening Loom document bundles: normal documents still list correctly, but some damaged bundles report checksum failures and return empty files after the latest format feature was deployed. The container contains the utility, format notes, fixture bundles, a deployment wrapper, and unrelated maintenance tools; please leave a working line-oriented service in place rather than just producing a one-off conversion.",
+  "instruction_draft": "Can you get the Loom bundle service working again and deploy it at `/usr/local/bin/loomd`? It must speak the JSON-lines protocol documented in the tree, correctly list and extract files from valid and partially damaged bundles, and report verification results without inventing data. Recovery must use the newest internally consistent directory and tolerate an incomplete tail, but it must never use a block whose checksum or decoded length is wrong; keep output ordering and error objects deterministic. Please make it work for bundles created after deployment too, not only the checked-in examples.",
+  "requirements": [
+   "Install or build a runnable `/usr/local/bin/loomd` service.",
+   "Read one JSON request per line and emit exactly one deterministic JSON response per request using the documented protocol.",
+   "Support the documented `list`, `extract`, `verify`, and `repair` request operations.",
+   "List the live files in a bundle in the protocol's prescribed lexical order with their recovered sizes.",
+   "Extract the exact bytes of a requested live file, including files assembled from multiple extents and files containing zero bytes.",
+   "Select the newest internally consistent directory rather than blindly trusting the header pointer or the physically last directory.",
+   "Ignore incomplete trailing records and reject records with invalid magic, CRC, decoded length, or impossible bounds.",
+   "Recover data from a damaged bundle only when every extent needed for that file is independently valid; return the specified structured unavailable/error response otherwise.",
+   "Honor duplicate directory names according to the documented generation and tombstone rules, without exposing deleted files.",
+   "Verify a bundle with deterministic counts and statuses, distinguishing valid, recoverable, and unrecoverable damage as specified by the protocol.",
+   "Produce deterministic repair output containing only validated live data and a valid new directory, without copying corrupt or incomplete blocks.",
+   "Handle fresh bundles generated after deployment, including 48-bit offsets, empty extents, long names, non-ASCII UTF-8 names, multiple compression blocks, and directory entries that are not stored in name order.",
+   "Keep the service alive across multiple requests and return a protocol error for malformed requests instead of terminating."
+  ],
+  "environment": [
+   "Use a Dockerfile based on `python:3.13-slim-bookworm`, with pinned apt packages and no network dependency at runtime; install a C compiler, make, and the small pinned Python helper dependencies needed by the fixture generator.",
+   "Create roughly 1,500 lines of C across `src/loomd.c`, `src/format.c`, `src/codec.c`, `src/protocol.c`, and plausible unrelated logging and CLI maintenance code, plus a Makefile and deployment script.",
+   "Provide `docs/loom-format.md`, which documents the binary format: 4 KiB pages, a header locator, little-endian 48-bit page offsets, directory generations, tombstones, extent maps, CRC32C, UTF-8 names, and two block codecs (raw and a block-local literal/run codec with escape bytes).",
+   "Provide a Python fixture builder and reference inspector under `tools/`, along with several checked-in bundles: a healthy bundle, a bundle with an interrupted tail, a bundle with an old valid directory followed by a corrupt newer candidate, and a bundle containing duplicate names and deleted entries.",
+   "Seed the shipped C implementation with a plausible feature-iteration regression: it interprets the header's directory hint as authoritative, uses a 32-bit intermediate for extent offsets, assumes directory entries are name-sorted, and lets the codec's streaming state cross a page boundary. These defects only become observable on combinations of large offsets, stale hints, duplicate generations, and particular run/literal boundaries.",
+   "Include a misleading startup log and fixture metadata saying that the incident is a CRC regression; several visible examples should pass CRC checks even though they exercise none of the bad offset, directory-selection, or codec-reset paths.",
+   "Include an opaque prebuilt `loom-fixturegen` helper binary used by verification to generate fresh bundles from a seed. Its source must not be shipped; the documented format and visible Python inspector remain available to the solver.",
+   "Make `/opt/loom/bin/loomd` the initially deployed binary or wrapper, with configuration under `/etc/loom/loomd.conf`; the solver must update the deployment so `/usr/local/bin/loomd` is the authoritative service entry point."
+  ],
+  "internal_hint": "The real fix is found by exercising the service against the fixtures and comparing it with `tools/inspect.py`, not by accepting the CRC symptom. Trace a failed extract through directory discovery, extent arithmetic, and codec decoding. The header hint can point at a stale or partially written directory, so scan aligned directory candidates and choose the highest generation whose header, entry table, bounds, and entry-table CRC all validate. Treat offsets and lengths as unsigned 48-bit values before bounds checking. Directory entries form a generation-specific set keyed by UTF-8 name; apply tombstones and duplicate generations only after validating the whole candidate. Decode each extent independently: the run/literal codec resets at every page and must enforce both decoded length and source consumption, then verify CRC32C over the decoded bytes. The repair operation should rebuild a canonical bundle from validated live files, rather than copying pages. The opaque generator produces large offsets, unsorted entries, empty runs, names with multibyte characters, and codec state boundaries that expose partial fixes.",
+  "trap": "A shallow solution that merely disables CRC failures, trusts the newest physical directory, or fixes only the obvious 32-bit cast will pass the healthy and simple damaged fixtures. Hidden bundles place a valid older directory after a corrupt newer candidate, split a literal/run sequence at a page boundary, use duplicate and tombstoned names, and put extents above 4 GiB in the logical address space. Such a service either returns stale content, silently truncates files, resurrects deleted files, or emits apparently successful but incorrect repairs.",
+  "tests": [
+   "Start `/usr/local/bin/loomd`, send several requests on one stdin session, and check that valid JSON responses, persistent service behavior, and malformed-request errors match the protocol.",
+   "Run `list` and `extract` against the checked-in healthy bundle, including an empty file and a UTF-8 filename, and compare exact JSON and byte payloads with the reference.",
+   "Run `verify` against the healthy, interrupted-tail, stale-directory, and corrupt-block fixtures and check the required valid/recoverable/unrecoverable classifications and counts.",
+   "Generate fresh bundles at verify time with the opaque fixture generator using several deterministic seeds. Inputs vary directory order, generation count, stale header hints, 48-bit logical offsets, duplicate names, tombstones, empty extents, and long UTF-8 names; compare list and extract responses with an independent reference implementation.",
+   "Generate codec-focused bundles whose raw and run/literal blocks end at every possible page boundary. Check exact extraction, decoded-length rejection, CRC rejection, and the rule that a bad extent makes only dependent files unavailable.",
+   "Generate bundles with a valid older directory and a physically newer candidate containing one invalid entry or invalid directory CRC. Check that the service chooses the newest internally consistent directory and does not merge entries from candidates.",
+   "Send `repair` requests for damaged bundles, reopen the produced bundle through the same service, and compare its live file set and bytes with the reference. Check that corrupt extents and deleted files are absent and that the repaired output is deterministic.",
+   "Check that generated files placed in a temporary directory work without modifying the checked-in fixtures and that repeated identical requests produce byte-for-byte identical responses."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "9",
+   "effect": "Increasing this adds independently generated combinations of directory generations, damaged tails, codec boundary placements, large logical offsets, duplicate/tombstoned names, and repair/reopen sequences; lowering it leaves fewer protocol paths and makes partial fixes much more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent believes the CRC message and weakens validation instead of tracing directory selection and decoding.",
+   "The agent fixes the visible 32-bit offset truncation but misses stale-directory selection or page-local codec resets.",
+   "The agent implements listing but treats extraction and repair as aliases, so dependent-file corruption and canonical rebuilding are wrong.",
+   "The agent assumes directory entries are sorted or names are unique and fails on generated duplicate and tombstone cases.",
+   "The agent tests only the supplied fixtures and never generates cases where a valid older directory beats a corrupt newer one.",
+   "The agent deploys a command-line converter rather than a persistent JSON-lines service, or leaves the wrapper pointing at the old binary.",
+   "The agent accepts decoded data based on CRC alone without checking decoded length, source consumption, bounds, or per-extent independence.",
+   "The agent mishandles 48-bit arithmetic, multibyte name ordering, empty files, or codec state at page boundaries."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "file-formats",
+  "tags": [
+   "c",
+   "binary-format",
+   "data-recovery",
+   "deployment",
+   "json-lines",
+   "hidden-generators"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the tree and locate the format documentation, protocol documentation, fixtures, build files, deployment files, and tools.",
+   "Read docs/loom-format.md and the JSON-lines protocol specification.",
+   "Read the directory-discovery, extent arithmetic, codec, protocol, and deployment code.",
+   "Inspect the Makefile, configuration, fixture metadata, and reference inspector.",
+   "Build the shipped implementation and run it against the healthy and damaged fixtures.",
+   "Compare list, extract, and verify results with tools/inspect.py.",
+   "Trace failures to the authoritative header hint, 32-bit extent arithmetic, directory ordering, and page-crossing codec state.",
+   "Patch directory scanning to validate candidates and select the newest internally consistent generation.",
+   "Patch all offset and length calculations to use validated unsigned 48-bit values.",
+   "Patch directory reconstruction to handle unsorted names, generations, duplicate names, and tombstones.",
+   "Reset and validate codec state per page and enforce decoded length, source consumption, bounds, and CRC checks.",
+   "Implement per-extent dependency handling so damaged extents make only dependent files unavailable.",
+   "Implement deterministic verify classifications and canonical repair output from validated live files.",
+   "Fix malformed-request handling and deterministic JSON response serialization while preserving the long-running service.",
+   "Build, deploy, and ensure /usr/local/bin/loomd points to the corrected authoritative service.",
+   "Run multi-request protocol checks and the checked-in fixture tests.",
+   "Run the opaque generator across seeds and compare list, extract, verify, and repair results with the reference.",
+   "Repeat identical requests and reopen repaired bundles to check determinism and persistence."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact JSON response schemas, error objects, repair-output representation, and lexical ordering rules are deferred to files not included in the blueprint; if those documents are incomplete, failures would be ambiguous.",
+   "The fixture generator's opaque binary must be available for the solver's architecture and execution environment; an incompatible or missing helper would make fresh-bundle failures invalid.",
+   "Tests involving logical offsets above 4 GiB need a specified sparse-file and disk-space budget; otherwise they may fail because of container storage limits rather than implementation correctness.",
+   "Pinned apt and Python dependency versions should be specified precisely, and the Docker build's network assumptions should be distinguished from the stated no-runtime-network requirement.",
+   "The service startup contract should explicitly define whether tests invoke the binary directly, through the configuration file, or through a wrapper, especially for stdin persistence and repair output paths."
+  ],
+  "verdict": "reject",
+  "reasons": "The outcome and verification plan are generally clear, realistic, and strongly verifiable, but the seeded defects and internal solution guidance make the core bugs discoverable by source inspection. A plausible 18-step speedrun can identify and patch the relevant paths, so genuine_difficulty is 2 under the stated rubric; that alone requires rejection despite an otherwise acceptable average.",
+  "fixes": [
+   "Remove or substantially obscure the directly readable regression pattern in the shipped source, and avoid spelling out the exact directory-selection, arithmetic, and codec fixes in solver-visible materials.",
+   "Add a small amount of genuinely necessary cross-feature behavior that must be inferred from the protocol and reference implementation rather than from comments or obvious defective lines.",
+   "Publish a complete protocol contract with exact request fields, response schemas, error codes, ordering, byte encoding, and repair-output semantics.",
+   "Document the opaque generator's invocation, supported architectures, sparse-file behavior, and maximum temporary disk usage.",
+   "Pin exact package versions and specify the expected build-time network/cache behavior so environment failures cannot be confused with solution failures."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This task recovers and repairs a checksummed binary bundle format with versioned directories and extents, whereas the reference replays validated transactional event logs into a snapshot."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "Although both are long-running recovery services, this task salvages binary bundle contents and directories, while the reference reconstructs an event-sourced catalog with persistent CRUD and audit semantics."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This task concerns directory and block-level recovery in a document container, not authenticated settlement-frame parsing and financial reconciliation."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The candidate implements a local JSON-lines bundle extraction and repair service, whereas the reference is an HTTP metrics query service over a live SQLite database and aggregation engine."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "The candidate recovers and rewrites a binary document format, while the reference audits report manifests, configuration merging, SQL translation, and Git-based query recovery."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.226
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.201
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.168
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.144
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.141
+    ]
+   ],
+   "cost_usd": 0.0010132
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0042902
+}

@@ -1,0 +1,180 @@
+{
+ "blueprint": {
+  "slug": "catalog-reconcile-config",
+  "title": "Repair the Configured Catalog Reconciler",
+  "scenario": "You are a data engineer inheriting a Go service that builds a SQLite product catalog from append-only change-event shards. The repository contains several historical implementations of its configuration format, a partially implemented reconciliation command, large representative event data, and operational tools that are not directly involved in catalog construction.",
+  "instruction_draft": "Finish the Go pipeline's catalog reconciliation feature so that a clean run produces the correct SQLite catalog, quarantine records, checkpoint, and manifest from the configured event history. It must honor profile inheritance, field mappings and transforms, event ordering and tombstones, malformed-record recovery, deterministic output, and idempotent reruns for the documented configuration and CLI contract.",
+  "requirements": [
+   "The reconciliation command must load the repository's documented configuration format and select the configured profile, including inherited profiles and explicit child-overrides-parent precedence.",
+   "It must discover every configured event shard, process all supported event records regardless of shard-file order, and produce the same final state on repeated runs.",
+   "For each entity and primary key, the catalog must contain the winner defined by the documented event version, source-priority, and sequence ordering rules; delete winners must remove the catalog row while preserving the required tombstone accounting.",
+   "Configured field mappings must support nested source paths, aliases, defaults, and the documented transforms, including trimming, case normalization, numeric conversion, and timestamp normalization.",
+   "Malformed JSON, invalid schema versions, missing required identity fields, and transform failures must be quarantined with the required reason, source shard, line number, and stable event identifier without preventing valid events from being materialized.",
+   "The generated SQLite tables, indexes, aggregate counters, quarantine table, and tombstone table must match the documented schema and exact contents for the input history.",
+   "The command must write a deterministic checkpoint and manifest containing the configured input identity, accepted and rejected counts, per-shard statistics, and final catalog digest.",
+   "A rerun against unchanged inputs must be idempotent: it must not duplicate catalog, quarantine, tombstone, or audit rows and must produce byte-equivalent deterministic state files.",
+   "The implementation must preserve the existing ingest and inspection commands and remain compatible with the repository's existing configuration fixtures and operational scripts."
+  ],
+  "environment": [
+   "Use a Dockerfile based on FROM python:3.13-slim-bookworm with pinned apt packages including the Go toolchain, SQLite CLI, git, jq, and Python test dependencies; no network access is needed at runtime.",
+   "Create a private Git repository with roughly 1,700 lines of Go across cmd, configuration, event decoding, SQLite persistence, reporting, and unrelated health-check packages, plus a complete commit history showing two prior configuration schema revisions and an abandoned reconciliation attempt.",
+   "The current checkout contains a partially implemented `catalog reconcile` command, a working single-shard ingest command, configuration examples, schema documentation, and operational shell wrappers; the reconciliation path currently passes a tiny happy-path fixture but is not correct for the full history.",
+   "Provide approximately 30,000 event records spread over many nested shard directories and about 40 files, with duplicates, out-of-order versions, retries, deletes, profile-specific mappings, malformed records, and a small number of rare ties and escaped JSON values.",
+   "Include several realistic but irrelevant Go components such as metrics formatting, a health endpoint, and an archive inspector so the relevant implementation must be located through repository exploration and history rather than by reading one obvious file.",
+   "Plant runtime-only problems involving configuration overlays and accumulated state: a cached effective configuration can be reused across profiles, shard processing can expose unstable map iteration, and the existing state update path treats some late tombstones and duplicate quarantine records incorrectly.",
+   "Include documentation and fixtures for the exact event ordering, mapping, transform, quarantine, SQLite schema, checkpoint, and manifest contracts, but make the small visible fixture omit the rare tie, nested escaping, profile override, and late-delete cases.",
+   "Provide a deterministic test harness and generator used by verification to create fresh configurations and event histories with thousands of records, including rare cases not present in the checked-in fixture."
+  ],
+  "internal_hint": "A skilled engineer should first inspect the CLI, configuration documentation, Git history, schema migrations, and run the supplied fixture while querying every resulting table rather than relying on the summary. The effective-config cache is keyed too coarsely and leaks parent/profile state; the reconciliation path also relies on nondeterministic iteration and applies deduplication before the full event winner ordering is known, which only becomes visible with generated multi-shard histories containing profile changes, retries, equal-version events, and late tombstones. The fix is to make configuration resolution explicit per run and profile, canonicalize and sort all input identities, stage or otherwise retain candidate events until winner selection is complete, make quarantine and tombstone writes keyed and idempotent, and generate checkpoint/manifest data from canonical sorted state. The reference solution should investigate with fixture runs, SQLite queries, repeated executions, and targeted generated histories before making the implementation changes.",
+  "trap": "A shallow solution can make the supplied fixture and final row count look correct by fixing only the visible mapping or by sorting filenames, while hidden histories expose profile-cache leakage, equal-version tie handling, late deletes, duplicate malformed records, or nondeterministic manifest ordering. Rebuilding only the catalog table also leaves stale quarantine, tombstone, checkpoint, and digest state that fails the state checks on a second run.",
+  "tests": [
+   "Build the Go program and run the documented reconciliation command against the checked-in fixture; verify the exact catalog rows, quarantine rows, tombstones, counters, schema indexes, checkpoint, and manifest.",
+   "Generate a fresh history of roughly 12,000 to 35,000 events across randomized shard names and nested directories, then compare every SQLite table and state file with a deterministic reference implementation.",
+   "Generate multiple profiles with inherited mappings, child overrides, aliases, defaults, and transform combinations; verify that each run uses only its selected effective configuration and that running profiles in the opposite order does not change either result.",
+   "Generate out-of-order events, retries, equal-version events, source-priority ties, and deletes; verify the documented complete winner ordering and that a winning tombstone removes the row without allowing an older upsert to resurrect it.",
+   "Inject malformed JSON, invalid schema versions, missing identities, invalid numeric values, invalid timestamps, escaped Unicode, and duplicate bad records; verify exact quarantine reasons and stable source/line/event identity while valid records continue processing.",
+   "Run reconciliation twice without changing inputs and verify byte-equivalent manifest and checkpoint files plus no duplicate rows in catalog, quarantine, tombstone, or audit tables.",
+   "Run the existing single-shard ingest, inspection, and health-check commands after the changes and verify their pre-existing outputs and database compatibility.",
+   "Repeat the same generated case under different filesystem directory-entry orders and process invocations; verify identical database contents, aggregate ordering, digest, and manifest bytes."
+  ],
+  "verifier_knob": {
+   "name": "generated_event_and_state_scale",
+   "value": "30,000 events, 40 shards, 6 independent state surfaces",
+   "effect": "Raising it increases the number of rows, shards, rare malformed cases, and checked tables/files, making manual inspection and accidental quadratic or nondeterministic implementations less viable; lowering it makes shallow fixture-based fixes more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the obvious demo failure but never runs a large generated history, missing data-dependent ordering and profile interactions.",
+   "The agent computes winners while streaming each shard and cannot correctly handle a later higher-priority event or tombstone from another shard.",
+   "The agent resolves inherited configuration once globally, causing one profile or sequential test run to contaminate another.",
+   "The agent uses Go map iteration or filesystem discovery order in catalog, statistics, or manifest generation, producing flaky state despite correct rows.",
+   "The agent deduplicates quarantine or audit data by line number or message text instead of the documented stable event identity.",
+   "The agent validates only the main catalog and leaves stale derived tables or checkpoint data after reruns.",
+   "The agent changes the existing ingest command or schema migration behavior while concentrating on the new reconciliation path.",
+   "The agent attempts a full rewrite without using Git history and misses compatibility details in the older configuration fixtures and operational wrappers."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "debugging",
+  "tags": [
+   "go",
+   "configuration",
+   "sqlite",
+   "event-sourcing",
+   "determinism",
+   "git-history"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd; find . -maxdepth 3 -type f | sort",
+   "git log --oneline --all --decorate -20",
+   "git show --stat HEAD~1..HEAD; git log --all -- config",
+   "rg -n \"catalog reconcile|profile|mapping|transform|manifest|checkpoint\" .",
+   "sed -n '1,240p' README.md; find docs config -type f -maxdepth 3 -print",
+   "cat the configuration and schema documentation plus checked-in fixtures",
+   "inspect cmd/reconcile and configuration-resolution packages",
+   "inspect event decoding and SQLite persistence/migration code",
+   "inspect reporting, checkpoint, manifest, and state-update code",
+   "run the documented reconciliation command on the visible fixture",
+   "query every SQLite table, index, and aggregate from the resulting database",
+   "go test ./...",
+   "trace effective-configuration caching and profile selection",
+   "fix configuration resolution to be explicit and isolated per run/profile",
+   "fix canonical shard discovery, input identity sorting, and all output ordering",
+   "retain or stage all valid candidates before applying complete winner ordering",
+   "implement documented version/source-priority/sequence/tombstone winner comparison",
+   "make quarantine, tombstone, audit, and derived-state writes keyed and idempotent",
+   "make reruns rebuild or reconcile all derived state without stale rows",
+   "make checkpoint, manifest, statistics, and digest generation canonical and deterministic",
+   "gofmt -w changed.go; go vet ./...; go test ./...",
+   "rerun the visible fixture and diff all tables and state files against expectations",
+   "run the supplied generated-history harness and compare every table/state surface",
+   "repeat generated cases with reversed profile order, repeated runs, and varied directory-entry order",
+   "run ingest, inspection, and health-check compatibility commands and verify their outputs"
+  ],
+  "speedrun_commands": 25,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The task depends on repository documentation for the exact winner ordering, transform semantics, quarantine reasons, output paths, and schema; if those documents are incomplete or contradictory, failures would be ambiguous rather than implementation errors.",
+   "Tests comparing byte-equivalent SQLite or state files could be invalid if they require unspecified SQLite page layout, journaling, or serialization behavior instead of documented logical contents and canonical files.",
+   "The generated-history test must use fixed seeds and deterministic profile/configuration construction; otherwise randomized shard names, filesystem order, or rare-case selection could make failures flaky.",
+   "The Docker build specification should pin package versions that actually exist in the selected bookworm repositories, and all generator/test dependencies needed at verification time must be available without runtime network access.",
+   "Compatibility checks must distinguish intentional reconciliation schema additions from regressions in ingest and inspection behavior; otherwise preserving old commands could conflict with the new documented schema."
+  ],
+  "verdict": "accept",
+  "reasons": "The blueprint specifies a concrete end state across catalog, quarantine, tombstone, derived state, and deterministic reporting, and its generated tests exercise the data-dependent bugs that a visible fixture would miss. The implementation is substantial and likely takes more than a trivial patch, but the existing partial path, documentation, history, and targeted failure hints make it feasible for a skilled engineer in the stated environment. The tests are appropriately outcome-based and broad enough to reject shallow fixes.",
+  "fixes": [
+   "State explicitly in the task documentation which files/directories hold each run's database, checkpoint, manifest, and audit state, including how profile-specific outputs are isolated.",
+   "Define the complete winner comparator and stable event-identity formula in one normative document, including behavior for exact duplicate records and all tie cases.",
+   "Specify whether deterministic equivalence means logical SQLite contents or byte-identical database files, and require canonical serialization only where byte equality is intended.",
+   "Pin and validate all Docker apt and Python dependency versions against the chosen base image, and include an offline build/test smoke check.",
+   "Make generated test seeds, expected output locations, and directory-order perturbation procedures explicit so verification is reproducible rather than merely randomized."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "variant",
+     "reason": "Both reconstruct deterministic SQLite state from append-only event data with ordering, tombstones, malformed-input handling, and idempotent reruns, but the candidate adds configuration-driven mappings and batch reconciliation rather than a replay service."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The reference indexes filesystem artifacts using an authoritative scanner, whereas the candidate reconciles configured product change events into a catalog."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The reference computes campaign sessions and attribution through an HTTP event-ingestion service, while the candidate materializes a configured catalog from shards."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The reference performs actor resolution, dependency ordering, and incident correlation, whereas the candidate performs schema-driven catalog reconciliation with field transforms and quarantine."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both are deterministic, idempotent replay pipelines that scan configured event files, apply ordered changes, preserve delete semantics, and emit canonical state and checksums, though the candidate focuses on configurable catalog transformation and SQLite metadata."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.32
+    ],
+    [
+     "ours/official-982469e29790",
+     0.215
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.179
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.175
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.161
+    ]
+   ],
+   "cost_usd": 0.0010574
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0041202
+}

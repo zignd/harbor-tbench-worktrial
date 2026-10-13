@@ -1,0 +1,187 @@
+{
+ "blueprint": {
+  "slug": "repair-release-query-cards",
+  "title": "Repair Release Query Card Build",
+  "scenario": "A release engineer is unblocking a broken JavaScript build for an internal release-reporting service. The repository contains a SQLite-backed report runner, deployment configuration, an append-only recovery journal, and several historical commits documenting successive versions of an in-house Query Card format, but the current checkout cannot reliably load cards or rebuild its reporting state.",
+  "instruction_draft": "Make the repository's release-reporting build and CLI operational without changing the public command names. Query Card configuration files must be accepted according to the documented format in the repository and translated into parameterized SQLite queries with correct filtering, joins, grouping, aggregates, ordering, pagination, NULL behavior, quoting, and error reporting; the implementation must work for arbitrary valid cards rather than only the checked-in examples.\n\nRecover the checked-in reporting database from its journal so that the final state reflects the last applicable event for each release, including corrections and tombstones, and recovery is idempotent. Update the checked-in configuration to the current documented schema, preserve the historical report behavior where the documentation requires it, and leave `npm test`, the recovery command, and the report CLI passing on fresh databases and generated Query Cards.",
+  "requirements": [
+   "The repository must install and run its existing JavaScript build and test commands successfully.",
+   "The report CLI must load the checked-in configuration using the current documented configuration schema.",
+   "The Query Card implementation must parse every construct documented in the repository's Query Card specification, including nested boolean expressions, typed and escaped literals, parameter references, quoted identifiers, joins, projections, aliases, aggregates, grouping, ordering, limits, and offsets.",
+   "Query Cards must be translated to parameterized SQLite SQL rather than interpolating values into SQL text.",
+   "Generated valid Query Cards must produce the same rows, column names, ordering, NULL behavior, and aggregate results as the reference semantics on fresh SQLite databases.",
+   "Malformed Query Cards and invalid parameter types must fail deterministically with a useful error instead of silently falling back to an unrestricted query.",
+   "The recovery command must replay the append-only journal into the reporting database, applying corrections and tombstones in journal order and preserving the final state for releases that have multiple historical events.",
+   "Recovery must be idempotent: running it repeatedly must not duplicate rows or alter already recovered state.",
+   "The checked-in database must contain the recovered release state and the report CLI must return the expected checked-in report.",
+   "The public command names and documented output shape must remain compatible with existing callers."
+  ],
+  "environment": [
+   "A Dockerfile based on `python:3.13-slim-bookworm` with pinned apt and pip dependencies; Node.js and SQLite tooling are installed from pinned packages or bundled local artifacts, with no network required at run time.",
+   "A git repository containing roughly 1,500 lines of JavaScript across a CLI, configuration loader, SQLite repository layer, report formatter, migration utilities, tests, and unrelated release tooling.",
+   "Git history with several meaningful commits: the original Query Card v1 implementation, a documented v2 configuration migration, a failed refactor that left v2 cards partially accepted, and a later recovery change whose assumptions are only apparent when comparing history with journal behavior.",
+   "A repository document describing a line-oriented, indentation-aware Query Card language. The language supports source tables and aliases, inner and left joins, selected expressions, aliases, nested `and`/`or` predicates, comparison and NULL predicates, `in`, `between`, arithmetic expressions, aggregate functions, grouping, ordering by aliases or expressions, limits, offsets, comments, quoted names, escaped strings, and named parameters.",
+   "The central card compiler module is intentionally incomplete: tokenization and a small expression helper exist, but the grammar, AST validation, SQL emission, and parameter binding pipeline are missing enough functionality that a superficial patch only handles the checked-in examples.",
+   "A checked-in configuration currently mixes legacy and current keys, including a report card path, database path, parameter declarations, and output settings. The loader's compatibility path silently applies defaults for some malformed combinations.",
+   "A SQLite database containing releases, services, deployments, environments, and status history, with duplicate-looking release identifiers that are distinguished by journal sequence and correction events.",
+   "An append-only JSONL recovery journal containing creates, updates, corrections, and tombstones, deliberately including out-of-order release updates, repeated events, fields explicitly set to NULL, and records whose replacement has a different deployment status.",
+   "Visible tests cover simple equality filters, one join, and a short journal. Hidden verification creates fresh databases and Query Cards from seeded generators, exercises the full documented grammar, compares results to a reference evaluator, and checks final file and database state.",
+   "A deterministic reference-solution shell script first inspects repository history, documentation, sample runtime failures, schema, journal replay behavior, and generated query traces before making the refactor and recovery changes."
+  ],
+  "internal_hint": "The main difficulty is not visible by reading one file: the important failures appear when real cards run against accumulated data and when journal corrections interact with NULLs, duplicate business keys, and repeated recovery. A skilled solution starts with `git log`, `git show`, the Query Card specification, schema inspection, and traced CLI runs, then constructs a real lexer/parser and typed AST rather than extending string substitutions. It should compile expressions into SQLite with a separate ordered parameter list, explicitly preserve three-valued SQL logic, validate identifiers and clause combinations, and test generated cards against a reference evaluator. History reveals that v2 changed configuration nesting and that the old loader's fallback loses parameter declarations. The recovery implementation must use journal sequence as the authority, distinguish an explicit NULL from an absent field, apply tombstones, replace current rows atomically, and use a unique or upserted identity so replay is idempotent. Finally the engineer should migrate the checked-in config, rebuild the database transactionally, and run both generated-card and repeated-recovery probes.",
+  "trap": "A shallow solution can make the sample report pass by accepting only the visible equality-and-join cards and by rebuilding rows keyed only by release name. Hidden inputs expose nested precedence, escaped literals, quoted identifiers, aggregate aliases, left-join NULLs, repeated parameters, and parameter values that look like SQL. Hidden journal cases expose corrections after an earlier update, explicit NULL fields, tombstones, and replay duplication. A loader that silently defaults missing v2 settings also passes the old sample while querying the wrong table or ignoring configured parameters.",
+  "tests": [
+   "Run the existing build and test commands and verify the public CLI entry points, output schema, and exit behavior.",
+   "Load the migrated checked-in configuration and inspect the resulting effective settings through the running CLI, checking all required paths, parameter declarations, and report options.",
+   "Run the recovery command twice against the checked-in journal and database; verify identical database contents after both runs, including release, deployment, correction, and tombstone outcomes.",
+   "Run the checked-in report and compare exact rows, column labels, aggregate values, and deterministic ordering with the expected recovered state.",
+   "Generate fresh SQLite fixtures with thousands of release and deployment rows, including NULLs, duplicate names, empty groups, and values containing quotes and SQL metacharacters.",
+   "Generate valid Query Cards covering every documented grammar production and compare the compiler's parameterized execution results with a deterministic reference evaluator, including nested boolean precedence, left joins, grouping, aggregates, ordering, offsets, and limits.",
+   "Verify that parameter values are bound separately by using generated values containing quotes, comment markers, Unicode, and strings resembling SQL syntax.",
+   "Generate malformed cards and invalid parameter declarations and verify deterministic nonzero failure with no unrestricted or partially executed query.",
+   "Generate journals with repeated events, out-of-order business identifiers, explicit NULL updates, corrections, and tombstones; compare the recovered database with a reference event reducer and verify that recovery is atomic on malformed input.",
+   "Check that recovery and query execution work on a fresh empty database as well as on the prepopulated checked-in database."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "10",
+   "effect": "Raising this adds independently checked configuration fields, recovered tables and event cases, generated Query Card grammar features, and exact output properties, making partial fixes less likely to pass. Lowering it to 4 or 5 would allow a solution that handles only the checked-in report and a simple journal to succeed."
+  },
+  "expected_failure_modes": [
+   "Implementing a query-string rewrite instead of a complete parser, causing precedence, quoting, aggregate, or nested-expression failures.",
+   "Reading the current configuration in isolation and missing the schema contract encoded in earlier commits.",
+   "Using JavaScript truthiness or ad hoc predicate evaluation, which mishandles SQL NULL and left-join semantics.",
+   "Interpolating parameters into SQL or binding them in the wrong traversal order.",
+   "Treating a business key as globally unique and losing corrections or unrelated releases during journal replay.",
+   "Applying journal events non-transactionally or treating explicit NULL as an omitted field.",
+   "Appending recovered rows on every run instead of making replay idempotent.",
+   "Testing only the visible report and not probing generated cards or accumulated journal state.",
+   "Changing CLI output or command names while repairing internals, breaking compatibility checks."
+  ],
+  "predicted_pass_rate": 0.2,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "javascript",
+   "sqlite",
+   "sql-translation",
+   "configuration",
+   "git-history",
+   "state-recovery"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd && find . -maxdepth 2 -type f | sort",
+   "git status --short && git log --oneline --decorate -12",
+   "cat package.json && npm ci",
+   "find . -iname '*query*' -o -iname '*config*' -o -iname '*journal*' -o -iname '*schema*'",
+   "read the Query Card specification and configuration documentation",
+   "inspect the CLI entry points, tests, and current compiler module",
+   "inspect the SQLite schema, checked-in database, and journal contents",
+   "run npm test and each documented CLI command to capture baseline failures",
+   "inspect relevant historical commits with git show, especially v1, v2, refactor, and recovery changes",
+   "trace the current configuration loader and effective CLI settings",
+   "trace a visible report query and its generated SQL and parameters",
+   "implement a lexer for indentation, identifiers, quoted names, literals, comments, and parameters",
+   "implement the documented Query Card parser and validated typed AST",
+   "implement SQL emission with separate ordered parameter binding and explicit NULL semantics",
+   "implement validation for expressions, joins, grouping, ordering, pagination, and malformed cards",
+   "migrate the checked-in configuration to the documented v2 schema and remove silent fallback behavior",
+   "implement journal reduction using sequence order, explicit-null tracking, corrections, tombstones, and stable identity",
+   "make recovery transactional and idempotent with upsert or replacement semantics",
+   "rebuild the checked-in database from the journal",
+   "run npm test, recovery twice, and the checked-in report CLI",
+   "create fresh SQLite fixtures and generated cards covering joins, predicates, aggregates, NULLs, quoting, and pagination",
+   "compare generated-card results and metadata with the reference evaluator",
+   "test malformed cards, invalid parameters, malformed journals, atomic rollback, and SQL-looking parameter values",
+   "inspect git diff, verify public command compatibility, and rerun all checks from a fresh database"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact Query Card grammar and semantics are only described indirectly; hidden tests could require behavior not determinable from the repository documentation.",
+   "Reference-evaluator behavior for SQLite-specific NULL ordering, aggregate edge cases, duplicate rows, and empty groups may be underspecified.",
+   "The required recovery identity is ambiguous when releases have duplicate-looking identifiers and corrections, so a correct implementation could disagree with the verifier's key.",
+   "The requirement to work on a fresh empty database is unclear about whether schema creation and migrations are part of recovery.",
+   "Pinned Node.js and SQLite installation details are not concrete enough to establish that the stated no-network Docker build is reproducible.",
+   "Exact output-shape and configuration compatibility checks could overreach if the repository documentation does not specify whether additional fields or ordering are allowed."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and difficult, and its generated-input verification is substantially stronger than a visible-example repair. However, implementing a complete indentation-sensitive language, SQL compiler, configuration migration, transactional event reducer, database rebuild, and generated-test validation is unlikely to be solvable by a skilled engineer in under an hour on one CPU and 2 GB of memory. Several core semantics are also delegated to documentation or hidden reference behavior, creating avoidable solvability and invalid-failure risk.",
+  "fixes": [
+   "Reduce scope by separating the full Query Card compiler and journal-recovery work into two tasks, or provide a substantial parser/compiler scaffold and limit the task to completing specified productions.",
+   "Include the exact grammar, AST constraints, SQL NULL and ordering semantics, duplicate-row expectations, aggregate behavior, and parameter-binding traversal order in the repository.",
+   "Document the canonical recovery identity, sequence ordering rules, field-merge semantics, tombstone behavior, and fresh-database initialization contract.",
+   "Provide a fully pinned, locally available Node.js/SQLite toolchain and a deterministic build command that can be verified without network access.",
+   "State precise output schemas and compatibility rules, including whether extra configuration or report fields are permitted.",
+   "If retaining the current scope, raise the expected time/resource budget and make the reference evaluator and generated fixtures available to the solver."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/query-optimize",
+     "verdict": "distinct",
+     "reason": "This task requires implementing a Query Card compiler and recovery workflow, not optimizing a fixed SQLite query."
+    },
+    {
+     "ref_id": "ours/official-18899524e171",
+     "verdict": "variant",
+     "reason": "Both require a general-purpose filter/query specification to be validated and translated into parameterized SQLite queries, but they use different formats and the candidate adds substantial journal recovery and CLI integration."
+    },
+    {
+     "ref_id": "ours/official-f4862e2c2598",
+     "verdict": "distinct",
+     "reason": "The reference is an HTTP time-series aggregation service backed by a compiled engine, whereas this task concerns a JavaScript Query Card parser, SQLite query compiler, and database recovery."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The reference fixes one SQL report involving window-function semantics, while this task implements an arbitrary Query Card language and journal replay system."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "Although both involve release reporting and SQLite data, the reference focuses on shard ingestion, analytical parity, performance, and database size rather than query-language implementation and recovery correctness."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/query-optimize",
+     0.164
+    ],
+    [
+     "ours/official-18899524e171",
+     0.156
+    ],
+    [
+     "ours/official-f4862e2c2598",
+     0.125
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.097
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.085
+    ]
+   ],
+   "cost_usd": 0.0010238
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0032627999999999997
+}

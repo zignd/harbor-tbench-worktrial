@@ -1,0 +1,72 @@
+{
+ "slug": "repair-security-event-index",
+ "title": "Repair the Security Event Index",
+ "scenario": "You maintain an open-source incident-indexing utility used by security teams to turn signed JSONL event archives into a queryable SQLite database. A recent release introduced a regression that only appears in long archives containing unusual network indicators, and the downstream maintainers need a reproducible repair rather than a one-off edit to the sample data. The container contains the roughly 1,600-line importer, SQLite migrations and reports, a large deterministic archive, fixtures, and a compiled address-classification component with no source.",
+ "instruction_draft": "The release candidate must rebuild `/work/state/events.sqlite` from `/work/input/archive.jsonl` using `./bin/rebuild-index`; do not hand-edit the database or discard input records. The final database must contain exactly the accepted events with their original event identity and revision, canonical source and destination indicators, signature verdicts, and deterministic risk scores; rejected records must be retained with their reason, and rerunning the command must produce the same state.\n\nThe index must preserve every valid event, including IPv4-mapped IPv6 addresses, IPv6 zone identifiers, non-ASCII actor names, duplicate deliveries, superseded revisions, and records split across archive chunks. Enforce the documented identity, revision, signature, timestamp, and risk rules, keep aggregate tables consistent with the event and rejection tables, and make the rebuild work for fresh archives placed at the same input path. The supplied checker will inspect the complete SQLite state, not just a few report queries.",
+ "requirements": [
+  "Running `./bin/rebuild-index` with `/work/input/archive.jsonl` as input must produce `/work/state/events.sqlite`.",
+  "The rebuild must be deterministic and idempotent: two clean runs over the same archive must have byte-equivalent logical SQLite contents and no accumulating rows.",
+  "Every accepted event must retain its event identity, revision, raw timestamp, actor, source indicator, destination indicator, signature verdict, and computed risk fields.",
+  "Indicators must be stored in the canonical form produced by the installed address-classification component, including IPv4-mapped IPv6 and IPv6 zone-identifier cases.",
+  "Duplicate deliveries must not create duplicate logical events, while distinct revisions of one event must be handled according to the repository's revision rules.",
+  "Superseded or otherwise rejected records must remain queryable in the rejection table with their original line identity and deterministic rejection reason.",
+  "Malformed JSON, invalid required fields, invalid timestamps, and failed signatures must be rejected without aborting processing of the rest of the archive.",
+  "Records whose actor names or indicator text contains non-ASCII UTF-8 must round-trip without replacement characters or lossy normalization.",
+  "Archive records may be divided into chunk files and the rebuild must process all records represented by the archive manifest rather than only the first visible chunk.",
+  "The event, rejection, daily-summary, actor-summary, and indicator-summary tables must agree exactly: every summary must be reproducible from the final accepted and rejected rows.",
+  "Risk scores and severity buckets must follow the repository's documented deterministic rules and must use the verdict and canonical indicator classification for each accepted event.",
+  "The resulting database must satisfy all existing schema constraints and indexes and must pass the supplied `./bin/check-index` command.",
+  "The implementation must work on newly generated archives using the same JSONL schema and installed helper binary, not only on the supplied archive."
+ ],
+ "environment": [
+  "The Docker image is based on `python:3.13-slim-bookworm`, with pinned SQLite/Python packages and no network dependency.",
+  "`/work/src` contains approximately 1,600 lines across a command-line importer, chunk reader, SQLite repository, migrations, signature adapter, reporting code, and unrelated maintenance commands.",
+  "`/work/input/archive.jsonl` and its manifest describe roughly 18,000 deterministic security events spread across multiple logical chunks; only a small number exercise the unusual address, Unicode, duplicate, revision, and cross-chunk cases.",
+  "`/work/state/events.sqlite` is an initially populated but stale database containing plausible rows and summaries; the intended operation is a clean rebuild, not an append.",
+  "`./bin/rebuild-index` is the production entry point and `./bin/check-index` performs local consistency checks. Existing documentation describes the JSONL schema, revision policy, rejection vocabulary, risk formula, and SQLite schema.",
+  "`/opt/security/bin/addrclass` is a compiled opaque component with no source. It accepts one indicator per invocation or framed batches on stdin and returns a classification and canonical indicator used by the reference implementation; its behavior includes edge cases not faithfully captured by Python's standard IP parser.",
+  "The importer includes a native subprocess adapter, a chunk/line decoder, transaction batching, and summary generation. Several components are intentionally unrelated to the regression so the fault must be located by observing executions and comparing intermediate state.",
+  "The test harness can replace `/work/input/archive.jsonl` with deterministic hidden archives containing thousands of generated records and can reset `/work/state` before each run."
+ ],
+ "internal_hint": "The resolution path is to inspect the CLI, schema, fixture manifest, and checker, then run the importer with SQL tracing or temporary counters while comparing accepted/rejected counts by chunk. Characterizing `/opt/security/bin/addrclass` on boundary inputs reveals that its framed output can contain an empty classification field and that canonicalization is not equivalent to `ipaddress.ip_address`; the current adapter splits output on all whitespace and silently pairs results with the wrong records when a batch contains such an output. Separately, the chunk reader's deduplication key omits the revision, and the summary stage groups before the final supersession filter, so the supplied sample appears mostly correct while long histories drift. The repair should use length- or line-framed helper results, preserve helper ordering, use the full documented logical identity including revision during ingestion, apply supersession before all aggregates, use explicit UTF-8 and NULL-safe SQLite bindings, and rebuild summaries from the finalized accepted/rejected sets. A deterministic shell reference investigates counts and helper behavior first, patches the adapter/reader/aggregation path, runs clean rebuilds, and checks both supplied and generated archives.",
+ "trap": "A shallow solution can make the visible reports look correct by replacing the opaque helper with Python address parsing or by deleting duplicate-looking rows. Hidden archives contain rare helper classifications, an event with a later revision in an earlier chunk, duplicate deliveries separated by thousands of lines, and Unicode fields. Such a solution produces plausible event counts but mismatched canonical indicators, loses a legitimate revision, leaves stale summary rows, or misaligns batched helper results; inspecting only the first few rows or one report does not expose the failure.",
+ "tests": [
+  "Reset the workspace, run the repaired entry point on the supplied 18,000-record archive, and compare all logical rows in events, rejections, and every summary table against the deterministic reference state.",
+  "Check that all required SQLite tables, indexes, foreign keys, uniqueness constraints, and metadata rows exist and that the database passes `./bin/check-index`.",
+  "Run the rebuild twice from clean and then non-clean state and verify identical logical contents, no duplicate summaries, and no accumulation of rejected rows.",
+  "Generate a fresh large archive with seeded records covering ordinary addresses, IPv4-mapped IPv6, zone-qualified IPv6, helper outputs with empty fields, malformed records, Unicode actor names, repeated deliveries, and multiple revisions; compare the complete resulting state against a reference driver that invokes the opaque binary.",
+  "Generate archives with records permuted between chunks and verify that accepted rows, supersession decisions, rejection reasons, and aggregate values are invariant where the documented ordering policy says they must be.",
+  "Use hidden cases where a failed signature, invalid timestamp, or malformed JSON is surrounded by valid events and verify that processing continues and line/chunk provenance is retained.",
+  "Recompute risk scores and all daily, actor, and indicator aggregates independently from final rows and compare exact integer values, NULL behavior, and severity buckets.",
+  "Verify that canonical indicator values and classifications match the compiled helper for every hidden record, rather than merely matching a sample of common IPv4 addresses.",
+  "Inspect that raw Unicode values round-trip exactly and that event identity and revision fields remain stable through rebuild and SQLite export."
+ ],
+ "verifier_knob": {
+  "name": "generated_archive_records_and_state_tables",
+  "value": "18,000 supplied records, 12 independently checked tables/properties, and 4,000-25,000 verify-time records",
+  "effect": "Increasing the record count and the proportion of rare cross-chunk, revision, Unicode, and opaque-helper cases makes sampling and ad hoc fixes less effective; increasing checked summary and provenance tables catches partial repairs. Lowering either produces faster feedback and makes a solution that only fixes the visible event table more likely to pass."
+ },
+ "expected_failure_modes": [
+  "Reading the importer source and fixing only the obvious SQL or JSON bug without experimentally characterizing the compiled helper.",
+  "Replacing the opaque classifier with a standard-library IP parser that disagrees on rare canonical forms.",
+  "Parsing helper output with whitespace splitting, causing one unusual result to shift every subsequent batched result.",
+  "Treating event ID alone as uniqueness and silently dropping a legitimate revision.",
+  "Computing summaries before applying final supersession and rejection decisions.",
+  "Processing only the first chunk or relying on filesystem order instead of the manifest.",
+  "Appending into the stale database rather than rebuilding all state transactionally.",
+  "Verifying only row counts or a handful of visible addresses and missing stale aggregate or rejection rows.",
+  "Using locale-dependent decoding, lossy Unicode handling, or text normalization that changes actor or indicator values.",
+  "Implementing a fix that works for the supplied archive but assumes its exact chunk size, ordering, or distribution."
+ ],
+ "predicted_pass_rate": 0.2,
+ "difficulty": "hard",
+ "category": "security-data-processing",
+ "tags": [
+  "sqlite",
+  "opaque-binary",
+  "event-reconciliation",
+  "systems-programming",
+  "large-state",
+  "deterministic-rebuild"
+ ]
+}

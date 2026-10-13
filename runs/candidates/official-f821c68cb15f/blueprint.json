@@ -1,0 +1,55 @@
+{
+ "slug": "telemetry-session-attribution-service",
+ "title": "Log Session Attribution and Metric Query Service",
+ "scenario": "A platform team is migrating edge telemetry from a legacy ingress proxy to a new observability platform. In the legacy cluster, frontend edge access logs and backend execution task logs were recorded in separate streams without propagated trace IDs due to an obsolete proxy header filter. To compute accurate latency quantiles and route SLAs, the platform needs a local HTTP query service (`telemetry-queryd`) that processes historical log packs, reconstructs trace sessions by solving a temporal interval constraint satisfaction problem between frontend requests and backend tasks, and serves windowed quantile/SLA metrics over a REST API.",
+ "instruction_draft": "Hey, we need to wrap up the telemetry migration service in `/opt/telemetry-service`. The old ingress stripped downstream trace headers, so frontend edge logs and backend worker logs in `/var/log/telemetry/` have no matching request IDs. We need the query daemon (`telemetry-queryd`) running on port 8085 to serve `/v1/query` and `/v1/attribution/stats`. The API specification and log schema notes are in `README.md` and `docs/spec.md`. The log unpacker needs to decode the legacy compact `.bpack` binary logs (there's a legacy C header and a partial prototype in `legacy/`), the engine needs to solve the temporal bipartite matching constraints between frontend requests and backend tasks, and then compute the windowed latency percentiles. Once you have it running and passing the queries, make sure `systemctl restart telemetry-queryd` (or equivalent service script) stays healthy.",
+ "requirements": [
+  "Run an HTTP service listening on `0.0.0.0:8085` that implements `GET /healthz`, `POST /v1/query`, and `GET /v1/attribution/stats` as documented in `docs/spec.md`.",
+  "Decode the compact binary log packs (`.bpack` files) located in `/var/log/telemetry/backend/` according to the struct specification in `legacy/bpack.h` (handling 16-byte fixed headers, variable-length endpoint strings, and delta-encoded millisecond timestamps).",
+  "Parse the text access logs in `/var/log/telemetry/frontend/` (formatted as TSV: `timestamp_ms`, `req_id`, `client_ip`, `endpoint`, `status`, `frontend_latency_ms`).",
+  "Reconstruct end-to-end traces by solving the constraint satisfaction problem matching frontend requests to backend tasks: (1) matching endpoint string, (2) backend execution interval `[t_start, t_end]` must be strictly contained within frontend request window `[req_start, req_start + frontend_latency_ms]`, (3) backend concurrency limit: a backend worker instance cannot execute overlapping tasks simultaneously, (4) status code consistency: if backend task failed (non-zero worker exit code), frontend status must be 502 or 504.",
+  "For ambiguous multi-candidate matches, resolve via minimum slack time `(t_start - req_start) + (req_end - t_end)` constraint optimization as defined in `docs/spec.md`.",
+  "Support `/v1/query` with JSON POST body containing `endpoint`, `time_range` (`[start_ms, end_ms]`), and metric aggregations (`matched_count`, `unmatched_frontend_count`, `p50_backend_latency`, `p90_backend_latency`, `p99_backend_latency`, `error_rate`).",
+  "Ensure the service auto-reloads or correctly processes newly appended log files when queried."
+ ],
+ "environment": [
+  "Ubuntu 24.04 / Debian Linux container with Python 3.13, GCC, make, standard unix tools, and systemd/init script for `telemetry-queryd`.",
+  "Directory `/opt/telemetry-service/` containing skeleton code, a draft FastAPI/Aiohttp or stdlib HTTP daemon stub, and `docs/spec.md` detailing the REST schemas, status codes, and exact percentile definitions (nearest rank method).",
+  "Directory `/opt/telemetry-service/legacy/` containing `bpack.h` (C struct definitions for `.bpack` format) and a sample unpack test script.",
+  "Directory `/var/log/telemetry/` containing two subdirectories: `frontend/` (TSV text logs) and `backend/` (binary `.bpack` files).",
+  "Systemd unit file `/etc/systemd/system/telemetry-queryd.service` pointing to `/opt/telemetry-service/run.sh`.",
+  "Pre-generated baseline sample dataset to allow immediate testing by the solver."
+ ],
+ "internal_hint": "Difficulty stems from multi-stage dependency: Stage 1 decodes binary delta-timestamps and string offsets from `.bpack` backend records; an off-by-one or sign error in delta decoding shifts backend timestamps. Stage 2 matches edge requests with backend worker executions using interval constraints and worker capacity bounds. Stage 3 computes metrics (p50/p90/p99) over the matched join. A small error in Stage 1 causes matching failures in Stage 2, which corrupts percentile calculations in Stage 3. The solver can inspect `bpack.h` to write a binary unpacker in Python (using `struct` module), implement an interval-matching bipartite matching / greedy minimum-slack allocation respecting per-worker concurrency, and expose the HTTP endpoints.",
+ "trap": "A solver might match frontend and backend records solely on endpoint and timestamp proximity without enforcing the worker non-overlap constraint (single worker executing one task at a time) or fail to correctly handle delta-encoded timestamps across chunk boundaries in `.bpack` files, causing matches to look plausible on small test subsets but fail completely when query windows span across multiple chunks with high concurrency.",
+ "tests": [
+  "Health check test: verifies `GET /healthz` returns `200 OK` with JSON `{\"status\": \"healthy\"}`.",
+  "Bpack unpacker verification: tests that all binary records from historical packs are parsed with exact start/end millisecond timestamps.",
+  "Constraint attribution endpoint: tests `GET /v1/attribution/stats` against hidden ground-truth matches generated from a hidden seed across 1,000+ records, validating total matched, orphaned, and slack distributions.",
+  "Multi-endpoint metric aggregation: sends 20+ distinct POST `/v1/query` requests with diverse time windows and endpoints, comparing `matched_count`, `p50_backend_latency`, `p90_backend_latency`, `p99_backend_latency`, and `error_rate` against ground-truth values computed by the reference model.",
+  "Dynamic log ingestion: appends a fresh batch of binary and TSV logs generated at verify-time from a hidden seed and verifies that queries reflecting the new time range return correct aggregations."
+ ],
+ "verifier_knob": {
+  "name": "query_scenario_count",
+  "value": "25",
+  "effect": "Controls the number of distinct time-window, concurrency, and endpoint combinations queried against the service at verify time, including edge cases with high contention and tight worker constraints."
+ },
+ "expected_failure_modes": [
+  "Incorrect unpacking of variable-length strings or delta timestamps in `.bpack` binary logs, causing timestamp drift and 0% match rate.",
+  "Naive greedy matching that ignores per-worker concurrency constraints, resulting in physically impossible worker assignments and incorrect slack optimization.",
+  "Off-by-one boundary errors in time-range filtering (`start_ms <= timestamp < end_ms` vs `<=`).",
+  "Percentile calculation discrepancies (e.g. using continuous interpolation instead of nearest rank as specified in `docs/spec.md`).",
+  "Service instability or failure to handle concurrent HTTP query requests within timeout."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "text-and-log-processing",
+ "tags": [
+  "log-processing",
+  "reverse-engineering",
+  "constraint-satisfaction",
+  "service-protocol",
+  "algorithms",
+  "telemetry"
+ ]
+}

@@ -1,0 +1,161 @@
+{
+ "blueprint": {
+  "slug": "monte-carlo-settlement-pipeline-deployment",
+  "title": "Monte Carlo Settlement Reconciliation Pipeline Deployment",
+  "scenario": "A quantitative risk compute cluster produces stochastic Monte Carlo path simulation batches that finance-ops reconciles against institutional compute credit ledgers. The pipeline deployment scripts, worker dispatchers, and SQLite settlement database located in `/srv/sim-recon` fail intermittently when ingesting incoming batch archives from `/var/spool/sim-recon/incoming/`. Logs attribute the failure to numerical checksum drifts and arithmetic verification errors in the scientific payload parser, leaving ledger balances unreconciled and transactions dropped.",
+  "instruction_draft": "Our scientific risk modeling cluster outputs Monte Carlo path simulation batches that finance-ops must reconcile against institutional compute credit accounts. The reconciliation deployment under `/srv/sim-recon` is failing in staging: incoming batch archives are being rejected with numerical checksum mismatch errors, leaving account ledgers unreconciled and batch records dropped.\n\nFix and deploy the reconciliation pipeline using `/srv/sim-recon/bin/deploy.sh` so that running `/srv/sim-recon/bin/reconcile.sh` completely processes all pending simulation archives in `/var/spool/sim-recon/incoming/`. The SQLite database at `/var/lib/sim-recon/settlement.db` must accurately record all batch summaries and uncorrupted path metrics, deduct account balances atomically without permitting negative credit balances (marking overdrawn batches as `INSUFFICIENT_CREDITS`), cleanly move processed archives to `/var/spool/sim-recon/archive/` or `/var/spool/sim-recon/quarantine/`, and leave the database in WAL mode with passing integrity checks.",
+  "requirements": [
+   "Execute `/srv/sim-recon/bin/deploy.sh` to configure system directories, SQLite database pragmas, and pipeline workers without error.",
+   "Running `/srv/sim-recon/bin/reconcile.sh` must process all batch archives (`.tar.gz`) present in `/var/spool/sim-recon/incoming/` until the directory is empty.",
+   "Every incoming batch must be registered in the `batches` table in `/var/lib/sim-recon/settlement.db` with status `SETTLED`, `INSUFFICIENT_CREDITS`, or `CORRUPTED`.",
+   "Each settled batch in `batches` must have its individual path outputs recorded in `path_metrics` with exact floating-point metrics (drift and terminal values matching simulation records to 6 decimal places).",
+   "Account balances in `accounts` must be updated atomically: compute cost must be debited only when the account has sufficient available credits; if credits are insufficient, balance must remain unchanged and the batch marked `INSUFFICIENT_CREDITS`.",
+   "Valid processed archives must be moved to `/var/spool/sim-recon/archive/`; corrupted or unparseable archives must be moved to `/var/spool/sim-recon/quarantine/`.",
+   "The SQLite database at `/var/lib/sim-recon/settlement.db` must have `journal_mode=wal`, return `ok` on `PRAGMA integrity_check;`, and maintain foreign key integrity."
+  ],
+  "environment": [
+   "Base image `python:3.13-slim-bookworm` with `sqlite3`, `gcc`, `make`, `bash`, `coreutils`, `gawk`, and `tar` installed.",
+   "Pre-populated directory `/srv/sim-recon` containing `bin/deploy.sh`, `bin/reconcile.sh`, `bin/worker.sh`, `src/sim_verifier.c`, and `schema.sql`.",
+   "Compiled utility `/srv/sim-recon/bin/sim_verifier` built from `src/sim_verifier.c` that parses packed binary `.sim` records (IEEE 754 double precision trajectory metrics) and prints CSV output with verification checksums.",
+   "SQLite database at `/var/lib/sim-recon/settlement.db` pre-populated with baseline account records and initial allocation credits.",
+   "Incoming staging directory `/var/spool/sim-recon/incoming/` containing sample batch archives, along with empty directories `/var/spool/sim-recon/archive/` and `/var/spool/sim-recon/quarantine/`.",
+   "Planted Bug 1 (Misleading Symptom): In `bin/deploy.sh` and `bin/worker.sh`, worker subshells read binary `.sim` files through a single shared named pipe (`/tmp/sim_recon.fifo`) concurrently. When batch sizes exceed `PIPE_BUF` (4096 bytes), binary stream chunks interleave across workers, corrupting struct alignment and triggering `sim_verifier` checksum mismatch errors that log messages blame on 'FPU drift' or 'AVX rounding'.",
+   "Planted Bug 2: `bin/worker.sh` does not set `busy_timeout` or enable WAL mode on `settlement.db`, resulting in `database is locked` write failures during concurrent batch updates that cause silent rollbacks.",
+   "Planted Bug 3: `bin/reconcile.sh` does not isolate locale (`LC_NUMERIC`), causing floating-point awk formatting to truncate or alter decimal points depending on subshell environments.",
+   "Planted Bug 4: In `bin/reconcile.sh`, account credit checks and deductions are performed in two disjoint non-transactional SQL statements without `BEGIN IMMEDIATE` transactions, allowing race conditions and negative balances when multiple batches debit the same account."
+  ],
+  "internal_hint": "The solver will first observe batch runs failing with logs claiming arithmetic drift in `sim_verifier`. Examining `sim_verifier.c` will show the math is correct, but examining the raw input streamed into `sim_verifier` reveals split binary structs caused by multiple worker processes reading simultaneously from `/tmp/sim_recon.fifo`. Replacing the shared FIFO with per-worker inputs or direct file processing eliminates data interleaving. Next, concurrent SQLite transactions cause lock contention and dropped records: the solver must configure WAL mode (`PRAGMA journal_mode=WAL;`), set a sensible `busy_timeout`, and wrap the credit check + debit + batch insert inside an atomic `BEGIN IMMEDIATE ... COMMIT` transaction. Finally, ensuring `LC_ALL=C` guarantees deterministic float parsing and moving processed archives to archive/quarantine directories satisfies filesystem state.",
+  "trap": "A naive solver will only inspect the provided small sample batch in `/var/spool/sim-recon/incoming/`, where batch payloads are small enough (<4096 bytes) that named pipe interleaving rarely triggers. If they only 'fix' the script to pass the visible sample without replacing the shared FIFO architecture or fixing the non-atomic credit deduction, the hidden-seed verification test will run multi-kilobyte batches concurrently across identical accounts, instantly corrupting structs and producing negative credit balances.",
+  "tests": [
+   "Verify-time generator creates 10 fresh, multi-megabyte simulation batches derived from a hidden seed across 4 accounts with varied credit limits and deliberate corrupt payloads in 2 batches.",
+   "State check 1: `/var/spool/sim-recon/incoming/` contains exactly 0 files after execution.",
+   "State check 2: The count of files in `/var/spool/sim-recon/archive/` matches the number of valid batches, and `/var/spool/sim-recon/quarantine/` contains exactly the corrupted batches.",
+   "State check 3: Total count of rows in `batches` equals 10, with exact ground-truth status mapping (settled vs insufficient credits vs corrupted).",
+   "State check 4: Total row count in `path_metrics` matches the sum of paths from all settled batches.",
+   "State check 5: Aggregate sum of `terminal_value` and `drift` in `path_metrics` matches reference simulation values to within 1e-6 relative tolerance.",
+   "State check 6: Account credit balances in `accounts` match reference ledger deductions exactly, with zero negative balances.",
+   "State check 7: `PRAGMA integrity_check;` on `settlement.db` returns `ok` and `PRAGMA journal_mode;` returns `wal`."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties_checked",
+   "value": "7",
+   "effect": "Increasing the knob adds strict sub-path metric distribution checks and audit log sequence invariants; lowering it only checks final account balances and batch status."
+  },
+  "expected_failure_modes": [
+   "Falling for the misleading symptom: spending time modifying `sim_verifier.c` compiler optimization flags (-O0, -mfpmath) to fix apparent FPU drift.",
+   "Only testing against the small sample files where `PIPE_BUF` boundary interleaving is not triggered, failing when hidden test generates realistic large batches.",
+   "Failing to handle SQLite concurrency: relying on default DELETE journal mode without busy timeout, causing SQLite busy locks and lost batch rows.",
+   "Non-atomic balance deduction: checking `credit_balance >= cost` in bash/read queries before running an UPDATE, resulting in balance underflows under concurrent worker execution."
+  ],
+  "predicted_pass_rate": 0.3,
+  "difficulty": "hard",
+  "category": "systems-programming",
+  "tags": [
+   "scientific-computing",
+   "deployment",
+   "sqlite",
+   "bash",
+   "concurrency",
+   "ipc"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "ls -la /srv/sim-recon/bin /srv/sim-recon/src",
+   "cat /srv/sim-recon/schema.sql",
+   "cat /srv/sim-recon/bin/deploy.sh",
+   "cat /srv/sim-recon/bin/reconcile.sh",
+   "cat /srv/sim-recon/bin/worker.sh",
+   "cat /srv/sim-recon/src/sim_verifier.c",
+   "sed -i 's|/tmp/sim_recon.fifo|\"$batch_archive\"|g' /srv/sim-recon/bin/worker.sh /srv/sim-recon/bin/deploy.sh",
+   "python3 -c 'import re; s=open(\"/srv/sim-recon/bin/worker.sh\").read(); # rewrite pipeline to bypass shared FIFO, direct stream per-worker'",
+   "python3 -c 'import re; s=open(\"/srv/sim-recon/bin/worker.sh\").read(); # inject PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON; and atomic BEGIN IMMEDIATE transactions'",
+   "sed -i '1s|^|export LC_ALL=C\\n|' /srv/sim-recon/bin/reconcile.sh /srv/sim-recon/bin/worker.sh",
+   "sqlite3 /var/lib/sim-recon/settlement.db 'PRAGMA journal_mode=WAL;'",
+   "/srv/sim-recon/bin/deploy.sh",
+   "/srv/sim-recon/bin/reconcile.sh",
+   "sqlite3 /var/lib/sim-recon/settlement.db 'SELECT * FROM batches; SELECT * FROM accounts; PRAGMA integrity_check; PRAGMA journal_mode;'",
+   "ls -la /var/spool/sim-recon/incoming /var/spool/sim-recon/archive /var/spool/sim-recon/quarantine"
+  ],
+  "speedrun_commands": 15,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "String vs float comparison mismatch in path_metrics: scientific notation (e.g. 1e-05 vs 0.000010) or trailing zero formatting in CSV ingestion can fail checks if verifier compares text rather than numeric floats.",
+   "Background process race condition: if reconcile.sh launches worker subshells asynchronously without a synchronization barrier (wait), reconcile.sh might return before processing completes, failing tests that inspect state immediately.",
+   "Resource exhaustion / OOM: multi-megabyte binary batches passed through naive bash command substitutions (e.g. var=$(cat ...)) instead of streaming pipes."
+  ],
+  "verdict": "reject",
+  "reasons": "The planted concurrency bugs (shared named pipe in worker.sh, lack of BEGIN IMMEDIATE/busy_timeout, missing LC_ALL=C) are immediately visible upon reading the shell scripts. A frontier agent will identify and resolve these anti-patterns in under 16 commands without getting derailed by the misleading FPU drift logs.",
+  "fixes": [
+   "Move worker dispatching and binary parsing logic into a compiled binary or multi-threaded daemon (e.g., in C or Python) rather than small bash scripts where architectural flaws are visible in a single cat command.",
+   "Make the misleading checksum symptom require genuine mathematical or protocol reverse-engineering (e.g., checksum verification polynomial or endianness bug in the protocol header) rather than an obvious shared FIFO path.",
+   "Introduce complex distributed or asynchronous worker coordination that requires dynamic backpressure or dead-letter queue management to prevent trivial script rewrites."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference focuses on optimizing and matching fixed-point arithmetic in a single Rust accumulator against a reference binary, whereas the candidate involves shell-orchestrated settlement pipeline deployment, atomic credit deduction, and archive quarantine management."
+    },
+    {
+     "ref_id": "terminal-bench-2-1/circuit-fibsqrt",
+     "verdict": "distinct",
+     "reason": "The reference requires synthesizing boolean logic gates for a custom simulator, which is completely unrelated to data pipeline reconciliation and SQLite ledger accounting."
+    },
+    {
+     "ref_id": "ours/official-3ba65cf95a9b",
+     "verdict": "distinct",
+     "reason": "The reference is a telemetry build script optimization task evaluated on analytical query parity and database file size constraints, rather than an archive ingestion, debiting, and settlement pipeline."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference focuses on resolving protocol framing mismatches in a Rust demultiplexer for high-frequency binary traces rather than multi-file archive reconciliation and SQLite balance transactions."
+    },
+    {
+     "ref_id": "ours/official-6a588ca66d21",
+     "verdict": "distinct",
+     "reason": "The reference addresses a silent overflow bug inside a compiled C extension sliding-window rate limiter, which has no overlap with financial batch settlement reconciliation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-c396920d769d",
+     0.14
+    ],
+    [
+     "terminal-bench-2-1/circuit-fibsqrt",
+     0.133
+    ],
+    [
+     "ours/official-3ba65cf95a9b",
+     0.113
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.07
+    ],
+    [
+     "ours/official-6a588ca66d21",
+     0.062
+    ]
+   ],
+   "cost_usd": 0.0066195
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0210435
+}

@@ -1,0 +1,7 @@
+Rebuild `/work/state/events.sqlite` from `/work/input/archive.jsonl` using `/work/bin/rebuild-index`; do not hand-edit the database or discard input records. The rebuild must be clean, deterministic, and idempotent, including when the existing database is stale.
+
+Preserve every accepted event's identity, revision, raw timestamp, actor, source and destination indicators, signature verdict, canonical indicators and classifications, risk score, and severity. Duplicate deliveries must not create duplicate logical events, while distinct revisions must follow the documented latest-revision policy. Retain superseded, malformed, invalid, and failed-signature records in `rejections` with their original chunk, line, identity, revision, and deterministic reason, and continue processing after rejected records.
+
+Process every archive chunk listed by `/work/input/archive.manifest`, preserve UTF-8 text exactly, and classify every indicator through `/opt/security/bin/addrclass`, including IPv4-mapped IPv6, zone-qualified IPv6, and empty classifications. Do not replace that component with standard-library parsing. Apply final duplicate, revision, and rejection decisions before building aggregates.
+
+Keep the events, rejections, daily_summary, actor_summary, and indicator_summary tables mutually consistent, with required metadata, indexes, keys, constraints, NULL behavior, and integer risk totals. The completed database must pass `/work/bin/check-index` and must work for newly generated archives using the same JSONL schema and helper binary.

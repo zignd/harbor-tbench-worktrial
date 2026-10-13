@@ -1,0 +1,175 @@
+{
+ "blueprint": {
+  "slug": "repair-framed-ingress-deployment",
+  "title": "Repair the Framed Ingress Deployment",
+  "scenario": "A backend team is chasing missing events in a single-container production ingress stack that accepts framed TCP telemetry and translates it into the HTTP/NDJSON protocol expected by an internal sink. The container contains an opaque compiled frame gateway, a partially implemented translator, a sink service, deployment scripts, configuration fragments, health checks, logs, and a deterministic replay client representing downstream traffic.",
+  "instruction_draft": "Deploy and repair the ingress stack so that it accepts the documented framed TCP protocol on port 9100, remains healthy on port 8080, and delivers each valid input record exactly once and in per-stream sequence order to the sink, including across client fragmentation and one translator restart. On fresh replay workloads, at least 99.5% of valid records must be delivered and the stack must sustain at least 12,000 valid records per second.",
+  "requirements": [
+   "A reproducible deployment command starts all required services in the container.",
+   "The framed TCP ingress listens on port 9100 and implements the documented framing and validation behavior.",
+   "The health endpoint listens on port 8080 and reports ready only when the complete pipeline can accept records.",
+   "Valid records are translated into the sink's documented HTTP/NDJSON format.",
+   "Invalid frames are rejected without corrupting subsequent valid frames.",
+   "TCP fragmentation, coalescing, and multiple concurrent streams are handled correctly.",
+   "Every valid record is delivered exactly once.",
+   "Records remain in sequence order within each stream, while different streams may interleave.",
+   "The pipeline remains correct across one controlled translator restart.",
+   "On fresh replay workloads, at least 99.5% of valid records reach the sink.",
+   "The deployed pipeline sustains at least 12,000 valid records per second on the supplied one-CPU container."
+  ],
+  "environment": [
+   "The Dockerfile is based on python:3.13-slim-bookworm and installs pinned system packages including gcc, make, procps, strace, and socat; no network access is needed at runtime.",
+   "The repository contains roughly 1,600 lines across Bash deployment scripts, Python translator and replay utilities, a small C sink wrapper, configuration files, protocol documentation, fixture logs, and operational runbooks.",
+   "An opaque `/opt/ingress/bin/framegate` executable is supplied without source. It validates the outer binary envelope and emits versioned Unix-domain packet messages to a configured socket; its executable behavior and packet format are documented but its implementation cannot be inspected.",
+   "The outer protocol uses a magic value, version, stream identifier, monotonically increasing stream sequence, payload length, UTF-8 JSON payload, and CRC32. Frames may be split or combined arbitrarily by TCP, and malformed frames must not consume bytes belonging to the next frame.",
+   "The visible translator converts framegate packets into HTTP/NDJSON requests for `/opt/ingress/bin/sinkd`, which exposes health and deterministic inspection endpoints used by the verifier.",
+   "The deployment currently contains inconsistent socket paths, a stale generated configuration file, an overly early readiness check, buffering and retry behavior that interacts badly with sink acknowledgements, and state handling that is wrong after reconnects and translator restarts.",
+   "The supplied replay client and sample capture exercise only one stream, whole-frame writes, ASCII payloads, and no restart; they are intentionally insufficient to expose all failures.",
+   "The verifier starts a clean deployment, generates new deterministic workloads from a hidden seed, injects randomized TCP chunk boundaries and concurrent stream reconnects, sends malformed frames among valid ones, performs one controlled translator restart, and inspects the sink's durable received-record ledger."
+  ],
+  "internal_hint": "The reference shell solution first inventories the processes, sockets, generated configuration, and sink ledger, then runs the replay client under strace and with deliberately fragmented frames. This reveals that the launcher renders one socket path while the translator reads another, readiness is declared before the Unix socket and sink acknowledgement path exist, and the translator uses a process-global sequence/deduplication cursor rather than per-stream state. Its retry loop also advances the cursor before a successful sink acknowledgement and loses buffered packets during restart. The fix is to make configuration generation single-source and atomic, order startup and readiness around actual end-to-end acceptance, parse packet boundaries independently of TCP writes, track sequence and replay state per stream, commit state only after sink acknowledgement, drain and persist the pending queue across the controlled restart, and use bounded batching with explicit flushes so the throughput threshold is met. Hidden inputs are needed to observe the state corruption and buffering failures; reading the obvious sample path alone does not expose them.",
+  "trap": "A shallow solution can make the sample replay pass by correcting the visible port or socket mismatch, but hidden workloads use many streams with overlapping sequence numbers, malformed frames, reconnects, non-ASCII payloads, fragmented headers, and a restart while records are buffered. Global deduplication, advancing state before acknowledgement, dropping partial buffers, or declaring health from only one process causes silent loss, duplication, or reordering while a simple count-based smoke test still appears successful.",
+  "tests": [
+   "The deployment test launches the submitted command in a clean container, verifies that the expected processes and ports become available, and checks that readiness is false until an end-to-end sink acceptance probe succeeds.",
+   "The protocol test sends generated valid frames with arbitrary TCP fragmentation and coalescing, then checks the sink ledger for matching payloads, exact once-only delivery, and per-stream sequence order.",
+   "The malformed-input test inserts bad magic, unsupported versions, invalid lengths, CRC failures, invalid UTF-8, and truncated frames before valid frames; it checks that invalid records are absent and later valid records are still delivered.",
+   "The multi-stream test generates fresh stream identifiers and overlapping sequence ranges from a hidden seed, including reconnects and out-of-order arrival between streams; it checks that deduplication and ordering are scoped per stream.",
+   "The restart test kills and restarts the translator while a deterministic workload is in flight, waits for readiness, and checks that the combined sink ledger contains every valid record exactly once with no sequence regression.",
+   "The hidden-seed accuracy test varies payload sizes, Unicode JSON strings, frame boundaries, stream counts, and malformed-frame placement, and requires at least 99.5% of valid generated records to be present in the sink ledger.",
+   "The throughput test sends a fresh large workload through the deployed services and requires at least 12,000 valid records per second while retaining the accuracy and ordering properties.",
+   "The consistency test changes the generated runtime directory and configured socket namespace between runs, ensuring that the launcher, health check, translator, and sink do not rely on stale fixture paths or memorized sample data."
+  ],
+  "verifier_knob": {
+   "name": "minimum_valid_delivery_ratio",
+   "value": "0.995",
+   "effect": "Raising the ratio makes rare restart, malformed-frame, and retry-state errors fail more often; lowering it permits partial implementations that lose a small fraction of records to pass."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the obvious configuration mismatch but never exercises fragmented frames or multiple streams.",
+   "The agent implements deduplication with one global sequence counter, which passes the single-stream fixture but drops valid records from other streams.",
+   "The agent acknowledges or advances state before the sink confirms receipt, causing loss or duplicate records during retries and restart.",
+   "The agent uses a line-oriented or one-read-per-frame parser that fails when TCP combines frames or splits a length field.",
+   "The agent starts all processes in the background without dependency-aware readiness and races the verifier.",
+   "The agent replaces the translator with a convenient but slow implementation that meets correctness checks but misses the throughput threshold.",
+   "The agent validates only the final count and misses per-stream ordering or duplicate records.",
+   "The agent leaves stale Unix sockets, PID files, or generated configuration from the sample run, making later clean-instance tests fail."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "deployment",
+  "tags": [
+   "bash",
+   "networking",
+   "protocol-translation",
+   "service-deployment",
+   "stateful-retry",
+   "throughput"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the repository layout and deployment entrypoints with pwd, find, and ls.",
+   "Read the protocol, deployment, health-check, and operational documentation.",
+   "Inspect translator, launcher, sink wrapper, and generated configuration sources.",
+   "Search all files for socket paths, readiness checks, retry logic, sequence state, buffering, and PID handling.",
+   "Read the framegate packet-format documentation and sink HTTP/NDJSON contract.",
+   "Run the current deployment and inspect processes, listeners, Unix sockets, logs, and the sink ledger.",
+   "Replay the sample workload, including a small manually fragmented client, while tracing the translator and launcher.",
+   "Compare the rendered socket configuration with the translator and framegate runtime paths.",
+   "Fix configuration generation to use one runtime socket namespace and atomically replace generated files.",
+   "Fix startup ordering and readiness so the sink, Unix socket, translator, and end-to-end acceptance probe are all ready.",
+   "Replace one-read/line-oriented packet handling with length-aware buffering that handles partial and coalesced packets.",
+   "Implement per-stream sequence and deduplication state, including reconnect handling and non-ASCII payloads.",
+   "Change retry bookkeeping so state is committed only after sink acknowledgement and preserve pending records across restart.",
+   "Add bounded batching with explicit flushes and clean stale sockets, PID files, and runtime state on deployment.",
+   "Rebuild or restart the clean deployment and run fragmented, coalesced, malformed, and multi-stream workloads.",
+   "Perform the controlled translator restart during an in-flight workload and verify the sink ledger for duplicates, losses, and per-stream ordering.",
+   "Run a fresh large workload and measure throughput on the supplied one-CPU container.",
+   "Run the deployment, consistency, accuracy, and throughput checks from a clean runtime directory and remove any stale artifacts."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "Exactly-once delivery across a kill and restart is not well-defined unless the sink's acknowledgement and idempotency semantics are explicitly transactional; otherwise a sink acceptance followed by a lost acknowledgement can cause either duplication or loss.",
+   "Malformed-frame resynchronization is underspecified for invalid lengths or arbitrary bytes: the protocol needs an explicit rule for finding the next frame boundary without mistaking payload bytes for a magic value.",
+   "A 12,000-records-per-second threshold on a one-CPU container can be flaky without specifying workload size, warmup, measurement interval, CPU limits, and allowable variance.",
+   "The instruction simultaneously says every valid record must be delivered exactly once and permits 0.5% loss; the scope of the exception should be explicit.",
+   "The restart test should define whether termination is graceful or abrupt and which state directory is durable across the restart."
+  ],
+  "verdict": "reject",
+  "reasons": "The likely repair path is about 18 commands and the important defects are discoverable by reading the visible source, so the mandated speedrun rule caps genuine difficulty at 2. The task also leaves transactional exactly-once semantics and malformed-frame resynchronization insufficiently specified, making some failures potentially invalid rather than genuinely difficult.",
+  "fixes": [
+   "Specify the sink's idempotency key, acknowledgement, and durable-ledger semantics, or weaken the restart guarantee to at-least-once with deduplicated sink results.",
+   "Document a deterministic malformed-frame resynchronization algorithm, including behavior for invalid lengths, unsupported versions, and truncated input.",
+   "Define the throughput benchmark duration, warmup, workload shape, CPU quota, and acceptable timing variance.",
+   "Reconcile the exact-once requirement with the 99.5% threshold by stating which test scopes allow loss and which require zero loss.",
+   "To increase genuine difficulty, remove implementation-specific clues from the task materials and add a failure mode requiring diagnosis from black-box observations rather than a direct source-level patch."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a high-throughput framed TCP-to-HTTP/NDJSON ingress pipeline with delivery and ordering guarantees, rather than implementing a transactional database replay utility and canonical snapshot generator."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate focuses on live framed-stream translation, validation, backpressure, and exactly-once delivery, not reconstructing and mutating persistent catalog state from segment files and SQLite."
+    },
+    {
+     "ref_id": "ours/official-0cd67d8adf4",
+     "verdict": "distinct",
+     "reason": "Although both process network telemetry, the candidate is a framed TCP protocol gateway with downstream delivery semantics, whereas the reference is a UDP NetFlow template decoder and aggregation/query service."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The candidate concerns a production TCP ingress translator and sink-delivery pipeline, while the reference concerns persistent event-journal recovery and weighted percentile computation."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "The candidate repairs framing, translation, throughput, ordering, and delivery across a streaming deployment, not stateless request-target policy classification and rejection."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.165
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.162
+    ],
+    [
+     "ours/official-0cd67d8adf4d",
+     0.132
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.132
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.125
+    ]
+   ],
+   "cost_usd": 0.0008372
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0040278
+}

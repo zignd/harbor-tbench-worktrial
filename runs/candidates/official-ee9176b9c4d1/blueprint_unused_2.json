@@ -1,0 +1,176 @@
+{
+ "blueprint": {
+  "slug": "repair-binary-event-rollup",
+  "title": "Repair the Binary Event Rollup",
+  "scenario": "I\u2019m on call and the overnight event rollup is both drifting from the warehouse numbers and taking far too long on a busy shard. The container has a small in-house Python/SQLite codebase with several SQL reports, migration scripts, fixtures, and a compiled event-classification utility that was supplied by another team without source. Please leave the replay command production-ready rather than just making the checked-in fixture pass.",
+  "instruction_draft": "Can you fix `./replay-rollup` so it accepts an input SQLite database and output path, materializes the documented event and summary tables, and produces the same results as the shipped classifier for every valid event? It must retain every input event exactly once, including unusual timestamps, event kinds, negative values, and duplicate sequence numbers, and the summaries must be reproducible regardless of insertion order. On the supplied container it also needs to process at least 100,000 events per second on the standard 80,000-row workload; please verify that yourself before handing it back.",
+  "requirements": [
+   "`./replay-rollup INPUT_DB OUTPUT_DB` must complete successfully on valid input databases.",
+   "The output database must contain the required materialized event and summary tables with the existing schema and column names.",
+   "Every input event must appear exactly once in the materialized event table, with no loss, duplication, or accidental deduplication of equal-valued or equal-sequence events.",
+   "Each materialized event's classification and normalized fields must match the behavior of the shipped classifier.",
+   "Summary rows must equal the aggregation of the materialized events, including all event kinds, negative values, boundary timestamps, and empty groups where the existing contract requires them.",
+   "Results must be independent of input insertion order and repeated runs must produce byte-for-byte equivalent logical table contents.",
+   "The implementation must handle at least 80,000 events in the supplied benchmark at a measured rate of 100,000 events per second or greater on the provided one-CPU container.",
+   "The command must work without network access, wall-clock dependence, or manually edited fixture-specific constants."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm`, with pinned SQLite/Python dependencies and no network access.",
+   "A roughly 1,500-line in-house repository split among `replay-rollup`, Python orchestration code, six SQL files, schema migrations, report formatting code, and unrelated health-check and archival utilities.",
+   "A SQLite input fixture containing several thousand events across tenants, event kinds, signed values, repeated sequence numbers, old and future timestamps, and sparse intervals.",
+   "A compiled executable at `vendor/event-classifier` with no source, symbols, or equivalent implementation. It consumes a packed binary batch protocol and emits packed classification records. A thin Python adapter exposes it to the current row-oriented pipeline.",
+   "The classifier's protocol is documented only by the adapter's framing code; its classification behavior depends on timestamp boundaries, tenant-specific modes, event kind, signed value ranges, and a small stateful rule involving adjacent sequence numbers.",
+   "The current pipeline invokes the classifier once per row, translates its packed response into temporary SQLite rows, and uses several SQL reports to build the final materialization.",
+   "Planted problems include an incorrect scalar-to-batch translation in the adapter, SQL grouping that assumes timestamp ordering, an aggregation join that loses zero-valued classifications, and a per-row subprocess path that is functionally plausible but too slow.",
+   "Hidden verification databases are generated with thousands to hundreds of thousands of rows, rare boundary combinations, shuffled insertion order, duplicate keys, and adversarial mixtures that are absent from the visible fixture.",
+   "The verifier has access to the same opaque classifier and independently computes expected materialized rows and summaries from freshly generated inputs."
+  ],
+  "internal_hint": "The resolution requires investigation rather than inspection alone. First run the existing command on controlled databases, trace the adapter's binary frames, and query the classifier with one-variable-at-a-time batches; its records use little-endian signed timestamp/value fields and its response contains more than the currently consumed classification code. Differential experiments around bucket boundaries, tenant mode changes, negative values, and adjacent sequence numbers reveal that classification is deterministic over a sorted per-tenant sequence, with a carry rule that the existing unordered SQL path breaks. The old adapter also assumes one output record per input frame even when the classifier emits an explicit status record. Recreate the experimentally established semantics as a set-based SQLite staging/query pipeline (including deterministic per-tenant ordering and status handling), use the classifier only to validate the model or in one batch call rather than once per row, then repair the summary joins and indexes. The reference solution is a deterministic shell script that inventories the repository, probes the binary protocol and behavior, generates differential fixtures, patches the adapter and SQL, and benchmarks both ordinary and boundary-heavy workloads before finalizing.",
+  "trap": "A shallow fix can make the visible fixture and a simple aggregate look correct by sorting rows or changing the obvious GROUP BY, while still treating classifier output as a one-to-one scalar response. Hidden inputs exercise response status records, negative and boundary values, adjacent-sequence state, duplicate sequence numbers, and shuffled insertion order. Retaining one subprocess call per row may pass correctness but fails the throughput threshold; caching only by timestamp or value gives a convincing speedup but produces wrong classifications when tenant mode or sequence context differs.",
+  "tests": [
+   "Run the repaired command on the visible fixture and compare all required output tables against the independent oracle, including row counts, nullability, ordering-independent contents, and summaries.",
+   "Generate fresh databases with 5,000 to 30,000 events using a hidden seed, including duplicate sequence numbers, repeated payloads, negative values, timestamp boundaries, sparse tenants, and shuffled insertion order; compare every materialized row and aggregate to results derived from the opaque classifier.",
+   "Generate a separate 80,000-row workload with a rare mixture of boundary and stateful cases, run the command three times, and require a median throughput of at least 100,000 events per second on the fixed one-CPU container.",
+   "Permute insertion order and transaction chunking for the same generated event set, then verify identical logical output and summaries.",
+   "Run a large hidden workload with more than 250,000 rows to check that memory and subprocess behavior scale with batches rather than spawning one classifier process per event.",
+   "Check that an input containing equal-valued events, duplicate sequence numbers, zero values, and classification statuses that produce no summary contribution still retains every event and preserves the required zero/empty summary rows.",
+   "Run the command twice into independent output databases and compare normalized SQLite contents to detect wall-clock, hash-order, or unseeded-randomness dependencies."
+  ],
+  "verifier_knob": {
+   "name": "minimum_events_per_second",
+   "value": "100000",
+   "effect": "Raising the threshold forces a more complete set-based refactor and fewer classifier invocations; lowering it allows a partially batched or heavily cached implementation to pass while leaving more of the original row-oriented architecture intact."
+  },
+  "expected_failure_modes": [
+   "The agent reads the SQL and fixes only the visible aggregation join without experimentally characterizing the opaque classifier.",
+   "The agent assumes classifier responses correspond one-for-one with request frames and silently drops status or carry records.",
+   "The agent groups by raw timestamp or input order instead of reproducing the classifier's deterministic per-tenant sequence semantics.",
+   "The agent uses a convenient cache key that omits tenant mode, event kind, signed value, or neighboring sequence context.",
+   "The agent validates only the supplied fixture and misses rare timestamp boundaries, negative values, duplicate sequence numbers, or shuffled insertion order.",
+   "The agent preserves correctness with one subprocess invocation per row and fails the quantitative throughput check.",
+   "The agent changes the output schema or removes required zero/empty groups because they are absent from the visible sample.",
+   "The agent hardcodes observed fixture classifications rather than implementing behavior that works on verify-time generated inputs."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "systems",
+  "tags": [
+   "sql",
+   "sqlite",
+   "reverse-engineering",
+   "opaque-binary",
+   "performance",
+   "large-scale-refactor"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "Inventory the repository, entrypoint, migrations, SQL files, adapter, fixtures, and classifier usage with find, grep, and sed.",
+   "Run ./replay-rollup on the visible fixture and record schemas, row counts, failures, and baseline timing.",
+   "Inspect the input/output schemas and all report queries, especially grouping, joins, ordering, and zero-valued classifications.",
+   "Read the Python classifier adapter and its framing code, then run the classifier on a one-event database.",
+   "Add temporary tracing or use hexdump/Python unpacking to capture request and response frames.",
+   "Generate tiny controlled databases varying one timestamp, tenant, mode, kind, signed value, or sequence number at a time.",
+   "Probe batches containing adjacent sequences, duplicate sequence numbers, shuffled insertion order, and cases likely to produce status records.",
+   "Infer response record types, field widths, signedness, ordering, carry behavior, and the deterministic per-tenant tie-breaking rule.",
+   "Build a differential probe harness comparing classifier responses with candidate Python/SQLite semantics.",
+   "Patch the adapter to use the documented batch protocol and correctly retain or interpret status records.",
+   "Create deterministic per-tenant staging order independent of insertion order, preserving a distinct identity for every input row.",
+   "Implement the established classification and carry semantics in the set-based staging/query pipeline.",
+   "Repair summary joins and grouping so negative, zero, empty, boundary, and non-contributing classifications are retained.",
+   "Add or repair indexes needed for tenant/sequence staging and summary aggregation.",
+   "Run the visible fixture and compare every materialized table and summary with an independent classifier-derived oracle.",
+   "Generate randomized 5,000-to-30,000-row differential fixtures covering duplicate keys, boundaries, signed values, sparse tenants, and shuffled insertion order.",
+   "Repeat the same event set with different insertion orders and transaction chunking and compare normalized logical contents.",
+   "Run the 80,000-row benchmark three times, calculate median events per second, and inspect subprocess counts and query plans.",
+   "Optimize remaining hot paths, especially subprocess invocation, row-at-a-time Python work, temporary tables, and missing indexes.",
+   "Run the 250,000-plus-row workload and repeat correctness, reproducibility, and benchmark checks before finalizing."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The instruction does not state the exact deterministic tie-breaker for duplicate sequence numbers, so hidden tests could require a rule that cannot be inferred unambiguously from the prose.",
+   "The documented event and summary table names, required empty-group semantics, and output ordering are referenced but not stated; relying on repository inspection is reasonable, but hidden tests must use the same discoverable contract.",
+   "A strict 100,000-events-per-second threshold on a one-CPU container can be flaky because of host scheduling, filesystem variance, SQLite build differences, or process startup noise.",
+   "The phrase 'byte-for-byte equivalent logical table contents' is potentially contradictory unless the verifier explicitly normalizes row ordering, SQLite metadata, and irrelevant file-level differences.",
+   "If the classifier has behavior that cannot be characterized from finite black-box probes or requires undocumented interaction outside the supplied protocol, exact hidden-input reproduction would be an invalid expectation.",
+   "Requiring both exact opaque-classifier equivalence and a substantially different set-based reimplementation may overconstrain the solution if the classifier's stateful semantics are not fully documented or inferable."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear operational endpoint and strong correctness, adversarial-input, reproducibility, and performance checks, while the opaque stateful classifier and scaling requirement create genuine engineering difficulty rather than format friction. The shortest credible path is about 20 substantial investigation and implementation steps, so it is not a source-visible quick fix; however, solvability is borderline because exact tie-breaking and classifier semantics must be discoverable and the benchmark must be stabilized.",
+  "fixes": [
+   "State that duplicate sequence numbers are ordered by a specific existing event identity column or explicitly define the required deterministic tie-breaker.",
+   "Name the required materialized tables and summarize the required empty-group and status-record semantics in the task contract or point to exact repository files.",
+   "Define throughput measurement precisely: whether it excludes fixture generation, includes output writing, uses a warm filesystem, and how subprocess startup and outliers are handled.",
+   "Use a calibrated benchmark threshold or an allowed tolerance across repeated runs to reduce one-CPU environmental flakiness.",
+   "Clarify that logical-output comparisons normalize row order, SQLite schema metadata, and database page-level differences rather than requiring literal database-file identity.",
+   "Ensure the build environment pins the SQLite version/build and includes all tooling needed for binary probing, differential generation, and benchmark verification without network access."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Both use deterministic SQLite replay, but this task centers on per-event classification and rollup aggregation rather than incident graph construction, corrections, policy evaluation, and SLA materialization."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The reference is an HTTP campaign-attribution service with deduplication and session semantics, whereas this task is an offline SQLite event-classification and summary pipeline."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The reference validates cryptographic audit chains and emits authoritative events, which is fundamentally different from classifying arbitrary events and aggregating them into SQLite summaries."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "Despite the shared replay framing and opaque compiled component, the reference solves journal recovery and weighted-percentile queries in a Rust service rather than event normalization and SQLite rollups."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "distinct",
+     "reason": "The reference is a recursive log-file parser producing CSV sessions, metrics, and rejects, while this task processes SQLite inputs and must preserve and classify every database event."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9cbb677d2a2f",
+     0.268
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.234
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.22
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.19
+    ],
+    [
+     "ours/official-37d13d3e2124",
+     0.187
+    ]
+   ],
+   "cost_usd": 0.0019578
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0049046
+}

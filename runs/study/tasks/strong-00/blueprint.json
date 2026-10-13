@@ -1,0 +1,47 @@
+{
+ "slug": "go-secure-audit-rate-limiter",
+ "title": "Build a Secure and Performant Leaky Bucket Rate Limiter",
+ "scenario": "A security audit of the internal 'GopherShield' microservice reveals it lacks a robust rate-limiting mechanism, leaving the API vulnerable to DoS. The environment contains a Go codebase for a high-throughput proxy and a compiled 'black-box' traffic generator that simulates production-grade bursty requests.",
+ "instruction_draft": "Our internal proxy service is currently unprotected against traffic bursts. You must implement a thread-safe, leaky-bucket rate limiter in `limiter/limiter.go` that strictly adheres to the provided `RateLimiter` interface. \n\nYour implementation must support a configurable rate (requests per second) and bucket capacity (burst size), ensuring that no request is processed if the bucket is full. Crucially, the implementation must be highly performant: it must handle a sustained load of 50,000 concurrent goroutines with sub-millisecond overhead per decision while maintaining exact mathematical precision of the leak rate over long durations. The final service must pass the audit script at `/app/audit_traffic.sh` which simulates various attack and usage patterns.",
+ "requirements": [
+  "Implement the `Allow()` method in `limiter/limiter.go` following the leaky bucket algorithm.",
+  "The limiter must be thread-safe and handle high concurrency without deadlocks or significant contention.",
+  "The leak rate must be mathematically precise: `rate` is requests per second, calculated with nanosecond granularity.",
+  "The implementation must pass a performance benchmark: average overhead per `Allow()` call under high contention must be < 500ns.",
+  "The system must correctly handle clock drift and potential overflow in duration calculations."
+ ],
+ "environment": [
+  "A Go project structure in `/app` with `main.go`, `limiter/interface.go`, and a skeleton `limiter/limiter.go`.",
+  "A compiled binary `/usr/bin/traffic-gen` that generates non-trivial, bursty request patterns to a local port.",
+  "A shell script `/app/audit_traffic.sh` that wraps the traffic generator and checks for both compliance (no over-limit requests) and performance (latency/throughput).",
+  "Go 1.23-bookworm installed with standard library only."
+ ],
+ "internal_hint": "The core difficulty is achieving high performance under extreme contention. A naive `sync.Mutex` implementation will likely fail the 500ns performance threshold due to lock contention among 50,000 goroutines. The solver must use atomic operations (`sync/atomic`) to manage the state (last leak time and current bucket level) using a Compare-and-Swap (CAS) loop. Additionally, the 'leaky bucket' math requires careful handling of time intervals\u2014calculating 'leaked' units based on `time.Since(lastLeak)` and updating the timestamp atomically.",
+ "trap": "A standard mutex-based solution will pass functional tests but fail the performance threshold. Conversely, a naive atomic solution might suffer from 'lost updates' or precision errors if the solver doesn't account for the remainder of time that doesn't sum up to a full 'drop' in a single calculation, leading to a slight drift that the auditor detects over long-horizon traces.",
+ "tests": [
+  "Functional Test: Verify that for a rate of 100 rps and burst 10, exactly 110 requests are allowed in the first second.",
+  "Concurrency Test: Run 50,000 goroutines calling Allow() simultaneously and ensure no race conditions occur (using -race).",
+  "Performance Test: Measure the nanoseconds per op; must be below 500ns on the container's 1 CPU.",
+  "Precision Test: A 5-minute sustained test where the total allowed requests must be within 0.001% of (Rate * Duration + Burst)."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "5",
+  "effect": "Increasing the number of scenarios adds diverse burst patterns (e.g., oscillating rates, sudden idle periods) that expose subtle math errors in the leak calculation."
+ },
+ "expected_failure_modes": [
+  "Solver uses a Mutex and fails the quantitative performance bar.",
+  "Solver fails to handle the atomic update of two related values (time and count) simultaneously, leading to race conditions.",
+  "Solver's mathematical derivation of the 'leak' amount during an atomic swap is slightly off, failing the long-horizon precision test."
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "debugging",
+ "tags": [
+  "go",
+  "concurrency",
+  "performance-optimization",
+  "security",
+  "atomic-operations"
+ ]
+}

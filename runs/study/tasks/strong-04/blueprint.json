@@ -1,0 +1,46 @@
+{
+ "slug": "rust-data-ingestion-refactor",
+ "title": "Rust Data Ingestion Pipeline Refactor",
+ "scenario": "A high-throughput data processing service written in Rust is failing to reconcile daily aggregates against source files. The system consists of a parallelized ingestion binary and several gigabytes of partitioned CSV data files; the analyst reports that approximately 0.2% of records are missing or corrupted in the final output despite the pipeline reporting success.",
+ "instruction_draft": "We have an ingestion pipeline in `/app/ingestor` that processes large batches of sensor data. Our analyst says the final aggregate numbers for the 'North' and 'South' regions don't match the raw CSVs in `/app/data`. The system was recently refactored to use a custom lock-free buffer for speed.\n\n```bash\n$ cargo run --release -- --input /app/data --output /app/results.json\n[INFO] Processed 1,048,576 records.\n[INFO] Success.\n$ python3 check_audit.py /app/results.json\nAUDIT FAILED: Expected sum 52428800.0, got 52312064.0 (Delta: -116736.0)\n```\n\nFix the pipeline so it processes every record in the input directory exactly once and produces numerically correct aggregates. The final solution must maintain a throughput of at least 500,000 records per second on this hardware.",
+ "requirements": [
+  "The ingestion tool must process all CSV files in the provided input directory.",
+  "The output JSON must contain the correct sum of the 'value' column for each 'region'.",
+  "The pipeline must handle concurrent processing without data loss or race conditions.",
+  "The processing speed must exceed 500,000 records/sec on the provided data."
+ ],
+ "environment": [
+  "A Rust project in `/app/ingestor` using `crossbeam` and `rayon`.",
+  "Planted Bug 1 (Interacting Cause): A subtle off-by-one error in the custom circular buffer implementation that drops the last record of every internal chunk (1024 records).",
+  "Planted Bug 2 (Misleading Symptom): The CSV parser in `parser.rs` has a regex-based validator that looks like it's failing on special characters, but the actual data is clean; the solver might waste time 'fixing' the parser.",
+  "Data: 100 CSV files with 10k records each, plus a 'hidden' large 10GB-equivalent stream generated during verification.",
+  "Planted Bug 3 (State-dependent): The aggregator uses a `f32` for summing large values, leading to floating-point precision loss that only becomes significant on larger datasets (the sample data is small enough that this looks like a rounding error, but the verify data is huge)."
+ ],
+ "internal_hint": "The solver must first realize that the 'dropped' records correspond to chunk boundaries in the circular buffer (`buffer.rs`), which is a deployment-level concurrency bug. After fixing the buffer logic, the audit will still fail slightly on very large inputs due to the use of `f32`. The solver must refactor the accumulation logic to use `f64` or fixed-point math. The 'misleading' regex parser is a distraction\u2014it's slow but correct.",
+ "trap": "The agent fixes the obvious off-by-one error in the buffer and sees the sample audit pass. However, it fails the verification because it doesn't address the floating-point precision loss (`f32` vs `f64`) which only triggers when the hidden test uses a much larger dataset, or it fixes the precision but breaks the throughput requirement by introducing a global Mutex.",
+ "tests": [
+  "Correctness: Verify the sums for all regions match an oracle on a new 5-million-row dataset.",
+  "Performance: Ensure the binary processes the test set in under 10 seconds.",
+  "Concurrency: Run the ingestor with `TSAN_OPTIONS` or equivalent check to ensure no data races in the buffer."
+ ],
+ "verifier_knob": {
+  "name": "throughput_threshold",
+  "value": "500000",
+  "effect": "Higher values force the solver to use unsafe/lock-free Rust; lower values allow for simpler Mutex-based fixes."
+ },
+ "expected_failure_modes": [
+  "The agent fixes the buffer bug but misses the precision issue because it only tests on the provided sample.",
+  "The agent replaces the lock-free buffer with a standard Mutex, failing the throughput requirement.",
+  "The agent spends the entire hour trying to optimize the 'broken' regex parser instead of looking at the buffer logic."
+ ],
+ "predicted_pass_rate": 0.25,
+ "difficulty": "hard",
+ "category": "data-processing",
+ "tags": [
+  "rust",
+  "concurrency",
+  "floating-point",
+  "refactoring",
+  "performance"
+ ]
+}

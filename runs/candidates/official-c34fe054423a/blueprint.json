@@ -1,0 +1,71 @@
+{
+ "slug": "recover-rational-frame-archives",
+ "title": "Recover Rational Frame Archives",
+ "scenario": "An analyst's daily totals stopped adding up after a telemetry export upgrade. The container contains an in-house Python reporting application, several `.rfx` binary archives, diagnostic fixtures, and a compiled frame codec used by the exporter but shipped without source. A new recovery command is needed so analysts can reconstruct exact values from reordered, damaged, and partially truncated archives.",
+ "instruction_draft": "```\n$ python /opt/ledgerforge/bin/report.py data/bad-day.rfx\nERROR: frame 7 has invalid payload length\nreported total: 18446744073709551584\n```\n\nImplement the missing recovery feature in `/opt/ledgerforge`. Create an executable `/opt/ledgerforge/bin/recover.py` that accepts one archive path and an optional `--out PATH` argument. It must read the RFX archives used by this installation and write canonical UTF-8 JSON to the requested output path, or to stdout when `--out` is omitted.\n\nThe JSON must contain `records`, `total`, and `status`. `records` must contain every recoverable logical observation exactly once, ordered by sequence number, with each item represented as `{\"seq\": integer, \"value\": reduced-fraction-string}`. `total` must be the exact reduced rational sum of the recovered values, using strings such as `\"0\"`, `\"7/3\"`, and `\"-5/11\"`; do not use binary floating point. `status` must be `\"complete\"` when all logical observations are present and `\"recovered\"` when damaged or truncated frame data was reconstructed from the archive's redundancy.\n\nArchives may contain frames in physical order different from logical sequence order, duplicate frame copies, valid zero and negative values, very large coefficients, negative decimal exponents, cancellation to zero, and frame payloads whose lengths exceed one-byte varint boundaries. A frame with a bad checksum or malformed payload must not contribute its unverified value. Use the archive's recovery information whenever a logical observation is recoverable. If the archive does not contain enough information to recover a logical observation, exit nonzero and emit a concise error rather than inventing a value.\n\nDo not change the supplied fixtures or the public report command. The implementation must use only the Python standard library and must work for freshly generated archives, not just the examples in `data/`. The observable result for every valid generated archive must be independent of frame ordering, duplicate copies, and whether recovery was needed.",
+ "requirements": [
+  "Create executable `/opt/ledgerforge/bin/recover.py` accepting an archive path and optional `--out PATH`.",
+  "Write canonical UTF-8 JSON to `--out`, or stdout when `--out` is absent.",
+  "Include JSON keys `records`, `total`, and `status`.",
+  "Represent each recovered record as `{\"seq\": integer, \"value\": reduced-fraction-string}` and sort records by logical sequence number.",
+  "Compute `total` as the exact reduced rational sum without binary floating-point arithmetic.",
+  "Use fraction strings including `0`, integer strings, and `p/q` with a positive denominator.",
+  "Handle physically reordered frames and duplicate copies without changing the logical result.",
+  "Handle negative values, zero values, very large coefficients, negative decimal exponents, cancellation, and encoded lengths crossing one-byte varint boundaries.",
+  "Reject bad-checksum or malformed frame payloads unless the archive redundancy reconstructs the corresponding logical observation.",
+  "Recover observations from the archive's redundancy when sufficient information exists.",
+  "Return `status` `complete` when no logical observation needed reconstruction and `recovered` when damaged or truncated data was reconstructed.",
+  "Exit nonzero and report an error when an observation is not recoverable.",
+  "Use only the Python standard library and leave supplied fixtures and `/opt/ledgerforge/bin/report.py` unchanged.",
+  "Produce the same result for freshly generated archives regardless of frame ordering, duplicate copies, or whether recovery was required."
+ ],
+ "environment": [
+  "The Docker image is based on `python:3.13-slim-bookworm`, with pinned standard Debian utilities and no network requirement.",
+  "`/opt/ledgerforge/` contains roughly 1,500 lines of plausible Python code across reporting, archive inspection, fixture generation, and command-line components; only part of it is relevant to recovery.",
+  "`/opt/ledgerforge/data/` contains several small `.rfx` examples, including a clean archive that exercises only ordinary positive values and a damaged archive that makes the existing report command print the pasted error.",
+  "`/opt/ledgerforge/docs/format-notes.txt` documents the RFX header, frame layout, checksum placement, logical sequence fields, and parity-group concept, but deliberately leaves the payload integer codec and one recovery convention to be determined from the installed tools and examples.",
+  "`/opt/ledgerforge/bin/rfxcodec` is a stripped, compiled, black-box executable with subcommands for encoding and decoding individual payload components. Its source and symbols are not present. It is deterministic and accepts hexadecimal input on stdin.",
+  "RFX archives contain logical rational observations encoded as an integer coefficient plus a signed decimal exponent, grouped into data frames with redundant parity frames. Frames include lengths, sequence metadata, checksums, and footer offsets; archives can be physically reordered or truncated at frame boundaries.",
+  "The existing report path contains unrelated CSV, JSON, and plotting code plus a deliberately incomplete recovery integration. The obvious fixtures are insufficient to expose all codec and exact-arithmetic cases.",
+  "`/opt/ledgerforge/tests/reference_generator.py` is available for local experimentation and creates seeded archives, but hidden verification creates additional archives independently at verify time."
+ ],
+ "internal_hint": "The real difficulty is not a visible Python typo. A skilled solution first inventories the application and reads the format notes, then probes `rfxcodec` with zero, negative, boundary-sized, and exponent-varying inputs while comparing clean fixture bytes and decoded results. The codec uses a nonstandard signed integer representation with a continuation convention that differs between coefficient and exponent fields; ordinary positive sample values therefore look correct under several incorrect implementations. Frame offsets are encoded as unsigned varints, while sequence deltas are signed, and the footer can point to frames in nonlogical order. Recovery requires grouping frames by logical group, validating CRCs before accepting data, deduplicating by sequence, and applying the documented parity relation over the encoded integer fields rather than over decimal floating-point values. The final implementation should parse coefficients and exponents into `fractions.Fraction`, perform reconstruction before summation, normalize fractions, and use differential probes plus generated archives to verify all stages.",
+ "trap": "A shallow implementation can pass the supplied clean and damaged examples by treating values as Python floats, assuming all varints are unsigned, trusting the first duplicate frame, or summing only intact data frames. Hidden archives include negative exponents, exact cancellation, coefficients larger than 64 bits, sequence and offset values above 127, reordered duplicate frames, and corruption that is recoverable only after parity decoding. Such an implementation commonly reports the right-looking decimal total on the sample while producing a different reduced fraction or silently omitting a recovered observation.",
+ "tests": [
+  "Invoke `recover.py` on ordinary clean fixtures and verify executable behavior, JSON keys, canonical fraction formatting, sequence ordering, and exact totals; this checks the requirements for the command interface and output schema.",
+  "Generate fresh archives with positive, negative, zero, and cancelling rational observations and compare `records` and `total` with an independent exact-fraction reference; this checks exact arithmetic and edge-case values.",
+  "Generate coefficients and frame lengths around every varint continuation boundary, including values larger than 64 bits and signed negative exponents; this checks the stated large-value and boundary requirements.",
+  "Permute physical frame order and insert duplicate valid copies, then compare output with the unpermuted archive; this checks order independence and deduplication.",
+  "Corrupt checksummed data frames while leaving enough parity information for reconstruction, then require `status` `recovered` and compare all reconstructed records and the exact total; this checks validated recovery.",
+  "Truncate archives at several frame boundaries and generate groups with insufficient redundancy; require nonzero exit for unrecoverable observations and verify that no fabricated value is emitted.",
+  "Run the same generated logical observations through different valid frame layouts and compare byte-decoded JSON results against the reference computation; this checks that behavior is not fixture-specific.",
+  "Run the existing report command after implementation and verify its supplied behavior remains unchanged; this checks that the new feature does not alter unrelated application paths."
+ ],
+ "verifier_knob": {
+  "name": "generated_archive_count_and_case_variety",
+  "value": "180 archives per verification run: 40 clean, 70 reordered or duplicated, 50 damaged-but-recoverable, and 20 unrecoverable, with coefficients up to 256 bits and exponents from -40 through 40",
+  "effect": "Lowering the count or restricting values to small positive integers makes float-based and sample-specialized parsers appear correct. Raising the count, number of parity groups, corruption locations, and boundary-sized values increases exposure to codec, ordering, exact-arithmetic, and recovery mistakes while keeping the reference computation deterministic."
+ },
+ "expected_failure_modes": [
+  "The agent reads only the visible fixtures and implements the obvious positive-integer path.",
+  "The agent cannot characterize the stripped codec within the available time and guesses standard zigzag or two's-complement varints.",
+  "The agent uses `float` or `Decimal` and loses exactness for large coefficients, cancellation, or negative exponents.",
+  "The agent treats physical frame order as logical order or keeps the first duplicate without validating checksums.",
+  "The agent validates checksums after using a corrupted value, causing silent total drift.",
+  "The agent understands parity as a byte-level XOR but the recovery relation is over decoded signed fields.",
+  "The agent handles intact frames but does not implement reconstruction, or reconstructs records but forgets to update status and exact totals.",
+  "The agent reports a partial total instead of failing on an unrecoverable logical observation.",
+  "The agent changes shared reporting code while integrating the feature, causing the regression check to fail."
+ ],
+ "predicted_pass_rate": 0.27,
+ "difficulty": "hard",
+ "category": "file-formats",
+ "tags": [
+  "binary-recovery",
+  "exact-arithmetic",
+  "black-box-codec",
+  "fuzz-equivalence",
+  "python",
+  "parity-reconstruction"
+ ]
+}

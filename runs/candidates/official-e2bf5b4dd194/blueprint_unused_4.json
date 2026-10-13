@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "optimal-ledger-capture-query",
+  "title": "Repair the Optimal Capture Reconciliation Query",
+  "scenario": "A finance-ops reconciliation worker compares our append-only ledger with processor capture logs stored in SQLite. The container includes the worker, its SQL query layer, ingestion logs, and Prometheus-style metrics; a recent deployment began reporting different unmatched totals depending on row order.",
+  "instruction_draft": "Repair the reconciliation component in `/opt/recon` so that `python3 /opt/recon/bin/reconcile.py --db DB --window SECONDS --tolerance CENTS` produces canonical JSON on stdout with `matches`, `unmatched_ledger`, `unmatched_processor`, and `metrics` fields. A ledger charge may match at most one processor capture only when account and currency agree, the absolute timestamp difference is at most `SECONDS`, and the absolute cent difference is at most `CENTS`; rows in different account/currency partitions must never interact.\n\nFor every input, choose the matching with the greatest number of pairs, then the smallest total absolute cent difference, then the smallest total timestamp difference, then the lexicographically smallest sorted list of `[ledger_id, processor_id]` pairs using Python string ordering. Emit matches sorted by ledger ID, unmatched IDs sorted, and metrics containing exact `matched_count`, `matched_ledger_cents`, `matched_processor_cents`, and `total_abs_cent_difference`; results must be deterministic regardless of SQLite row order and must not omit valid matches in the generated cases.",
+  "requirements": [
+   "The executable `/opt/recon/bin/reconcile.py` must accept `--db DB --window SECONDS --tolerance CENTS`.",
+   "The executable must emit valid JSON containing `matches`, `unmatched_ledger`, `unmatched_processor`, and `metrics`.",
+   "A pair is eligible only when account and currency agree, absolute timestamp difference is no greater than `SECONDS`, and absolute cent difference is no greater than `CENTS`.",
+   "Each ledger charge and each processor capture may occur in at most one match.",
+   "Rows from different account/currency partitions must never be matched.",
+   "The selected matching must maximize pair count, then minimize total absolute cent difference, then minimize total timestamp difference, then minimize the lexicographically sorted list of ID pairs.",
+   "Matches must be emitted sorted by ledger ID, and both unmatched ID arrays must be sorted.",
+   "Metrics must contain exact matched_count, matched_ledger_cents, matched_processor_cents, and total_abs_cent_difference values.",
+   "The result must be deterministic regardless of SQLite row order and must not omit valid eligible matches."
+  ],
+  "environment": [
+   "Use `FROM python:3.13-slim-bookworm` with pinned apt and pip dependencies and no network requirement.",
+   "Create roughly 1,200-1,800 lines across `/opt/recon/bin`, `/opt/recon/recon`, `/opt/recon/worker`, `/opt/recon/sql`, `/opt/recon/logs`, and `/opt/recon/metrics`, including realistic ingestion, health-check, logging, and metrics code that is only partly relevant.",
+   "Provide an SQLite schema with `ledger_charges(id TEXT, account TEXT, currency TEXT, cents INTEGER, ts INTEGER)` and `processor_captures(id TEXT, account TEXT, currency TEXT, cents INTEGER, ts INTEGER)` plus indexes and seed data.",
+   "Provide a documented command-line wrapper and configuration files, with the core matching routine incomplete or replaced by a deliberately simplistic greedy implementation.",
+   "Include logs showing row-order-dependent reconciliation totals and metrics snapshots that help locate the failing execution path without revealing a hand-written hidden answer.",
+   "Include a small visible fixture where greedy matching happens to produce the expected result, while hidden verification creates fresh partitions, duplicate amounts, ties, crossing candidates, negative and zero differences, and adversarial ID orderings from a hidden seed.",
+   "Keep the public schema and command stable so verification can copy freshly generated SQLite databases into a temporary path and invoke the repaired executable."
+  ],
+  "internal_hint": "The real repair is a substantial algorithmic construction, not a one-line SQL correction. Investigation should begin with the command wrapper, SQLite schema, logs, and metric counters, then instrument or run the worker on reordered copies of the fixture to expose the row-order dependence. The core must solve a maximum-cardinality, minimum-cost bipartite matching separately for every account/currency partition, with a cost ordering that preserves cardinality before cent error, timestamp error, and the final deterministic lexicographic tie break; a greedy nearest-neighbor pass and an ordinary single weighted cost are insufficient unless their integer encoding exactly preserves all four priorities. The reference verifier computes the objective independently and compares canonical JSON on newly generated databases.",
+  "trap": "The visible fixture is arranged so greedy matching and several common SQL window-function solutions agree. Shallow solutions commonly match each ledger row to its nearest unused capture, process rows in SQLite order, collapse equal-cost candidates arbitrarily, or optimize a weighted sum that sacrifices one pair for a lower discrepancy. They pass the sample but fail hidden crossing candidates, equal-cost perfect matchings, multiple independent partitions, and reordered tables.",
+  "tests": [
+   "A smoke test invokes the required CLI against the supplied fixture and checks JSON shape, ordering, and metric arithmetic; this corresponds to the instruction sentences requiring the CLI and the four output fields.",
+   "A verify-time generator creates many fresh SQLite databases from a hidden seed with varied partition counts, row orders, IDs, timestamps, amounts, windows, and tolerances, computes the objective with an independent exact reference matcher, and compares the complete canonical JSON.",
+   "Generated cases include augmenting-path situations where taking the locally closest eligible pair reduces the final cardinality; this checks the requirement to maximize pair count.",
+   "Generated cases include multiple maximum-cardinality matchings with different cent and timestamp totals; this checks the two numerical tie-break requirements.",
+   "Generated cases include multiple matchings equal on all numerical objectives but different ID pairings; this checks the lexicographically smallest sorted pair-list requirement.",
+   "Generated cases shuffle insertion order and use separate account/currency partitions with overlapping amounts; this checks row-order determinism and partition isolation.",
+   "A metrics test recomputes matched counts, both matched gross totals, and total absolute cent difference from the returned pairs and checks the required exact values.",
+   "A scale test generates thousands of rows spread across small partitions and checks completion within the configured CPU and memory budget, preventing exhaustive enumeration of all global matchings."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "180 generated SQLite instances, with 25% containing adversarial tie and augmenting-path structures and partitions of up to 35 ledger and 35 processor rows",
+   "effect": "Increasing the instance count and partition variety makes memorized fixtures and shallow greedy implementations less likely to pass and exercises more combinations of objective ties; lowering it makes debugging and partial implementations substantially easier."
+  },
+  "expected_failure_modes": [
+   "Implementing greedy nearest-neighbor matching instead of maximum-cardinality matching.",
+   "Using a weighted scalar cost whose coefficients allow a lower-priority improvement to outweigh an additional pair or a higher-priority discrepancy.",
+   "Relying on SQLite's unspecified row order or unstable dictionary/set iteration for tie resolution.",
+   "Solving each account but accidentally allowing currencies or partitions to interact.",
+   "Returning correct pairs but incorrect gross or discrepancy metrics.",
+   "Handling numerical tie breaks correctly while missing the final lexicographic matching tie break.",
+   "Using exhaustive enumeration that works on the fixture but times out or exhausts memory on generated scale cases.",
+   "Inspecting only the visible sample and not running reordered or adversarially constructed databases."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "bipartite-matching",
+   "reconciliation",
+   "sqlite",
+   "fuzz-equivalence"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "List the repository tree and identify the CLI, worker, SQL, schema, fixture, and test-related files.",
+   "Read /opt/recon/bin/reconcile.py and the reconciliation worker/query modules.",
+   "Read the SQLite schema, seed-data loader, configuration, and wrapper documentation.",
+   "Inspect logs and metrics snapshots for row-order-dependent totals.",
+   "Run the supplied fixture and record the current JSON and matching behavior.",
+   "Create a reordered copy of the fixture database and confirm the observed nondeterminism.",
+   "Trace how ledger and processor rows are fetched, partitioned, and passed to the matcher.",
+   "Inspect output serialization and existing metric calculations.",
+   "Design a per-account/currency bipartite matching solver with eligibility filtering and exact lexicographic objective priorities.",
+   "Implement a polynomial maximum-cardinality min-cost matching algorithm rather than greedy pairing or exhaustive enumeration.",
+   "Encode or otherwise enforce cardinality, cent discrepancy, timestamp discrepancy, and sorted-pair lexicographic tie priorities exactly.",
+   "Replace the incomplete/greedy matching path while preserving the required CLI and database interface.",
+   "Implement deterministic sorting of matches and unmatched IDs.",
+   "Recompute all required metrics directly from the selected pairs.",
+   "Run syntax checks and the supplied smoke fixture.",
+   "Construct a small augmenting-path case and verify maximum cardinality.",
+   "Construct numerical-tie and ID-lexicographic-tie cases and verify the selected pairs.",
+   "Shuffle insertion order and verify identical JSON across reordered databases.",
+   "Check cross-partition isolation, negative and zero differences, and boundary window/tolerance cases.",
+   "Run a generated scale case and inspect runtime and memory behavior.",
+   "Review the final diff and rerun the CLI with a temporary copied database."
+  ],
+  "speedrun_commands": 21,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The phrase canonical JSON does not specify whether byte-for-byte key ordering and separators are tested or whether parsed JSON is compared.",
+   "The schema does not state that IDs are unique; duplicate IDs would make pair-list ordering, unmatched output, and metric reconstruction ambiguous.",
+   "The timestamp unit and accepted integer range are implicit, so a generator using unexpected units or very large values could create an avoidable interpretation issue.",
+   "The scale-test CPU and memory limits are not numerically specified, making a performance failure potentially environment-dependent.",
+   "A reference implementation that mishandles duplicate IDs, non-ASCII IDs, or its own lexicographic tie ordering could reject a correct implementation."
+  ],
+  "verdict": "accept",
+  "reasons": "The requirements define a deterministic, independently verifiable optimization problem and the verify-time fuzzing meaningfully defeats fixture-specific or greedy solutions. The task is genuinely algorithmic and somewhat time-intensive, although the exact lexicographic tie-break and unspecified canonicalization details make implementation and interpretation tighter than necessary.",
+  "fixes": [
+   "Explicitly state that ledger and processor IDs are unique text values and define behavior if duplicates are encountered.",
+   "Define canonical JSON serialization, or state that verification parses JSON and compares the resulting object.",
+   "Specify timestamp units, valid numeric ranges, and whether negative window or tolerance values are rejected.",
+   "Give concrete scale-test CPU and memory limits and indicate whether only standard-library Python solutions are expected.",
+   "Clarify that the lexicographic comparison is over the sorted list of string ID pairs after matching cardinality and the two numerical objectives are fixed."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "The candidate centers on deterministic multi-criteria maximum bipartite matching between ledger charges and processor captures, whereas the reference centers on reference-ID refund attribution and idempotent imports."
+    },
+    {
+     "ref_id": "ours/official-ac47e792cfa3",
+     "verdict": "distinct",
+     "reason": "The reference is an event-sourced fill and correction processor with deduplication and sequence semantics, not an optimal timestamp-and-amount matching problem."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "The reference concerns repairing a Monte Carlo deployment and SQLite ingestion pipeline, with no corresponding reconciliation matching algorithm."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "The reference is a streaming weighted-quantile service with lateness, checkpoints, and recovery, rather than ledger-to-capture matching."
+    },
+    {
+     "ref_id": "ours/official-15587ff53b0c",
+     "verdict": "distinct",
+     "reason": "The reference is a deterministic integer-arithmetic settlement packager with FX conversion and release packaging, not a maximum-cardinality reconciliation matcher."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.141
+    ],
+    [
+     "ours/official-ac47e792cfa3",
+     0.108
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.107
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.094
+    ],
+    [
+     "ours/official-15587ff53b0c",
+     0.093
+    ]
+   ],
+   "cost_usd": 0.0008824
+  },
+  "novel": true
+ },
+ "cost_usd": 0.003998
+}

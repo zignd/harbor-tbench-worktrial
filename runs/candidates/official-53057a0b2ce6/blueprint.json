@@ -1,0 +1,67 @@
+{
+ "slug": "repair-sealed-sql-audit-service",
+ "title": "Repair the Sealed Audit Query Service",
+ "scenario": "A security engineer is auditing an in-container C service that stores tenant audit events in SQLite and exposes authenticated history queries over a JSON-lines TCP protocol. The service has recently started reporting invalid audit roots and occasionally returning the wrong event set, although its health endpoint and simple single-row queries still look fine. The container includes the service, a local opaque sealing daemon used for epoch keys and MACs, a seeded database, protocol notes, and several unrelated maintenance tools.",
+ "instruction_draft": "Hey, can you get the audit service on port 7070 healthy again without replacing its wire protocol?  It must accept JSON-lines append, query, rotate, verify, and reset requests, preserve each tenant's event order, and return exactly the events matching the requested tenant, epoch, sequence range, and payload-prefix filters, including the documented numeric ordering and pagination fields.  Every successful append and rotation must produce cryptographically valid results according to the sealing daemon and protocol notes, and verify responses must remain valid after arbitrary mixtures of appends, queries, rotations, resets, and service restarts; please leave the service runnable with the existing start script and make it work for binary payloads, sequence numbers above 9, and multiple tenants.  Do not weaken verification or discard existing records: the final chain root, epoch metadata, SQLite rows, and responses from the service and sealing daemon must agree.",
+ "requirements": [
+  "The repaired service must continue to run through the existing start script and listen for JSON-lines requests on TCP port 7070.",
+  "The service must support the existing append, query, rotate, verify, and reset request types without changing their JSON field names or response framing.",
+  "Query results must contain exactly the events matching tenant, epoch, sequence-range, and payload-prefix filters.",
+  "Query results must use numeric sequence ordering rather than textual ordering and must honor the documented offset and limit pagination fields.",
+  "Successful appends and rotations must produce cryptographically valid MACs, chain roots, and epoch transition records according to the sealing daemon and protocol notes.",
+  "The service must preserve independent event order and verification state for multiple tenants.",
+  "Verification must remain valid after arbitrary mixtures of appends, queries, rotations, resets, and service restarts.",
+  "Binary payloads, sequence numbers above 9, and multiple tenants must work correctly.",
+  "The final chain root, epoch metadata, SQLite rows, and service/sealing-daemon responses must agree.",
+  "Existing records must not be discarded and verification must not be weakened."
+ ],
+ "environment": [
+  "The Docker image is built from python:3.13-slim-bookworm with pinned apt packages including gcc, make, libsqlite3-dev, sqlite3, socat, gdb, and openssl; no network access is needed.",
+  "The repository under /opt/audit contains roughly 1,500 lines across a C audit daemon, a small SQLite migration utility, a protocol client, startup scripts, fixtures, and unrelated log-maintenance code.",
+  "auditd is a C JSON-lines TCP server started by /opt/audit/bin/start.sh and backed by /opt/audit/state/audit.sqlite; its intended listener is 127.0.0.1:7070.",
+  "seal-helper is a separate compiled binary with no accompanying source, started on a Unix socket by the same script. It implements the documented epoch-key derivation, canonical byte encoding, HMAC operation, and transition signature operation; only its header, request format, protocol notes, and diagnostic client are provided.",
+  "The protocol notes document canonical encoding, fixed-width big-endian sequence and length fields, binary-safe payloads, the per-tenant chain-root recurrence, epoch transitions, and the exact JSON response fields, but do not reveal implementation details beyond the helper protocol.",
+  "The seeded database contains several hundred events across four tenants and three epochs, including sequence values 2, 9, 10, 255, and 256, repeated payloads, NUL bytes, non-UTF-8 bytes encoded in the documented JSON form, a mid-history rotation, and records that expose pagination and tenant-isolation errors.",
+  "The planted defects span components: auditd uses a text-oriented canonicalization path in one append/replay branch, reconstructs a chain with a different field-width convention after rotation, and builds one range predicate through a textual SQLite expression; the migration utility writes epoch metadata using a subtly different tenant key; and the startup script can leave an old helper socket and stale database connection state after reset.",
+  "The apparent symptom is an invalid cryptographic root, but the root is often only the first visible consequence of inconsistent SQL ordering, replay state, and helper canonicalization. Some failures occur only after enough history has accumulated or when a payload contains embedded zero bytes.",
+  "A deterministic generator and reference client are included under /opt/audit/tools for local experimentation, while verify-time tests generate fresh tenants, payloads, sequence distributions, and operation histories from fixed hidden seeds."
+ ],
+ "internal_hint": "First start the whole stack and capture raw request/response traces rather than reading only auditd.c. Compare append-time MAC inputs, SQLite rows, replay-time canonical bytes, and seal-helper diagnostics for a seeded event containing NULs and for sequence values 9 and 10. The core repair is to centralize the documented byte-exact canonical encoder, use the helper for every MAC and transition operation, bind sequence values as integers in all SQL paths, order and paginate numerically, and make replay carry tenant plus epoch state explicitly. Then repair migration/reset lifecycle handling so epoch rows use the same composite tenant/epoch identity, stale helper sockets are removed safely, and restart/replay rebuilds exactly the roots produced during append. The useful proof is to generate long mixed histories with binary payloads, rotations, resets, and restarts and compare every response and final SQLite/root state with the reference client.",
+ "trap": "A shallow fix that changes only the displayed root or replaces MAC verification with a checksum passes the health check and simple ASCII samples but fails when the hidden generator uses embedded NULs, sequence 10 before sequence 2, multiple tenants, or a rotation followed by restart. Likewise, changing one SELECT to ORDER BY CAST(seq AS INTEGER) leaves append/replay canonicalization and composite epoch identity inconsistent, so later verify requests expose a different root or one tenant's records leak into another tenant's pagination.",
+ "tests": [
+  "A startup test runs the supplied start script and sends health, append, query, and verify requests on TCP port 7070, checking that the documented JSON-lines protocol remains available.",
+  "A seeded regression test queries every tenant and epoch with range, payload-prefix, offset, and limit combinations, checking exact row membership, numeric sequence order, pagination metadata, and tenant isolation.",
+  "A cryptographic test appends generated binary payloads, including embedded NUL and non-UTF-8 bytes, then compares returned MACs and roots with the opaque sealing daemon's reference behavior and checks that verify accepts them.",
+  "A hidden-seed history test generates thousands of mixed append, query, rotate, and verify operations across multiple tenants and epochs, checking every response and the final per-tenant chain roots against a deterministic reference implementation.",
+  "A restart test stops and restarts the service and sealing daemon at deterministic points in generated histories, then checks that replayed verification, epoch metadata, query results, and roots are unchanged.",
+  "A reset and migration consistency test exercises reset followed by new appends and rotations, checks that old records are not silently dropped unless the documented reset scope requests it, and compares SQLite epoch rows with service and helper responses.",
+  "A boundary test specifically covers sequence values 0, 1, 2, 9, 10, 255, 256, and large generated values, checking that SQL filtering, ordering, pagination, and chain construction agree.",
+  "A cross-component state test inspects outcomes through the public protocol and SQLite queries, requiring the stored event MAC, canonical digest, epoch transition record, reported root, and helper verification result to agree without accepting weakened verification."
+ ],
+ "verifier_knob": {
+  "name": "request_scenarios",
+  "value": "8 deterministic scenarios: seeded queries, binary append, multi-tenant history, rotation, restart, reset, boundary sequences, and cross-component consistency",
+  "effect": "Lowering the value to 2 or 3 mostly exercises health, basic append, and a simple query; raising it adds longer generated histories, more rotations and restarts, rarer binary payloads, and more interleaved tenant operations, making partial fixes increasingly unlikely to pass."
+ },
+ "expected_failure_modes": [
+  "The solver fixes the visible invalid-root response instead of finding the append/replay canonical-byte mismatch.",
+  "The solver repairs SQL filtering but leaves textual sequence ordering or pagination in another query path.",
+  "The solver implements HMAC directly in auditd and misses the opaque helper's documented canonical encoding and epoch-key derivation.",
+  "The solver handles ASCII payloads but truncates or mis-encodes payloads containing NUL bytes.",
+  "The solver treats epoch as globally unique rather than part of a tenant-scoped identity, causing cross-tenant state contamination.",
+  "The solver validates only the seeded examples and misses failures that appear after a rotation, restart, or long generated history.",
+  "The solver resets or rebuilds the database to make visible tests pass, losing records and failing state-consistency checks.",
+  "The solver repairs the daemon but not the startup/reset lifecycle, leaving a stale helper socket or replay state that fails only after a restart."
+ ],
+ "predicted_pass_rate": 0.3,
+ "difficulty": "hard",
+ "category": "data-querying",
+ "tags": [
+  "sql",
+  "cryptography",
+  "c",
+  "service-protocol",
+  "debugging",
+  "state-consistency"
+ ]
+}

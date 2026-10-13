@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "repair-weighted-settlement-packager",
+  "title": "Repair the Weighted Settlement Packager",
+  "scenario": "A finance-ops reconciliation job packages daily multi-currency settlement batches for downstream accounting. The repository contains a small C implementation, a command-line frontend, build scripts, historical feature commits, sample settlement data, and an existing release-packaging target; a recent feature iteration has produced plausible totals on the supplied sample but fails on less common settlement shapes.",
+  "instruction_draft": "```\n$ make package\ncc ... -o bin/reconcile\n$ ./bin/reconcile samples/day-17.settle\nTOTAL|USD|184237\nTOTAL|EUR|91702\n$ ./bin/reconcile samples/adversarial.settle\nTOTAL|USD|184236\nreconciliation warning: allocation residue\n```\n\nRepair the repository so that the settlement tool and its release package are correct and reproducible. Read the repository documentation and history to preserve the documented text input format and output format. `bin/reconcile` must read a settlement file from its positional argument and emit one `TOTAL|<account>|<minor-units>` line per account, sorted by account byte order, with no diagnostic text on stdout; diagnostics may go to stderr. For every batch, compute the fee with exact rational arithmetic and round it to the nearest minor unit using ties-to-even, allocate the signed post-fee amount proportionally among its positive-weight legs using largest remainder with lexicographic leg-ID tie breaking, convert every allocated leg by its positive rational FX rate with ties-to-even rounding, and then aggregate repeated account names. The result must be independent of input line order, must conserve each batch's signed post-fee amount before FX conversion, and must handle negative gross amounts, repeated accounts, zero remainders, exact half-way values, duplicate weights, and arbitrary decimal-free integer numerators and denominators accepted by the documented format.\n\nThe program must reject malformed records, zero or negative denominators, non-positive leg weights, missing batch members, and arithmetic overflow with a nonzero exit status without emitting a partial result. Update or add deterministic tests as useful. `make clean all` must build the tool with the repository's normal warnings enabled, and `make package` must create `dist/reconcile.tar.gz` containing a relocatable executable, the required runtime data, and the format documentation; unpacking that archive in a fresh directory and running the executable must give the same results. Do not depend on network access, wall-clock time, locale, or unseeded randomness.",
+  "requirements": [
+   "Build successfully with `make clean all` and provide the executable at `bin/reconcile`.",
+   "Read the documented settlement format from the positional input-file argument.",
+   "Emit exactly one `TOTAL|<account>|<minor-units>` line per account, sorted by account byte order, with diagnostics excluded from stdout.",
+   "Compute batch fees with exact rational arithmetic and nearest-integer ties-to-even rounding.",
+   "Allocate each signed post-fee batch amount proportionally to positive-weight legs using largest remainder and lexicographic leg-ID tie breaking.",
+   "Convert every allocated leg using its positive rational FX rate with ties-to-even rounding.",
+   "Aggregate repeated account names.",
+   "Make results independent of settlement-record input order.",
+   "Conserve each batch's signed post-fee amount before FX conversion.",
+   "Correctly handle negative gross amounts, repeated accounts, zero remainders, exact half-way values, and duplicate weights.",
+   "Reject malformed records, zero or negative denominators, non-positive leg weights, missing batch members, and arithmetic overflow with a nonzero exit status and no partial result.",
+   "Make `make package` produce `dist/reconcile.tar.gz` containing a relocatable executable, required runtime data, and format documentation.",
+   "Ensure the unpacked release package produces the same deterministic results without network, wall-clock, locale, or unseeded-randomness dependencies."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` with pinned apt packages including gcc, make, binutils, git, tar, and coreutils; no network is needed after image creation.",
+   "A git repository with roughly 1,500 lines of C, headers, tests, Makefiles, packaging scripts, documentation, and generated sample settlement files across about a dozen realistic historical commits.",
+   "The current checkout contains `src/reconcile.c`, `src/rounding.c`, `src/allocator.c`, account aggregation code, a parser, and a CLI, plus unrelated reporting and logging components that require investigation to rule out.",
+   "Git history contains an earlier correct-looking fee feature, a later proportional-allocation feature, and a packaging refactor; the current checkout is the result of a partial merge of those iterations.",
+   "The planted implementation uses floating-point intermediates on one data-dependent path, mishandles signed largest-remainder allocation when a batch is negative, and uses encounter order rather than leg-ID order for some tied remainders.",
+   "A persistent per-batch accumulator is reused across batches after a parser fast path, so the supplied small examples do not expose residue leakage; the issue appears only after particular mixtures of batch sizes and record ordering.",
+   "The sample data includes ordinary positive settlements and one visible residue warning, but does not cover all tie, sign, permutation, repeated-account, and exact-half cases.",
+   "The repository initially builds an executable but produces a non-relocatable package because the packaging target assumes the checkout's absolute data directory."
+  ],
+  "internal_hint": "The solution requires investigation rather than merely reading one function. Start by inspecting git log, README/history notes, build targets, sample files, and the parser/allocator call graph; use small generated permutations and instrumented runs to expose state leakage and tie behavior. Reimplement the arithmetic around a sufficiently wide signed integer/rational representation, normalize signed allocation by magnitude and restore the sign, use a deterministic lexicographic tie order, reset all batch-local state on every close, and make aggregation and output sorting deterministic. Then test the executable against an independent reference script over generated batches before repairing the relocatable archive target. The key difficulty is the interaction between persistent parser state, signed exact arithmetic, and multiple dependent rounding/allocation stages; the causes are not reliably visible from a quick source inspection or the supplied examples.",
+  "trap": "A shallow fix that replaces one `double` calculation or merely sorts the final account totals passes the sample but fails when a negative batch has tied remainders, when two legs share an account, or when input batches are permuted. Another plausible solution computes each leg independently and rounds before largest-remainder allocation, which appears reasonable but violates conservation and diverges on exact half-way and duplicate-weight cases. A package-only test also misses the stale batch accumulator that appears after several differently shaped batches.",
+  "tests": [
+   "Build test: run `make clean all` and execute the resulting `bin/reconcile` on the supplied samples, checking exit status, exact stdout format, and expected totals.",
+   "Input-validation test: feed malformed records, zero and negative denominators, non-positive weights, missing batch members, and deliberately overflowing integers; require a nonzero exit status, no partial TOTAL output, and diagnostics only on stderr.",
+   "Fuzz-equivalence test: at verification time, a deterministic hidden-seed generator creates fresh settlement files containing 1-200 batches, 1-40 legs per batch, positive and negative gross amounts, repeated accounts, duplicate weights, exact half-way rational values, varied numerator/denominator sizes, and arbitrary record permutations. Tests compare the executable's complete sorted output with an independent exact-integer reference computation.",
+   "Permutation/property test: regenerate each fuzz case with records shuffled globally and within batches; require byte-identical output and require every batch's pre-FX allocated legs to sum exactly to its signed post-fee amount.",
+   "State-history test: concatenate batches designed to exercise parser fast paths, empty intermediate groups, tied residues, and alternating positive and negative gross values; compare all account totals with the reference to detect leaked batch-local state.",
+   "Packaging test: run `make package`, unpack `dist/reconcile.tar.gz` into a fresh temporary directory outside the repository, verify that the required executable, documentation, and runtime data are present, and rerun the fuzz corpus from the unpacked directory.",
+   "Reproducibility test: execute the same packaged binary twice under different locale settings and from different working directories; require identical stdout, stderr classification, and exit status."
+  ],
+  "verifier_knob": {
+   "name": "generated_settlement_cases",
+   "value": "240 fresh cases, averaging 90 batches and 14 legs per batch, with 15% negative batches, 20% exact-half-way rounding opportunities, 20% tied largest remainders, and 30% record permutations",
+   "effect": "Lowering the case count or rare-case percentages allows floating-point, encounter-order, or state-reset mistakes to survive; raising them increases exposure to interacting signed-rounding, tie-breaking, and accumulated-state failures while keeping the reference computation inexpensive."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the current allocator and patches an obvious rounding expression without exploring git history, parser state, or packaging behavior.",
+   "The implementation uses floating point or insufficiently wide intermediate integers and fails only on generated rational values near half-way boundaries.",
+   "Negative largest-remainder allocation is implemented by truncating signed quotients, causing conservation errors for negative batches.",
+   "Tie breaking depends on input order, pointer order, or hash-table iteration instead of lexicographic leg IDs.",
+   "Batch-local residue or leg state survives into the next batch, producing history-dependent totals.",
+   "The agent validates only the visible samples and does not generate permutations or cases with repeated accounts and exact ties.",
+   "The core executable is fixed but `make package` still embeds an absolute repository path or omits required runtime data.",
+   "The agent emits useful diagnostics to stdout or produces partial output before rejecting a malformed record."
+  ],
+  "predicted_pass_rate": 0.27,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "c",
+   "exact-arithmetic",
+   "git-history",
+   "fuzz-equivalence",
+   "finance-ops",
+   "packaging"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "Inspect repository layout, README, format documentation, and status (`pwd; find ...; sed ...`).",
+   "Inspect recent history and feature/packaging commits (`git log --oneline --all; git show ...`).",
+   "Read Makefiles, packaging scripts, and archive manifests.",
+   "Trace the CLI, parser, batch lifecycle, allocator, rounding, aggregation, and output code.",
+   "Build and run the supplied samples to establish baseline behavior.",
+   "Inspect sample settlement files and documented batch/member grouping rules.",
+   "Generate or manually create reordered versions of samples and compare outputs.",
+   "Construct small negative, duplicate-weight, repeated-account, and exact-half cases to expose allocation and rounding behavior.",
+   "Identify the persistent accumulator and all batch-close/reset paths.",
+   "Replace floating-point and narrow intermediate arithmetic with checked exact integer/rational operations.",
+   "Implement ties-to-even fee and FX rounding, including negative values and overflow checks.",
+   "Normalize signed largest-remainder allocation by magnitude, restore the sign, and use lexicographic leg-ID ordering for ties.",
+   "Reset all batch-local state on every batch close and reject incomplete or malformed batches before emitting output.",
+   "Make account aggregation and final account sorting deterministic and ensure diagnostics use stderr.",
+   "Repair validation for denominators, weights, integer parsing, and partial-output suppression.",
+   "Fix the package target to include relocatable executable, runtime data, and format documentation without checkout paths.",
+   "Run `make clean all` and supplied sample tests.",
+   "Run invalid-input, negative, tie, duplicate-account, and permutation tests.",
+   "Write or run an independent exact-integer reference generator and compare randomized cases.",
+   "Run state-history and global/per-batch permutation tests against the reference.",
+   "Run `make package`, unpack outside the repository, and execute the packaged binary on the corpus.",
+   "Run packaged executions from multiple working directories and locale settings.",
+   "Review the final diff and rerun the complete deterministic test set."
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The documented settlement schema and batch grouping rules are not included in the blueprint, so malformed-record and missing-member tests could overreach if the repository documentation is incomplete or ambiguous.",
+   "\u201cArbitrary\u201d integer numerators and denominators conflicts with mandatory overflow rejection unless the documentation specifies accepted bounds and exactly which operations must be checked.",
+   "Negative largest-remainder semantics, especially remainder ordering after sign normalization and ties-to-even for negative half-way values, should be defined mathematically rather than inferred by the verifier.",
+   "The executable exposes only final account totals, so a black-box test cannot independently establish per-batch pre-FX conservation when accounts or FX rates obscure individual allocations.",
+   "Requiring identical stderr across locales and working directories is stronger than the stated allowance for arbitrary diagnostics on stderr and may fail because diagnostics contain paths or implementation-specific wording.",
+   "The package\u2019s required runtime data and relocatability expectations are not enumerated, and a dynamically linked binary may depend on the verifier image rather than the archive."
+  ],
+  "verdict": "accept",
+  "reasons": "This is a genuinely difficult but realistic repair task: correctness depends on interacting parser state, signed exact arithmetic, deterministic tie handling, and packaging rather than one isolated bug. The independent verify-time reference and permutation/fuzz coverage make shallow fixes unlikely to pass, although several numeric and packaging semantics need tighter specification. The average score is 3.6, meeting the acceptance threshold.",
+  "fixes": [
+   "Document the complete settlement grammar, batch/member association rules, account byte-order definition, and exact output/error contract in the task or required repository files.",
+   "Specify numeric limits or require a defined big-integer strategy, and state whether lexically valid but computationally overflowing inputs must be rejected before any output.",
+   "Give formal pseudocode for signed largest-remainder allocation and ties-to-even rounding, including negative half-way cases and duplicate leg IDs if those are possible.",
+   "Make the package manifest explicit: list required files, runtime data, invocation assumptions, and whether static linking is required or the verifier guarantees compatible shared libraries.",
+   "Change the reproducibility assertion to compare stdout and exit status, or define stable diagnostic text and require tests to run under explicitly installed locales.",
+   "If conservation is an intended hidden invariant, add a test mode or fixtures with uniquely identifiable accounts/rates so black-box tests can observe each batch\u2019s pre-FX allocation rather than merely relying on final totals."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Although both involve finance reconciliation, the candidate is an integer/rational settlement allocation and packaging repair, while this reference centers on authenticated binary spool parsing, decryption, adjustments, and audit reporting."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "The reference is a Monte Carlo risk deployment and SQLite pipeline repair, whereas the candidate concerns deterministic settlement arithmetic, validation, and release packaging."
+    },
+    {
+     "ref_id": "ours/official-ac47e792cfa3",
+     "verdict": "distinct",
+     "reason": "Both aggregate financial records, but the reference is an event-sourced JSON fill/correction/cancel ledger with sequence and deduplication semantics, not weighted settlement allocation with exact rational FX and fee arithmetic."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference repairs a Rust sensor fixed-point aggregation pipeline and database output, which has no matching core problem with the candidate's settlement parsing, allocation, rounding, and packaging."
+    },
+    {
+     "ref_id": "ours/official-fe5e13a6b5b7",
+     "verdict": "distinct",
+     "reason": "Both involve finance and FX, but the reference computes counterparty margin calls from black-box-pricer outputs, while the candidate repairs batch fee allocation, rational FX conversion, validation, and packaging."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.282
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.182
+    ],
+    [
+     "ours/official-ac47e792cfa3",
+     0.124
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.123
+    ],
+    [
+     "ours/official-fe5e13a6b5b7",
+     0.117
+    ]
+   ],
+   "cost_usd": 0.0009826
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0041519999999999994
+}

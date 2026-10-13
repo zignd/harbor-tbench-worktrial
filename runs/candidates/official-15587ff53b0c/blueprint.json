@@ -1,0 +1,68 @@
+{
+ "slug": "signed-settlement-packager",
+ "title": "Repair the Signed Settlement Packager",
+ "scenario": "A finance-ops engineer is preparing a release of an internal C utility that converts multi-currency ledger lines into integer settlement allocations for downstream reconciliation. The repository contains several years of Git history, format notes, fixtures, a partially implemented C library, a command-line wrapper, and a release-packaging pipeline; a recent feature iteration added chargebacks and split settlements without a reliable regression reproduction.",
+ "instruction_draft": "$ make release\ncc ...\nreconcile-pack: reconciliation invariant failed for batch B-104\nmake: *** [release] Error 2\n\nRepair the repository so that `make test` and `make release` succeed. The released artifact must be `dist/reconcile-pack.tar.gz`, and extracting it must provide an executable `bin/reconcile-pack` that reads the documented ledger format from standard input and writes the documented allocation format to standard output. Implement all documented v2 settlement semantics, including exact rational FX conversion, grouping, signed amounts, chargebacks, split settlements, deterministic tie handling, and conservation of every group total; do not use floating-point arithmetic for monetary decisions. The command must reject malformed records without emitting partial settlement output, and repeated builds from the same checkout must produce byte-identical release archives. Preserve the existing command-line interface and make the implementation work for inputs substantially larger than the checked-in fixtures.",
+ "requirements": [
+  "The repository must pass `make test`.",
+  "`make release` must succeed and create exactly `dist/reconcile-pack.tar.gz`.",
+  "The release archive must contain an executable `bin/reconcile-pack` and the documented runtime support files, and the executable must run without relying on the source checkout.",
+  "`bin/reconcile-pack` must read the documented ledger format from standard input and write the documented allocation format to standard output while preserving the existing CLI interface.",
+  "For every settlement group, the emitted integer allocations must conserve the mathematically rounded exact total of all input lines in that group.",
+  "FX conversion and monetary rounding must be performed with exact integer or rational arithmetic; floating-point values must not affect allocation decisions.",
+  "The implementation must apply the repository's documented v2 semantics for positive lines, negative chargebacks, zero values, split settlements, grouping keys, fractional remainders, and deterministic ties.",
+  "Malformed records, invalid denominators, unknown currencies, overflow, and inconsistent split metadata must be rejected with a nonzero status and no partial settlement output.",
+  "The implementation must handle inputs substantially larger than the checked-in fixtures without quadratic behavior or fixed-size record limits.",
+  "Two release builds from the same checkout must produce byte-identical archives."
+ ],
+ "environment": [
+  "The Dockerfile must use `FROM python:3.13-slim-bookworm`, install pinned apt packages including gcc, make, libc6-dev, git, and python3, and install no network-dependent runtime component.",
+  "The repository must be a synthetic Git repository with roughly 1,200-1,800 lines of C, headers, shell, Python test helpers, Makefiles, and documentation spread across multiple plausible components.",
+  "The tree must include a C parser, a rational-number utility, a grouping/index module, a settlement allocator interface, a CLI, test fixtures, and a release Makefile; unrelated validation and manifest code should make locating the relevant path require investigation.",
+  "Git history must contain several dated feature commits, including an earlier working settlement implementation, a v2 design-note commit, a split-settlement feature commit, and a later merge/regression commit that is checked out at HEAD.",
+  "The current checkout must compile far enough to expose the pasted invariant failure, but its allocator and one state-management path must be incomplete or semantically wrong rather than presenting a single obvious one-line defect.",
+  "Repository documentation and historical diffs must define the ledger and output formats, exact rounding rule, grouping identity, chargeback behavior, split-settlement semantics, and tie ordering; the checked-in fixtures must cover ordinary positive values but only sparsely exercise signed and tied cases.",
+  "The ledger format should contain stable line identifiers, batch/account/group fields, source currency, settlement currency, signed minor-unit amount, rational FX numerator and denominator, and optional split metadata. The output should retain line identity and emit an integer settlement allocation plus the group key.",
+  "The release process must include a generated manifest and archive normalization logic, with a planted reproducibility issue involving file ordering or archive metadata that is only apparent when building twice.",
+  "A deterministic reference implementation must be available only to the verifier, not as a source file adjacent to the broken allocator."
+ ],
+ "internal_hint": "The intended resolution is investigative: inspect `git log`, historical branches, design notes, and the existing fixtures; run the current binary on generated probes; add temporary instrumentation around grouping, remainder calculation, and split expansion; then reconstruct the v2 algorithm. The reference semantics are signed Hamilton-style apportionment over exact rationals: expand valid splits, group by the full documented settlement identity, compute the exact group sum, round that group sum according to the documented nearest-even rule, assign mathematical-floor base units to each line, and distribute the signed residual by fractional remainder with the documented stable line-order tie break. Negative chargebacks must participate in the same exact group calculation rather than being independently rounded, and split children must conserve their parent line before group residual allocation. The regression also loses group state when interleaved records return to a prior group, so a streaming-only accumulator is insufficient unless it is finalized correctly. The archive problem is separate: normalize member order, ownership, and timestamps before tar creation. The hard part is not a visible typo: correctness appears only after state has accumulated across interleaved groups and after many rare signed, tied, and split inputs.",
+ "trap": "A shallow solution can make the visible fixtures pass by rounding each line independently, sorting only positive remainders, or assuming records for a group are contiguous. It then fails generated cases containing negative residuals, equal fractional remainders, interleaved groups, chargebacks that cancel positive lines, or splits whose parent and children cross rounding boundaries. Another plausible solution fixes the allocator but leaves nondeterministic tar member metadata, so a single successful release build passes while the reproducibility check fails.",
+ "tests": [
+  "The build test runs `make test` and checks the existing parser, CLI, allocator, malformed-input handling, and checked-in regression cases; this covers the instruction's requirements to pass `make test` and preserve the documented interface.",
+  "The packaging test runs `make release`, verifies `dist/reconcile-pack.tar.gz`, extracts it into a clean directory, checks that `bin/reconcile-pack` is executable, and runs it without the source checkout; this covers the release-artifact requirements.",
+  "The reproducibility test removes the release output, builds twice from the same checkout, and compares the archive bytes and generated manifest; this covers byte-identical repeated builds.",
+  "The fuzz-equivalence test uses a hidden deterministic seed to generate hundreds of fresh ledgers with thousands of records, multiple currencies and groups, interleaved group order, positive and negative amounts, zero lines, rational rates, ties, chargebacks, and valid split trees. It runs the released C executable and compares every output allocation and rejection result with an independent reference computation; this covers exact rational conversion, signed group conservation, split behavior, grouping, and deterministic tie handling.",
+  "The fuzz generator deliberately includes cases where each line rounds differently from the group total, where the signed residual is negative, where several lines have identical remainders, and where a group is revisited after other groups; this checks the stated conservation and v2 semantics rather than merely matching ordinary examples.",
+  "The invalid-input test generates malformed rows, zero or negative denominators, unknown currencies, inconsistent split metadata, arithmetic overflow boundaries, and truncated records, then verifies a nonzero exit status, a useful diagnostic on stderr, and an empty stdout; this covers the no-partial-output requirement.",
+  "The scale test generates tens of thousands of valid records with many simultaneous groups and checks completion, output cardinality, and a generous runtime bound; this covers the requirement to work beyond fixture size without fixed-size or quadratic behavior."
+ ],
+ "verifier_knob": {
+  "name": "generated-ledger-count-and-adversarial-density",
+  "value": "700 hidden ledgers, 1,000-8,000 records each, with approximately 35% signed chargebacks, 20% split trees, 25% interleaved-group transitions, and 15% tied-remainder cases",
+  "effect": "Lowering the count and adversarial density lets line-by-line rounding or contiguous-group assumptions survive by chance. Raising them increases exposure to accumulated state errors, signed residual mistakes, split-conservation bugs, and unstable tie handling, while keeping the reference computation deterministic."
+ },
+ "expected_failure_modes": [
+  "The agent inspects only the current source and patches the first invariant failure without reconstructing the historical v2 contract.",
+  "The agent rounds each input independently instead of apportioning the exact rounded group total.",
+  "The agent handles positive residuals but distributes negative residuals in the wrong direction.",
+  "The agent groups only by account or batch and omits one documented settlement identity field.",
+  "The agent assumes records for each group are contiguous and loses or double-finalizes state when groups are interleaved.",
+  "The agent expands splits after rounding, causing parent-child conservation failures on fractional cases.",
+  "The agent uses doubles or casts to signed integer types before deciding fractional order, producing rare discrepancies on large or negative values.",
+  "The agent uses an unstable sort or pointer addresses for equal-remainder ties.",
+  "The agent emits already-parsed rows before discovering a later malformed record.",
+  "The agent fixes functional output but misses deterministic archive normalization and fails the repeated-build check.",
+  "The agent validates only the checked-in fixtures and does not generate probes for signed, tied, or revisited-group cases."
+ ],
+ "predicted_pass_rate": 0.28,
+ "difficulty": "hard",
+ "category": "build-packaging",
+ "tags": [
+  "c",
+  "git-history",
+  "fixed-point-math",
+  "fuzz-equivalence",
+  "release-reproducibility"
+ ]
+}

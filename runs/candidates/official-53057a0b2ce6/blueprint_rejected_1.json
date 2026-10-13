@@ -1,0 +1,183 @@
+{
+ "blueprint": {
+  "slug": "repair-rotating-blind-index-catalog",
+  "title": "Repair the Rotating Blind-Index Catalog",
+  "scenario": "A security engineer is auditing an in-container C service that stores encrypted customer records in SQLite and supports exact-lookups through keyed blind indexes. Searches started returning no rows after tenant key rotation, although the key broker and database both report healthy; the container includes the catalog daemon, an opaque key-broker service, fixtures, logs, and a protocol client.",
+  "instruction_draft": "Hey, can you get the catalog stack working again? Fix `/opt/catalog/catalogd` and any related startup/configuration issues so the service listens on `127.0.0.1:7419`, talks to the key broker on `127.0.0.1:7420`, and correctly handles newline-delimited JSON `put`, `find`, `rotate`, and `health` requests: `put` must encrypt and persist a tenant record, `find` must return exactly the matching records in deterministic order with working pagination cursors, and `rotate` must leave both old and new records searchable. Keep tenants isolated, preserve data across daemon restarts, reject altered or cross-query cursors, and ensure the SQLite database contains ciphertext rather than plaintext record bodies; do not weaken authentication or bypass the key broker.",
+  "requirements": [
+   "The catalog service must listen on 127.0.0.1:7419 and provide newline-delimited JSON put, find, rotate, and health requests.",
+   "A put request must persist the supplied tenant, record identifier, searchable field, and body, and a subsequent matching find must return the body exactly.",
+   "Find must perform the documented normalization and keyed blind-index lookup, return only records belonging to the requested tenant and exact normalized searchable value, and return rows in deterministic record order.",
+   "Find pagination must honor the requested limit and produce a cursor that resumes without duplicates or omissions.",
+   "Cursors must be cryptographically authenticated and bound to the tenant, normalized query, ordering, and page position; altered cursors and cursors reused for another query must be rejected.",
+   "After a successful rotate request, records written before rotation and records written after rotation must both remain searchable and decryptable.",
+   "Tenant A operations must never return or decrypt Tenant B records, including after either tenant rotates its key.",
+   "Catalog state and encrypted records must survive stopping and restarting catalogd and the key-broker client must recover from normal service response fragmentation.",
+   "The catalog SQLite database must not contain plaintext record bodies, and the service must continue to use the configured key broker rather than a hard-coded or locally substituted key.",
+   "Malformed requests, unknown key versions, invalid authentication tags, and invalid cursors must produce structured errors without crashing the daemon or corrupting existing records.",
+   "Health must report the actual readiness of both the SQLite catalog and the key-broker connection rather than merely reporting that catalogd is running."
+  ],
+  "environment": [
+   "The Docker image is built from python:3.13-slim-bookworm with pinned apt packages including gcc, make, sqlite3, libsqlite3-dev, libssl-dev, and netcat, plus pinned Python packages used only by deterministic fixture and verifier tools.",
+   "The repository contains roughly 1,400 lines of C across catalogd, a small protocol/client library, migration utilities, and unrelated logging and metrics code, plus SQL migrations and shell startup scripts.",
+   "catalogd initially listens on 127.0.0.1:7419 and stores its database at /var/lib/catalog/catalog.sqlite; it uses SQLite, OpenSSL HKDF/HMAC-SHA256, and AES-256-GCM for blind-index derivation, authenticated encryption, and cursor authentication.",
+   "An opaque compiled `/opt/keybroker/keybroker` service listens on 127.0.0.1:7420. Its source is absent by design. Its documented protocol returns tenant/version-specific encryption and index material derived through HKDF from a container-installed master key, and responses may legally be split across multiple TCP reads.",
+   "The key broker is deterministic and seeded from fixed fixture material, but has several tenants, multiple key versions, and deliberately varied response sizes so a one-read client appears to work for the initial examples but fails after rotation or with long tenant names.",
+   "The catalog database is preloaded with records for several tenants, including records written under both the current and previous key versions, normalization edge cases, and enough rows to require pagination.",
+   "The supplied protocol documentation defines JSON fields including tenant, id, search, body, limit, cursor, and key version, the normalization rules, result ordering, error objects, and the exact startup commands.",
+   "The planted defects span the SQL binding and key-material cache paths: a rotated lookup can use the process-global current version instead of the row's version, one HKDF info length is computed from a C string rather than the documented byte length, cursor verification does not bind every query component, and the broker client assumes a complete response arrives in one read.",
+   "A migration/configuration defect causes one startup mode to open a second relative-path SQLite database, making the visible healthy process and the queried database diverge; logs misleadingly emphasize SQL 'no rows' rather than the key-version and path problems.",
+   "The source includes substantial unrelated C code for metrics, logging, and retry accounting so the defects are not isolated in a tiny file. The verifier starts and restarts the services using the documented scripts rather than inspecting source."
+  ],
+  "internal_hint": "The apparent SQL empty-result problem is downstream of several state and crypto mismatches. First run the protocol client against baseline, pre-rotation, post-rotation, long-name, and restart cases while tracing catalogd and keybroker traffic; compare the database path reported by health with the actual opened file and use sqlite3 to inspect schema, versions, and ciphertext. The broker protocol permits short reads, so replace single-read assumptions with framed accumulation and validate length/status fields. Derive the documented HKDF inputs byte-for-byte, including explicit lengths and tenant/version separation, and make every row lookup obtain the row's key version rather than a global current version. Repair the canonical cursor payload and HMAC verification so tenant, normalized search, order, limit, and offset are authenticated. Fix startup to use the configured absolute database path, invalidate or version caches correctly on rotation, and preserve old key versions. Exercise the service with hundreds of generated records, rotation at different offsets, daemon restarts, and tampered database ciphertext before declaring it fixed.",
+  "trap": "A shallow fix that changes only the SQL WHERE clause or always retries the initial key version passes the supplied examples but fails on records spanning a rotation. A client that accepts the first broker read works with short fixture responses but fails when a hidden tenant produces a fragmented response. A cursor implementation that authenticates only the offset passes ordinary pagination while allowing a cursor from one tenant or search to disclose another query's rows. A daemon that accidentally uses a relative database path can appear persistent while restart tests query a different empty database.",
+  "tests": [
+   "Launch keybroker and catalogd, send health requests, and verify that health is false or an explicit dependency error before the broker is ready and becomes ready only when both the broker and the configured SQLite catalog are usable; this checks the health requirement.",
+   "Send puts for multiple tenants and exact finds with ordinary ASCII values, then compare returned IDs and bodies with a deterministic reference; this checks persistence, exact lookup, tenant isolation, and deterministic ordering.",
+   "Generate fresh searches containing Unicode, combining characters, case variants, whitespace, and long tenant names according to the documented normalization rules; compare catalog results to the reference implementation; this checks the byte-exact normalization and HKDF blind-index requirements.",
+   "Insert 1,000 records across several tenants and request pages with limits from 1 through 37, including a final partial page; verify no duplicate, missing, or reordered rows and verify the final cursor behavior; this checks general pagination.",
+   "Capture a valid cursor, alter its offset, tenant, search value, limit, and one byte of its authentication tag independently, and reuse it with another query; every altered or cross-query cursor must receive a structured error; this checks cursor binding and authentication.",
+   "Rotate one tenant at zero, one, and several hundred existing records, then add records under the new version and query both old and new records in every order; this checks cross-version decryptability, row-specific key versions, and rotation consistency.",
+   "Rotate Tenant A while leaving Tenant B unchanged, then issue interleaved finds and pagination requests for both; verify that no body, key material, or row from either tenant crosses the boundary; this checks cross-component tenant isolation.",
+   "Run a broker test mode that fragments every response at deterministic byte boundaries and injects normal connection reuse; perform puts, finds, and rotations and compare with an unfragmented reference; this checks framed broker I/O.",
+   "Stop and restart catalogd repeatedly without deleting the database or key-broker state, then query all previously inserted records and continue inserting; verify the same results and a single configured database file; this checks restart persistence and absolute-path consistency.",
+   "After inserting records, inspect the SQLite tables and raw pages through the verifier and assert that supplied body strings are absent from stored record payload columns and that authentication tags/ciphertexts are structurally valid; this checks encrypted-at-rest behavior without relying on source inspection.",
+   "Inject deterministic invalid ciphertext, unknown key-version, malformed JSON, oversized field, and invalid cursor requests; verify structured errors, no process crash, no partial writes, and unchanged results for unaffected records; this checks defensive protocol behavior.",
+   "Run hidden fresh-input scenarios combining rotation, fragmented broker replies, Unicode normalization, pagination, restart, and tenant interleaving in different orders; compare every response and final database-visible result with the deterministic reference service."
+  ],
+  "verifier_knob": {
+   "name": "request_scenarios",
+   "value": "12 generated protocol scenarios, including 1,000-record mixed-rotation datasets",
+   "effect": "Lowering this to 3 mostly exercises ordinary puts and finds and allows partial fixes to pass; raising it adds more rotation boundaries, fragmented broker responses, cursor mutations, restarts, tenants, and generated normalization cases, making shallow or state-inconsistent repairs fail."
+  },
+  "expected_failure_modes": [
+   "The agent treats empty results as a SQL predicate problem and misses the row-key-version, HKDF, or database-path interaction.",
+   "The agent reads only the visible source and does not run enough history-dependent requests to discover that the failure appears only after rotation or restart.",
+   "The agent assumes one TCP read returns a complete key-broker response and passes short examples but corrupts or rejects long hidden responses.",
+   "The agent repairs encryption for new rows but cannot read pre-rotation rows, or invalidates all old keys during rotation.",
+   "The agent implements pagination with an unsigned offset or a cursor authenticated without query context.",
+   "The agent stores plaintext as a shortcut, which passes protocol responses but fails encrypted-at-rest and restart inspection.",
+   "The agent fixes catalogd while leaving the startup script opening a second relative SQLite database.",
+   "The agent tests one tenant and one page only, missing cross-tenant cursor reuse, mixed key versions, and fragmented responses.",
+   "The agent makes an apparently correct HKDF change but uses C string length or a different canonical byte encoding on rare Unicode or long-name inputs."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "cryptography",
+   "c",
+   "service-protocol",
+   "debugging",
+   "key-rotation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd; find /opt/catalog /opt/keybroker -maxdepth 3 -type f -print",
+   "cat the protocol documentation, README, and startup scripts",
+   "Inspect the catalog schema and migration SQL",
+   "Run the documented stack startup and baseline health/put/find requests",
+   "Capture catalogd and keybroker logs during pre-rotation and post-rotation lookups",
+   "grep for broker reads, HKDF derivation, key-version selection, cursor signing, and database-path configuration",
+   "Read the broker protocol/client implementation and response framing code",
+   "Read the record lookup, encryption/decryption, and rotation code",
+   "Read cursor serialization and HMAC verification code",
+   "Use sqlite3 to compare the configured database path with the file actually opened and inspect row key versions",
+   "Patch broker I/O to accumulate complete framed responses and validate lengths/statuses",
+   "Patch HKDF inputs to use documented byte lengths and tenant/version separation",
+   "Patch lookups and decryption to fetch and use each row's key version, preserving old versions across rotation",
+   "Patch cursor canonicalization and verification to bind tenant, normalized query, ordering, limit, and position",
+   "Patch startup/configuration to use the configured absolute SQLite path and correct health dependency state",
+   "Build catalogd and run the supplied unit/protocol checks",
+   "Exercise puts, Unicode finds, rotation, pagination, cursor tampering, tenant interleaving, and restart persistence",
+   "Run fragmented-broker and ciphertext/error scenarios, inspect SQLite for plaintext, and fix any remaining failures"
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The environment description effectively identifies each planted defect, so source inspection may make the repair largely mechanical rather than genuinely difficult.",
+   "The requirement that health be false before the broker is ready can be timing-sensitive unless the verifier provides a deterministic startup/readiness barrier.",
+   "Checking that plaintext bodies are absent from raw SQLite pages can produce false positives or false negatives for short or low-entropy bodies unless the verifier uses distinctive markers and checks the schema and encryption structure together.",
+   "The stated opaque broker test mode and its fragmentation controls must be present and documented in the container; otherwise the fragmentation test would overreach the solver's available interface.",
+   "Exact normalization, cursor error objects, rotation semantics, and startup commands must be fully specified in the supplied documentation; otherwise otherwise-correct implementations could fail on underspecified wire details.",
+   "A test that asserts no key material crosses tenants cannot directly observe key material and should rely on protocol-visible isolation and carefully controlled fixtures."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is clear, realistic, and mostly strongly verifiable, but the speedrun is plausibly achievable in about 18 commands because the environment description exposes the relevant defect classes and the internal design is small. Under the stated rubric, that makes genuine_difficulty a 2, so the acceptance threshold is not met.",
+  "fixes": [
+   "Remove the defect-by-defect disclosures from the build description while retaining the protocol documentation and observable symptoms; leave agents to identify the failing components through tracing and tests.",
+   "Add a deterministic readiness fixture or barrier for the pre-broker health test, and document the exact broker-fragmentation test-mode interface.",
+   "Make encrypted-at-rest verification use distinctive high-entropy body markers, schema checks, and authenticated-decryption checks rather than simple substring absence alone.",
+   "Provide an explicit canonical wire-format specification for normalization, cursor payloads, error objects, and rotation behavior, and ensure all hidden tests stay within those documented semantics.",
+   "Retain multiple interacting defects but add a recovery or migration edge case that requires diagnosis from history-dependent behavior rather than direct source-guided patching."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a rotating-key encrypted SQLite blind-index service, whereas this task reconstructs transactional state from segment logs and a catalog."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34-m",
+     "verdict": "distinct",
+     "reason": "The candidate centers on tenant-isolated encryption, key rotation, authenticated cursors, and blind-index queries, unlike this task's committed-log recovery and event-history consistency."
+    },
+    {
+     "ref_id": "ours/official-99d1e913c00d",
+     "verdict": "distinct",
+     "reason": "Although both involve a catalog daemon and line-oriented service, this task handles encrypted tenant records and key brokers while the reference indexes device capture histories and immutable generations."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124-m",
+     "verdict": "distinct",
+     "reason": "The candidate is a persistent encrypted database service with rotation and authenticated pagination, not a deterministic malformed-line-tolerant log-to-CSV backfill."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "distinct",
+     "reason": "The candidate's core problem is repairing cryptographic storage and lookup across tenant key rotation, whereas this reference validates and aggregates JSON log events into CSV outputs."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ea89cb64bf34",
+     0.207
+    ],
+    [
+     "ours/official-ea89cb64bf34-m",
+     0.188
+    ],
+    [
+     "ours/official-99d1e913c00d",
+     0.15
+    ],
+    [
+     "ours/official-37d13d3e2124-m",
+     0.129
+    ],
+    [
+     "ours/official-37d13d3e2124",
+     0.121
+    ]
+   ],
+   "cost_usd": 0.0008791999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0035832
+}

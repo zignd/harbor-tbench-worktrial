@@ -1,0 +1,185 @@
+{
+ "blueprint": {
+  "slug": "reconcile-event-ledgers",
+  "title": "Reconcile Event Ledgers",
+  "scenario": "The finance-ops team is investigating why processor settlement totals differ from the internal payment ledger. The container contains a small SQLite-backed reconciliation utility, append-only event logs, SQL views, operational logs, and a metrics emitter; the missing reconciliation component must be completed without changing the command-line contract.",
+  "instruction_draft": "Implement the reconciliation component used by `/opt/recon/bin/reconcile.py`. It must read the supplied SQLite database, materialize the latest non-deleted version of each event by maximum sequence number, independently reconcile ledger debits with processor captures and ledger credits with processor refunds, and write the deterministic JSON report requested by the existing CLI. A pair is eligible only when account and currency agree, absolute amount difference is at most 3 cents, and absolute event-time difference is at most 3,600 seconds; each event may occur in at most one pair.\n\nChoose the eligible pairing that first maximizes the number of pairs, then minimizes total absolute amount difference, then minimizes total absolute time difference, and finally chooses the lexicographically smallest sorted list of `(ledger_id, processor_id)` pairs. Emit all matched and unmatched IDs, per-account totals, and the specified objective fields in the documented schema, and append one deterministic metrics record containing the input counts, candidate count, match count, unmatched counts, and a SHA-256 report digest. Preserve unrelated CLI behavior, reject malformed databases with a nonzero exit, and write report and metrics files atomically.",
+  "requirements": [
+   "Implement the existing `/opt/recon/bin/reconcile.py` CLI rather than changing its invocation contract.",
+   "Read the supplied SQLite database and select the row with maximum sequence number for each source and event ID.",
+   "Exclude latest-version events marked deleted and correctly parse the documented JSON payload fields.",
+   "Reconcile debits with captures and credits with refunds as two independent one-to-one matching problems.",
+   "Require matching account and currency, amount difference no greater than 3 cents, and event-time difference no greater than 3,600 seconds.",
+   "Allow every ledger or processor event to appear in at most one pair.",
+   "Maximize pair count before minimizing total absolute amount difference.",
+   "After amount cost, minimize total absolute event-time difference.",
+   "After all numeric objectives tie, select the lexicographically smallest sorted list of `(ledger_id, processor_id)` pairs.",
+   "Emit the documented deterministic JSON report containing matched pairs, unmatched IDs, per-account totals, and objective fields.",
+   "Append one deterministic JSON-lines metrics record containing input counts, candidate count, match count, unmatched counts, and the SHA-256 digest of the report.",
+   "Reject malformed databases with a nonzero exit status.",
+   "Write report and metrics outputs atomically so an interrupted run cannot leave a partial final file.",
+   "Preserve unrelated existing CLI options and behavior."
+  ],
+  "environment": [
+   "Use a Docker image based on `python:3.13-slim-bookworm` with pinned apt and pip dependencies, one CPU, and 2 GB RAM.",
+   "Create roughly 1,400 lines of Python, SQL, shell, and configuration across `/opt/recon`, including decoy log parsers, a metrics formatter, a report consumer, tests for the visible fixture, and operational documentation.",
+   "Provide `/opt/recon/bin/reconcile.py` with the CLI and output-schema documentation but leave its core matching/materialization component incomplete.",
+   "Provide a SQLite schema containing `ledger_events`, `processor_events`, `accounts`, and metadata tables; event tables contain source ID, event ID, sequence number, deletion flag, event kind, and JSON payload.",
+   "Provide append-only sample event logs with revisions, duplicate IDs, deletions, amount ties, timestamp ties, multiple currencies, and unrelated event kinds.",
+   "Provide existing SQL views and helper modules that expose the documented effective-event shape, while including realistic logging and metrics code not all involved in the defect.",
+   "Provide a small visible fixture where greedy matching happens to produce the optimal report, while hidden instances contain augmenting-path and multi-way tie cases.",
+   "Include an offline deterministic reference generator used only by verification to create fresh SQLite databases from a hidden seed.",
+   "Do not ship the reference matching implementation or hidden generated databases in the container."
+  ],
+  "internal_hint": "The missing work is a general bipartite optimization component, not a local SQL typo. First inspect the CLI, schema, report consumer, and sample metrics with a run and SQLite queries; confirm that revisions must be reduced by `(source,event_id)` and maximum sequence before matching. Build candidate edges separately for debit/capture and credit/refund, then solve maximum-cardinality minimum-cost matching, retaining enough exact integer cost information for cents and seconds. A robust approach is min-cost max-flow or equivalent augmenting-path matching with a carefully constructed lexicographic tie cost, followed by an explicit comparison of the sorted pair list when costs tie. Use the existing report schema and atomically replace temporary files, then exercise adversarial generated fixtures rather than relying on the visible greedy-looking example.",
+  "trap": "A greedy nearest-amount or nearest-time matcher passes the visible fixture but loses cardinality when one event has a choice that is needed by another. Solutions that use a single weighted sum can also choose the wrong objective tier, and solutions that deduplicate before applying the maximum sequence or combine debit and credit matching can silently produce plausible totals while failing revised, deleted, cross-currency, and tie-heavy hidden instances. Floating-point timestamps, nondeterministic dictionary iteration, and non-atomic metrics writes create additional failures.",
+  "tests": [
+   "Run the CLI on the visible fixture and compare the complete report schema and values, including matched pairs, unmatched IDs, account totals, and objective fields; this checks the instruction sentences requiring the documented deterministic JSON report and both reconciliation directions.",
+   "Generate fresh databases from a hidden seed with revised and deleted events, then verify that only the maximum-sequence non-deleted version contributes; this checks the instruction sentence requiring latest-version materialization.",
+   "Generate fresh bipartite instances with augmenting paths and conflicts, and compare pair sets and objective values against an independent exact reference matcher; this checks the instruction sentences requiring one-to-one matching and the three-level numeric objective.",
+   "Generate instances with equal cardinality and equal numeric costs but different pairings, and compare the exact sorted pair list; this checks the instruction sentence requiring lexicographically smallest tie resolution.",
+   "Generate boundary cases at and just beyond the 3-cent and 3,600-second eligibility limits, including negative amounts and large integer timestamps; this checks the instruction sentence defining eligibility.",
+   "Generate multiple accounts, currencies, event kinds, duplicate revisions, and unmatched records, then compare per-account totals and unmatched lists; this checks the instruction sentences requiring independent debit/capture and credit/refund reconciliation and complete unmatched output.",
+   "Inspect the metrics JSONL record and recompute its counts and SHA-256 digest from the report; this checks the instruction sentence requiring deterministic metrics fields.",
+   "Interrupt or simulate a failed write using a destination directory fixture and verify that no partial report or metrics file is exposed; this checks the instruction sentence requiring atomic output.",
+   "Pass malformed schemas, invalid JSON payloads, and invalid sequence values and verify a nonzero exit without a successful report; this checks the instruction sentence requiring malformed-database rejection.",
+   "Run the CLI repeatedly on the same generated database and compare byte-for-byte report and metrics output; this checks deterministic behavior required by the report, tie-breaking, and metrics sentences."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "Generate 80-140 fresh databases per verification run, with 10-180 events per side, 20% revision/deletion density, 15% boundary candidates, and 25% cardinality-conflict or exact-tie cases.",
+   "effect": "Lowering the count or removing conflict and tie cases makes greedy, floating-point, and partially implemented solutions appear correct. Raising the count, event size, revision density, and adversarial tie variety exposes incorrect objective ordering, incomplete augmenting paths, nondeterminism, and state-leak bugs."
+  },
+  "expected_failure_modes": [
+   "The solver reads the visible sample and implements greedy nearest-neighbor matching.",
+   "The solver finds the right matching objective but fails to encode lexicographic tie-breaking deterministically.",
+   "The solver deduplicates by first-seen or last-inserted row rather than maximum sequence number.",
+   "The solver treats deletion revisions as ordinary events or applies revisions after matching.",
+   "The solver combines debit/capture and credit/refund records into one matching pool.",
+   "The solver uses floating-point time or amount costs and loses boundary or large-integer cases.",
+   "The solver emits plausible totals but omits exact unmatched IDs or required objective fields.",
+   "The solver relies on Python iteration order or SQLite row order for tie resolution.",
+   "The solver modifies the CLI contract or bypasses the existing schema and fails generated databases.",
+   "The solver writes directly to final files and fails atomicity or malformed-input checks.",
+   "The solver implements only the visible report path and leaves metrics, error handling, or revised-event handling incomplete."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "algorithmic-sql",
+  "tags": [
+   "sqlite",
+   "bipartite-matching",
+   "event-reconciliation",
+   "logs-metrics",
+   "hidden-fuzzing"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List /opt/recon, the CLI entrypoint, documentation, tests, and database fixtures.",
+   "Read /opt/recon/bin/reconcile.py and identify the incomplete materialization, matching, report, and output paths.",
+   "Read the output-schema documentation and report consumer to recover exact field names, ordering, and objective semantics.",
+   "Inspect the SQLite schema, views, helper modules, and sample metrics formatter.",
+   "Run the visible fixture and capture the current failure and expected output shape.",
+   "Query the fixture directly to inspect revisions, deletions, payload formats, event kinds, and sequence values.",
+   "Inspect logging and metrics code to determine destination paths and existing CLI options.",
+   "Locate all TODOs, stubs, and callers of the missing reconciliation component.",
+   "Implement strict SQLite/schema/payload validation and latest-version selection by (source,event_id) and maximum sequence.",
+   "Implement separate debit/capture and credit/refund candidate graphs with exact integer amount and timestamp costs.",
+   "Implement maximum-cardinality minimum-cost one-to-one matching with deterministic lexicographic tie resolution.",
+   "Implement deterministic report construction, sorted IDs, per-account totals, and objective fields.",
+   "Implement metrics generation using the report SHA-256 digest and atomic temporary-file replacement.",
+   "Run syntax checks and the visible fixture comparison.",
+   "Create a few local adversarial fixtures for augmenting paths, revisions, deletions, boundaries, and equal-cost ties.",
+   "Run malformed-schema, invalid-JSON, invalid-sequence, and output-failure checks.",
+   "Run the CLI repeatedly and compare report and metrics outputs byte-for-byte.",
+   "Run the provided test suite and inspect any schema or ordering mismatches."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The requirement to append one metrics JSONL record conflicts with the requirement that repeated runs produce byte-for-byte identical metrics output unless the tests reset or truncate the metrics destination between runs.",
+   "Atomic append semantics are not defined: rename-based replacement is atomic but is not ordinary append, while true append can expose a partial record without stronger filesystem guarantees.",
+   "The exact documented report schema, metrics field meanings, and whether lexicographic tie-breaking applies separately to each reconciliation direction or to a combined pair list are not stated in the blueprint itself.",
+   "The interruption test can be flaky or platform-dependent unless it specifies the injection point and whether retaining the old complete file is acceptable.",
+   "Pinned apt and pip dependencies are said to require no internet, but the blueprint does not require vendored packages or an available package cache.",
+   "The hidden reference matcher and generated-input size may make verification runtime unpredictable on one CPU if exact lexicographic optimization is implemented inefficiently."
+  ],
+  "verdict": "reject",
+  "reasons": "The core requirements are mostly testable and realistic, but the speedrun is plausibly under 20 steps once the existing source and hint expose the intended architecture, so genuine difficulty is only 2. The append-versus-repeatable-metrics requirement is also internally inconsistent, and the resulting average score is 3.4, below the acceptance threshold.",
+  "fixes": [
+   "Resolve metrics semantics explicitly: either rewrite a single deterministic record atomically on every run, or append to a persistent log and test only the newly appended record.",
+   "Specify the complete report and metrics schemas, including input-count and candidate-count scope and whether objective fields are per direction or global.",
+   "Define lexicographic tie-breaking separately for debit/capture and credit/refund, or explicitly define the combined comparison key.",
+   "Define atomic-output behavior during interruption, including whether the previous complete file must remain and whether directory fsync is required.",
+   "Make offline buildability concrete by vendoring dependencies or requiring only standard-library packages and cached system packages.",
+   "If higher genuine difficulty is desired, reduce the exposed implementation path and require more adversarial behavior or a less directly signposted optimization formulation, while retaining precise schemas and objective definitions."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "Although both retain latest event versions and produce deterministic reports, this task centers on constrained ledger-to-processor bipartite matching rather than campaign session attribution and funnel analytics."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Both involve finance reconciliation and deterministic reporting, but this task solves a sequence-deduplicated event matching optimization while the reference parses authenticated binary frames, applies adjustments, and validates settlement batches."
+    },
+    {
+     "ref_id": "ours/official-15587ff53b0c",
+     "verdict": "distinct",
+     "reason": "The shared finance and deterministic-allocation themes do not make the problems equivalent, since this task performs independent ledger/processor event matching rather than settlement-pack allocation and release packaging."
+    },
+    {
+     "ref_id": "ours/official-8a671c38fabd",
+     "verdict": "distinct",
+     "reason": "This task has no shared central problem with the reference's cryptographic event sealing, key rotation, authenticated chaining, and canonical manifest generation."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "Despite overlapping reconciliation terminology and SQLite usage, the candidate implements an event-level matching optimizer rather than repairing a Monte Carlo ingestion, database, and deployment pipeline."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ce30ab52c4d1",
+     0.175
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.16
+    ],
+    [
+     "ours/official-15587ff53b0c",
+     0.155
+    ],
+    [
+     "ours/official-8a671c38fabd",
+     0.154
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.149
+    ]
+   ],
+   "cost_usd": 0.0009794
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0043882
+}

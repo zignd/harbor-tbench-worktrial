@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "repair-device-config-materializer",
+  "title": "Repair the Device Configuration Materializer",
+  "scenario": "A backend developer is chasing a production incident where some devices receive stale configuration after a large rollout. The container contains an in-house Rust service that reconstructs effective device configuration from a SQLite event database, along with a small CLI, fixtures, logs, and unrelated operational components. The service passes its tiny demo fixture but becomes both incorrect and very slow on the larger production-shaped dataset.",
+  "instruction_draft": "Can you fix the config materializer in `/workspace/config-materializer`? The command `./target/release/config-materializer --db PATH --cutoff UNIX_SECONDS` must rebuild the `device_config` table so that, for every device, active events at or before the cutoff are applied in `(effective_at, event_id)` order, with device scope overriding tenant scope overriding global scope; a null value deletes and masks that key, and an event superseded by another event must have no effect. It needs to be rerunnable without changing the result, preserve the documented JSON and SHA-256 output format, and process the hidden production-sized databases in under 1.8 seconds on this container.",
+  "requirements": [
+   "The executable at `/workspace/config-materializer/target/release/config-materializer` must accept `--db PATH --cutoff UNIX_SECONDS`.",
+   "The command must rebuild `device_config` for every device represented by the input database.",
+   "Only active configuration events whose `effective_at` is less than or equal to the supplied cutoff may affect the result.",
+   "Events must be applied in ascending `(effective_at, event_id)` order.",
+   "Configuration precedence must be device scope over tenant scope over global scope.",
+   "A null event value must remove that key and mask lower-precedence values.",
+   "An event superseded by another event must not affect the materialized result.",
+   "The resulting JSON must use the documented canonical key ordering and value encoding.",
+   "Each output row must contain the documented SHA-256 digest of its canonical JSON.",
+   "Running the command twice with the same database and cutoff must produce the same rows and digests.",
+   "The command must complete each hidden production-sized rebuild in less than 1.8 seconds on the one-CPU container."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned Rust tooling and Python packages installed locally; it has no network dependency and is limited to one CPU and 2 GB RAM.",
+   "`/workspace/config-materializer` is a roughly 1,500-line Rust workspace containing the materializer binary, a SQLite repository layer, JSON canonicalization helpers, a fixture generator, logging code, and unrelated health-check and metrics modules.",
+   "`schema.sql` defines `config_events`, `devices`, `tenants`, `device_config`, and the event supersession relation. `OPERATIONS.md` documents the event fields, scope identifiers, canonical JSON encoding, and output digest format.",
+   "`fixtures/demo.db` is a small readable example. `fixtures/production.db` contains tens of thousands of events across thousands of devices, including repeated timestamps, null masks, supersession chains, inactive rows, and events beyond the cutoff.",
+   "The planted implementation has a cursor-based event loader whose ordering is not total, a cache that conflates scope and cutoff state, and a row-at-a-time SQLite/JSON merge path. These problems interact only on sufficiently large and varied histories.",
+   "A deterministic fixture generator and a reference checker are present for local investigation, but hidden verification creates fresh databases from a different seed rather than reusing the supplied fixtures.",
+   "The reference solution is a deterministic shell script that inspects the schema, runs the existing binary against targeted generated cases, profiles the large fixture, and then applies the general Rust and SQL changes before building the release binary."
+  ],
+  "internal_hint": "Start by reading the schema and operations document, then compare the existing output against a small independently written replay script over generated cases. Instrument event counts and query timings rather than trusting the demo fixture. The important correctness failures emerge from equal effective timestamps, superseded events that are not adjacent in the cursor order, null masks inherited across scopes, and reuse of cached partial state at a different cutoff. The robust fix is to make event selection deterministic and set-based, resolve supersession and cutoff before merging, represent scope and mask state explicitly, and canonicalize once per device. Replace the N+1 event/key queries with indexed bulk reads or a temporary staging relation, then benchmark the large fixture and inspect query plans. Verify idempotence and fresh generated seeds before rebuilding the release binary.",
+  "trap": "A shallow fix that adds an index or changes the cursor to use `event_id` can make the supplied production fixture fast while still dropping tied events, incorrectly retaining an indirectly superseded event, or allowing a lower-scope value through a null mask. Conversely, a straightforward correct replay loop passes small correctness checks but exceeds the 1.8-second threshold because it performs thousands of SQLite queries and repeated JSON parsing. Caching the first cutoff's result also makes repeated local runs look correct while hidden tests use several cutoffs and regenerated histories.",
+  "tests": [
+   "The verifier builds the release binary and runs it on several fresh SQLite databases generated from a hidden seed; it checks that the command and arguments named in the instruction exist and complete successfully.",
+   "For each generated database, it independently replays active events through the cutoff in `(effective_at, event_id)` order and compares every `device_config` JSON value and SHA-256 digest with the implementation's output, covering equal timestamps, scope precedence, null masks, inactive rows, and supersession chains.",
+   "The verifier runs the materializer twice on the same database and cutoff and checks byte-equivalent logical rows, unchanged digests, and no duplicate output rows.",
+   "The verifier runs multiple cutoffs against the same database, including a cutoff before and after a supersession and a cutoff before and after a masking event, to catch stale cache state and incorrect historical visibility.",
+   "The verifier generates a large hidden instance with thousands of devices and tens of thousands of events, including rare tied timestamps and long histories, and requires the complete rebuild to finish under 1.8 seconds on the one-CPU container.",
+   "The verifier checks that the output remains valid after reopening the SQLite database and that unrelated tables and event history are not modified."
+  ],
+  "verifier_knob": {
+   "name": "large-instance rebuild time limit",
+   "value": "1.8 seconds for a hidden database of approximately 2,500 devices and 70,000 events on one CPU",
+   "effect": "Lowering the limit increasingly rejects correct but N+1 or JSON-heavy implementations and requires better batching and indexing; raising it makes performance optimization less important while leaving the hidden semantic cases difficult."
+  },
+  "expected_failure_modes": [
+   "The agent inspects only the demo output and misses equal-timestamp and long-history behavior that appears only in generated data.",
+   "The agent fixes correctness with a per-event or per-key replay loop that cannot meet the quantitative threshold.",
+   "The agent uses a non-total SQL order or unstable pagination and silently skips or repeats events.",
+   "The agent treats supersession as a local adjacency problem instead of resolving it over the complete eligible event set.",
+   "The agent merges scopes in the wrong order or lets null values disappear rather than acting as masks.",
+   "The agent leaves a cache keyed only by device and reuses results across different cutoffs.",
+   "The agent produces semantically equivalent JSON but violates the required canonical encoding or digest calculation.",
+   "The agent validates one seed and does not test reruns, multiple cutoffs, or fresh hidden-generated databases."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "rust",
+   "sqlite",
+   "reverse-engineering",
+   "large-scale-refactoring",
+   "performance",
+   "hidden-seeds"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /workspace/config-materializer && find . -maxdepth 2 -type f | sort",
+   "cat schema.sql && cat OPERATIONS.md",
+   "rg -n \"config_events|supersed|device_config|cutoff|cache|canonical|digest\" src migrations .",
+   "sed -n '1,260p' src/main.rs && sed -n '1,320p' src/repository.rs",
+   "cargo run --release -- --db fixtures/demo.db --cutoff 0 && sqlite3 fixtures/demo.db '.schema'",
+   "inspect the fixture generator and reference checker, then generate a few targeted databases",
+   "run the checker and an independently written small replay script on those generated cases",
+   "inspect the event-loader SQL, cursor pagination, cache keys, and current merge path",
+   "run EXPLAIN QUERY PLAN and a timed production-fixture rebuild",
+   "change event selection to a deterministic set-based query ordered by effective_at and event_id",
+   "resolve active supersession chains over the complete eligible event set before merging",
+   "replace scope/cutoff-confused cached partial state with explicit per-device, per-scope, and mask state",
+   "replace N+1 event/key queries and repeated JSON parsing with bulk loading and one canonicalization pass per device",
+   "preserve the documented null-mask, precedence, JSON, and digest behavior",
+   "cargo fmt && cargo check",
+   "cargo test",
+   "cargo build --release",
+   "run the demo and targeted generated cases through the rebuilt binary and checker",
+   "run multiple cutoffs, including before and after masks and supersessions, and run twice for idempotence",
+   "time the production-shaped fixture and inspect query counts/plans",
+   "generate fresh seeds, reopen the database, verify unrelated tables, and make any final performance fixes",
+   "cargo build --release and confirm /workspace/config-materializer/target/release/config-materializer exists"
+  ],
+  "speedrun_commands": 22,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 1.8-second threshold could be flaky if verifier hosts have materially different SQLite, filesystem, or container startup performance despite the one-CPU specification.",
+   "The task depends on the schema and OPERATIONS.md defining supersession semantics, active-row semantics, and canonical encoding precisely; any missing definition would make the independent oracle ambiguous.",
+   "If the verifier includes compilation or database-generation time in the rebuild timing, the performance requirement would overreach the stated materializer behavior.",
+   "A hidden generator that produces schema variants not accepted by the documented repository layer could reject otherwise valid general implementations."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements are mostly explicit and the verifier is strong, but the proposed speedrun is about 22 commands and the internal guidance nearly identifies every required fix. The planted defects are discoverable from the source and targeted fixtures, so this is likely a routine repository repair for a strong agent rather than a genuinely difficult Terminal-Bench task; genuine_difficulty therefore scores only 2.",
+  "fixes": [
+   "Increase genuine difficulty by removing the internal solution-shaped hints about the exact failure modes and prescribed architecture while retaining precise behavioral requirements.",
+   "Make the supplied fixtures less diagnostic and require validation against several independently generated workloads, including adversarial supersession graphs and larger scale variation.",
+   "Specify a benchmark protocol with warmup, repeated runs, and a fixed measurement boundary so the performance score is not host-noise sensitive.",
+   "Add a test that verifies supersession and cutoff semantics through multiple historical materializations without relying on implementation-specific table-cleanup behavior."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Both process and materialize event data deterministically with supersession, but this task specifically resolves hierarchical device configuration from SQLite rather than replaying incidents, dependencies, policies, and SLA state."
+    },
+    {
+     "ref_id": "ours/official-8a671c38fabd",
+     "verdict": "distinct",
+     "reason": "This task concerns SQLite configuration reconstruction and precedence semantics, not cryptographic event sealing, key rotation, authenticated chains, or manifest generation."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The candidate materializes configuration values from scoped events, whereas the reference verifies signed audit-chain membership and emits authoritative event records."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f-m",
+     "verdict": "distinct",
+     "reason": "The candidate materializes configuration values from scoped events, whereas the reference verifies signed audit-chain membership and emits authoritative event records."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "Although both involve deterministic event ingestion and supersession, the candidate's core problem is cutoff-based hierarchical configuration materialization rather than JSONL validation, address classification, and archival indexing."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9cbb677d2a2f",
+     0.159
+    ],
+    [
+     "ours/official-8a671c38fabd",
+     0.14
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.135
+    ],
+    [
+     "ours/official-371a54d3de9f-m",
+     0.135
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.122
+    ]
+   ],
+   "cost_usd": 0.0008994
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0039001999999999995
+}

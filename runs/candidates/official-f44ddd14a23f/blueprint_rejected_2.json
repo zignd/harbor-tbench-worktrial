@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "repair-event-replay-materializer",
+  "title": "Repair the event replay materializer",
+  "scenario": "A backend developer is chasing a production incident in an internal Rust service that rebuilds account state from a SQLite event journal. The container contains the service, a small collection of operational tools and logs, a seeded database with tens of thousands of events, and a release benchmark showing that replay has become both incomplete and unexpectedly slow.",
+  "instruction_draft": "Hey, can you fix the replay path in `/opt/replayer`? `ledger-replay` must rebuild the `account_state` and `account_history` tables from the events in the supplied SQLite database, preserving the documented ordering and as-of semantics for every tenant, and the result must be identical if the command is run twice or resumed from a checkpoint. Please keep the existing CLI and database schema compatible, make the write visible atomically, and get the release replay benchmark to at least 18,000 events/second on the included large fixture without dropping or double-applying events.",
+  "requirements": [
+   "The existing `ledger-replay` CLI and its documented flags must continue to work without changing the SQLite schema.",
+   "Replay must rebuild both `account_state` and `account_history` from the events in the supplied SQLite database.",
+   "Replay must preserve the documented event ordering and as-of cutoff semantics for every tenant, including events with equal timestamps, out-of-order arrival, and cross-account references.",
+   "A completed replay must be idempotent: running it twice on the same database produces the same rows and values.",
+   "A replay resumed from a checkpoint must produce the same final rows and values as a clean replay.",
+   "The replacement tables must become visible atomically rather than exposing a partially rebuilt result.",
+   "Every eligible event must be applied exactly once; no event may be silently dropped or double-applied.",
+   "The release replay benchmark on the included large fixture must process at least 18,000 events per second."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned Debian packages for `rustc`, `cargo`, `sqlite3`, `libsqlite3-dev`, and diagnostic utilities; there is no network access.",
+   "`/opt/replayer` is a roughly 1,700-line Rust workspace with several modules: CLI parsing, SQLite access, checkpoint handling, event normalization, state reduction, reporting, and unrelated health-check code.",
+   "`ledger-replay` reads an existing SQLite database and supports the documented `--db`, `--tenant`, `--at`, `--checkpoint`, and `--resume` options. Its schema and event semantics are documented in `/opt/replayer/README.md` and migration files.",
+   "The database contains `events`, `replay_checkpoints`, `account_state`, and `account_history` tables, multiple tenants, event timestamps, a separate monotonic journal sequence, account transfers, reversals, corrections, and late-arriving events.",
+   "The checked-in fixture has about 24,000 events and deliberately includes only a few same-timestamp ordering collisions and checkpoint-boundary cases; a larger generated fixture is created during verification.",
+   "The current implementation contains several interacting production regressions in ordering, checkpoint continuation, and SQLite write batching. The obvious sample replay completes and produces plausible totals, but it does not exercise all of them.",
+   "A Python operational script can inspect and summarize the database, while the Rust release build and a benchmark wrapper are already provided. The expected repair is a substantial refactoring of the replay pipeline rather than editing fixture data.",
+   "All source, fixtures, configuration, logs, and Docker setup are authored for this task; no external repository or network dependency is required."
+  ],
+  "internal_hint": "Start by inventorying the workspace and reading the schema and event-semantics documentation, then run the supplied replay on copies of the fixture while querying row counts, duplicate event application, checkpoint contents, and `EXPLAIN QUERY PLAN`. Compare a clean run, a forced checkpoint/resume run, and an independently written slow reducer over exported events. The planted failures are an unstable event ordering that ignores the journal sequence for timestamp ties, a resume cursor that can advance past same-boundary rows and can reprocess rows after a tenant-local restart, and a state/history writer that performs per-event commits and repeatedly queries related accounts. The robust fix is to define one deterministic ordered stream, make checkpoint progress represent the complete ordering key, use set-based/prepared SQLite operations inside bounded transactions, and atomically swap or replace the rebuilt result only after successful completion. Validate with generated data containing ties, late events, reversals, multiple tenants, empty tenants, and checkpoints at every chunk boundary before measuring the release throughput.",
+  "trap": "A shallow solution that merely adds an index or wraps the existing loop in one transaction passes the visible fixture and may meet the speed target, but hidden seeds place events with identical timestamps exactly across chunk and checkpoint boundaries. Such a solution either loses rows when resuming, applies a correction twice, leaks one tenant's state into another, or produces nondeterministic history ordering. A solution that only fixes the clean replay path also fails the atomicity and resume checks.",
+  "tests": [
+   "A smoke test runs the unchanged documented CLI against the checked-in fixture and checks that `account_state` and `account_history` contain the reference rows and values.",
+   "A hidden-seed correctness test generates fresh SQLite databases with thousands of events per tenant, including equal timestamps, late journal arrival, transfers, reversals, corrections, empty accounts, and cross-tenant identifiers, then compares both output tables against a deterministic reference reducer.",
+   "An ordering test generates many collisions where timestamp order differs from journal-sequence order and verifies the exact history sequence and resulting balances.",
+   "An as-of test invokes the documented cutoff option at several generated timestamps and compares the resulting state and history to the reference output.",
+   "A checkpoint test interrupts or forces replay at generated chunk boundaries, resumes with `--resume`, and requires byte-for-byte equivalent logical rows to a clean replay, including boundaries containing timestamp ties.",
+   "An idempotence test runs replay twice on the same database and verifies that row counts, values, history ordering, and checkpoint state do not change or accumulate duplicates.",
+   "An atomicity test injects a deterministic failure during a generated replay and checks that readers never observe a partially rebuilt result and that the prior completed result remains usable.",
+   "A performance test creates a fresh hidden-seed database with approximately 120,000 to 180,000 events, runs the optimized release binary on one CPU, and requires at least 18,000 processed events per second while checking the output against sampled and aggregate reference invariants."
+  ],
+  "verifier_knob": {
+   "name": "minimum_replay_events_per_second",
+   "value": "18000",
+   "effect": "Raising the value requires more effective batching, indexing, and reduction design and makes solutions that preserve correctness but retain per-event SQLite overhead fail; lowering it permits slower but functionally correct implementations."
+  },
+  "expected_failure_modes": [
+   "The agent reads the reducer but does not run enough data-dependent experiments to discover that timestamp ties and checkpoint boundaries interact.",
+   "The agent fixes the visible ordering query but leaves the resume cursor or checkpoint serialization semantically incomplete.",
+   "The agent makes clean replay correct while leaving resume replay non-idempotent.",
+   "The agent uses an in-memory map or loads all events, which works on the fixture but exceeds practical memory or runtime on the hidden scale.",
+   "The agent optimizes with a broad SQL rewrite that changes as-of or cross-tenant semantics.",
+   "The agent benchmarks a debug build or a warm cache and assumes the metric is satisfied without measuring the verifier-sized release workload.",
+   "The agent replaces the fixture or bypasses replay with precomputed rows, which fails because verification generates fresh databases from hidden seeds.",
+   "The agent exposes partially written tables during a failure because atomic publication was not tested."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "rust",
+   "sqlite",
+   "event-replay",
+   "checkpointing",
+   "performance",
+   "refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/replayer && find . -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' README.md",
+   "grep -RInE 'structopt|clap|--db|--tenant|--at|checkpoint|resume' src",
+   "find . -iname '*migration*' -o -iname '*.sql' -print -exec sed -n '1,240p' {} \\;",
+   "sqlite3 /path/to/fixture.db '.schema' && sqlite3 /path/to/fixture.db 'select name from sqlite_master where type=\"table\";'",
+   "cargo run --release --bin ledger-replay -- --db /path/to/fixture.db",
+   "sqlite3 /path/to/fixture.db 'select count(*) from events; select count(*) from account_state; select count(*) from account_history; select * from replay_checkpoints;'",
+   "grep -RInE 'ORDER BY|checkpoint|resume|BEGIN|COMMIT|account_state|account_history' src",
+   "sed -n '1,260p' src/replay.rs; sed -n '1,260p' src/checkpoint.rs; sed -n '1,260p' src/state.rs",
+   "cargo test --release",
+   "Write a small independent reducer over exported events and compare its state and history with the baseline output.",
+   "Edit the event query and normalization path to use one deterministic tenant-scoped ordering key including timestamp, journal sequence, and a stable event tie-breaker.",
+   "Edit checkpoint serialization and continuation to store and resume the complete ordering key without skipping or reprocessing boundary rows.",
+   "Refactor state and history writes to use prepared/set-based statements in bounded transactions while preserving cross-account and cross-tenant semantics.",
+   "Publish rebuilt results through a transactionally atomic replacement or swap, retaining the prior completed result when replay fails.",
+   "cargo fmt --all && cargo check --release",
+   "Copy the fixture and run clean replay, forced-checkpoint replay, and --resume replay; compare ordered logical rows and checkpoint contents.",
+   "Inject a deterministic failure during replay and query from a concurrent reader to verify atomic visibility and preservation of the prior result.",
+   "Build the release binary and run the supplied benchmark on the large fixture, then inspect query plans and event throughput.",
+   "Run final release tests and verify idempotence, as-of cutoffs, equal-timestamp ordering, late arrivals, reversals, transfers, and empty tenants."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The exact documented ordering, tie-breaker, transfer semantics, and checkpoint contract are referenced but not included in the blueprint, so failures could reflect missing documentation rather than an incorrect implementation.",
+   "An 18,000-events-per-second threshold may be flaky across CPU, SQLite cache, filesystem, and container scheduling conditions even with the stated one-CPU environment; the benchmark needs a defined measurement protocol and tolerance.",
+   "A concurrent-reader atomicity test can be nondeterministic unless its transaction isolation, synchronization points, and injected failure location are precisely specified.",
+   "The requirement that checkpoint state not change on an idempotent replay may conflict with legitimate checkpoint metadata updates unless the expected checkpoint representation is explicitly defined.",
+   "Pinned Debian Rust packages may not build the workspace if the selected compiler is incompatible with the existing Cargo edition or dependencies."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements and hidden tests are mostly strong, and the scenario is realistic, but the planted defects and internal diagnostic path make the likely repair visible in roughly twenty commands. Under the required speedrun rule, genuine difficulty must therefore be scored at most 2, which fails the acceptance gate despite good verifiability and realism.",
+  "fixes": [
+   "Remove or substantially obscure the source-visible regression pattern and internal fix recipe; require the agent to infer the ordering and checkpoint contract from tests, logs, and operational behavior rather than naming the exact defects.",
+   "Add a precise, deterministic benchmark protocol with fixed database placement, cache policy, warmup policy, measured interval, and an allowance for unavoidable container variance.",
+   "Specify the exact atomic-publication and checkpoint contract, including what readers may observe during resume and what checkpoint rows must contain after an idempotent run.",
+   "Provide an explicit synchronized failure-injection harness for the atomicity test instead of relying on timing-sensitive concurrent observation.",
+   "Validate compiler and dependency compatibility in the image build and include a prebuilt or locally vendored dependency cache so build failures cannot be mistaken for task failures."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "variant",
+     "reason": "Both repair deterministic event-log materializers that rebuild SQLite-derived state while enforcing canonical ordering and replay semantics, but they target different domains and event rules."
+    },
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This task replays committed sharded transaction files into a canonical export with parsing and deployment checks, whereas the candidate rebuilds account state and history from an existing SQLite journal with checkpoint semantics."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34-m",
+     "verdict": "distinct",
+     "reason": "The reference implements a line-oriented persistent key-value recovery service over framed segment logs, not an account-state SQLite materializer with as-of event semantics."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "Although both involve replay and idempotent recovery, the reference is a live JSON key-value service recovering segment files and supporting mutations, while the candidate is a batch relational account rebuild."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The reference verifies authenticated audit chains and emits filtered TSV events, with no comparable state-materialization or account replay problem."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9cbb677d2a2f",
+     0.328
+    ],
+    [
+     "ours/official-01d037111e00",
+     0.256
+    ],
+    [
+     "ours/official-ea89cb64bf34-m",
+     0.223
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.204
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.186
+    ]
+   ],
+   "cost_usd": 0.0013546
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0046814
+}

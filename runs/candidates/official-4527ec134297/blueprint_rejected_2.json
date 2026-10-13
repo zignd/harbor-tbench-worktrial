@@ -1,0 +1,172 @@
+{
+ "blueprint": {
+  "slug": "repair-replay-pipeline-deployment",
+  "title": "Repair Telemetry Replay Deployment",
+  "scenario": "An open-source maintainer is triaging a regression in a JavaScript telemetry replay package that turns append-only shard files into hourly reports. The container contains a roughly 1,400-line multi-stage pipeline, deployment scripts, generated bundles, journals, manifests, and realistic data with retries, corrections, late arrivals, and interrupted-run artifacts.",
+  "instruction_draft": "Repair and deploy the JavaScript telemetry replay pipeline so `./deploy.sh` installs `/srv/replay/current/bin/replay.js`, and `node /srv/replay/current/bin/replay.js --manifest <manifest.json> --out <report.ndjson>` emits one canonical NDJSON row per `(tenant, hour)` with the documented fields, no duplicate rows, and at least 99.5% exact row agreement with the reference on hidden generated inputs. A rerun after an interrupted execution must resume safely and produce byte-for-byte identical output, and the deployed program must pass `node /srv/replay/current/bin/replay.js --self-test`.",
+  "requirements": [
+   "Running `./deploy.sh` must install the working program at `/srv/replay/current/bin/replay.js`.",
+   "The deployed CLI must accept `--manifest <manifest.json>` and `--out <report.ndjson>`.",
+   "The CLI must emit canonical NDJSON with one row per `(tenant, hour)`.",
+   "The report must contain the documented output fields and no duplicate rows.",
+   "On hidden generated inputs, at least 99.5% of expected report rows must match the reference exactly.",
+   "A rerun after an interrupted execution must resume safely rather than duplicate or lose records.",
+   "A resumed run must produce byte-for-byte identical output to an uninterrupted run.",
+   "The deployed program must pass `--self-test`."
+  ],
+  "environment": [
+   "A Dockerfile based on `python:3.13-slim-bookworm` installs pinned Debian Node.js/npm packages and creates a deterministic, offline workspace under `/opt/replay`.",
+   "The application consists of approximately 1,400 lines of authored JavaScript across manifest loading, shard streaming, recovery journaling, normalization, session reconstruction, aggregation, deployment, and CLI components, with unrelated utilities and misleading but plausible tests.",
+   "`data/manifest.json` references dozens of NDJSON and gzipped-NDJSON shard files containing telemetry records with tenant IDs, logical IDs, attempt IDs, revisions, event timestamps, arrival sequence numbers, event kinds, and correction or tombstone operations.",
+   "The supplied data includes mostly ordinary records plus a small number of multi-digit shard sequences, cross-tenant identifier collisions, out-of-order arrivals, retries, revisions, deletions, zero-valued measurements, and late events; the most revealing cases are sparse enough that sampling the files looks correct.",
+   "The pipeline has dependent stages: manifest ordering and recovery feed canonicalization, canonical records feed session reconstruction, reconstructed sessions feed hourly aggregation, and aggregate state feeds report serialization.",
+   "An interrupted-run journal and partially written output are included, and the runner has deterministic fault-injection hooks that hidden verification uses to stop execution after each stage boundary.",
+   "The repository contains both source modules and a generated/minified deployment bundle; the deployment script currently selects stale generated content unless the build and installation path are repaired.",
+   "A README and example report document the public record and output formats without identifying the regression, while the visible fixture does not exercise all correction and ordering cases."
+  ],
+  "internal_hint": "Investigate by running the existing CLI against every supplied fixture, inspecting intermediate journals and stage outputs, and comparing uninterrupted runs with injected stops. The important data invariant is that records represent revisions of a logical event: the greatest revision wins, tombstones suppress earlier revisions, identity includes tenant and attempt as well as logical ID, and ordering decisions use event time with deterministic sequence/revision tie-breaking rather than file arrival order. Repair the shard merge and reducer so corrections survive all stages, preserve zero-valued measurements, and make sessionization and hour bucketing consume canonical event-time order. Recovery must commit stage checkpoints and output atomically so restarting replays neither committed records nor partial rows. Finally rebuild the generated bundle and make `deploy.sh` install that rebuilt artifact, then validate the deployed path rather than only the source CLI.",
+  "trap": "A shallow fix that changes the source reducer but runs the old generated bundle will appear successful on the visible fixture. Other plausible partial fixes pass ordinary data but fail when a late tombstone follows a retry, when two tenants reuse an event ID, when a zero measurement is aggregated, when shard names have multiple digits, or when the process is stopped after a checkpoint and restarted.",
+  "tests": [
+   "Run `./deploy.sh`, verify that `/srv/replay/current/bin/replay.js` exists and execute the deployed CLI rather than source files.",
+   "Run the deployed CLI on supplied manifests and verify canonical NDJSON structure, required documented fields, one row per `(tenant, hour)`, and absence of duplicate keys.",
+   "Generate fresh seeded shard sets containing arbitrary shard counts, numeric shard-order edge cases, retries, revisions, tombstones, tenant and attempt collisions, zero values, late arrivals, and mixed compressed/uncompressed files; compare report rows with an independent reference and require at least 99.5% exact row agreement.",
+   "For generated inputs, compare an uninterrupted execution with executions killed at each deterministic stage boundary; rerun using the same manifest and output path and require byte-for-byte identical output without duplicated rows.",
+   "Exercise malformed or truncated final shard records through the documented recovery path and verify that committed records remain correct and the run does not silently corrupt later stages.",
+   "Run `node /srv/replay/current/bin/replay.js --self-test` from the installed deployment and require success.",
+   "Verify that changing only source modules followed by `./deploy.sh` changes the deployed behavior, catching deployments that continue to serve the stale generated bundle."
+  ],
+  "verifier_knob": {
+   "name": "minimum_exact_report_row_agreement",
+   "value": "0.995",
+   "effect": "Raising the threshold toward 1.0 makes small data-dependent reducer or recovery errors fail and requires complete correctness; lowering it allows partial fixes that handle common records while missing rare corrections or restart cases."
+  },
+  "expected_failure_modes": [
+   "The agent reads the source and patches an obvious reducer without exercising the supplied data or inspecting intermediate state.",
+   "The agent validates only the visible fixture, which does not contain the rare revision, tombstone, collision, or multi-digit ordering cases.",
+   "The agent repairs source code but forgets that deployment runs a stale generated bundle.",
+   "The agent deduplicates by logical ID alone and merges unrelated tenants or attempts.",
+   "The agent uses arrival order or lexical shard order, causing early mistakes to propagate through sessionization and hourly aggregation.",
+   "The agent treats zero-valued measurements as missing and silently changes aggregates.",
+   "The agent truncates or reprocesses partial output during recovery, producing duplicates or output that differs after interruption.",
+   "The agent verifies only aggregate totals and misses wrong session boundaries or event-time buckets that happen to cancel out on the sample.",
+   "The agent implements a local workaround for the supplied journal instead of a general recovery protocol that handles hidden fault-injection points."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "deployment",
+   "data-pipeline",
+   "recovery",
+   "hidden-invariant",
+   "large-scale-refactor"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "`find . -maxdepth 3 -type f | sort`",
+   "`cat README.md` and inspect the documented record/report schemas",
+   "`find src test data -type f -maxdepth 4 | sort`",
+   "`grep -RIn \"revision\\|tombstone\\|arrival\\|checkpoint\\|bundle\\|self-test\" .`",
+   "Run the existing source CLI against every supplied manifest and inspect the reports.",
+   "`cat deploy.sh package.json` and identify the build and installation paths.",
+   "Inspect the manifest loader, shard merge, canonicalization, sessionization, aggregation, journaling, and CLI modules.",
+   "Inspect supplied journals, partial output, and intermediate stage files.",
+   "Run the existing recovery/fault-injection cases and compare interrupted versus uninterrupted output.",
+   "Patch shard ordering and reduction to use tenant/attempt/logical identity, maximum revision, tombstone suppression, and deterministic event-time ordering.",
+   "Patch normalization, sessionization, and aggregation to preserve zero values and consume canonical event-time order.",
+   "Patch checkpoint and output handling to commit stage state atomically and resume without replaying committed records.",
+   "Patch the build/deployment script so the generated bundle is rebuilt and installed at `/srv/replay/current/bin/replay.js`.",
+   "`npm run build` or the repository's equivalent bundle-generation command.",
+   "`./deploy.sh`",
+   "Run the deployed CLI on all supplied manifests and validate keys, fields, ordering, and duplicate absence.",
+   "Generate several local seeded manifests with retries, corrections, collisions, zeroes, late arrivals, and mixed compression, then compare against a reference reducer.",
+   "Kill runs at each fault-injection boundary, rerun with the same output path, and compare byte-for-byte with uninterrupted output.",
+   "`node /srv/replay/current/bin/replay.js --self-test` and verify that changing source then redeploying changes installed behavior."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The documented recovery path for malformed or truncated final records is not specified, so tests could require behavior the instruction never defines.",
+   "The fault-injection interface and stage-boundary semantics are not stated, making interruption tests potentially overreaching.",
+   "The 99.5% row-agreement threshold is ambiguous about missing versus extra rows and may conflict with the unconditional one-row-per-key requirement.",
+   "Byte-for-byte output depends on an unstated canonical JSON field order, numeric formatting, and newline policy.",
+   "Pinned Debian packages may not be reproducibly available in the described offline Docker build unless all package artifacts are included."
+  ],
+  "verdict": "reject",
+  "reasons": "The end state and most verification requirements are clear and largely deterministic, but the recovery and canonical serialization contracts need tighter specification. More importantly, the supplied invariant hints and the described source-level shape make a strong agent's likely path about 20 commands, so this task scores at most 2 for genuine difficulty under the stated rubric; the resulting average is below the acceptance threshold.",
+  "fixes": [
+   "Specify the recovery protocol, journal format, atomic commit semantics, malformed-record behavior, and exact fault-injection controls in the public task materials.",
+   "Define canonical NDJSON serialization precisely, including field order, numeric formatting, row ordering, newline termination, and how the 99.5% metric treats missing and extra rows.",
+   "Include all offline package artifacts or use a fully self-contained Node base image and add a build smoke test for the Docker environment.",
+   "To make the task genuinely difficult rather than source-readable, remove or disguise direct invariant clues, add independently generated multi-stage cases, and require validation of intermediate canonical/session outputs as well as final reports."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Although both involve deterministic replay from sharded append-only inputs and deployment, the reference reconstructs transactional database live rows while the candidate performs corrected, late-arriving telemetry aggregation by tenant and hour."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34-m",
+     "verdict": "distinct",
+     "reason": "The reference is a persistent line-oriented key-value recovery service with catalog and audit APIs, whereas the candidate is a batch telemetry aggregation pipeline producing hourly reports."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The reference canonicalizes incident histories with actor resolution, dependency ordering, policy evaluation, and SQLite materialization, which is fundamentally different from replaying telemetry into hourly aggregate rows."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "The reference repairs a stateful JSON replay service that recovers key-value objects and supports mutations, while the candidate computes deterministic tenant-hour telemetry reports."
+    },
+    {
+     "ref_id": "ours/official-8a671c38fabd",
+     "verdict": "distinct",
+     "reason": "The reference implements cryptographic event sealing and canonical signed manifests, not recovery and aggregation of append-only telemetry shards into reports."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.28
+    ],
+    [
+     "ours/official-ea89cb64bf34-m",
+     0.214
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.191
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.176
+    ],
+    [
+     "ours/official-8a671c38fabd",
+     0.168
+    ]
+   ],
+   "cost_usd": 0.0013564
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0038957999999999996
+}

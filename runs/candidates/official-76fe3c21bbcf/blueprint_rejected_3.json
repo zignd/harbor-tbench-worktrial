@@ -1,0 +1,191 @@
+{
+ "blueprint": {
+  "slug": "dns-spray-rollup-repair",
+  "title": "Repair the DNS Spray Rollup",
+  "scenario": "The threat-intelligence team uses a small shell utility to import resolver observations into SQLite and identify clients performing DNS spray or tunneling-like bursts. An analyst reports that the daily source counts stopped adding up after malformed feed data and a replay of an older spool; the container contains the utility, its database schema, sample spools, and several unrelated operational components.",
+  "instruction_draft": "Repair `/opt/dnsrollup/bin/dnsrollup` so that `dnsrollup --db PATH --input PATH` processes every input line without shell execution, continues past bad lines, and exits successfully after recording rejected lines in the database. A valid line has exactly five tab-separated fields: an event id matching `[A-Za-z0-9._:-]{1,64}`, a nonnegative decimal millisecond timestamp no greater than `9223372036854775807`, an IPv4 address or IPv6 address, a DNS name whose ASCII labels contain only letters, digits, and interior hyphens with total length at most 253, and one of `NOERROR`, `NXDOMAIN`, or `SERVFAIL`; DNS names are compared case-insensitively and may have one trailing dot, while malformed fields, controls, non-ASCII names, invalid addresses, and extra fields are rejected. Preserve every valid event in `events`, ignore an identical replay of an existing event id, quarantine a reused id whose canonical contents differ, and never allow one bad record to roll back other valid records. Rebuild `source_summary` with one row per source containing accepted event count, distinct canonical-name count, NXDOMAIN count, a `spray` flag, and the selected qualifying window fields. A source is a spray source when a timestamp-inclusive 60,000 ms window contains at least 20 distinct canonical names, at least 16 of those names have an NXDOMAIN observation, and the selected window is the qualifying window with the smallest ending timestamp, breaking ties by smallest starting timestamp; report its start and end event timestamps and the two distinct-name counts, or NULL window fields when no window qualifies. The importer must be safe to rerun, use bounded-memory or SQLite-backed processing rather than quadratic per-source rescans, and process a generated 250,000-line spool in under 12 seconds on the supplied one-CPU container.",
+  "requirements": [
+   "The executable must be `/opt/dnsrollup/bin/dnsrollup` and accept `--db PATH --input PATH`.",
+   "Each input record must be parsed as exactly five tab-separated fields.",
+   "Valid event ids must match `[A-Za-z0-9._:-]{1,64}`.",
+   "Valid timestamps must be decimal integers in the inclusive range 0 through 9223372036854775807.",
+   "Valid sources must be valid IPv4 or IPv6 addresses.",
+   "Valid DNS names must use ASCII labels containing only letters, digits, and interior hyphens, have total length at most 253, and may have one trailing dot.",
+   "DNS names must be canonicalized case-insensitively and with a permitted trailing dot removed.",
+   "Only NOERROR, NXDOMAIN, and SERVFAIL are valid result codes.",
+   "Malformed fields, control characters, non-ASCII names, invalid addresses, and extra fields must be rejected.",
+   "Processing must continue after rejected records and return success after the input has been examined.",
+   "Every valid event must be preserved in the `events` table.",
+   "An identical replay of an existing event id must not create a duplicate.",
+   "A reused event id with different canonical contents must be quarantined without changing the stored event.",
+   "Rejected records must be represented in the database quarantine data with their line number and a diagnostic reason.",
+   "The `source_summary` table must contain one row for every source having an accepted event.",
+   "Each summary must contain accepted event count, distinct canonical-name count, NXDOMAIN count, and a zero-or-one spray flag.",
+   "A spray source must be detected using timestamp-inclusive 60,000 ms windows with at least 20 distinct names and at least 16 distinct NXDOMAIN names.",
+   "The selected qualifying window must have the smallest ending timestamp, then the smallest starting timestamp, and its start, end, distinct-name, and NXDOMAIN-name fields must be reported.",
+   "Sources without a qualifying window must have NULL window fields.",
+   "The result must be safe to rerun and must not execute data supplied in the input or command-line paths.",
+   "The implementation must process a generated 250,000-line spool in under 12 seconds on the supplied one-CPU container."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, installs pinned SQLite and shell utilities, and creates a one-CPU, 2 GB RAM environment with no network dependency.",
+   "`/opt/dnsrollup/bin/dnsrollup` is an executable Bash wrapper around a partially implemented importer with an existing SQLite schema, batch checkpoint code, and deliberately fragile field handling.",
+   "`/opt/dnsrollup/lib/` contains roughly 900 lines of plausible feed, metrics, and retention code, including unrelated decoy components and a small compiled helper whose source is not shipped.",
+   "`/opt/dnsrollup/schema.sql` defines `events`, `quarantine`, and `source_summary`; indexes and a unique event-id constraint are present but the derivation query is incomplete.",
+   "`/opt/dnsrollup/sample/` contains a short clean spool and an expected database snapshot that does not exercise timestamp ties, replay conflicts, uppercase names, trailing dots, IPv6 formatting, boundary timestamps, or malformed control bytes.",
+   "`/opt/dnsrollup/tools/make_spool.py` is a deterministic local fixture generator used by the visible smoke test; hidden verification generates fresh adversarial corpora with a separate seed.",
+   "The planted implementation problems include Bash word-splitting and locale-sensitive sorting, a transaction path that can discard a preceding batch after one malformed row, non-idempotent replay insertion, and an O(n-squared) source-window calculation that appears correct on the sample.",
+   "The verifier supplies hidden mixtures of benign and malicious records, including SQL-looking text, shell metacharacters, duplicate names with case and trailing-dot differences, IPv4/IPv6 edge forms, 59,999/60,000/60,001 ms boundaries, out-of-order events, duplicate NXDOMAIN observations, and conflicting event ids."
+  ],
+  "internal_hint": "Investigate the actual schema, run the sample, trace transactions, and generate small differential cases before editing. The reliable path is to make byte-oriented line ingestion explicit, validate fields without eval or unquoted expansions, canonicalize names and addresses once, use a savepoint or per-batch error strategy so malformed input cannot erase earlier commits, and define duplicate handling through a canonical unique-event comparison. Recompute summaries from persisted events after import, ordering each source by timestamp and event id and using a sweep/sliding-window structure that maintains distinct-name and distinct-NXDOMAIN counts; do not compare every pair of events. Check inclusive boundaries and tie selection against brute-force fixtures, then benchmark the large generated spool.",
+  "trap": "A shallow repair that replaces the obvious SQL or adds a regex passes the clean sample but loses records after a bad line, treats `Example.COM.` and `example.com` as different, counts repeated NXDOMAIN observations more than once, selects the wrong equal-ending window, or rescans each source quadratically. Another natural failure is accepting shell or SQL payloads because validation occurs after an unquoted Bash expansion, or treating a conflicting replay as an ordinary ignored duplicate.",
+  "tests": [
+   "A schema/output test checks that the executable creates the required `events`, `quarantine`, and `source_summary` data and that every accepted source has exactly one summary row; this is stated by the requirements for the executable, tables, preserved events, quarantine, and summaries.",
+   "A generated adversarial-corpus test feeds valid and invalid records containing tabs, newlines, control bytes, shell metacharacters, SQL-looking fields, Unicode names, invalid addresses, bad labels, oversized names, invalid result codes, and extra fields, and compares accepted events and quarantine counts/reasons with a reference parser; this is stated by the validation, rejection, continuation, and no-execution requirements.",
+   "A canonicalization test checks uppercase names, one trailing dot, repeated observations, IPv4/IPv6 inputs, and invalid address edge cases against the canonical `events` contents; this is stated by the DNS canonicalization and valid-source requirements.",
+   "A replay test runs the same spool twice and then injects a same-id conflicting record, checking that identical replay is idempotent and the conflicting record is quarantined without modifying the original event; this is stated by the replay and conflict requirements.",
+   "A recovery test places malformed records between valid records and checks that all valid rows before and after them survive, including across batch boundaries; this is stated by the continue-after-rejection and no-rollback requirements.",
+   "A window oracle generates out-of-order events with duplicate names, duplicate NXDOMAINs, exact 60,000 ms boundaries, several qualifying windows, and tied end timestamps, then compares `source_summary` with a brute-force reference; this is stated by the inclusive-window, distinct-count, and tie-breaking requirements.",
+   "A benign-corpus test verifies that non-spray sources remain present with accurate totals and NULL window fields, rather than being silently discarded; this is stated by the one-row-per-source and NULL-field requirements.",
+   "A security test supplies paths and records designed to trigger command substitution, option injection, SQL injection, and delimiter confusion, and checks that only data rows change; this is stated by the no-data-execution and safe-rerun requirements.",
+   "A performance test generates a deterministic 250,000-line spool spread across many sources and measures end-to-end execution on one CPU, failing runs at 12 seconds; this is stated by the quantitative performance requirement."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_size_and_window_density",
+   "value": "250000 generated records, 18% malformed or replay/conflict cases, 12% boundary/tie cases, and 35% of sources having enough events to stress the sliding-window calculation",
+   "effect": "Increasing record count and the number of dense sources makes quadratic implementations exceed the time limit, while increasing malformed, replay, Unicode, address, and boundary cases exposes incomplete validation and state-recovery logic. Lowering them makes a sample-oriented implementation more likely to pass."
+  },
+  "expected_failure_modes": [
+   "Using Bash `read` or unquoted expansions that collapse tabs, interpret backslashes, or execute shell syntax.",
+   "Rejecting a whole batch or transaction after one malformed line and silently losing previously valid records.",
+   "Using a simple event-id conflict ignore that hides conflicting replay data instead of quarantining it.",
+   "Failing to canonicalize case and trailing dots, or counting observations instead of distinct names.",
+   "Implementing the 60-second detector with pairwise scans, causing the large corpus to miss the performance bar.",
+   "Using exclusive rather than inclusive window endpoints.",
+   "Choosing the first qualifying window in input order rather than the specified ending-time and starting-time order.",
+   "Relying on locale-sensitive sorting or textual IPv6 comparisons.",
+   "Testing only the clean visible sample and never checking recovery, idempotence, or generated boundary cases."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "bash",
+   "sqlite",
+   "adversarial-parser",
+   "sliding-window",
+   "recovery",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the installed tree and identify the wrapper, importer, schema, sample data, and generator.",
+   "Read `/opt/dnsrollup/bin/dnsrollup` and the importer modules, tracing argument handling and subprocess usage.",
+   "Read `/opt/dnsrollup/schema.sql` and determine the exact event, quarantine, and summary columns and constraints.",
+   "Run the clean sample through the current utility and query all three tables.",
+   "Inspect the sample generator and existing batch/checkpoint logic.",
+   "Locate the parser, transaction boundaries, replay insertion, and source-window derivation code with grep.",
+   "Back up the existing executable and importer.",
+   "Replace fragile Bash field handling with byte-oriented or Python line ingestion using explicit tab splitting and no shell evaluation.",
+   "Implement strict validation for field count, ASCII event IDs, decimal timestamps, IP addresses, DNS labels, controls, and result codes.",
+   "Canonicalize DNS names and addresses before comparison and insertion.",
+   "Implement per-record or savepoint-based rejection handling with line numbers and diagnostic reasons.",
+   "Implement idempotent event replay handling and quarantine canonical-content conflicts.",
+   "Recompute summaries from persisted events using per-source timestamp ordering and a sliding-window distinct-name structure.",
+   "Apply inclusive 60000 ms endpoints and deterministic end-time/start-time tie selection.",
+   "Run the sample and inspect events, quarantine, and summaries.",
+   "Run small hand-built cases for malformed rows, recovery, uppercase/trailing-dot names, duplicate NXDOMAINs, replay conflicts, and boundary windows.",
+   "Run the security cases with shell metacharacters, SQL-looking data, and hostile paths.",
+   "Generate and time the 250000-line spool, then optimize SQLite batching or indexing if needed.",
+   "Rerun the same spool and verify idempotence and stable summaries.",
+   "Remove temporary artifacts, make the executable mode correct, and perform a final schema/output check."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The required diagnostic-reason vocabulary for quarantine rows is not specified, so tests that compare exact reasons rather than only rejection classification could overreach.",
+   "Canonicalization of source IP addresses is implied by the internal hint but is not stated precisely; conflicting expectations for IPv6 textual forms could make otherwise valid implementations fail.",
+   "The canonical contents used to distinguish an identical replay from a conflicting event ID are not explicitly defined, especially regarding raw versus canonical address and DNS representations.",
+   "The exact schema column names and summary field types are delegated to the supplied schema, but tests that assume unstated schema details would be invalid.",
+   "A strict 12-second end-to-end limit may be sensitive to filesystem, SQLite, container startup, or host scheduling variance unless the verifier controls those factors tightly.",
+   "The treatment of physical newlines or other record delimiters inside malformed input is not explicitly distinguished from ordinary line splitting."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly testable, but the speedrun is a short source-reading-and-patching path, and the stated measurement explicitly indicates that this task shape is often solved in roughly 9-25 commands; therefore genuine difficulty is at most 2. Several canonicalization and quarantine-reason details are also underspecified, so the minimum-score and average-score acceptance criteria are not met.",
+  "fixes": [
+   "Define the exact canonical event tuple used for replay comparison, including source-address normalization and stored representations.",
+   "Specify the required quarantine reason categories or make verification check only a stable category/code rather than free-form diagnostic text.",
+   "State whether and how malformed physical lines containing embedded control characters or newline-like input are framed and numbered.",
+   "Add a deterministic performance protocol with fixed SQLite pragmas, filesystem assumptions, warm-up policy, and allowed variance.",
+   "Increase genuine difficulty through a non-obvious but fully specified recovery or migration invariant, or provide a larger interaction surface where correctness requires differential investigation rather than merely replacing visible fragile code.",
+   "Include explicit tests for the selected schema contract and address canonicalization so implementations are not judged against unstated assumptions."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "Both involve resilient SQLite ingestion with validation, deduplication, and quarantining, but the candidate's central problem is DNS-specific spray-window aggregation from TSV records rather than revisioned event indexing with signature and address-classification rules."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "The reference is a restart-safe TCP and HTTP service deployment problem, whereas the candidate is an offline DNS observation importer and SQLite aggregation utility."
+    },
+    {
+     "ref_id": "ours/official-d19257a8f76d",
+     "verdict": "distinct",
+     "reason": "The reference implements a stateful JSON-line replay daemon with transactional trace ingestion, while the candidate repairs a batch TSV-to-SQLite DNS rollup with spray detection."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "distinct",
+     "reason": "The reference is recursive log-file conversion with JSON schema validation, event selection, and session reconstruction, not a DNS importer with SQLite quarantine and sliding-window analytics."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "The reference performs complex incident replay, dependency ordering, supersession, and policy evaluation across SQLite inputs, whereas the candidate performs validated DNS event ingestion and source-level spray summarization."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-1112cdbd9938-m",
+     0.21
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.178
+    ],
+    [
+     "ours/official-d19257a8f76d",
+     0.175
+    ],
+    [
+     "ours/official-37d13d3e2124",
+     0.173
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.171
+    ]
+   ],
+   "cost_usd": 0.0013135999999999998
+  },
+  "novel": true
+ },
+ "cost_usd": 0.004352399999999999
+}

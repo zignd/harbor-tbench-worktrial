@@ -1,0 +1,184 @@
+{
+ "blueprint": {
+  "slug": "beamline-campaign-planner",
+  "title": "Deploy the Beamline Campaign Planner",
+  "scenario": "An on-call SRE has been paged because the overnight neutron beamline campaign service is accepting requests but producing incomplete experiment plans. The container contains a Python API, a background materialization worker, a SQLite state store, campaign specifications, and a small opaque beam-physics validator used by the existing services.",
+  "instruction_draft": "Add and deploy a deterministic campaign planner at `/v2/campaign/plan` on the existing service at `127.0.0.1:8091`; it must accept the documented JSON campaign format, use the beam validator, and persist the resulting campaign and ordered allocation rows in `/var/lib/beamline/plans.db`. Every response and persisted plan must schedule the highest-priority feasible set of experiments, respect all resource, precedence, cooldown, detector-mode, temperature, deadline, and incompatibility constraints, and break equal-quality solutions by minimum makespan, minimum setup cost, then lexicographic experiment order. Keep the API and materializer running after the change, and make repeated submissions with the same campaign id idempotent.",
+  "requirements": [
+   "Expose a deterministic planner at `/v2/campaign/plan` on `127.0.0.1:8091`.",
+   "Accept the documented JSON campaign format and use the installed beam-physics validator.",
+   "Persist the resulting campaign and ordered allocation rows in `/var/lib/beamline/plans.db`.",
+   "Schedule the highest-priority feasible set of experiments.",
+   "Respect resource, precedence, cooldown, detector-mode, temperature, deadline, and incompatibility constraints.",
+   "Break equal-quality solutions by minimum makespan, then minimum setup cost, then lexicographic experiment order.",
+   "Keep the API and background materializer running after the change.",
+   "Make repeated submissions with the same campaign id idempotent."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with pinned Python dependencies and no network requirement.",
+   "The application occupies roughly 1,500 lines across an HTTP API, SQLite repository, worker, campaign loader, logging utilities, and health-check code.",
+   "The existing service listens on `127.0.0.1:8091`, has working health and campaign-inspection endpoints, and runs a background materializer process in the same container.",
+   "Campaign specifications are stored under `/opt/beamline/campaigns/` and include a public sample, schema documentation, transition-cost tables, and several historical campaigns.",
+   "The JSON format describes experiments with priorities, durations, requested temperature bands, detector modes, deadlines, predecessor ids, cooldown requirements, incompatibility groups, and optional instrument restrictions.",
+   "The facility has two instruments sharing a single sample-exchange robot; each instrument has mode-dependent setup transitions, and some temperature transitions require stabilization intervals.",
+   "An executable `/opt/beamline/bin/beamcheck` is supplied without source. It accepts a documented line-oriented request and reports whether an experiment/instrument/mode/temperature combination is physically valid, including validator-specific transition restrictions.",
+   "The visible sample is intentionally benign: a greedy earliest-deadline schedule produces the same result as the optimal schedule and all worker smoke checks pass.",
+   "The current planner integration is incomplete and the worker logs misleading `sqlite busy during reconciliation` warnings while the API's real missing behavior is the absent general campaign-planning feature.",
+   "The initial database contains historical campaigns and materializer metadata; changing or deleting those rows is not permitted."
+  ],
+  "internal_hint": "Investigate the API contract, worker logs, schema, campaign fixtures, and the beamcheck protocol before editing. Implement a real constraint-search planner rather than extending the visible greedy path: validate candidate assignments through beamcheck, construct precedence and cooldown constraints, search instrument/order choices with pruning, and compare complete schedules using the required priority/makespan/setup/lexicographic objective. Materialize one canonical campaign row and ordered allocation rows transactionally, use the campaign id as an idempotency key, and ensure the worker does not duplicate rows. The difficulty is primarily substantial construction and domain reasoning: the important failures only appear on generated campaigns with interacting DAG, shared-robot, thermal, mode-transition, and incompatibility constraints; the source does not reveal a single defective line.",
+  "trap": "A planner that greedily schedules by deadline or priority passes the supplied campaign but drops a higher-value experiment on hidden cases where a short prerequisite blocks a later high-priority chain. A solver that validates experiments independently misses shared-robot intervals, half-open versus inclusive cooldown boundaries, or validator-dependent setup transitions. A response-only implementation also appears correct until the verifier checks transactional SQLite state, restart recovery, and duplicate submissions.",
+  "tests": [
+   "The service is started and its health endpoint confirms that the API and materializer remain available after the change.",
+   "A public campaign submission checks that `/v2/campaign/plan` accepts the documented JSON format, returns a deterministic ordered plan, and creates the required campaign and allocation rows in `/var/lib/beamline/plans.db`.",
+   "Generated campaigns with 8-24 experiments check that every scheduled experiment is beamcheck-valid and that resource, precedence, cooldown, detector-mode, temperature, deadline, and incompatibility constraints hold.",
+   "Generated campaigns include adversarial cases where greedy deadline or priority ordering is suboptimal; the returned schedule is compared with the reference optimizer for maximum feasible priority, minimum makespan, minimum setup cost, and lexicographic tie-breaking.",
+   "Generated campaigns include multiple instruments, shared sample-exchange intervals, thermal stabilization, validator-rejected transitions, disconnected precedence components, and experiments that must be omitted.",
+   "A state check verifies that persisted allocation rows exactly match the returned canonical schedule, have contiguous deterministic sequence numbers, and preserve all required experiment, instrument, start, end, mode, and temperature fields.",
+   "A restart test stops and restarts the API and worker, then verifies that previously materialized campaigns and allocations remain unchanged and queryable.",
+   "An idempotency test submits the same campaign id and payload repeatedly, including after a worker restart, and checks that no duplicate campaign, allocation, or event rows are created.",
+   "A mutation test submits a changed payload under an existing campaign id and checks that the service rejects it without altering the original persisted state.",
+   "Fresh verify-time inputs are generated from a hidden seed and are not present in the container, preventing hard-coding the visible campaign or relying on its greedy solution."
+  ],
+  "verifier_knob": {
+   "name": "hidden_campaign_count_and_constraint_density",
+   "value": "24 generated campaigns with 8-24 experiments each, including 30% adversarial precedence/shared-resource interactions",
+   "effect": "Lowering the count or interaction density makes heuristic and partially implemented planners more likely to pass; raising it increases the chance that incorrect pruning, tie-breaking, cooldown handling, or state materialization is exposed."
+  },
+  "expected_failure_modes": [
+   "Implementing only the visible sample path or a greedy scheduler.",
+   "Treating precedence, cooldown, and resource intervals as independent constraints.",
+   "Ignoring beamcheck transition results or caching validator answers without all relevant state in the key.",
+   "Using an approximate optimizer that returns a feasible but non-optimal schedule.",
+   "Getting endpoint output correct while failing to persist exact allocation state.",
+   "Duplicating rows during worker retries or failing idempotency after restart.",
+   "Using unstable dictionary or set iteration order and therefore violating deterministic tie-breaking.",
+   "Misinterpreting interval endpoints or thermal stabilization boundaries.",
+   "Fixating on the misleading SQLite-busy warning and changing the repository rather than implementing the missing planner.",
+   "Failing to inspect the undocumented-in-source behavior of the supplied beamcheck executable through its protocol and observed responses."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "python",
+   "constraint-satisfaction",
+   "scheduling",
+   "sqlite-state",
+   "running-services",
+   "black-box-validator"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, running processes, service entrypoints, and configuration.",
+   "Read the API routes, campaign schema documentation, sample campaigns, and existing planner integration.",
+   "Inspect the SQLite schema, repository methods, worker reconciliation logic, and startup/shutdown code.",
+   "Run the health and campaign-inspection endpoints and query the initial database without modifying it.",
+   "Read the beamcheck documentation and probe its line protocol with valid, invalid, and transition requests.",
+   "Determine the exact schedule representation, time origin, interval semantics, priority aggregation, setup-cost calculation, and idempotency behavior from fixtures and code.",
+   "Construct a small local campaign matrix covering precedence, cooldown, shared robot, detector mode, temperature, incompatibility, and rejected transitions.",
+   "Implement a beamcheck-backed candidate validator with a complete cache key including instrument, mode, temperature, and transition state.",
+   "Implement deterministic constraint search over experiment subsets, instrument assignments, and orderings with pruning.",
+   "Compare complete schedules by maximum feasible priority, makespan, setup cost, and lexicographic experiment order.",
+   "Integrate the planner into the existing API while preserving health and inspection endpoints.",
+   "Add transactional campaign and ordered allocation persistence using campaign id as an idempotency key.",
+   "Reject changed payloads for an existing campaign id and ensure retries do not duplicate campaign, allocation, or event rows.",
+   "Update or verify worker materialization and reconciliation so retries and restarts preserve one canonical plan.",
+   "Build or restart the service and worker, then submit the public campaign.",
+   "Compare the response exactly with persisted campaign and allocation rows, including contiguous sequence numbers.",
+   "Restart both processes and verify historical rows and the submitted plan remain unchanged and queryable.",
+   "Generate adversarial campaigns locally and compare planner output against an independent exhaustive or reference optimizer.",
+   "Run the supplied test suite, inspect failures, and fix interval boundaries, thermal stabilization, transition validation, and tie-breaking.",
+   "Run final health, restart, duplicate-submission, mutation, and database-integrity checks."
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction does not define how experiment priorities are aggregated when selecting a feasible set, so 'highest-priority feasible set' may admit multiple incompatible interpretations.",
+   "The documented campaign format, schedule time origin, horizon, interval endpoint semantics, setup-cost definition, and exact beamcheck protocol are not included in the blueprint; tests may rely on information that is only discoverable in the container.",
+   "The required tie-breaking order does not explicitly define how lexicographic experiment order is encoded or whether omitted experiments participate in that comparison.",
+   "A hidden reference optimizer may impose objective or scheduling semantics not stated in the task, making a correct implementation fail for specification rather than engineering reasons.",
+   "The requirement to solve 8-24 experiment campaigns with shared resources and validator-dependent transitions in under an hour on one CPU may be infeasible without an adequately specified bounded search strategy or solver dependency.",
+   "Restart tests could be flaky if API and worker readiness, SQLite locking, or materialization timing are not synchronized deterministically.",
+   "The blueprint does not specify required HTTP status codes and error-body behavior for changed-payload idempotency violations."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and strongly verifiable, and its intended difficulty is genuine rather than superficial. However, the core optimization objective and several scheduling semantics are underspecified, while the expected implementation is likely too large and computationally demanding for the stated under-one-hour, one-CPU environment; therefore it fails the minimum-score acceptance rule.",
+  "fixes": [
+   "Define the priority objective formally, including whether priorities are lexicographically maximized, summed, weighted, or compared by a specified priority vector.",
+   "Specify the schedule time origin and horizon, half-open or closed interval rules, cooldown boundary behavior, thermal stabilization timing, and exact makespan and setup-cost formulas.",
+   "Document the canonical lexicographic comparison key, including treatment of omitted experiments and allocation fields.",
+   "Include the campaign JSON schema, beamcheck request/response contract, required HTTP status codes, and mutation/idempotency error behavior in the task-visible specification.",
+   "Provide a bounded-search strategy or solver library already installed, plus explicit campaign-size/resource limits that make the reference optimization tractable within the stated environment.",
+   "Add deterministic readiness and restart synchronization requirements so failures are not caused by process timing or SQLite lock races.",
+   "Clarify whether the worker is expected to materialize API-created plans or merely reconcile them, and define the canonical event-row behavior on retries."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The candidate implements a constrained beamline experiment scheduling and persistence planner, whereas this reference restores an event-based marketing funnel attribution service."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1-m",
+     "verdict": "distinct",
+     "reason": "The candidate solves deterministic resource-constrained campaign planning, not event retention, sessionization, attribution, and refund accounting in a marketing funnel."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576-m",
+     "verdict": "distinct",
+     "reason": "The reference is a performance-focused SQLite authorization-policy audit export with precedence matching, unrelated to experiment scheduling and materialization."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576",
+     "verdict": "distinct",
+     "reason": "The candidate plans feasible beam experiments, while the reference exports authorization decisions under policy scope and validity precedence rules."
+    },
+    {
+     "ref_id": "ours/official-53057a0b2ce6",
+     "verdict": "distinct",
+     "reason": "The reference is a multi-tenant append-only audit log with cryptographic sealing and verification, not a constrained campaign planner."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-ce30ab52c4d1",
+     0.272
+    ],
+    [
+     "ours/official-ce30ab52c4d1-m",
+     0.269
+    ],
+    [
+     "ours/official-a111d7f89576-m",
+     0.062
+    ],
+    [
+     "ours/official-a111d7f89576",
+     0.058
+    ],
+    [
+     "ours/official-53057a0b2ce6",
+     0.056
+    ]
+   ],
+   "cost_usd": 0.0007708
+  },
+  "novel": true
+ },
+ "cost_usd": 0.003036
+}

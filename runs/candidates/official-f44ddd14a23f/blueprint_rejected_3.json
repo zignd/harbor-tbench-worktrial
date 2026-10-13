@@ -1,0 +1,189 @@
+{
+ "blueprint": {
+  "slug": "repair-route-snapshot-index",
+  "title": "Repair the Route Snapshot Index",
+  "scenario": "I\u2019m chasing a production issue in our tenant-aware route service: after a busy day of route updates, some lookups choose the wrong next hop and rebuilding the snapshot takes far too long. The container has a Rust service, a SQLite route-history database, several helper crates, and a small prebuilt route-key codec that is part of the deployed interface but has no source. Please make the service reliable on large histories rather than just patching the supplied fixture.",
+  "instruction_draft": "Please fix the route materializer and lookup path so `route-agent build --input INPUT.db --output OUTPUT.db` produces the correct current snapshot, and `route-agent lookup --db OUTPUT.db --queries QUERIES.jsonl --output ANSWERS.jsonl` returns one answer per query. Operations are applied independently per tenant in `(seq, op_id)` order; an ADD or REPLACE makes its `route_id` active, WITHDRAW removes only that route ID, and a lookup must select the active route containing the address with the longest prefix, then lowest metric, then lexicographically smallest `route_id`. IPv4 and IPv6, exact prefix boundaries, duplicate sequence numbers, withdrawn routes, and tenant isolation must all work, and the output must be deterministic. The rebuilt database must preserve the documented route and provenance columns, and the build must process at least 120,000 operations and 40,000 lookups per second on the supplied one-CPU container while using bounded memory; do not solve the benchmark by special-casing the checked-in data.",
+  "requirements": [
+   "The `route-agent build --input INPUT.db --output OUTPUT.db` command must complete successfully on the documented SQLite schema.",
+   "Operations must be applied independently for each tenant in ascending `(seq, op_id)` order.",
+   "ADD and REPLACE operations must make their route ID active with the operation's address, prefix length, next hop, and metric.",
+   "WITHDRAW must remove only the specified route ID and must not remove another route with the same prefix or metric.",
+   "The output snapshot must contain exactly the effective active routes, including the documented route and provenance columns.",
+   "Lookup must select only routes belonging to the query tenant.",
+   "Lookup must consider both IPv4 and IPv6 routes and select the route with the longest containing prefix.",
+   "Lookup tie-breaking must be lowest metric followed by lexicographically smallest `route_id`.",
+   "IPv4 and IPv6 prefix boundaries, including non-byte-aligned prefixes and IPv4-mapped IPv6 addresses, must be handled according to the schema documentation.",
+   "Withdrawn routes must never be returned, including when an older route with the same prefix remains in the history.",
+   "Lookup output must contain one deterministic JSON result for every input query in input order, including the documented no-route representation.",
+   "The implementation must preserve tenant isolation and deterministic results across repeated builds.",
+   "The build must process at least 120,000 operations and 40,000 lookups per second on the supplied one-CPU container.",
+   "The implementation must use bounded memory rather than loading the complete operation history and all lookup requests into an unbounded in-memory structure.",
+   "The solution must work on fresh verify-time databases and query streams generated from hidden seeds rather than relying on the checked-in fixture."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` installs pinned Rust tooling, SQLite development/runtime packages, Python's pinned SQLite helper dependencies, and no network-dependent runtime services.",
+   "A roughly 1,700-line Rust workspace contains `route-agent`, a SQLite ingestion/materialization layer, a lookup layer, a small connection-pool abstraction, CLI parsing, logging, and unrelated health-check and metrics modules.",
+   "The input database schema is documented in `/opt/route-agent/SCHEMA.md` and contains `route_ops` with tenant, sequence, operation ID, route ID, address-family, packed address, prefix length, next hop, metric, and action fields, plus metadata tables.",
+   "The checked-in fixture contains about 18,000 operations across many tenants and both address families, with a small JSONL query file and an expected-output diagnostic script. Most ordinary prefixes and unique sequence numbers appear in the fixture.",
+   "A prebuilt `/opt/route-agent/lib/libroutekey.so` is loaded through a documented C ABI. It canonicalizes route addresses and computes family-aware sortable keys, but its implementation is intentionally shipped only as a binary; no source for it is present in the container.",
+   "The Rust code contains several interacting production defects: a history compaction path assumes a byte ordering that is not the codec's canonical ordering, a connection reuse path can retain a tenant-specific temporary index across batches, and the existing lookup implementation degenerates into repeated scans on large prefix sets.",
+   "The repository includes a small sample test suite and observability commands, but does not include the rare mapped-address, same-sequence, cross-tenant, or large-overlap cases used by verification.",
+   "A deterministic hidden-data generator is supplied only to the verifier. It creates fresh SQLite histories with thousands of tenants, hundreds of thousands of operations, overlapping prefixes, random operation ordering with controlled duplicate sequence values, withdrawals, and adversarial boundary addresses from a hidden seed."
+  ],
+  "internal_hint": "The intended resolution requires investigation rather than reading one obvious faulty function. First run the sample end to end, inspect SQLite query plans and intermediate snapshot counts, then generate small histories that isolate same-sequence ordering, repeated route IDs, tenant switches, prefix lengths crossing byte boundaries, and IPv4-mapped addresses. Probe the opaque codec through its tiny diagnostic utility and disassemble or call it on controlled inputs; the service's ordering and mask assumptions do not match its canonical key representation. Trace temporary tables and connection reuse under alternating tenants to expose stale state that never appears in the fixture. The robust fix is a staged refactor: canonicalize and order operations using the codec-defined representation, materialize effective routes with set-based SQLite statements and explicit per-build temporary state, add family-aware binary prefix predicates/indexes, and implement indexed longest-prefix lookup with deterministic metric/ID tie breaks. Benchmark the large generated shape while checking counts and provenance after each stage; merely adding an index to the existing per-query scan does not reach the threshold.",
+  "trap": "A shallow solution can make the checked-in example pass by sorting on textual addresses, using the apparent byte order, or retaining the existing scan while adding a superficial SQLite index. Those approaches fail on hidden non-byte-aligned and mapped IPv6 prefixes, duplicate sequence numbers, alternating tenants on reused connections, and histories where a withdrawal exposes an older overlapping route. A solution that materializes correct rows but performs one prefix scan per lookup also misses the throughput threshold on the hidden large state.",
+  "tests": [
+   "A build test creates a fresh hidden-seed SQLite history with thousands of tenants and verifies the exact effective snapshot rows, route provenance, and row count against an independent reference implementation.",
+   "An ordering test generates duplicate `seq` values with different `op_id` values and checks that operations are applied in `(seq, op_id)` order.",
+   "A lifecycle test generates ADD, REPLACE, and WITHDRAW operations reusing route IDs and verifies that WITHDRAW removes only its route ID and that later effective provenance is correct.",
+   "A prefix test generates IPv4 and IPv6 routes at every prefix length, including non-byte-aligned masks, prefix boundaries, and IPv4-mapped IPv6 addresses, then compares every lookup answer with the reference longest-prefix implementation.",
+   "A tie-break test creates overlapping active routes with equal prefix lengths and varying metrics and route IDs, checking lowest metric and then lexicographic route ID.",
+   "A tenant-isolation test interleaves operations and queries for many tenants and alternates tenants across batches and pooled SQLite connections, checking that no route or temporary state crosses tenant boundaries.",
+   "A determinism test builds the same hidden database twice and requires byte-equivalent logical snapshot rows and identical JSONL lookup output in query order.",
+   "A no-match test checks the exact documented JSON representation for addresses with no active containing route.",
+   "A scale test generates at least 240,000 operations and 80,000 lookups from a hidden seed, measures the complete build-plus-lookup workload on the one-CPU container, and requires at least 120,000 operations and 40,000 lookups per second with bounded resident memory.",
+   "A fresh-instance test repeats correctness and performance checks with several hidden seeds so memorizing the supplied fixture or special-casing its prefixes cannot pass."
+  ],
+  "verifier_knob": {
+   "name": "hidden_route_operations_and_lookup_rate",
+   "value": "120000 operations plus 40000 lookups per second on 240000-operation, 80000-lookup hidden instances",
+   "effect": "Raising the rate or increasing the generated overlap/history size makes inefficient scan-based implementations fail while leaving the correct indexed/set-based implementation viable; lowering it makes performance shortcuts and smaller in-memory approaches more likely to pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads the obvious SQL and patches one ordering or withdrawal condition without probing the opaque codec or exercising accumulated state.",
+   "The agent assumes textual or raw-byte address ordering is equivalent to the deployed canonical route-key ordering and fails rare IPv6 and mapped-address cases.",
+   "The agent fixes correctness for one tenant but leaves temporary tables or prepared statements tied to a previous pooled connection tenant.",
+   "The agent implements a correct reference-style nested loop that is overwhelmed by the hidden number of overlapping routes and queries.",
+   "The agent validates only the checked-in fixture, whose unique sequence numbers and ordinary prefixes conceal the dependent ordering and boundary failures.",
+   "The agent loads the complete history or query set into memory, passing small samples but violating bounded-memory behavior on generated instances."
+  ],
+  "predicted_pass_rate": 0.18,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "rust",
+   "sqlite",
+   "reverse-engineering",
+   "route-lookup",
+   "performance",
+   "large-state"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /opt/route-agent && find . -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' SCHEMA.md",
+   "rg -n \"route_ops|snapshot|lookup|temporary|tenant|routekey|WITHDRAW|REPLACE\" .",
+   "cargo test --workspace",
+   "route-agent build --input fixture.db --output /tmp/snapshot.db",
+   "route-agent lookup --db /tmp/snapshot.db --queries fixture.jsonl --output /tmp/answers.jsonl",
+   "cat /tmp/answers.jsonl",
+   "find . -type f \\( -name '*.sql' -o -name '*.rs' -o -name '*.py' \\) -print",
+   "sed -n '1,260p' route-agent/src/main.rs",
+   "sed -n '1,320p' route-agent/src/materialize.rs",
+   "sed -n '1,320p' route-agent/src/lookup.rs",
+   "sed -n '1,260p' route-agent/src/db.rs",
+   "sqlite3 fixture.db '.schema' && sqlite3 fixture.db 'EXPLAIN QUERY PLAN SELECT * FROM route_ops'",
+   "find /opt/route-agent -type f -perm -111 -o -name '*diagnostic*' -print",
+   "run codec diagnostic utility on controlled IPv4, IPv6, mapped, and non-byte-aligned prefixes",
+   "write a small generator for duplicate-sequence, repeated-route-ID, withdrawal, tenant-switch, and boundary cases",
+   "run the generated cases through the current build and compare them with a reference implementation",
+   "disassemble or call libroutekey.so to establish canonical address and sortable-key behavior",
+   "replace raw/textual operation ordering with codec-defined canonical ordering plus explicit (seq, op_id) ordering",
+   "rewrite materialization as set-based SQLite staging and effective-route selection with per-build temporary state",
+   "remove connection-specific tenant state and reset or recreate temporary objects on pooled-connection reuse",
+   "add family-aware packed-address prefix predicates and indexes for IPv4 and IPv6",
+   "replace per-query route scans with indexed longest-prefix candidate lookup and deterministic metric/route_id ordering",
+   "cargo fmt && cargo test --workspace",
+   "benchmark generated 240000-operation and 80000-query workloads while recording RSS and query plans",
+   "repeat builds and hidden-like generated tests, compare logical snapshot rows and ordered JSONL output"
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 5,
+   "realism": 5
+  },
+  "invalid_failure_risks": [
+   "The performance requirement is ambiguous: it separately names operation and lookup rates, while the scale test describes a combined build-plus-lookup workload without defining whether both rates must be met independently or in aggregate.",
+   "A one-CPU throughput threshold can vary with host contention, SQLite version, filesystem behavior, Rust build mode, and verifier overhead; the blueprint does not specify warm-up, timing boundaries, repetition, or tolerance.",
+   "Bounded memory is stated qualitatively without a resident-memory ceiling or measurement protocol, making rejection criteria under-specified.",
+   "The exact snapshot schema, provenance semantics, no-route JSON representation, and IPv4-mapped IPv6 interpretation are delegated to SCHEMA.md; if that document is incomplete or inconsistent with the tests, failures would be invalid.",
+   "The opaque codec's required behavior may be impossible to reproduce robustly if the documented ABI lacks sufficient information about ownership, initialization, error handling, or canonicalization semantics.",
+   "The speedrun requires implementing a substantial materialization and lookup refactor plus reverse-engineering an opaque library, which is unlikely to be reliably solvable by a skilled engineer within the stated under-one-hour criterion."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and genuinely difficult, but solvability is below the required threshold: the shortest credible path is about 26 substantial investigation and implementation steps, including reverse-engineering a binary codec and redesigning both SQLite materialization and lookup. Verifiability is also weakened by underspecified memory measurement and an ambiguous, potentially flaky throughput criterion. Since solvability scores 2 and every score must be at least 3, this blueprint should be rejected pending tighter scope and measurement definitions.",
+  "fixes": [
+   "Define whether build and lookup must each independently meet their stated rate or whether the combined workload has one aggregate target; specify timing boundaries, warm-up, build mode, repetitions, and allowable variance.",
+   "Set an explicit RSS or heap-memory ceiling and document exactly how the verifier measures it.",
+   "Provide a small ABI contract and diagnostic examples for libroutekey.so, including canonicalization, mapped-address behavior, key ordering, buffer ownership, and error cases.",
+   "Reduce the implementation scope by supplying a reference staging schema and indexed lookup design, or split materialization correctness and high-performance lookup into separate tasks.",
+   "State the exact snapshot columns, provenance rules, no-route JSON shape, and SQLite version/features directly in the task contract.",
+   "Add a verifier preflight that confirms the container has the intended CPU quota, SQLite version, codec library, and release-build executable before applying performance judgments."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-9114f040ac4a",
+     "verdict": "distinct",
+     "reason": "This task materializes tenant-scoped route state and performs longest-prefix IP lookups, whereas the reference deduplicates and reconciles capture packets into flow summaries."
+    },
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "Despite both mentioning routes and a compiled helper, this task concerns event-sourced route snapshots and IP prefix selection, not HTTP target normalization and policy classification."
+    },
+    {
+     "ref_id": "ours/official-3a04e2577db1-m",
+     "verdict": "distinct",
+     "reason": "This task does not involve SQL authorization or prepared-statement policy enforcement; it requires route-history materialization and efficient IPv4/IPv6 lookup."
+    },
+    {
+     "ref_id": "ours/official-3a04e2577db1",
+     "verdict": "distinct",
+     "reason": "The shared SQLite and determinism concerns are incidental, since this task solves route state reconstruction and prefix matching rather than SQL policy gating."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576-m",
+     "verdict": "distinct",
+     "reason": "Although both use tenants and prefix precedence, this task builds a mutable route snapshot and performs IP next-hop selection, while the reference exports historical policy-audit decisions."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-9114f040ac4a",
+     0.232
+    ],
+    [
+     "ours/official-6c6f79cc88e4",
+     0.217
+    ],
+    [
+     "ours/official-3a04e2577db1-m",
+     0.143
+    ],
+    [
+     "ours/official-3a04e2577db1",
+     0.13
+    ],
+    [
+     "ours/official-a111d7f89576-m",
+     0.121
+    ]
+   ],
+   "cost_usd": 0.0009383999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0034333999999999996
+}

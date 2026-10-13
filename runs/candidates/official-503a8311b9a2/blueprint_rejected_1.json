@@ -1,0 +1,201 @@
+{
+ "blueprint": {
+  "slug": "deploy-analyst-reconciliation",
+  "title": "Deploy the Analyst Reconciliation Report",
+  "scenario": "An internal analyst reports that daily revenue and adjustment numbers stopped adding up after the last reporting deployment. The container contains a small in-house JavaScript reporting application, an interrupted replay database, packaging scripts, deployment metadata, and a compiled internal measurement component whose implementation is not shipped. The requested work is to finish and deploy a durable reconciliation feature rather than patching the displayed example.",
+  "instruction_draft": "$ npm run deploy\n[release] building analyst-report-0.8.0.tgz\n[replay] restored 37 records, 1,842.50 gross\n[reconcile] daily total 1,798.00 does not match ledger total 1,842.50\nFATAL deployment aborted: verification failed\n\nThe analyst-report deployment is currently unusable. Finish the reconciliation feature and deploy it from the repository in /workspace/analyst-report.\n\nThe deployed release must be available through the symlink /opt/analyst-report/current, and /opt/analyst-report/current/package.tgz must be a valid npm package containing the runnable application. The command `/opt/analyst-report/current/bin/reportctl reconcile --db PATH --input PATH --resume` must read UTF-8 newline-delimited JSON records with fields `id`, `account`, `occurred_at`, `kind`, `amount`, and `currency`, and must update the SQLite database at PATH.\n\nFor every accepted record, preserve its original record in the `events` table, derive its signed amount according to its `kind`, and record the measurement returned by the installed measurement component. A record is accepted only once by `id`; rerunning the same input, splitting it into different batches, or resuming after an interrupted run must produce the same database state as one uninterrupted run. Records that are malformed, duplicate an existing id with different contents, or use an unsupported currency must be rejected without changing totals or advancing the replay position.\n\nThe database must contain the tables `events`, `daily_totals`, `account_totals`, `replay_state`, and `reconciliation_runs`. `daily_totals` must contain one row per UTC calendar date and currency with gross, refunds, net, and measured totals. `account_totals` must contain one row per account and currency with the corresponding net and measured totals. Monetary values must be stored as integer minor units, and measured totals must use the exact integer output of the installed measurement component rather than a JavaScript floating-point approximation.\n\nThe command must recover the supplied interrupted replay using its journal and resume position, atomically commit each batch with its replay position, and leave no duplicate rows or partially applied totals after a process restart. It must exit nonzero for invalid input while preserving the last valid committed state.\n\nA successful deployment must write `/opt/analyst-report/current/release.json` containing the release name, package SHA-256, schema version, and a sorted list of supported currencies; make `reportctl` executable; and make `npm run verify-deployment` perform a complete self-check against the deployed symlink and database. Do not depend on network access, wall-clock time, or unseeded randomness.",
+  "requirements": [
+   "Deploy the finished release through the symlink `/opt/analyst-report/current`.",
+   "Place a valid npm package at `/opt/analyst-report/current/package.tgz` containing the runnable application.",
+   "Provide an executable command at `/opt/analyst-report/current/bin/reportctl` with the `reconcile --db PATH --input PATH --resume` interface.",
+   "Read UTF-8 newline-delimited JSON records containing `id`, `account`, `occurred_at`, `kind`, `amount`, and `currency`.",
+   "Preserve every accepted input record in the SQLite `events` table.",
+   "Derive signed amounts according to each record's `kind`.",
+   "Record the measurement returned by the installed measurement component for every accepted record.",
+   "Accept each record id at most once.",
+   "Reject duplicate ids with different contents without changing totals or advancing replay state.",
+   "Reject malformed records without changing totals or advancing replay state.",
+   "Reject unsupported currencies without changing totals or advancing replay state.",
+   "Make rerunning identical input, changing batch boundaries, and resuming after interruption produce the same final database state.",
+   "Create the tables `events`, `daily_totals`, `account_totals`, `replay_state`, and `reconciliation_runs`.",
+   "Store one `daily_totals` row per UTC date and currency with gross, refunds, net, and measured totals.",
+   "Store one `account_totals` row per account and currency with net and measured totals.",
+   "Store monetary values as integer minor units.",
+   "Use exact integer output from the installed measurement component instead of JavaScript floating-point approximations.",
+   "Recover the supplied interrupted replay using its journal and resume position.",
+   "Atomically commit each batch together with its replay position.",
+   "Leave no duplicate rows or partially applied totals after a process restart.",
+   "Exit nonzero for invalid input while preserving the last valid committed state.",
+   "Write `/opt/analyst-report/current/release.json` with the release name, package SHA-256, schema version, and sorted supported-currency list.",
+   "Make `npm run verify-deployment` perform a complete self-check against the deployed symlink and database.",
+   "Do not require network access, wall-clock time, or unseeded randomness."
+  ],
+  "environment": [
+   "The Dockerfile is based on `python:3.13-slim-bookworm`, installs pinned system and Python packages, installs a locally available Node.js runtime, and sets up `/workspace/analyst-report`.",
+   "The repository contains roughly 1,300 lines across JavaScript source, SQL migrations, a CLI, packaging scripts, fixtures, and unrelated account-import and CSV-reporting modules.",
+   "The existing deployment script builds a tarball, stages a release, replays a seed file, and runs a shallow verification, but it leaves the current symlink pointing at a failed release.",
+   "The seed state includes a SQLite database with an interrupted journal, a replay position that falls in the middle of a batch, some already committed events, and totals inconsistent with the journal until recovery is performed.",
+   "The repository includes deterministic fixtures that make the pasted error reproducible but do not cover duplicate ids, negative adjustments, multiple currencies, date boundaries, malformed lines, or restart recovery.",
+   "A compiled executable `/workspace/analyst-report/vendor/measure-engine` is shipped without source code. It accepts a documented line-oriented JSON request protocol and emits measurement responses, but its rounding, carry, and batch-boundary behavior is intentionally not described in source and must be characterized by experiments.",
+   "The measurement executable has behavior involving currency-specific minor units, signed values, and a carry that persists across requests in one process; invoking it once per record instead of using its streaming protocol produces plausible results on the visible fixture but incorrect results on longer histories.",
+   "The JavaScript application currently contains a naive decimal conversion path, non-atomic offset updates, and a package/deployment verifier that checks only the displayed fixture. These defects are distributed across the loader, replay worker, migration, and release scripts rather than isolated in one file.",
+   "A temporary C source file used to build the opaque executable is removed during the image build; no source or equivalent implementation is present beside the binary.",
+   "The environment includes deterministic crash-injection controls used by verification to stop the process after selected batch boundaries."
+  ],
+  "internal_hint": "The intended resolution is investigative. First inspect the repository, failed release metadata, SQLite schema, journal, replay logs, and package contents rather than trusting the shallow verifier. Exercise the opaque measurement executable with signed values, currency changes, boundary amounts, long streams, blank lines, and different request grouping; its streaming protocol and persistent carry explain why the sample can pass while hidden histories fail. Implement the reconciliation feature around a single long-lived engine process, exact integer representations, canonical record hashing, and UTC date derivation. Repair migrations and replay ordering so validation occurs before mutation, events, aggregates, run metadata, and the replay position are committed in one SQLite transaction, and recovery reconciles journal entries idempotently. Build a fresh npm tarball, stage it atomically, update the symlink only after full verification, regenerate release metadata, and run generated fresh histories plus crash/resume experiments before finalizing.",
+  "trap": "A shallow solution can hard-code the visible total, use `Number` arithmetic, invoke the binary independently for each record, or merely delete the stale journal and rebuild totals. Those approaches pass the supplied fixture and a one-shot self-check, but hidden histories expose persistent measurement carry, signed refunds, currency/date boundaries, duplicate conflicts, and crash points. A solution that writes the replay offset outside the aggregate transaction also creates silent gaps or double counting after verification forcibly terminates the process.",
+  "tests": [
+   "Inspect the final filesystem state to confirm `/opt/analyst-report/current` is a deployed release, `package.tgz` is a valid npm archive, `reportctl` is executable, and `release.json` contains the required fields and a matching SHA-256.",
+   "Run `npm run verify-deployment` and require a successful self-check against the deployed symlink and recovered database.",
+   "Open the recovered SQLite database and check that all five required tables exist, the supplied journal was replayed, the interrupted batch is complete exactly once, and aggregate totals match the reference state.",
+   "Generate fresh seeded NDJSON histories containing thousands of sales and refunds across accounts, currencies, UTC date boundaries, awkward decimal magnitudes, and repeated ids; run the deployed CLI and compare every event, daily aggregate, account aggregate, replay-state row, and reconciliation-run row with the reference implementation.",
+   "For generated histories, compare measured values against a long-lived invocation of the opaque measurement executable, including cases where the carry crosses record and currency boundaries.",
+   "Run each generated history as one input, multiple input chunks, and repeated identical replays, then compare complete SQLite state rather than only printed totals.",
+   "Inject deterministic termination after each selected batch boundary, restart with `--resume`, and require the final state to equal the uninterrupted reference with no duplicate events or partially applied totals.",
+   "Feed malformed JSON, missing fields, unsupported currencies, invalid amounts, and conflicting duplicate ids after valid records; require a nonzero exit and byte-for-byte preservation of all committed state and replay position before the invalid record.",
+   "Check that dates are grouped by UTC date, refunds affect gross/refund/net fields with the required signs, and all monetary and measured values remain exact integers.",
+   "Run hidden package-install and deployment checks from a clean staging directory with no network, wall-clock dependence, or inherited repository-relative paths."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "10",
+   "effect": "Raising this adds checks for more independent release metadata, schema rows, replay invariants, generated histories, crash points, and opaque-engine edge cases; lowering it to only the visible total makes naive fixes pass."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the obvious replay worker and misses behavior that appears only when the opaque engine processes a long stream.",
+   "The agent reimplements measurement with JavaScript decimals or starts a new engine process per record.",
+   "The agent repairs the sample database by deleting the journal instead of implementing idempotent recovery.",
+   "The agent updates SQLite aggregates and the replay offset in separate transactions.",
+   "The agent validates duplicate or malformed records after mutating state.",
+   "The agent verifies only the displayed fixture and leaves the package tarball or symlink pointing to an unverified build.",
+   "The agent handles refunds or currency minor units correctly for visible examples but fails hidden signed, boundary, or multi-currency histories.",
+   "The agent partially implements the schema and CLI but omits release metadata, package validity, or the clean-staging deployment behavior.",
+   "The agent runs out of time after discovering the recovery problem because fixing it requires coordinated changes across migration, replay, packaging, and deployment stages."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "build-and-packaging",
+  "tags": [
+   "javascript",
+   "deployment",
+   "sqlite",
+   "replay-recovery",
+   "opaque-binary",
+   "npm-packaging"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "cd /workspace/analyst-report && find . -maxdepth 3 -type f | sort",
+   "cat package.json Dockerfile README* 2>/dev/null",
+   "sed -n '1,240p' scripts/deploy* scripts/verify* 2>/dev/null",
+   "sed -n '1,260p' bin/reportctl src/* 2>/dev/null",
+   "find migrations sql -type f -maxdepth 3 -print -exec sed -n '1,240p' {} \\; 2>/dev/null",
+   "sqlite3 path/to/seed.db '.schema' '.dump replay_state' '.dump events'",
+   "find . -iname '*journal*' -o -iname '*replay*' -o -iname '*fixture*' | sort",
+   "cat vendor/measure-engine* docs/* 2>/dev/null",
+   "printf probe requests | vendor/measure-engine",
+   "Run signed, currency-switch, boundary, blank-line, and grouping probes against measure-engine",
+   "Inspect crash-injection controls and existing tests",
+   "Design canonical hashing, integer monetary parsing, UTC date handling, and transaction boundaries",
+   "Repair migrations for all five required tables and deterministic constraints",
+   "Implement strict NDJSON validation before mutation",
+   "Implement one long-lived measurement-engine stream and exact integer response handling",
+   "Implement idempotent event insertion and conflict detection by canonical record hash",
+   "Implement daily and account aggregate updates in integer units",
+   "Implement journal recovery and atomic batch-plus-replay-position commits",
+   "Update reconciliation-run metadata and resume semantics",
+   "Repair reportctl argument handling, exit codes, and executable packaging",
+   "Repair deployment staging, verification, release metadata, SHA-256, and symlink promotion",
+   "Run npm test and npm run verify-deployment",
+   "Run the supplied replay and inspect all tables and release metadata",
+   "Generate adversarial multi-currency, refund, date-boundary, duplicate, and malformed histories",
+   "Run uninterrupted, chunked, repeated, and crash-injected resume comparisons",
+   "Build and inspect the npm archive from a clean staging directory",
+   "Promote only the fully verified release to /opt/analyst-report/current and rerun verification"
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The requirement that changing batch boundaries produce identical measured totals may conflict with the opaque engine's persistent carry if 'multiple input chunks' means separate CLI processes; the required carry persistence mechanism across invocations is not specified.",
+   "The journal format, resume-position semantics, schema-version value, supported-currency set, and precise refund gross/refund sign conventions are not fully stated, so tests may depend on repository details unavailable from the instruction.",
+   "Requiring byte-for-byte preservation of SQLite state can be invalid if tests compare database files rather than logical rows, because SQLite page layout and freelist details are not a stable semantic result.",
+   "It is unclear whether invalid records after valid records must roll back the whole invocation or only the current batch, despite both 'without changing totals' and resumable batch behavior being described.",
+   "Crash-injection behavior and the expected clean-staging installation contract are referenced but not defined, which can make otherwise correct implementations fail environment-specific checks."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and strongly verifiable, and its investigative traps create genuine engineering difficulty. However, the requested coordinated recovery, opaque streaming measurement integration, exact accounting, packaging, and deployment work is unlikely to be solvable by a skilled engineer in under an hour in a 1 CPU/2 GB container, so solvability scores below the acceptance threshold; several state and batch-boundary semantics are also underspecified.",
+  "fixes": [
+   "Reduce the required scope or provide a tested skeleton/reference interfaces for schema, journal recovery, and deployment, so the core investigation and implementation fit the stated time budget.",
+   "Define whether chunking means batches within one process or separate CLI invocations, and specify how opaque-engine carry state is preserved across invocations if required.",
+   "Specify the journal format, schema version, supported currencies, exact signed gross/refund/net formulas, and transaction scope for invalid records.",
+   "Require logical database-state comparisons rather than byte-for-byte SQLite-file equality, and document crash-injection points and clean-staging expectations."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "This task builds an idempotent SQLite revenue aggregation and deployment workflow, whereas the reference replays manifest-selected database transactions into a canonical snapshot and report."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "This task processes newline-delimited JSON into durable daily and account totals with an opaque measurement component, unlike the reference's authenticated encrypted settlement-frame validation and cryptographic reconciliation."
+    },
+    {
+     "ref_id": "ours/official-e2bf5b4dd194",
+     "verdict": "distinct",
+     "reason": "Although both involve reconciliation and SQLite, this task aggregates accepted replay events while the reference performs globally optimized one-to-one matching between versioned ledger and bank events."
+    },
+    {
+     "ref_id": "ours/official-ac47e792cfa3",
+     "verdict": "distinct",
+     "reason": "Both are event-driven financial aggregation tasks, but this task handles currency-aware revenue/refund replay with durable SQLite state and measurements, whereas the reference models fills, corrections, cancels, rebates, and VWAP per order."
+    },
+    {
+     "ref_id": "ours/official-d19257a8f76d",
+     "verdict": "distinct",
+     "reason": "This task deploys a persistent SQLite reconciliation importer with transactional resume semantics, while the reference implements a line-oriented stateful service for parsing and reporting escaped trace records."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.233
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.198
+    ],
+    [
+     "ours/official-e2bf5b4dd194",
+     0.192
+    ],
+    [
+     "ours/official-ac47e792cfa3",
+     0.182
+    ],
+    [
+     "ours/official-d19257a8f76d",
+     0.172
+    ]
+   ],
+   "cost_usd": 0.0012414
+  },
+  "novel": true
+ },
+ "cost_usd": 0.00392
+}

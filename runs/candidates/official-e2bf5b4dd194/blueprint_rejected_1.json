@@ -1,0 +1,170 @@
+{
+ "blueprint": {
+  "slug": "settlement-log-reconciliation",
+  "title": "Repair Settlement Log Reconciliation",
+  "scenario": "The finance-ops reconciliation job compares ledger postings with provider settlement records emitted by an internal log collector, while Prometheus-style counters provide an independent settled-volume check. The container contains a SQLite-backed Python service, operational logs, metric snapshots, a partially implemented reconciliation component, and a small reporting CLI used by the nightly close process.",
+  "instruction_draft": "Repair `/opt/reconcile/app/matcher.py` so that `python3 -m reconcile --db DB --out REPORT` produces the exact deterministic reconciliation report described in `/opt/reconcile/README.md`. For every account/currency partition, match ledger rows to eligible provider log rows with maximum cardinality, then the documented minimum-cost and deterministic tie-breaking rules; reconstruct metric counter increases including resets and compare them with the matched totals. The report must include every match, every unmatched identifier, per-partition totals and metric gaps, with stable ordering and integer arithmetic.\n\nThe command must work on the supplied database and on fresh databases generated at verification time, including duplicate amounts, equal timestamps, retries, counter resets, empty partitions, negative adjustments, and disconnected candidate groups. Preserve the CLI and SQLite schema, do not use network access or wall-clock time, and keep execution below five seconds for a generated database containing up to 1,500 ledger rows, 1,500 provider rows, and 20,000 metric samples.",
+  "requirements": [
+   "Modify `/opt/reconcile/app/matcher.py` and preserve the invocation `python3 -m reconcile --db DB --out REPORT`.",
+   "Use the SQLite schema and eligibility rules documented in `/opt/reconcile/README.md` to produce the report.",
+   "For each account/currency partition, maximize the number of ledger-to-provider matches.",
+   "Among maximum-cardinality matchings, minimize the documented total timestamp-distance cost, then amount-distance cost, then apply the documented deterministic tie-breaking rule.",
+   "Emit every selected match and every unmatched ledger and provider identifier.",
+   "Reconstruct counter increases from metric samples, treating documented counter resets correctly, and report the metric total and matched-total gap for each partition.",
+   "Produce integer, stable, deterministic output with the required partition and identifier ordering.",
+   "Handle duplicate amounts, equal timestamps, retries, counter resets, empty partitions, negative adjustments, and disconnected candidate groups.",
+   "Run without network access or wall-clock dependence and finish within five seconds on the stated generated workload."
+  ],
+  "environment": [
+   "Use `FROM python:3.13-slim-bookworm`; install only pinned standard Debian/Python dependencies and no network-dependent runtime behavior.",
+   "Create roughly 1,300 lines across `/opt/reconcile/reconcile/__main__.py`, `app/matcher.py`, `app/report.py`, `app/schema.py`, a metric-import helper, configuration, documentation, and unrelated health-check/logging modules.",
+   "Provide `/opt/reconcile/README.md` with the complete SQLite schema, eligibility predicates, cost ordering, counter-reset semantics, JSON report schema, ordering rules, and CLI contract.",
+   "Provide a SQLite fixture containing several hundred rows and operational JSON-lines logs plus metric snapshots; the visible fixture should include ordinary one-to-one matches and at least one retry but should not exhaustively exercise tie cases.",
+   "Plant the missing component in `app/matcher.py`: parsing and database plumbing work, but the matching routine is incomplete and the report currently falls back to a greedy pairing implementation.",
+   "Ledger rows contain stable identifiers, account, currency, signed cents, nanosecond timestamp, and kind; provider rows contain stable identifiers, account, currency, signed cents, nanosecond timestamp, retry group, and source partition.",
+   "A provider row is eligible only when the documented account, currency, kind, signed amount tolerance, timestamp window, retry-group, and source-partition predicates all hold.",
+   "Metric samples contain a monotonically increasing counter value per partition except for explicit resets; the README defines reset handling and the interval used for the comparison.",
+   "Include deterministic generator utilities under `/opt/reconcile/tools/` used by verification to construct fresh databases from a hidden seed, but do not expose the verification reference implementation."
+  ],
+  "internal_hint": "The central defect is not a local SQL typo: the fallback greedy matcher silently loses cardinality on alternating-path examples and chooses the wrong result on equal-cost ties. A skilled engineer should inspect the README/schema and run the CLI with instrumented small databases, then replace the routine with an exact maximum-cardinality bipartite matching algorithm followed by min-cost optimization and the specified deterministic tie resolution; disconnected components can be solved independently. Counter reconstruction must be done in timestamp order per metric series, adding post-reset values rather than subtracting across a reset, and the resulting totals must be joined to the same account/currency partitions before report generation. The reference computes the full objective on generated instances, so validating only the visible fixture or only totals will miss incorrect pair identities.",
+  "trap": "A natural implementation pairs each ledger row with the nearest eligible provider row and passes the ordinary fixture, but an early choice can strand two later rows and reduce cardinality. Another plausible implementation uses a standard min-cost flow with a scalar sum of identifier ranks; that passes most ties but does not implement the required lexicographic matching tie-break. Counter code that computes only `last - first` also passes monotone samples while failing reset-containing metric histories.",
+  "tests": [
+   "Run the CLI on the supplied fixture and check that it emits valid JSON matching the documented schema, partition ordering, match ordering, unmatched lists, totals, and metric gaps; this checks the instruction sentence requiring the exact deterministic report.",
+   "Generate fresh SQLite instances from a hidden seed with varied partitions, duplicate amounts, retry groups, signed adjustments, equal timestamps, and disconnected candidate components, then compare the complete match set and unmatched identifiers with an independent reference optimizer; this checks maximum cardinality, eligibility, cost ordering, and deterministic tie-breaking.",
+   "Generate fresh metric histories containing monotone counters, multiple resets, single-sample series, empty series, and zero values, and compare every reported metric total and gap with the reference counter reconstruction; this checks the instruction sentence requiring reset-aware metric comparison.",
+   "Generate combined ledger/provider/metric instances where the matching result is correct but the metric join or partition aggregation is wrong, and compare every per-partition total; this checks the requirement to report metric totals and matched-total gaps for each partition.",
+   "Run generated workloads up to 1,500 ledger rows, 1,500 provider rows, and 20,000 metric samples under a five-second deadline on one CPU; this checks the stated performance requirement and rejects brute-force enumeration.",
+   "Repeat the same generated input twice with different process environments and verify byte-identical reports and no network or wall-clock dependence; this checks deterministic output."
+  ],
+  "verifier_knob": {
+   "name": "hidden_seed_instances",
+   "value": "24 generated databases per verification run, with 8 small adversarial tie/cardinality cases, 8 mixed reset-and-adjustment cases, and 8 scale cases",
+   "effect": "Increasing the number and variety of fresh instances makes greedy matching, incomplete reset handling, accidental dependence on fixture identifiers, and unstable tie behavior increasingly likely to fail; lowering it makes shallow validation more likely to pass."
+  },
+  "expected_failure_modes": [
+   "Implements nearest-neighbor or first-fit pairing instead of maximum-cardinality matching.",
+   "Finds a maximum matching but optimizes only timestamp distance and ignores amount distance or the required tie-break.",
+   "Uses a scalar tie cost that is not equivalent to the required lexicographic choice.",
+   "Treats retries as interchangeable without enforcing retry-group and source-partition eligibility.",
+   "Computes counter totals as last-minus-first and mishandles one or more resets.",
+   "Aggregates metrics before partitioning, causing cross-account or cross-currency leakage.",
+   "Returns correct totals but omits exact match identities or unmatched identifiers.",
+   "Uses brute-force matching that works on the fixture but times out on generated disconnected or dense components.",
+   "Relies on incidental SQLite row order or unordered Python containers, producing nondeterministic reports."
+  ],
+  "predicted_pass_rate": 0.34,
+  "difficulty": "hard",
+  "category": "data-querying",
+  "tags": [
+   "sql",
+   "bipartite-matching",
+   "min-cost-flow",
+   "metrics",
+   "reconciliation"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect the repository layout and existing CLI entry point.",
+   "Read /opt/reconcile/README.md completely, including schema, eligibility, objective, reset, and JSON ordering rules.",
+   "Open app/matcher.py and identify the greedy fallback and its data structures.",
+   "Read app/report.py, app/schema.py, metric-import code, and configuration to understand expected interfaces.",
+   "Inspect the fixture database schema and sample logs/metrics.",
+   "Run python3 -m reconcile --db <fixture> --out /tmp/before.json and inspect the output.",
+   "Search /opt/reconcile/tools and repository files for database generators and edge-case examples.",
+   "Construct a small alternating-path database to reproduce the greedy cardinality failure.",
+   "Construct a small equal-cost tie database and confirm the required tie order from the README.",
+   "Implement eligibility filtering and an exact maximum-cardinality bipartite matcher in matcher.py.",
+   "Add min-cost optimization for timestamp distance, amount distance, and the documented deterministic tie objective.",
+   "Solve disconnected components independently and ensure all identifiers are retained for unmatched output.",
+   "Implement per-series timestamp-ordered counter reconstruction with reset handling and partition joins.",
+   "Run python3 -m compileall on the package.",
+   "Run the CLI on the supplied fixture and validate JSON structure and ordering.",
+   "Run the local generator on adversarial cardinality, tie, retry, adjustment, empty-partition, and reset cases.",
+   "Benchmark a generated 1,500/1,500/20,000-row workload and optimize if necessary.",
+   "Run the same inputs twice under different hash seeds and diff the reports."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 4,
+   "verifiability": 5,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "If README.md does not specify the tie-breaking order, metric comparison interval, reset semantics, or exact JSON schema as promised, the task is ambiguous despite the instruction referring to it.",
+   "A five-second limit may be flaky if verification hardware is substantially slower than the assumed one-CPU environment; the benchmark should include tolerance or calibrated limits.",
+   "The task may be invalid if generated databases use schema or value combinations not actually covered by the documented eligibility predicates.",
+   "A requirement that the implementation preserve behavior outside matcher.py would be overreach unless those interfaces are explicitly tested and stable."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is clear, realistic, and strongly verifiable, but the measured speedrun criterion caps genuine_difficulty at 2: the defect is visible in the source and a strong agent can inspect the documentation, replace the matcher, and validate it in roughly 18 commands. Because acceptance requires every score to be at least 3, this blueprint does not qualify despite otherwise strong coverage.",
+  "fixes": [
+   "Increase genuine difficulty through a less obvious defect or a larger, layered component boundary while keeping the contract explicit.",
+   "Avoid making the greedy fallback and central defect immediately discoverable from the source; require reasoning across ingestion, matching, and reporting interfaces.",
+   "Add independently meaningful edge cases involving objective encoding or incremental counter joins that cannot be solved by a straightforward replacement of one routine.",
+   "Re-measure the task after the changes and require the speedrun to exceed roughly 20 commands for a strong agent without relying on ambiguity or environmental friction."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Both concern repairing deterministic settlement reconciliation tools, but this task centers on constrained bipartite matching and metric-counter reconstruction rather than binary frame authentication, decryption, and adjustment validation."
+    },
+    {
+     "ref_id": "ours/official-15587ff53b0c",
+     "verdict": "distinct",
+     "reason": "This task repairs a Python/SQLite reconciliation algorithm, whereas the reference implements a C settlement packager with rational FX, allocation, conservation, and reproducible release packaging."
+    },
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "The reference is primarily a deployment, ingestion, and database-recovery pipeline problem for Monte Carlo risk simulations, not a matching and counter-reconciliation algorithm."
+    },
+    {
+     "ref_id": "ours/official-p0-ledger-reconcile",
+     "verdict": "distinct",
+     "reason": "Although both reconcile financial records and handle duplicates, the reference is provider CSV import idempotency and identifier-linked refunds, while this task requires maximum-cardinality minimum-cost matching plus metric reset handling."
+    },
+    {
+     "ref_id": "ours/official-31ca491030e9",
+     "verdict": "distinct",
+     "reason": "The reference is a SQL window-function reporting fix for cumulative sums and ranks, with no record matching, eligibility optimization, or counter reconstruction."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.248
+    ],
+    [
+     "ours/official-15587ff53b0c",
+     0.212
+    ],
+    [
+     "ours/official-db27baf4dd3c",
+     0.199
+    ],
+    [
+     "ours/official-p0-ledger-reconcile",
+     0.181
+    ],
+    [
+     "ours/official-31ca491030e9",
+     0.179
+    ]
+   ],
+   "cost_usd": 0.0009274
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0027718
+}

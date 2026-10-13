@@ -1,0 +1,181 @@
+{
+ "blueprint": {
+  "slug": "meshpack-pipeline-redeployment",
+  "title": "Repair and Redeploy Meshpack",
+  "scenario": "An open-source maintainer is triaging a regression in Meshpack, a Node.js utility that turns sharded location data and polygon files into device-trip summaries for an offline mapping product. The container contains roughly 1,500 lines of JavaScript, deployment scripts, large representative data files, and a precompiled geometry helper used by the pipeline; the released deployment currently produces plausible but incorrect summaries on some datasets and performs poorly on large ones.",
+  "instruction_draft": "Repair and deploy Meshpack so `/usr/local/bin/meshpack --input DIR --zones FILE --output DIR` produces the documented `summary.json`, `zones.ndjson`, `errors.ndjson`, and `manifest.json` exactly for valid and invalid input data, with chronological cross-shard processing, correct polygon assignment, and no duplicate output after `--resume` recovery. On hidden generated datasets it must preserve all documented fields and totals, quarantine malformed records without aborting, reproduce the same outputs after an interrupted run, and process at least 100,000 input records per second on the provided single-CPU container.",
+  "requirements": [
+   "Deploy a working executable at `/usr/local/bin/meshpack` accepting `--input DIR --zones FILE --output DIR`.",
+   "Produce the documented `summary.json`, `zones.ndjson`, `errors.ndjson`, and `manifest.json` output files.",
+   "Produce exact documented summaries and totals for valid input data, including all documented fields.",
+   "Process records in chronological order across all input shards rather than relying on shard enumeration order.",
+   "Assign each valid location record to the correct polygon according to the documented geometry contract, including boundary and overlapping-polygon cases.",
+   "Quarantine malformed records in `errors.ndjson` with their documented reason and continue processing other records.",
+   "Support `--resume` after an interrupted run without duplicating records, trips, zone durations, or output lines.",
+   "Make a completed run and an interrupted-then-resumed run produce byte-for-byte identical output files.",
+   "Achieve at least 100,000 input records per second on hidden generated datasets in the supplied single-CPU container.",
+   "Keep the deployment self-contained and usable without network access or wall-clock-dependent behavior."
+  ],
+  "environment": [
+   "A Dockerfile based on `python:3.13-slim-bookworm`, with pinned apt packages including Node.js and no network access at verification time.",
+   "A JavaScript codebase of approximately 1,500 lines split among a CLI, shard reader, geometry client, sessionizer, aggregators, checkpoint writer, output publisher, and deployment scripts, plus unrelated tests and utilities.",
+   "Representative input data under `/opt/meshpack/data`: many NDJSON shard files whose records contain device ID, epoch, timestamp, latitude, longitude, event kind, and sequence metadata; shard filenames are intentionally not chronological.",
+   "Polygon definitions under `/opt/meshpack/data/zones.json`, including nested and overlapping polygons, points exactly on edges and vertices, clockwise and counterclockwise rings, and a longitude-wrap case.",
+   "A documented output schema in the repository describing trip boundaries, per-zone dwell totals, counts, rejected-record reasons, checksums, and manifest fields.",
+   "A precompiled, source-unavailable geometry helper at `/opt/meshpack/native/zoneprobe`, with a documented line protocol but stateful geometry loading and cache behavior that must be observed rather than inferred from source.",
+   "A release deployment is planted with a stale symlink and a broken checkpoint/output ordering path; the JavaScript implementation also has data-dependent failures when shards overlap in time, when an epoch changes, and when the geometry helper is reused across zone files.",
+   "A deterministic interruption harness and local baseline generator are included, along with enough data to expose common mistakes but not every hidden interaction."
+  ],
+  "internal_hint": "Begin by inspecting the deployment entry points, README/schema documents, data distributions, shard statistics, and the geometry helper protocol; run the existing CLI on small subsets while tracing timestamps, epoch transitions, helper requests, checkpoints, and emitted offsets. The important invariant is that a device's stream is ordered by `(epoch, timestamp, sequence)` after merging all shards, while a reset/epoch boundary closes the prior session; the helper also retains loaded polygon state, so the wrapper must explicitly establish the zone set for each run and correctly interpret its boundary result rather than treating a cached response as stateless. Refactor the pipeline into deterministic stages: validate/decode and quarantine records, externally or bounded-memory merge them, classify locations with a per-run geometry context, then sessionize and aggregate before atomically publishing outputs. Checkpoint only after durable stage output and record the merge position plus aggregate state, then make resume replay-safe. Investigate throughput with generated larger inputs: the existing per-record process spawning, repeated polygon serialization, and whole-history array accumulation must be replaced by a persistent helper session, cached geometry representation, and streaming aggregation. The reference solution is a deterministic shell script that first inventories files, probes the helper with crafted geometries and boundary points, runs fault-injection experiments, benchmarks each stage, and then applies and verifies the refactor.",
+  "trap": "A shallow repair can pass the visible sample by sorting each shard, using the first matching polygon, and rebuilding outputs from the beginning, but hidden data interleaves shards, repeats device IDs across epochs, exercises polygon boundaries and helper cache state, and interrupts after a checkpoint. Such a solution silently assigns records to the wrong trips or zones, double-counts on resume, or falls below the throughput threshold even though its sample summary looks reasonable.",
+  "tests": [
+   "The deployment test invokes `/usr/local/bin/meshpack --input DIR --zones FILE --output DIR` in a clean directory and checks that all four required output files exist, parse according to the documented schemas, and contain the expected reference results.",
+   "The correctness test generates fresh seeded NDJSON shards with randomized shard names and order, cross-shard timestamp interleaving, epoch changes, duplicate sequence values with documented tie rules, and malformed records; it compares summaries, zone assignments, quarantine reasons, checksums, and manifest values against an independent reference implementation.",
+   "The geometry test generates hidden polygon sets containing clockwise and counterclockwise rings, nested overlaps, edge/vertex points, and longitude-wrap polygons, then verifies exact per-record zone assignments and downstream dwell totals.",
+   "The state-isolation test runs multiple inputs and zone files through the same deployed process or repeated invocations and checks that geometry results do not leak across runs or depend on prior input.",
+   "The recovery test deterministically terminates Meshpack at several stage boundaries, including after partial shard consumption and after checkpoint publication, runs with `--resume`, and compares every output file byte-for-byte with an uninterrupted run while checking that no record or aggregate is duplicated.",
+   "The malformed-input test supplies bad JSON, missing fields, out-of-range coordinates, invalid timestamps, and unknown event kinds among valid records and verifies that processing continues and each rejected record appears once with the documented reason.",
+   "The performance test creates fresh hidden datasets of at least 500,000 records and measures end-to-end processing on the one-CPU container; the run must sustain at least 100,000 records per second while still passing the exact-output checks.",
+   "The offline deployment test removes network access, starts from a clean output directory, and verifies that the installed command resolves all dependencies from the image or deployed application and does not require the source checkout."
+  ],
+  "verifier_knob": {
+   "name": "minimum_records_per_second",
+   "value": 100000,
+   "effect": "Raising the threshold makes inefficient per-record helper calls, repeated sorting, and whole-history aggregation fail; lowering it permits more straightforward implementations while leaving the hidden correctness and recovery cases unchanged."
+  },
+  "expected_failure_modes": [
+   "The agent reads the JavaScript and patches the visible ordering bug without probing the stateful geometry helper.",
+   "The agent sorts records within each shard but never performs a global merge, causing plausible errors only when hidden shards overlap in time.",
+   "The agent groups only by device ID and misses epoch boundaries or deterministic sequence tie-breaking.",
+   "The agent treats polygon overlap or boundary results with a convenient first-match rule that disagrees with the documented precedence contract.",
+   "The agent implements resume by rerunning from the beginning and appending, producing duplicate summaries or non-identical manifests.",
+   "The agent fixes correctness by retaining all records or spawning a helper process for every point and misses the quantitative throughput bar.",
+   "The agent validates only the supplied data, which lacks the rare malformed, boundary, cache-isolation, and interruption combinations.",
+   "The agent repairs the application but leaves the deployment symlink or dependency resolution pointing at the stale release."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "data-pipeline",
+  "tags": [
+   "javascript",
+   "deployment",
+   "stream-processing",
+   "checkpoint-recovery",
+   "geospatial-data",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Inspect repository layout, README/schema, deployment scripts, and entry points.",
+   "Inspect shard statistics, zone definitions, sample outputs, and existing tests.",
+   "Read the CLI, shard reader, geometry client, sessionizer, aggregators, checkpoint writer, and publisher.",
+   "Run the existing CLI on a small subset and capture ordering, output schemas, and failure behavior.",
+   "Probe zoneprobe with crafted polygons, boundary points, overlapping zones, and repeated zone loads.",
+   "Trace helper requests, epoch transitions, timestamps, checkpoints, and emitted offsets on a small run.",
+   "Run the local baseline generator and compare its outputs with the current implementation.",
+   "Run the interruption harness at each available checkpoint boundary.",
+   "Generate a small cross-shard dataset with interleaved devices, epochs, duplicate sequences, and malformed records.",
+   "Patch deployment entry points and replace the stale symlink with the working executable.",
+   "Implement validation and deterministic quarantine reasons before downstream processing.",
+   "Implement a global bounded-memory or external merge ordered by epoch, timestamp, and sequence tie rules.",
+   "Refactor geometry access into a persistent per-run helper session with explicit zone initialization and cached representations.",
+   "Implement the documented boundary, overlap, ring-orientation, and longitude-wrap assignment rules.",
+   "Reset session state at epoch boundaries and preserve deterministic trip and dwell aggregation.",
+   "Replace whole-history accumulation with streaming aggregation and deterministic output ordering.",
+   "Redesign checkpoints to record durable stage output, merge position, and aggregate state.",
+   "Make resume replay-safe and publish all output files atomically in a deterministic order.",
+   "Run visible correctness, malformed-input, geometry, state-isolation, and recovery tests.",
+   "Benchmark generated large inputs, profile the slow stage, and remove per-record process spawning or repeated serialization.",
+   "Run the full interruption matrix and byte-compare every resumed output against a clean run.",
+   "Run the offline deployment test from a clean output directory without the source checkout.",
+   "Run the hidden-like 500,000-record benchmark and verify the 100,000-records-per-second threshold."
+  ],
+  "speedrun_commands": 23,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The 100,000-records-per-second end-to-end threshold may be hardware-, filesystem-, and container-scheduling-dependent on a one-CPU environment, especially when exact output and geometry classification are included.",
+   "Byte-for-byte clean-versus-resumed output is invalid if the documented schema permits unspecified ordering for equal epoch/timestamp/sequence keys, nondeterministic checksums, or run-specific manifest fields.",
+   "The geometry requirement is not independently verifiable from the blueprint unless the helper's boundary, overlap precedence, longitude-wrap, and cache-reset semantics are fully documented and testable through its line protocol.",
+   "The phrase 'same deployed process or repeated invocations' is ambiguous for a CLI that normally exits after one run; tests could accidentally require persistence behavior not stated by the interface.",
+   "The interruption harness needs a precise durability contract; terminating between filesystem operations can expose platform-specific atomic-rename or buffering behavior rather than application correctness.",
+   "The referenced documented schemas and tie rules are in the repository rather than the task statement, so missing, inconsistent, or underspecified repository documentation would make failures invalid."
+  ],
+  "verdict": "reject",
+  "reasons": "The end state and adversarial behaviors are mostly clear, and the problem is realistic and genuinely challenging. However, a complete global merge, stateful native-helper integration, streaming aggregation, crash-safe resume protocol, deployment repair, and 100,000-records-per-second optimization is unlikely to be solvable by a skilled engineer in under an hour, while the performance and byte-identity checks have several potential sources of invalid failure.",
+  "fixes": [
+   "Reduce the required scope or provide a stable pipeline scaffold and explicit extension points, leaving only two or three bugs for the solver to repair.",
+   "Include the complete output schema, equal-key ordering rules, geometry precedence/boundary contract, manifest determinism rules, and checkpoint durability semantics in the task materials.",
+   "Calibrate the performance threshold against repeated measurements on the exact verification container, pin CPU and storage conditions, and allow a measured tolerance or percentile-based criterion.",
+   "Define interruption points in terms of application-level durable checkpoints rather than arbitrary process termination between filesystem operations.",
+   "Clarify whether state isolation applies across one long-lived process, separate CLI invocations, or only repeated helper sessions.",
+   "Provide a protocol-level geometry-helper test fixture or a deterministic mock mode so cache and boundary behavior can be verified without relying on undocumented properties of a source-unavailable binary."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "distinct",
+     "reason": "Both require deterministic sharded processing and recovery, but this task centers on chronological location-trip aggregation and polygon geometry rather than transactional database replay."
+    },
+    {
+     "ref_id": "ours/official-94391df591b0",
+     "verdict": "distinct",
+     "reason": "Although both validate malformed records and impose a throughput target, this task additionally requires cross-shard temporal aggregation, geometry assignment, and resumable deterministic outputs."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "The reference is an event-revision and signature-classification SQLite rebuild, while this task is a spatial trip-summary pipeline with polygon semantics and resumable output."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The reference reconciles filesystem artifacts into an idempotent SQLite index using a scanner, whereas this task processes location records into spatial summaries and zone streams."
+    },
+    {
+     "ref_id": "ours/official-ee9176b9c4d1",
+     "verdict": "distinct",
+     "reason": "Despite shared concerns about malformed streams, ordering, deduplication, determinism, and performance, the candidate's core problem is spatial assignment and trip aggregation rather than incident-report decoding and analytics."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.19
+    ],
+    [
+     "ours/official-94391df591b0",
+     0.174
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.158
+    ],
+    [
+     "ours/official-982469e29790",
+     0.146
+    ],
+    [
+     "ours/official-ee9176b9c4d1",
+     0.143
+    ]
+   ],
+   "cost_usd": 0.0011458
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0036328000000000003
+}

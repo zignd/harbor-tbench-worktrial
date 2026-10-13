@@ -1,0 +1,189 @@
+{
+ "blueprint": {
+  "slug": "recover-quanta-batches",
+  "title": "Recover Quanta Batch Totals",
+  "scenario": "The finance analytics team reports that account totals from the Quanta settlement archive no longer add up after a storage transfer. The container contains several years of proprietary `.qsp` batch files, a partially implemented Python analytics package, documentation fragments, and a source-less vendor inspection executable used by the original ingestion service. Add a deterministic recovery utility that reconstructs the usable rows and produces corrected account totals.",
+  "instruction_draft": "qframe inspect data/incoming/2024-11-17.qsp\nframes=12 valid=9 damaged=3 rows=418\nanalytics/sum_batches.py: error: recovered total differs from trailer by 18446744069414584320\n\nThe Quanta settlement analyst needs the archived batch totals repaired. Implement `python3 recover.py INPUT.qsp OUTPUT.json` in `/workspace/quanta`.\n\nFor every recoverable input file, reconstruct all logically recoverable settlement rows, including rows in damaged frames, and write exactly one UTF-8 JSON object to `OUTPUT.json`. The object must map each account identifier to an object with integer fields `count`, `total_microcents`, and `checksum`; `checksum` is the unsigned 64-bit sum of the recovered row identifiers for that account modulo 2^64. Account keys must be emitted in lexicographic order, object keys must be emitted in the order `count`, `total_microcents`, `checksum`, and JSON numbers must not be floating point.\n\nUse the file's own metadata and recovery information rather than trusting its summary trailer. Preserve signed amounts, zero amounts, negative amounts, timestamps, row ordering within a frame, and duplicate account identifiers. A frame is usable only when its integrity and recovery conditions are satisfied; do not invent rows from an unrecoverable frame. For an input with no recoverable rows, write `{}`. Do not modify the input file, depend on network access, use wall-clock time, or require packages not already installed. The command must return exit status 0 for every recoverable archive and produce the same bytes for repeated runs.\n\nThe verifier will invoke your command on fresh generated `.qsp` files, not just the supplied examples, and will compare the parsed JSON result with an independent reference computation.",
+  "requirements": [
+   "Create `/workspace/quanta/recover.py` runnable as `python3 recover.py INPUT.qsp OUTPUT.json`.",
+   "Write exactly one UTF-8 JSON object to the requested output path.",
+   "Represent every account with integer fields `count`, `total_microcents`, and `checksum`.",
+   "Emit account keys lexicographically and fields in the order `count`, `total_microcents`, `checksum`.",
+   "Reconstruct every logically recoverable row, including recoverable rows from damaged frames.",
+   "Use archive metadata and recovery information instead of trusting summary trailers.",
+   "Preserve signed, zero, and duplicate amounts and account identifiers.",
+   "Preserve row ordering within each frame during reconstruction.",
+   "Compute `checksum` as the unsigned 64-bit sum of recovered row identifiers per account modulo 2^64.",
+   "Skip frames that fail their integrity or recovery conditions rather than inventing rows.",
+   "Write `{}` when an input has no recoverable rows.",
+   "Avoid modifying inputs, network access, wall-clock dependence, and undeclared packages.",
+   "Return status 0 on every recoverable archive and be byte-for-byte deterministic across repeated runs."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm`, with only pinned standard Python and small utility packages installed.",
+   "The workspace contains roughly 1,400 lines across a Python ingestion service, reporting scripts, fixtures, documentation fragments, and tests; only part of that code is relevant to the requested feature.",
+   "`data/incoming/` contains normal, damaged, empty, and multi-frame `.qsp` examples with misleading trailer totals and rare negative and zero-valued rows.",
+   "`format-notes/` documents the broad container layout and field names but omits several recovery details that can be learned by controlled experiments.",
+   "`bin/qframe` is a compiled, source-less vendor executable. It can inspect headers, validate frame integrity, print frame lengths and erasure counts, and report whether a frame is recoverable, but it does not print recovered settlement rows or account totals.",
+   "The binary uses a nonstandard finite-field parity/checksum implementation and a packed signed delta representation; its behavior can be characterized by making controlled copies of sample files and observing `qframe inspect` and `qframe validate` output.",
+   "The supplied Python package contains an existing fast path for intact frames and reporting code that appears plausible, but no complete recovery command.",
+   "Hidden verification generators create fresh archives with varying frame counts, row counts, account names, signed microcent amounts, timestamp deltas, duplicate accounts, empty frames, row identifiers near unsigned limits, frame permutations, and zero-valued fields.",
+   "The generators introduce zero, one, or multiple erasures in recoverable frames, checksum-valid but trailer-inconsistent archives, and unrecoverable frames that must be excluded. All generated archives remain within the documented resource limits."
+  ],
+  "internal_hint": "The intended path is investigative rather than a one-line patch. First inventory the package, format notes, fixtures, and `qframe` usage, then mutate copies of small archives one byte or bit at a time and compare inspection results. The container has a fixed header followed by independently coded frames; each frame carries a row-count/ordering section, packed signed delta-of-delta fields, and parity symbols over a prime finite field. Recovery is erasure recovery, not replacement with the trailer total: determine the number and positions of missing symbols, solve the corresponding Vandermonde equations in the field used by the vendor tool, then reverse the signed zigzag and delta layers in row order. A frame with too many erasures or a failed post-reconstruction integrity check must be discarded. The existing fast path also uses unsigned arithmetic for signed microcents and treats the summary trailer as authoritative, which explains the visible huge difference. The reference implementation should independently parse the container, reconstruct recoverable frames, aggregate exact integers modulo 2^64 only for the requested checksum, and serialize canonically.",
+  "trap": "A shallow solution can pass the supplied archive by reading intact rows and correcting the displayed trailer, or by handling only one missing symbol and using ordinary integer parity. Hidden archives include two- and three-erasure frames, negative deltas crossing zero, duplicate accounts, row identifiers that wrap 64-bit checksum arithmetic, empty frames, and trailers deliberately inconsistent with the reconstructed rows. Such solutions either silently produce plausible totals, recover rows in the wrong order, accept an invalid frame, or overflow signed values.",
+  "tests": [
+   "Run the command on supplied intact fixtures and compare the complete canonical JSON object, including counts, signed microcent totals, and per-account checksums.",
+   "Generate fresh archives with only intact frames, varied frame order, empty frames, zero amounts, negative amounts, duplicate accounts, and account names that sort differently from insertion order; compare output with the reference aggregator.",
+   "Generate fresh archives containing one recoverable erasure in each of several frame layouts and verify that reconstructed rows affect counts, totals, and checksums exactly.",
+   "Generate fresh archives containing multiple recoverable erasures requiring finite-field equation solving, including erasures in packed delta fields rather than only payload bytes.",
+   "Generate archives with signed delta and delta-of-delta values crossing zero, minimum and maximum representable field values, repeated timestamps, and row identifiers near the 64-bit checksum boundary.",
+   "Generate archives whose summary trailers are wrong but whose frame data and recovery metadata are valid; verify that the output follows recovered rows rather than trailer totals.",
+   "Generate archives with frames exceeding the recovery capability or failing post-reconstruction integrity checks; verify that those frames contribute no rows while other valid frames still aggregate.",
+   "Run repeated invocations on the same generated archive and compare output bytes and exit status to enforce deterministic canonical serialization.",
+   "Check that malformed or unrecoverable-but-well-formed archives do not cause invented rows or nonzero status when the archive otherwise contains recoverable frames.",
+   "Run a larger generated corpus with thousands of rows and many frames to catch state leakage between frames and accidental dependence on the supplied sample files."
+  ],
+  "verifier_knob": {
+   "name": "generated_archive_count_and_recovery_variety",
+   "value": "240 archives per verification run, with 1-24 frames each; 35% contain multi-erasure recoverable frames, 20% contain unrecoverable frames, and edge-value rows occur in 15% of archives",
+   "effect": "Lowering it makes sample-driven implementations more likely to pass because most inputs contain intact or single-erasure frames. Raising it increases the chance of exposing incorrect finite-field recovery, signed delta handling, frame-state leakage, trailer dependence, and 64-bit checksum mistakes while keeping the reference computation deterministic."
+  },
+  "expected_failure_modes": [
+   "The agent reads only the visible Python code and never experimentally characterizes the source-less vendor executable.",
+   "The agent implements ordinary XOR or integer parity instead of the vendor's finite-field erasure recovery.",
+   "The agent reconstructs payload bytes but fails to reverse packed signed delta and delta-of-delta encoding in the correct order.",
+   "The agent trusts the summary trailer because it matches the visible healthy sample.",
+   "The agent handles one erasure but not multiple erasures or rejects frames that are still recoverable.",
+   "The agent uses unsigned decoding for signed microcent or timestamp deltas.",
+   "The agent aggregates by account while accidentally dropping duplicate rows or changing frame-local row order.",
+   "The agent computes checksums with Python or signed overflow semantics different from modulo 2^64.",
+   "The agent accepts a frame after algebraic reconstruction without performing the required integrity check.",
+   "The agent makes a shallow test run against the supplied files and misses rare generated edge cases.",
+   "The agent attempts to call the opaque executable as a complete decoder even though it intentionally exposes no recovered rows and hidden verification supplies fresh files.",
+   "The agent modifies or normalizes input files during repair, causing later frames or repeated runs to differ."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "file-format-recovery",
+  "tags": [
+   "python",
+   "binary-format",
+   "finite-fields",
+   "fuzz-equivalence",
+   "opaque-binary",
+   "edge-cases"
+  ]
+ },
+ "accepted": true,
+ "review": {
+  "speedrun": [
+   "cd /workspace/quanta && find . -maxdepth 3 -type f | sort",
+   "sed -n '1,240p' format-notes/*",
+   "grep -RIn \"qsp\\|qframe\\|parity\\|delta\\|trailer\" --exclude-dir=.git .",
+   "sed -n '1,260p' analytics/sum_batches.py && find . -name '*.py' -maxdepth 4 -print",
+   "find data/incoming -name '*.qsp' -print",
+   "bin/qframe inspect data/incoming/2024-11-17.qsp && bin/qframe validate data/incoming/2024-11-17.qsp",
+   "xxd -g1 -l 512 data/incoming/2024-11-17.qsp",
+   "run the existing intact-frame parser/reporting code on every supplied fixture and compare it with qframe output",
+   "copy small fixtures into /tmp and flip one byte at a time, recording qframe inspect and validate changes",
+   "map the fixed header, frame boundaries, row-count sections, erasure markers, trailers, and parity regions",
+   "use intact rows and parity observations to identify symbol width, signed packing, and the vendor finite field",
+   "construct one- and multi-erasure equations from controlled mutations and verify Vandermonde orientation and field arithmetic",
+   "inspect the remaining package/tests for integrity and post-reconstruction validation rules",
+   "create recover.py with independent header and frame parsing, avoiding the misleading trailer totals",
+   "implement finite-field inversion and multi-erasure Vandermonde solving",
+   "implement packed signed zigzag and delta/delta-of-delta decoding in frame row order",
+   "reconstruct only frames whose erasure count and integrity checks pass; discard failed frames",
+   "aggregate duplicate account rows with exact signed integers and modulo-2^64 identifier checksums",
+   "serialize ordered account keys and count,total_microcents,checksum fields as deterministic UTF-8 JSON",
+   "run recover.py against all supplied fixtures and compare complete parsed results",
+   "make local mutated one-, two-, and three-erasure fixtures and compare recovered rows with intact originals",
+   "test negative, zero, duplicate, boundary identifier, timestamp-crossing, empty-frame, and wrong-trailer cases",
+   "test frame permutations, invalid frames, mixed valid/invalid archives, and archives with no recoverable rows",
+   "repeat each invocation and compare output bytes and exit status",
+   "run the supplied test suite and a larger local corpus, then inspect the final diff for input modification or undeclared dependencies"
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 5,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact behavior required for a wholly malformed archive or an archive with no recoverable frames is not fully specified, beyond the mixed-archive case.",
+   "The instruction relies on undocumented qframe output and on format details being inferable from experiments; if the supplied notes or executable do not expose enough independent observations, the task may be underdetermined.",
+   "The phrase \"exactly one UTF-8 JSON object\" does not specify whitespace or trailing-newline policy, although the stated verifier appears to compare parsed JSON and repeated bytes rather than a fixed canonical byte spelling.",
+   "A hidden test could incorrectly require behavior for malformed inputs that is not stated, such as a particular exit status or output file contents when the header itself cannot be parsed."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a deterministic observable contract and strong fuzz-equivalence tests that cover the principal shallow solutions. Its difficulty comes from genuine reverse engineering and finite-field recovery rather than merely obscure edge-case formatting, although completing the investigation and implementation within an hour is demanding. The main weakness is that some malformed-input and recovery-condition behavior is delegated to undocumented artifacts, so solvability is only moderate.",
+  "fixes": [
+   "State the required behavior when the entire archive is malformed or contains no recoverable frames, including whether an output file must still be written and what exit status is required.",
+   "Document the qframe command/output version and provide a concise example of inspect and validate output for an archive with multiple erasures.",
+   "Clarify whether a trailing newline and JSON whitespace are permitted, or explicitly define the canonical serialization separators and escaping policy.",
+   "Specify the resource and time expectations for the largest generated archive so implementations can choose an appropriate parsing strategy."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Although both involve settlement archives and damaged binary frames, this task centers on reverse-engineering Quanta recovery metadata and reconstructing rows and account totals rather than decrypting and reconciling authenticated batches."
+    },
+    {
+     "ref_id": "ours/official-e2bf5b4dd194",
+     "verdict": "distinct",
+     "reason": "This task performs binary archive recovery and aggregation, whereas the reference performs timestamp-constrained global matching between SQLite ledger and bank events."
+    },
+    {
+     "ref_id": "ours/official-d19257a8f76d",
+     "verdict": "distinct",
+     "reason": "This task is a deterministic file-recovery and totals utility, not a stateful line-oriented replay service with request validation and trace parsing."
+    },
+    {
+     "ref_id": "ours/official-15587ff53b0c",
+     "verdict": "distinct",
+     "reason": "This task reconstructs recoverable settlement rows from damaged proprietary files, while the reference implements exact-arithmetic CSV allocation and packaging."
+    },
+    {
+     "ref_id": "ours/official-aa07807ed980",
+     "verdict": "distinct",
+     "reason": "Both address data correctness and duplicate handling, but this task requires format recovery from damaged frames rather than fixing chunked CSV ETL deduplication and rejection handling."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-33004981f7b0",
+     0.211
+    ],
+    [
+     "ours/official-e2bf5b4dd194",
+     0.17
+    ],
+    [
+     "ours/official-d19257a8f76d",
+     0.158
+    ],
+    [
+     "ours/official-15587ff53b0c",
+     0.151
+    ],
+    [
+     "ours/official-aa07807ed980",
+     0.144
+    ]
+   ],
+   "cost_usd": 0.0009296
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0037472
+}

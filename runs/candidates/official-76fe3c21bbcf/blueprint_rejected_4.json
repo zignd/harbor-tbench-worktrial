@@ -1,0 +1,194 @@
+{
+ "blueprint": {
+  "slug": "repair-cidr-score-importer",
+  "title": "Repair the CIDR Score Importer",
+  "scenario": "A security analyst's traffic numbers stopped adding up after a policy refresh, and the nightly score import now disagrees with both the raw feed and the SQLite policy database. The container holds an in-house Bash importer, its SQLite database, policy-building utilities, fixtures, and reporting helpers; some components are deliberately unrelated noise.",
+  "instruction_draft": "The analyst needs `/opt/score/bin/import-feed` repaired. It must read `/opt/score/incoming/events.tsv`, retain every valid event exactly once in `/opt/score/score.db`, quarantine every invalid event in `/opt/score/quarantine.tsv` without executing or interpreting input, and classify each retained IP using the database's IPv4 and IPv6 CIDR rules: choose the longest matching prefix, then highest priority, then lowest rule id, with `allow` and `deny` decisions both reportable. Generate `/opt/score/report.tsv` with one deterministic row per tenant and decision containing event count and byte sum, and produce identical database, quarantine, and report results when an interrupted import is rerun.\n\nThe TSV format is exactly `event_id<TAB>tenant<TAB>ip<TAB>bytes<TAB>labels`; event and tenant names are 1\u201332 ASCII letters, digits, `_`, or `-`, bytes are decimal unsigned integers no greater than 9223372036854775807, IPs may be valid IPv4 or IPv6 text, and labels are a comma-separated list of 0\u201316 ASCII names matching `[A-Za-z0-9_.-]{0,24}`. Reject malformed lines, duplicate event ids, noncanonical field counts, control characters, and invalid IP spellings; preserve valid labels and fields in the events table. The importer must process 100,000 valid events in under 5 seconds on the supplied container, use a single consistent SQLite update, sort report rows by tenant and then decision using bytewise order, and never invoke a shell, SQL fragment, or command substitution derived from the feed.",
+  "requirements": [
+   "Repair `/opt/score/bin/import-feed`.",
+   "Read `/opt/score/incoming/events.tsv` using the exact five-field TSV format.",
+   "Retain every valid event exactly once in `/opt/score/score.db`.",
+   "Quarantine every invalid event in `/opt/score/quarantine.tsv`.",
+   "Do not execute or interpret any input-derived shell, SQL, or command-substitution text.",
+   "Validate event and tenant names as 1\u201332 ASCII letters, digits, underscore, or hyphen.",
+   "Validate bytes as an unsigned decimal integer no greater than 9223372036854775807.",
+   "Accept valid IPv4 and IPv6 text and reject invalid IP spellings.",
+   "Validate labels as zero to sixteen comma-separated ASCII names matching `[A-Za-z0-9_.-]{0,24}`.",
+   "Reject malformed field counts, duplicate event ids, control characters, and other invalid lines.",
+   "Preserve valid labels and fields in the events table.",
+   "Classify every retained IP using IPv4 and IPv6 CIDR rules from the SQLite database.",
+   "Select the longest matching CIDR prefix.",
+   "Break equal-prefix matches by highest priority and then lowest rule id.",
+   "Report both allow and deny decisions.",
+   "Generate one deterministic report row per tenant and decision containing event count and byte sum.",
+   "Sort report rows by tenant and then decision using bytewise order.",
+   "After interruption and rerun, produce the same database, quarantine, and report state as an uninterrupted import.",
+   "Process 100,000 valid events in under five seconds on the supplied container.",
+   "Never invoke a shell, SQL fragment, or command substitution derived from the feed."
+  ],
+  "environment": [
+   "Use `FROM python:3.13-slim-bookworm` with pinned apt packages including sqlite3, gcc, and coreutils; no network access is needed.",
+   "Install an approximately 1,400-line in-house project under `/opt/score`, mostly consisting of policy generation, report display, fixture loading, and diagnostic code.",
+   "Provide `/opt/score/bin/import-feed`, a Bash program that currently parses records, consults SQLite, writes a quarantine file, and builds a report, with several interacting defects in validation, CIDR matching, transaction boundaries, and restart handling.",
+   "Provide `/opt/score/score.db` containing `rules`, `events`, and metadata tables with overlapping IPv4 and IPv6 policies, equal-prefix priorities, and boundary addresses.",
+   "Provide `/opt/score/incoming/events.tsv` with ordinary examples, duplicate ids, malformed rows, SQL and shell metacharacters, CRLF cases, IPv4 boundary values, compressed IPv6 forms, and large byte values.",
+   "Provide `/opt/score/quarantine.tsv` and `/opt/score/report.tsv` as initial stale outputs that must be replaced.",
+   "Provide policy and reporting helpers, tests, README fragments, and generated fixture tools as realistic distractors; not all code under `/opt/score` participates in the import path.",
+   "Provide a deterministic interruption hook used by verification to terminate the importer during a large import, without relying on wall-clock time or randomness.",
+   "Include a corpus generator used only by verification to create fresh benign and malicious records, fresh overlapping rules, and fresh duplicate arrangements."
+  ],
+  "internal_hint": "Start by tracing the actual import path with sqlite3 tracing, strace, and runs against copied databases rather than trusting the sample report. The existing parser has data-dependent shell-word and delimiter behavior, the SQL path interpolates fields, and the classifier effectively depends on rule scan order instead of longest-prefix/priority ordering; signed arithmetic also corrupts large byte totals. The checkpoint and output writers can expose partially committed state after termination, especially when duplicate ids occur late in a batch. A robust repair is to parse with an explicit byte-oriented validator, canonicalize addresses into comparable packed values or safe SQLite parameters, perform classification with a set-based or indexed query that implements the complete tie-break order, load accepted rows and quarantine records in one controlled transaction, and atomically replace derived report/quarantine outputs. Measure the 100,000-row case while investigating so per-record sqlite3 process startup or quadratic rule scans are eliminated.",
+  "trap": "A shallow repair that quotes SQL and fixes the visible examples still fails on overlapping CIDRs where the first matching rule is not authoritative, IPv4 versus IPv4-mapped IPv6 boundaries, duplicate ids separated by thousands of lines, 9223372036854775807-byte values, labels containing commas or control characters, and a malicious field beginning with shell syntax. A solution that commits batches or writes the report incrementally can pass a clean run but leave events, quarantine, and report inconsistent after the verifier kills it. Per-line sqlite3 calls or scanning every rule for every event also exceed the performance bar.",
+  "tests": [
+   "Run the supplied fixture and compare the events table, quarantine rows, and report rows against a deterministic reference; this checks the exact five-field format, validation rules, preservation of valid fields, duplicate rejection, classification, aggregation, and bytewise ordering.",
+   "Generate fresh benign and malicious TSV records, including shell metacharacters, SQL syntax, embedded control bytes, CRLF, invalid UTF-8-adjacent bytes, empty labels, oversized numbers, malformed IPs, and duplicate ids; this checks that all bad records are rejected and all good records are retained without execution or injection.",
+   "Generate fresh IPv4 and IPv6 rule sets with overlapping prefixes, equal-prefix priorities, rule-order permutations, boundary addresses, and both decisions; this checks longest-prefix matching followed by priority and rule-id tie breaks rather than accidental insertion-order behavior.",
+   "Generate 100,000 valid events across many tenants and rules and measure `/opt/score/bin/import-feed`; this checks the stated five-second performance threshold and catches per-record process startup and quadratic classification.",
+   "Terminate an import at several deterministic progress points, restore the same input and database snapshot, rerun it, and compare SQLite contents plus both output files with a clean reference run; this checks atomicity, idempotence, and recovery from interruption.",
+   "Run the importer twice without changing input and verify that no counts, rows, quarantine entries, or report ordering change; this checks exactly-once behavior.",
+   "Inspect process execution during malicious-corpus tests and verify that no input-derived command or SQL fragment is executed; this checks the explicit injection-safety requirement."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_size_and_coverage",
+   "value": "The hidden verifier generates 6,000 records per ordinary case and 100,000 records for performance cases, with roughly 40 percent malformed or adversarial inputs and 30 percent overlapping-policy edge cases.",
+   "effect": "Lowering the corpus size or removing IPv6, duplicate-order, interruption, and injection cases makes naive fixes more likely to pass. Raising corpus size, rule overlap density, and the frequency of late duplicate or termination cases exposes parser state errors, order-dependent matching, unsafe interpolation, and slow implementations."
+  },
+  "expected_failure_modes": [
+   "Treating TSV fields with Bash word splitting or command substitution, causing whitespace, globbing, CRLF, or injection failures.",
+   "Using SQL string interpolation instead of bound values, allowing malformed input to alter queries or escape validation.",
+   "Implementing CIDR matching with first-match or last-match semantics instead of the required three-level ordering.",
+   "Handling IPv4 only, mishandling compressed IPv6, or confusing IPv4-mapped IPv6 with ordinary IPv4.",
+   "Using signed shell arithmetic or floating-point conversion for the maximum permitted byte value.",
+   "Checking duplicate ids only within a batch rather than against the existing database and the full input.",
+   "Committing partial batches or replacing only one derived output after an interruption.",
+   "Invoking sqlite3 once per record or performing an unindexed full rule scan for every event.",
+   "Trusting the visible fixture and missing generated control bytes, boundary prefixes, reordered rules, and late duplicates.",
+   "Producing locale-dependent or insertion-order-dependent report sorting."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "bash",
+   "sqlite",
+   "cidr",
+   "input-validation",
+   "transaction-recovery",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List /opt/score, inspect the importer entrypoint, and identify the actual import path.",
+   "Read /opt/score/bin/import-feed and the relevant README, schema, and fixture-loading utilities.",
+   "Inspect the SQLite schema, indexes, metadata, rules, and existing events with sqlite3.",
+   "Inspect report and quarantine helpers to determine their current serialization and ordering.",
+   "Run the supplied fixture against copies of the database and outputs to reproduce the failures.",
+   "Trace the importer with sqlite3 tracing and strace to locate shell expansion, SQL interpolation, and per-row process startup.",
+   "Determine the interruption hook and existing restart/checkpoint behavior.",
+   "Design a byte-oriented validator for exact five-field TSV records, explicit duplicate handling, and safe CRLF treatment.",
+   "Implement parsing, validation, CIDR matching, aggregation, and bound SQLite access in one efficient Python helper invoked by the Bash entrypoint.",
+   "Use packed IP values or a safe indexed/set-based classification query implementing prefix, priority, and rule-id ordering.",
+   "Load accepted events and quarantine rows in one controlled SQLite transaction, with deterministic temporary output files and recovery-safe replacement.",
+   "Make the importer idempotently rebuild or reconcile the import state and derived outputs on every run.",
+   "Mark the replacement executable and run it on the supplied fixture.",
+   "Query events, quarantine, and report outputs and compare them with the supplied reference behavior.",
+   "Exercise generated malicious records, control bytes, CRLF, large byte values, malformed IPs, labels, and duplicate arrangements.",
+   "Exercise reordered overlapping IPv4/IPv6 rules and boundary addresses, including both allow and deny decisions.",
+   "Run deterministic interruption tests, rerun from the restored snapshot, and compare all database and output state with a clean run.",
+   "Generate and benchmark 100,000 events, then run the importer twice and inspect process execution for input-derived commands or SQL."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 3,
+   "solvability": 3,
+   "verifiability": 3,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The required serialization of quarantine rows is not specified: it is unclear whether the original raw line, normalized line, reason, and original CRLF must be preserved.",
+   "The behavior of existing rows in the events table is ambiguous. In particular, rerunning against a database already containing imported event ids conflicts with rejecting duplicate ids unless the importer is explicitly a rebuild, reconciliation, or upsert operation.",
+   "The exact policy for duplicate occurrences is unspecified: whether the first occurrence is retained and later occurrences quarantined, or all occurrences are rejected, is left to the reference implementation.",
+   "CRLF handling conflicts with the blanket rejection of control characters unless terminal CRLF is explicitly permitted while embedded carriage returns are rejected.",
+   "The label grammar permits empty names through the stated zero-length regular expression, while the phrase comma-separated list and the mention of empty labels suggest a different intended rule.",
+   "IPv4-mapped IPv6 behavior is hinted at in the trap but is not explicitly defined for matching against ordinary IPv4 rules or IPv6 rules.",
+   "The interruption-hook interface and exact kill points are not specified, making recovery tests potentially implementation-dependent.",
+   "The five-second threshold may be sensitive to container load, SQLite configuration, fixture generation, and whether verification includes output and database reset overhead.",
+   "Pinned apt packages are requested, but exact package versions and an offline package source are not specified despite the no-network build requirement.",
+   "The task is likely easier than intended because the defects are visible in the supplied source; the stated Opus speedrun evidence caps genuine difficulty at 2."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and technically rich, but several externally observable semantics needed by the verifier are underspecified, especially duplicate handling, preexisting database rows, output serialization, CRLF treatment, and IPv4-mapped IPv6 classification. More importantly, the measured source-visible speedrun indicates that a strong agent can solve the task in roughly 20 commands, so genuine difficulty is 2 and the acceptance threshold is not met.",
+  "fixes": [
+   "Specify whether each import rebuilds the events table from the input or merges into existing rows, and define idempotence and duplicate behavior across reruns and preexisting data.",
+   "Define the exact quarantine TSV format, including whether it contains raw bytes, normalized lines, rejection reasons, and line terminators.",
+   "State explicitly that terminal LF or CRLF is accepted, while all other control bytes are rejected, and define handling of invalid UTF-8 bytes.",
+   "Resolve the label grammar by explicitly stating whether empty labels or empty comma-separated elements are valid.",
+   "Define IPv4-mapped IPv6 matching semantics and the address representation used for rule comparison.",
+   "Specify the interruption hook, deterministic progress points, transaction/recovery contract, and whether temporary files may remain after termination.",
+   "Pin concrete Debian package versions or provide an offline apt cache so the build specification is reproducible.",
+   "To raise genuine difficulty, move the key defect locations behind less obvious code paths or require recovery across a more realistic multi-stage import, while retaining a clear public behavioral specification."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-a111d7f89576",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a TSV-to-SQLite importer with CIDR classification and aggregation, whereas this task exports policy decisions for authorization requests using temporal and tenant-scoped policy resolution."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124",
+     "verdict": "distinct",
+     "reason": "Although both involve validated ingestion, deduplication, deterministic reruns, and reporting, the candidate centers on CIDR rule matching and SQLite score aggregation while this task reconstructs sessions from recursive JSON logs."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "distinct",
+     "reason": "The candidate performs feed validation and network-policy classification, while this task verifies cryptographic audit chains and emits only events in authenticated contiguous histories."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f-m",
+     "verdict": "distinct",
+     "reason": "The candidate is an idempotent event importer with CIDR precedence and quarantine handling, not an authorization-policy query preserving temporal decision semantics."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576-m",
+     "verdict": "distinct",
+     "reason": "Despite shared SQLite and deterministic precedence concerns, the candidate imports and aggregates network events whereas this task exports per-request authorization results under policy validity and scope rules."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-a111d7f89576",
+     0.177
+    ],
+    [
+     "ours/official-37d13d3e2124",
+     0.174
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.174
+    ],
+    [
+     "ours/official-371a54d3de9f-m",
+     0.174
+    ],
+    [
+     "ours/official-a111d7f89576-m",
+     0.167
+    ]
+   ],
+   "cost_usd": 0.0011802
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0048186
+}

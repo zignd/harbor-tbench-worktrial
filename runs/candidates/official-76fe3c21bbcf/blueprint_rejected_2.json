@@ -1,0 +1,199 @@
+{
+ "blueprint": {
+  "slug": "recover-signed-event-ledger",
+  "title": "Recover the Signed Event Ledger",
+  "scenario": "The security analytics team\u2019s daily account totals stopped matching the raw event spool after an import outage. You have inherited a SQLite-backed reconciliation utility, several thousand historical event records, and a small opaque signature-checking helper; some records are hostile input rather than ordinary data.",
+  "instruction_draft": "The analyst needs `/workspace/bin/reconcile.sh` repaired so that it can safely rebuild `/var/lib/reconcile/events.sqlite` from `/var/spool/reconcile`. The program must be a directly executable Bash program accepting an optional input directory and database path, must never execute record data as shell or SQL, and must finish with a consistent database even when files are shuffled, truncated, duplicated, or contain malformed and malicious lines.\n\nEach record is one UTF-8 line with seven `|`-separated fields: `seq|kind|account|cents|nonce|prev|mac`. Fields use only literal `[A-Za-z0-9._~:/-]` bytes or `%HH` escapes; decode escapes exactly once and reject malformed escapes, decoded NULs, controls, separators, and non-UTF-8 data. `kind` is `credit` or `debit`, `account` is 1\u201348 decoded bytes matching `[A-Za-z0-9][A-Za-z0-9._:/-]*`, `cents` is a positive decimal integer no longer than 10 digits, `nonce` is exactly 32 lowercase hexadecimal characters, `prev` is 64 lowercase hexadecimal characters, and `mac` authenticates the canonical decoded string `seq\\nkind\\naccount\\ncents\\nnonce\\nprev` with the key in `/opt/reconcile/secret.key` using HMAC-SHA256. Accept only a single unambiguous chain rooted at sequence 1 with an all-zero `prev`, require every later sequence to increment by one and reference the prior record hash, reject forks, gaps, cycles, bad signatures, duplicates, and all malformed records, and import every valid record even when input order is arbitrary. Processing must be idempotent, must leave valid records from a bad file intact, must atomically recover from an interrupted run, and must produce balances and totals that exactly reflect accepted credits and debits. It must process a verify-time corpus of at least 50,000 records in under 10 seconds on the supplied one-CPU container.",
+  "requirements": [
+   "Provide a directly executable `/workspace/bin/reconcile.sh` written as a Bash entry point.",
+   "Accept an optional input directory and database path while defaulting to `/var/spool/reconcile` and `/var/lib/reconcile/events.sqlite`.",
+   "Parse records as exactly seven pipe-separated fields: `seq|kind|account|cents|nonce|prev|mac`.",
+   "Allow only literal `[A-Za-z0-9._~:/-]` bytes and valid `%HH` escapes in encoded fields.",
+   "Decode percent escapes exactly once and reject malformed escapes, decoded NUL bytes, control characters, separators, and invalid UTF-8.",
+   "Accept only `credit` and `debit` kinds.",
+   "Accept accounts of 1\u201348 decoded bytes matching `[A-Za-z0-9][A-Za-z0-9._:/-]*`.",
+   "Accept only positive decimal cents values with at most 10 digits.",
+   "Require a 32-character lowercase hexadecimal nonce.",
+   "Require a 64-character lowercase hexadecimal previous hash.",
+   "Verify HMAC-SHA256 over the canonical decoded payload `seq\\nkind\\naccount\\ncents\\nnonce\\nprev` using `/opt/reconcile/secret.key`.",
+   "Accept only one unambiguous chain rooted at sequence 1 with an all-zero previous hash.",
+   "Require each subsequent sequence number to increment by one and reference the hash of the preceding accepted record.",
+   "Reject malformed records, bad MACs, duplicate records, duplicate sequence numbers, forks, gaps, cycles, and records that are not part of the rooted chain.",
+   "Import valid records despite arbitrary file and line ordering.",
+   "Keep valid records from a file containing invalid records.",
+   "Make repeated runs produce no duplicate rows or changed totals.",
+   "Use atomic recovery so an interrupted run cannot leave a partially updated ledger or inconsistent derived tables.",
+   "Populate the database\u2019s event, balance, and totals state consistently with the accepted chain.",
+   "Never interpret event contents as shell syntax or interpolate them into executable SQL.",
+   "Process at least 50,000 verify-time records in under 10 seconds on the supplied one-CPU container."
+  ],
+  "environment": [
+   "Build from `python:3.13-slim-bookworm` with pinned apt packages including Bash, SQLite, OpenSSL, coreutils, and a UTF-8 locale; no network is needed.",
+   "Create roughly 1,400 lines across Bash utilities, SQLite schema/migration files, configuration, fixture generators, and unrelated analyst reporting code so the defect requires investigation.",
+   "Install `/workspace/bin/reconcile.sh`, an existing partially functioning Bash orchestrator that uses unsafe shell splitting, a lexical file-order assumption, and per-record database commits.",
+   "Provide an opaque compiled helper `/opt/reconcile/sigcheck` that verifies the supplied HMAC convention but exposes no source.",
+   "Provide `/opt/reconcile/secret.key` with a deterministic test key.",
+   "Create `/var/lib/reconcile/events.sqlite` with a historical accepted prefix, derived balance tables, import journal rows, and a deliberately interrupted-run marker.",
+   "Create `/var/spool/reconcile` containing shuffled historical files with valid records, malformed lines, duplicate records, bad signatures, shell metacharacters, SQL-looking account names, invalid percent encodings, truncated final lines, and records that exercise chain forks and gaps.",
+   "Include README and schema documentation describing the record format, table names, and expected operational commands, but do not identify the planted implementation defects.",
+   "Provide deterministic fixture-generation code used by verification to create fresh corpora with different chain lengths, file partitions, ordering, malicious fields, duplicate placement, and interruption points."
+  ],
+  "internal_hint": "The reference solution first inventories the schema, journal, fixture generator, and the black-box signature helper, then runs the existing script against reordered and adversarial fixtures while tracing SQLite transactions and shell expansions. The durable fix is a Bash-controlled staged importer: collect and strictly frame lines without `eval` or lossy shell splitting, percent-decode and validate bytes, verify HMAC and record hashes, stage candidates in SQLite using bound or safely generated data, resolve the rooted unique chain independent of file order, quarantine everything else, and commit the event plus derived tables in one transaction. Recovery must inspect and reconcile the journal marker before accepting new work, and bulk staging/one transaction is needed for the performance bar. The key difficulty is not visible by reading one file: malformed records, shuffled state, interrupted history, fork interactions, and scale expose different failures only when the system is exercised.",
+  "trap": "A shallow solution often validates only the visible sample, trusts file order, or uses `IFS='|' read` and `printf` in ways that mishandle escaped separators, blank fields, trailing data, or control bytes. Another common solution accepts every correctly signed record and merely sorts by sequence, thereby admitting a signed fork or descendant of a gap. Per-line SQLite calls pass small tests but exceed the performance limit, while committing each file or updating balances before chain resolution leaves duplicate or inconsistent totals after a rerun or simulated interruption.",
+  "tests": [
+   "Run the repaired command on the supplied database and spool, then compare event rows, balances, totals, quarantine classifications, and journal state with the deterministic reference state.",
+   "Run the same import twice and verify that event cardinality, hashes, balances, totals, and journal state are byte-for-byte unchanged.",
+   "Generate fresh corpora with files and lines randomly shuffled and verify that every record on the unique rooted chain is imported regardless of presentation order.",
+   "Generate malformed percent escapes, double escapes, encoded separators, controls, NULs, invalid UTF-8, invalid account names, invalid kinds, invalid cents, and invalid nonce/hash syntax and verify that all are rejected without altering accepted rows.",
+   "Generate records containing shell substitutions, command substitutions, semicolons, SQL comments, quotes, wildcard characters, and newline-like encodings and verify that none execute or alter SQLite schema/data.",
+   "Generate correctly signed records with duplicate hashes, duplicate sequence numbers, forks, missing predecessors, cycles, bad roots, and descendants of invalid branches and verify that all non-chain records are rejected.",
+   "Place valid and invalid records in the same file and verify that valid chain records remain imported while invalid records are quarantined.",
+   "Start the importer after writing an interrupted-run marker and partially populated staging tables, then verify deterministic recovery without double counting or loss.",
+   "Interrupt or simulate failure at each documented journal phase and rerun; verify atomic final event, balance, totals, and journal state.",
+   "Generate verify-time corpora of at least 50,000 records with rare malformed and fork cases, and require completion in under 10 seconds on the one-CPU container.",
+   "Check that the final database satisfies the documented foreign-key, uniqueness, chain-continuity, and balance-sum invariants using independent SQL queries."
+  ],
+  "verifier_knob": {
+   "name": "corpus_size_and_adversarial_coverage",
+   "value": "50,000 baseline records, with 10% malformed or hostile lines, shuffled partitions, duplicate/fork cases, and four deterministic interruption points",
+   "effect": "Increasing corpus size makes per-record subprocesses and SQLite commits fail the time bar; increasing coverage of escaping, Unicode, fork, recovery, and mixed-validity cases defeats shallow parsers and sample-specific fixes. Lowering either produces a smaller, less representative test that mostly checks ordinary chain reconstruction."
+  },
+  "expected_failure_modes": [
+   "Treating percent-encoded data as already canonical or decoding it more than once.",
+   "Using shell evaluation, word splitting, command substitution, or unsafe temporary-file handling on attacker-controlled fields.",
+   "Building SQL with string interpolation instead of safe parameterization or equivalent robust staging.",
+   "Assuming files and records arrive in sequence order.",
+   "Accepting all validly signed records without enforcing a unique rooted chain.",
+   "Silently accepting forks, gaps, duplicate sequence numbers, or descendants of invalid records.",
+   "Rejecting an entire file when it contains one bad line and thereby losing valid events.",
+   "Leaving derived balances inconsistent after a crash between event insertion and aggregation.",
+   "Failing to make retries idempotent because hashes or journal rows are not unique.",
+   "Using external processes per record and missing the stated throughput threshold.",
+   "Passing visible fixtures while mishandling trailing empty fields, final lines without newlines, non-ASCII bytes, or embedded control characters.",
+   "Repairing the initial database but failing on fresh verify-time generated corpora."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "bash",
+   "sqlite",
+   "adversarial-parser",
+   "hash-chain",
+   "crash-recovery",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "`find /workspace /opt/reconcile /var/lib/reconcile /var/spool/reconcile -maxdepth 3 -type f -printf '%p\\n' | sort`",
+   "`sed -n '1,240p' /workspace/bin/reconcile.sh`",
+   "`find /workspace -type f \\( -name '*.sql' -o -name '*.md' -o -name '*.conf' \\) -exec sh -c 'echo ===$1; sed -n \"1,240p\" \"$1\"' _ {} \\;`",
+   "`sqlite3 /var/lib/reconcile/events.sqlite '.tables'`",
+   "`sqlite3 /var/lib/reconcile/events.sqlite '.schema'`",
+   "`sqlite3 /var/lib/reconcile/events.sqlite 'select * from import_journal; select * from sqlite_master;'`",
+   "`file /opt/reconcile/sigcheck; /opt/reconcile/sigcheck --help || true`",
+   "`grep -R \"sigcheck\\|HMAC\\|record hash\\|quarantine\" -n /workspace /opt/reconcile`",
+   "`find /workspace -type f -iname '*fixture*' -o -iname '*generate*' | xargs -r grep -n \"\"`",
+   "`cp -a /var/lib/reconcile/events.sqlite /tmp/events.before.sqlite`",
+   "`/workspace/bin/reconcile.sh /var/spool/reconcile /tmp/events.test.sqlite || true`",
+   "`sqlite3 /tmp/events.test.sqlite '.dump' | sed -n '1,260p'`",
+   "`Write a Python importer implementing byte-preserving line framing, strict percent decoding and UTF-8 validation, HMAC verification, candidate staging, rooted-chain resolution, quarantine, and one SQLite transaction.`",
+   "`Write reconcile.sh as an executable Bash wrapper that validates arguments and execs the importer without interpolating record data into shell or SQL.`",
+   "`chmod 755 /workspace/bin/reconcile.sh`",
+   "`Run the supplied corpus and query events, balances, totals, quarantine, and journal tables against the documented invariants.`",
+   "`Run the importer twice and compare two database dumps and row counts.`",
+   "`Use the fixture generator to create shuffled, malformed, forked, and interrupted corpora, then rerun and inspect results.`",
+   "`Generate the 50,000-record corpus and run /usr/bin/time -f '%e' to check the performance threshold.`",
+   "`Exercise each journal interruption point, restore the database as needed, rerun, and compare the final dump with the reference state.`"
+  ],
+  "speedrun_commands": 20,
+  "scores": {
+   "clarity": 2,
+   "solvability": 2,
+   "verifiability": 2,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The syntax and validation requirements for seq are not stated, including whether it must be canonical decimal, bounded, and percent-decodable.",
+   "The format and encoding of mac are not explicitly specified, and the definition of the record hash referenced by prev is missing.",
+   "It is unclear whether canonical payload fields use decoded or original seq/cents representations and whether the opaque helper's command-line contract is documented.",
+   "The exact quarantine classifications, required tables/columns, historical-prefix merge semantics, and journal recovery state machine are left implicit; tests could require undocumented implementation details.",
+   "The interruption mechanism and documented journal phases are not concretely defined, making crash-recovery tests potentially overreaching.",
+   "A hard wall-clock limit on a supplied one-CPU container can be flaky unless the harness specifies resource limits, warmup, timeout methodology, and acceptable variance.",
+   "Requirements involving NUL and invalid UTF-8 need an explicit byte-oriented line framing contract because ordinary Bash and text utilities may discard or reinterpret such data."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and technically challenging, but key protocol and persistence semantics are underspecified, especially seq/mac syntax, record-hash computation, quarantine expectations, and recovery phases. A plausible implementation can therefore fail deterministic tests for reasons unrelated to engineering quality; the speedrun also suggests a strong agent could replace the orchestrator with a compact Python-backed importer in about 20 steps, so genuine difficulty does not compensate for the ambiguity.",
+  "fixes": [
+   "Specify exact grammar and canonical representation for seq, cents, prev, and mac, including whether each may contain percent escapes and the exact MAC encoding.",
+   "Define the record hash algorithm and representation used by descendants in prev, with a worked valid-record example.",
+   "Document the complete schema, quarantine reason vocabulary, expected handling of historical accepted prefixes, and whether the rebuilt chain replaces or extends existing events.",
+   "Define the journal phases, interruption injection interface, recovery algorithm, and expected journal contents after each phase.",
+   "State whether invoking Python from the Bash entry point is allowed and document the exact sigcheck invocation, or require a standard OpenSSL command instead.",
+   "Define byte-level handling of physical lines, final unterminated lines, NULs, and invalid UTF-8, including how those inputs are represented in quarantine.",
+   "Make the performance test reproducible by specifying corpus generation, timeout methodology, CPU/memory limits, warmup, and an allowed tolerance."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-db27baf4dd3c",
+     "verdict": "distinct",
+     "reason": "Although both involve reconciliation into SQLite, this task centers on reconstructing and validating a signed predecessor-linked event chain rather than repairing a quantitative deployment and batch-processing pipeline."
+    },
+    {
+     "ref_id": "ours/official-d19257a8f76d",
+     "verdict": "distinct",
+     "reason": "The reference is a stateful JSON-line replay daemon with escaped trace parsing, whereas this task is an authenticated chain importer with SQLite ledger derivation."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "Both require robust ingestion and validation into SQLite, but the reference resolves JSON event revisions and classifications while this task reconstructs a cryptographically linked chain and computes balances."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f",
+     "verdict": "variant",
+     "reason": "Both principally validate reordered or corrupted signed audit records and select an authoritative contiguous predecessor chain while rejecting forks, gaps, duplicates, and invalid authentication."
+    },
+    {
+     "ref_id": "ours/official-371a54d3de9f-m",
+     "verdict": "variant",
+     "reason": "Both principally validate reordered or corrupted signed audit records and select an authoritative contiguous predecessor chain while rejecting forks, gaps, duplicates, and invalid authentication."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-db27baf4dd3c",
+     0.193
+    ],
+    [
+     "ours/official-d19257a8f76d",
+     0.188
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.176
+    ],
+    [
+     "ours/official-371a54d3de9f",
+     0.159
+    ],
+    [
+     "ours/official-371a54d3de9f-m",
+     0.159
+    ]
+   ],
+   "cost_usd": 0.0011381999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0040192
+}

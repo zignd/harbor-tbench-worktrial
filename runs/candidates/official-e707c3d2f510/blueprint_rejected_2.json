@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "repair-constrained-peak-assignment",
+  "title": "Repair Constrained Peak Assignment",
+  "scenario": "An on-call SRE has been paged because the in-container mass-spectrometry processing service reports successful jobs but downstream researchers receive incomplete isotope assignments. The container contains a Python HTTP API, a background worker, SQLite state, configuration, synthetic spectra, and several unrelated operational components; the assignment feature is present but unreliable on adversarial spectra.",
+  "instruction_draft": "Make the peak-assignment service reliable and leave it running on port 8080, with results persisted in `/var/lib/peakd/assignments.sqlite`. For every submitted JSON job, assign peaks to at most one candidate under the documented mass-tolerance, isotope-order, charge, and one-candidate-per-cluster constraints, choose the globally minimum total residual with deterministic lexicographic tie-breaking, and persist complete success or rejection records without changing the public response schema.",
+  "requirements": [
+   "The peak-assignment service is running and reachable on TCP port 8080.",
+   "Results are persisted in `/var/lib/peakd/assignments.sqlite`.",
+   "Every submitted JSON job receives a response using the existing public response schema.",
+   "Each observed peak is assigned to at most one candidate.",
+   "Assignments satisfy the configured mass-tolerance constraint.",
+   "Assignments satisfy isotope-order constraints.",
+   "Assignments satisfy charge constraints.",
+   "No isotope cluster uses more than one candidate from the same candidate group.",
+   "The selected assignment minimizes total residual globally rather than greedily per peak.",
+   "Equal-cost assignments use deterministic lexicographic tie-breaking.",
+   "Successful jobs persist complete assignment records, including job identity, peak identity, candidate identity, residual, and score.",
+   "Rejected or infeasible jobs persist an explicit rejection record rather than partial assignments or a false success."
+  ],
+  "environment": [
+   "The Dockerfile uses `FROM python:3.13-slim-bookworm`, pinned apt and pip dependencies, one CPU, and 2 GB RAM with no network dependency.",
+   "The image contains roughly 1,600 lines of authored Python across an API process, queue worker, SQLite repository, configuration loader, request validator, metrics endpoint, and unrelated health and archival code.",
+   "A supervisor-like launcher starts the API and background worker in the same container; the API listens on port 8080 and the worker consumes SQLite-backed jobs.",
+   "The application is installed under `/opt/peakd`; mutable state is under `/var/lib/peakd`; configuration is under `/etc/peakd/config.toml`.",
+   "The existing `/v1/assign` endpoint accepts JSON containing `job_id`, `tolerance_ppm`, `charges`, `peaks`, and candidate groups with isotope order and expected masses, and its response schema is documented in `/opt/peakd/docs/protocol.md`.",
+   "A visible fixture contains several straightforward spectra and makes the current implementation appear healthy.",
+   "The planted implementation uses a locally attractive candidate choice in the worker, applies one constraint after assignment rather than during optimization, and has a cache/retry path that can expose an apparently unrelated stale-result or worker-lag symptom.",
+   "The fixture data includes enough history and retries for the misleading stale-result symptom to appear in logs, but it does not directly reveal the failing algorithmic cases.",
+   "A hidden reference generator creates fresh deterministic spectra with overlapping candidate windows, competing isotope clusters, charge-specific candidates, infeasible jobs, and equal-cost alternatives.",
+   "The verifier starts the services, submits generated jobs through the HTTP API, waits for worker completion, and inspects both response bodies and SQLite rows rather than source text."
+  ],
+  "internal_hint": "Investigate the service contract, worker logs, SQLite job history, and visible fixtures first; reproduce the stale-looking response by submitting the same job before and after a retry, then instrument candidate counts and objective values. The real defect is the assignment algorithm: it greedily commits peaks before enforcing cluster, charge, and isotope-order constraints, so a locally closest match can block a feasible lower-cost global solution. Replace it with a deterministic constrained optimization algorithm such as dynamic programming over ordered isotope clusters or a min-cost-flow/backtracking solver with pruning, explicitly model infeasibility, and make the cache/retry path invalidate or version results by job payload. Exercise many generated spectra and verify persisted rows, not just the visible sample.",
+  "trap": "A shallow solution can repair cache invalidation or restart the worker and make the visible stale-result symptom disappear, while the greedy matcher still returns plausible assignments. Another common partial solution finds a feasible matching but does not minimize the global residual, mishandles equal-cost tie-breaking, or writes partial rows for infeasible jobs; these failures only appear on verify-time generated spectra.",
+  "tests": [
+   "Service-state check: confirms the launcher has both API and worker processes active and that port 8080 accepts requests, corresponding to the instruction requirement that the service remain reachable.",
+   "Protocol check: submits valid jobs and verifies the existing response fields and status behavior, corresponding to the requirement that every JSON job use the public response schema.",
+   "Global optimization check: generates fresh spectra with overlapping mass windows where greedy nearest-candidate selection is not globally optimal, computes the authored reference optimum, and compares every assignment and total score.",
+   "Constraint check: generates cases with conflicting isotope order, charge-specific candidates, and shared candidate groups, then verifies that no returned assignment violates any stated constraint.",
+   "Tie-break check: generates equal-cost feasible matchings and verifies the deterministic lexicographically smallest assignment, corresponding to the explicit tie-breaking requirement.",
+   "Infeasibility check: generates jobs with no valid complete constrained assignment and verifies an explicit rejection response plus a persisted rejection row with no partial success assignments.",
+   "Persistence check: queries `/var/lib/peakd/assignments.sqlite` after successful jobs and verifies job identity, peak identity, candidate identity, residual, score, and complete row counts.",
+   "Retry/history check: submits identical and then changed payloads with reused operational job identifiers, verifies that results are keyed to the actual payload/version rather than stale cache state, and confirms no duplicate or contradictory final rows.",
+   "Scale check: submits thousands of generated peaks across many small clusters and verifies deterministic completion and exact reference results without relying on the visible fixture."
+  ],
+  "verifier_knob": {
+   "name": "generated_spectra_count_and_adversarial_overlap",
+   "value": "240 jobs, including 80 overlapping-window cases, 40 infeasible cases, 30 equal-cost cases, and 90 mixed historical/retry cases",
+   "effect": "Raising the count or increasing candidate overlap creates more interacting global constraints and makes sampling or fixture-specific patches ineffective; lowering it reduces runtime and the chance of exposing greedy, tie-breaking, or stale-history errors."
+  },
+  "expected_failure_modes": [
+   "The agent follows the worker-lag symptom and only changes process startup, retries, or cache invalidation.",
+   "The agent patches the visible fixture case instead of implementing a general constrained optimizer.",
+   "The agent implements maximum-cardinality matching but ignores the minimum-total-residual objective.",
+   "The agent enforces constraints after optimization, allowing an invalid assignment or incorrectly rejecting a feasible one.",
+   "The agent uses floating-point comparison without deterministic tolerance handling and fails equal-cost or near-boundary cases.",
+   "The agent returns rejection correctly but leaves partial success rows in SQLite.",
+   "The agent updates the API path but misses the background worker path actually used for persisted results.",
+   "The agent validates only HTTP responses and does not repair incomplete or contradictory database persistence.",
+   "The agent's algorithm is correct on small examples but times out or becomes nondeterministic on the generated workload."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "python",
+   "constraint-satisfaction",
+   "mass-spectrometry",
+   "sqlite",
+   "background-worker",
+   "algorithmic"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the application tree and running processes: `find /opt/peakd -maxdepth 3 -type f; ps aux`",
+   "Read the protocol and configuration documentation: `cat /opt/peakd/docs/protocol.md /etc/peakd/config.toml`",
+   "Locate the assign endpoint, worker loop, matcher, cache, and persistence code with `grep -R`.",
+   "Read the endpoint and request-validation implementation.",
+   "Read the worker's assignment path and retry/cache handling.",
+   "Read the candidate-matching implementation and its constraint checks.",
+   "Read the SQLite schema and repository transaction code.",
+   "Start or inspect the launcher and confirm API and worker status.",
+   "Submit a visible fixture job with `curl` and inspect its response.",
+   "Query job, assignment, and retry rows in SQLite.",
+   "Submit the same job and a changed payload with the same operational identifier to reproduce stale behavior.",
+   "Construct a small overlapping-window case showing that greedy selection is not globally optimal.",
+   "Replace the greedy matcher with a deterministic constrained DP or pruned backtracking/min-cost solver.",
+   "Define explicit infeasibility handling and deterministic residual/tie comparisons.",
+   "Make cache and retry keys include a payload/version fingerprint.",
+   "Wrap successful assignment persistence and rejection cleanup in an atomic transaction.",
+   "Run `python -m compileall /opt/peakd` and restart the launcher.",
+   "Exercise valid, infeasible, tied, retry, and charge/cluster cases through HTTP, then inspect persisted rows."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction does not explicitly state whether every peak must be assigned for a successful job, although the infeasibility requirement and tests appear to assume complete assignment.",
+   "Lexicographic ordering is not defined in the instruction; candidate identity, peak ordering, and representation of unassigned peaks could produce different valid interpretations.",
+   "The meaning of the persisted `score`, total residual units, and floating-point comparison tolerance is not specified.",
+   "The documented response behavior for asynchronous worker completion, duplicate job identifiers, and changed payloads is not described sufficiently to establish one unambiguous implementation.",
+   "The scale check could become flaky on one CPU if the reference solver or submitted solver has unexpectedly poor complexity.",
+   "Tests that require exact SQLite row counts may overreach if the existing schema intentionally retains historical attempts or uses separate job-attempt records."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and largely verifiable, but the speedrun reaches the likely fix in 18 steps by reading the directly visible matcher and worker code, so genuine difficulty is at most 2 under the stated rubric. Several core semantics\u2014complete versus partial assignment, lexicographic ordering, score meaning, and numeric tolerance\u2014are also underspecified, making a strict hidden verifier potentially invalid.",
+  "fixes": [
+   "Explicitly define that success requires a complete assignment of all required peaks, and define the exact treatment of optional or unassigned peaks.",
+   "Specify the lexicographic key, candidate and peak ordering, residual units, score formula, and floating-point comparison or decimal quantization rules.",
+   "Document duplicate-job and changed-payload semantics, including whether attempts are versioned and which SQLite rows constitute the final record.",
+   "State the expected persistence schema or stable query contract so row-count checks do not depend on undocumented implementation details.",
+   "Bound or characterize the generated workload and require an algorithmic complexity suitable for 1 CPU and 2 GB RAM.",
+   "To increase genuine difficulty without adding ambiguity, make the defect span the worker, repository, and matcher contracts and include a reference reproducer that requires discovering the interaction rather than revealing the faulty greedy line."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e2bf5b4dd194",
+     "verdict": "same",
+     "reason": "Both tasks repair a service that must compute a globally optimal deterministic constrained one-to-one assignment, with unmatched/infeasible handling and persisted results."
+    },
+    {
+     "ref_id": "ours/official-cd259cd6c51d",
+     "verdict": "distinct",
+     "reason": "This task packages and validates dependency-selected release artifacts, rather than solving a constrained assignment problem."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This task implements a streaming weighted-quantile protocol with lateness, deduplication, and recovery, not combinatorial assignment."
+    },
+    {
+     "ref_id": "ours/official-9a13d7fca5c9",
+     "verdict": "distinct",
+     "reason": "This task parses configuration and manifests, recovers SQL, executes independent reports, and produces SQLite and JSON audit artifacts."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576",
+     "verdict": "distinct",
+     "reason": "This task exports policy decisions by evaluating temporal, hierarchical authorization rules, not by assigning peaks or matching entities."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e2bf5b4dd194",
+     0.128
+    ],
+    [
+     "ours/official-cd259cd6c51d",
+     0.088
+    ],
+    [
+     "ours/official-e05a846f6234",
+     0.083
+    ],
+    [
+     "ours/official-9a13d7fca5c9",
+     0.078
+    ],
+    [
+     "ours/official-a111d7f89576",
+     0.073
+    ]
+   ],
+   "cost_usd": 0.001173
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0036444
+}

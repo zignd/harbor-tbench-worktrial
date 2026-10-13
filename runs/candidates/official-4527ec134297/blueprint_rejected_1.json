@@ -1,0 +1,174 @@
+{
+ "blueprint": {
+  "slug": "repair-journal-rollup-deployment",
+  "title": "Repair Journal Rollup Deployment",
+  "scenario": "An open-source maintainer is triaging a regression in StreamFold, a Node.js utility that replays framed journal bundles into account rollups. The container contains the multi-stage JavaScript pipeline, deployment scripts, several hundred realistic bundle files, a small opaque frame-decoder executable, checkpoints, and release fixtures; the current deployment produces plausible results on the included sample but loses correctness and throughput on larger journals.",
+  "instruction_draft": "Repair and deploy StreamFold so `/opt/streamfold/current/bin/replay --input DIR --output FILE` deterministically replays every `.bundle` in the input directory into the canonical JSONL rollup format used by the fixtures, with safe restart after an interrupted run and no duplicate effects. The deployed command must produce exact reference results on fresh generated journals and sustain at least 18000 logical records per second on the verification workload.",
+  "requirements": [
+   "The deployed executable must be available at `/opt/streamfold/current/bin/replay`.",
+   "The executable must accept `--input DIR --output FILE`.",
+   "Every `.bundle` in the input directory must be included in the replay.",
+   "The output must use the canonical JSONL rollup format defined by the repository fixtures.",
+   "Results must be deterministic and exactly match the verifier's reference output on fresh generated journals.",
+   "Rerunning after an interrupted run must recover safely and produce the same result without duplicate effects.",
+   "The deployed implementation must process at least 18000 logical records per second on the verification workload."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` with pinned apt packages and Node.js installed locally, with no network access at verification time.",
+   "A roughly 1400-line JavaScript application divided into bundle discovery, frame decoding, revision reconciliation, balance derivation, rollup aggregation, checkpointing, and publication modules, plus unrelated CLI and logging code.",
+   "A deployment tree containing `deploy.sh`, a release manifest, a `current` symlink, and two versioned application trees; the launcher currently installs an older reconciliation module under some restart paths.",
+   "A compiled `bundle-scan` helper shipped without its source. It decodes the repository's framed `.bundle` files and exposes a stable command-line interface, but its frame boundaries and trailer behavior are not documented in the main README.",
+   "Several hundred data files totaling tens of thousands of logical records. Bundle names are intentionally not chronological; records include tenants, accounts, event identifiers, revisions, source ranks, event timestamps, adjustment events, and tombstones.",
+   "Fixtures contain duplicate logical events from multiple producers, records split across frame boundaries, stale checkpoints, interrupted-output remnants, and a small sample whose ordering happens to conceal the regression.",
+   "The hidden-input generator creates larger shuffled journals with rare cross-tenant identifier collisions, revision ties, tombstones, out-of-order timestamps, and bundle/frame sizes unlike the visible fixtures.",
+   "The current implementation has an arrival-order reconciliation shortcut, a non-streaming aggregation path that repeatedly scans account history, a checkpoint-resume path that can replay an already committed chunk, and deployment logic that can mix modules from different releases."
+  ],
+  "internal_hint": "The resolution path is to inventory the deployment tree and run the shipped replay against the fixtures before editing. Instrument the stages and inspect decoded records rather than trusting filenames: the invariant is that a logical event is identified by the tenant plus event identifier, and the winning record is selected by highest revision, then highest producer/source rank, with tombstones participating in that ordering; bundle order and arrival order are not semantic. After reconciliation, account effects must be applied in event-time order with a deterministic event-id tie-break, using integer minor units, and rollups must be emitted in canonical tenant/account/day order. The restart bug is found by killing a run around a checkpoint boundary and comparing the checkpoint's committed input position with the output journal; recovery must be idempotent and publish through a temporary file and atomic rename. Replace the repeated scans with indexed reconciliation and one ordered aggregation pass, ensure the release script installs one coherent version and the deployed launcher uses it, then benchmark using generated large inputs. The reference solution is a deterministic shell script that first lists files, decodes and probes several bundles, runs baseline/restart experiments, compares intermediate counts, patches the JavaScript and deployment files, performs the deployment, and runs exact-output and throughput checks.",
+  "trap": "A shallow solution that sorts bundle filenames, deduplicates only by event identifier, keeps the last arrival, or treats tombstones as a separate cleanup pass matches the visible sample but fails rare cross-tenant collisions, revision ties, and out-of-order tombstones. A solution that fixes the source tree without exercising `deploy.sh` can still publish the stale module, while a solution that computes correct values by repeatedly rescanning history fails the hidden throughput threshold; na\u00efve checkpoint handling can also duplicate effects after the verifier kills and restarts the process.",
+  "tests": [
+   "The verifier runs the deployed path `/opt/streamfold/current/bin/replay --input DIR --output FILE` on several freshly generated journal directories and checks byte-for-byte canonical JSONL output against an independent reference implementation.",
+   "Generated inputs contain shuffled bundle filenames and records whose logical identity, revision selection, source-rank tie-break, and tombstone behavior require processing all records rather than trusting arrival order.",
+   "Generated inputs include the same event identifier under multiple tenants and records spanning frame boundaries, checking that decoding and reconciliation preserve tenant-qualified identity and all decoded records.",
+   "The verifier derives account/day rollups from out-of-order events and checks exact integer-valued balances, counts, and adjustment totals in canonical output order.",
+   "The verifier interrupts a replay at deterministic checkpoint boundaries, leaves its temporary output and checkpoint state in place, reruns the same command, and checks that recovery produces exactly the uninterrupted reference output with no duplicate effects.",
+   "The verifier executes the deployed launcher after a clean deployment and checks that all runtime modules come from one release and that the output path is atomically replaced rather than partially published.",
+   "A large hidden workload with hundreds of thousands to over a million logical records is timed on one CPU; the implementation must sustain at least 18000 logical records per second while staying within the container memory limit."
+  ],
+  "verifier_knob": {
+   "name": "minimum logical-record throughput",
+   "value": "18000 records/second",
+   "effect": "Raising the threshold forces a more efficient indexed and single-pass implementation and exposes repeated scans or excessive JSON serialization; lowering it permits slower but still correct implementations while leaving semantic difficulty mostly unchanged."
+  },
+  "expected_failure_modes": [
+   "The agent inspects only the small fixture and infers that filename order or arrival order is meaningful.",
+   "The agent fixes the reconciliation code but misses the tenant component of the logical key or mishandles equal revisions from different producers.",
+   "The agent applies tombstones before revision selection, causing stale deletes or resurrected events.",
+   "The agent produces numerically plausible balances using floating point or applies events in input order instead of deterministic event-time order.",
+   "The agent implements exact replay but retains an O(records times accounts) aggregation path that misses the throughput bar.",
+   "The agent edits the active source tree but does not repair the release manifest, symlink, or mixed-version deployment path.",
+   "The agent treats a checkpoint as an input offset without making output publication idempotent, creating duplicates after interruption.",
+   "The agent validates only final totals and misses canonical ordering, rare records lost at opaque decoder frame boundaries, or exact JSONL formatting."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "deployment",
+   "journal-replay",
+   "checkpoint-recovery",
+   "throughput"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the repository, deployment tree, fixtures, generators, and available executables.",
+   "Read the README, package metadata, release manifest, deploy.sh, launcher, and checkpoint/output documentation.",
+   "Inspect the versioned source trees and diff the active release against the older release.",
+   "Run the deployed replay on the visible fixtures and compare its output with expected fixtures.",
+   "Use bundle-scan --help and probe several bundles, including files with multiple frames and trailers.",
+   "Decode sample bundles and inspect tenant, event ID, revision, source rank, tombstone, and timestamp fields.",
+   "Inspect reconciliation, aggregation, checkpoint, publication, and launcher modules for data-flow and complexity problems.",
+   "Run a small baseline benchmark and an interrupted-run experiment around a checkpoint boundary.",
+   "Inspect canonical JSONL fixtures and determine exact field ordering, numeric representation, and tenant/account/day ordering.",
+   "Patch bundle discovery and decoding so every .bundle and every frame record is consumed deterministically.",
+   "Patch reconciliation to key by tenant plus event ID and select highest revision, then highest source rank, including tombstones.",
+   "Patch aggregation to apply selected events in event-time/event-ID order using integer minor units and indexed state.",
+   "Replace repeated history scans with a single ordered aggregation pass and canonical emission ordering.",
+   "Patch checkpoint recovery to align committed input position with durable output, avoid replayed effects, and use idempotent temporary publication.",
+   "Repair deploy.sh, the release manifest, the current symlink, and the launcher so one coherent release is installed.",
+   "Run the deployment script from a clean deployment state.",
+   "Run exact-output checks on all visible fixtures and several shuffled/reordered copies.",
+   "Run a forced interruption at multiple checkpoint boundaries, restart, and byte-compare against uninterrupted output.",
+   "Generate or locate a large hidden-like journal with collisions, ties, tombstones, and out-of-order events.",
+   "Run the deployed command on that workload and compare against an independent reference or instrumented baseline.",
+   "Benchmark logical records per second on one CPU and inspect memory use.",
+   "Repeat deployment and replay after removing stale release artifacts to verify no mixed-version loading.",
+   "Check output replacement behavior by observing temporary files and final-file atomicity during publication.",
+   "Run final clean-state exact-output, restart, and throughput checks."
+  ],
+  "speedrun_commands": 24,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 3,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The throughput threshold may vary with host CPU scheduling, container contention, Node.js version, or filesystem performance unless the verifier fixes the runtime and benchmark conditions tightly.",
+   "The compiled bundle-scan helper may be unusable if its architecture or dynamic-library requirements are not guaranteed by the image specification.",
+   "The canonical JSONL schema, checkpoint locations, and interruption protocol are described as repository-defined but are not explicitly specified in the task, creating avoidable discovery or compatibility ambiguity.",
+   "A test that requires proving every runtime module came from one release could overreach unless the release manifest or launcher exposes a stable, testable provenance mechanism.",
+   "Atomic replacement and recovery checks can become flaky if interruption timing is based on wall-clock races rather than deterministic checkpoints."
+  ],
+  "verdict": "accept",
+  "reasons": "The task has a clear deployed end state and strong deterministic checks covering correctness, recovery, deployment coherence, and performance. It is genuinely challenging because the solver must discover semantic invariants across an opaque decoder and multiple pipeline stages, although the stated source and fixtures make it feasible for a skilled engineer within the intended environment.",
+  "fixes": [
+   "Pin and state the exact Node.js version and verify that the shipped decoder is executable in the target image.",
+   "Document the canonical JSONL schema, checkpoint metadata location, and deterministic interruption mechanism in the repository or task environment.",
+   "Define the throughput benchmark input size, warm-up policy, timing method, and CPU constraints to reduce environmental variance.",
+   "Provide a stable release-provenance check, such as a version file or manifest field consumed by the launcher and verifier."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-01d037111e00",
+     "verdict": "variant",
+     "reason": "Both require repairing a deterministic multi-file journal replay engine with validation, ordered application, deduplication, canonical output, and safe publication, but they use substantially different bundle and rollup semantics."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "The reference is a restart-safe live TCP/HTTP relay with streaming frame handling, whereas the candidate is an offline journal replay and rollup utility."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "distinct",
+     "reason": "Although both replay event data deterministically, the reference centers on temporal incident correlation and SQLite event-sourcing semantics rather than framed journal decoding and account rollups."
+    },
+    {
+     "ref_id": "ours/official-c396920d769d",
+     "verdict": "distinct",
+     "reason": "The reference repairs a fixed-point sensor aggregation pipeline against a reference binary, while the candidate performs stateful journal replay with recovery and canonical JSONL emission."
+    },
+    {
+     "ref_id": "ours/official-fc33c63adc58",
+     "verdict": "distinct",
+     "reason": "The reference reconstructs distributed telemetry traces through a multi-stage extraction and demultiplexing pipeline, not a restartable journal replay utility producing account rollups."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-01d037111e00",
+     0.17
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.154
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.143
+    ],
+    [
+     "ours/official-c396920d769d",
+     0.13
+    ],
+    [
+     "ours/official-fc33c63adc58",
+     0.109
+    ]
+   ],
+   "cost_usd": 0.0013628
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0033445999999999997
+}

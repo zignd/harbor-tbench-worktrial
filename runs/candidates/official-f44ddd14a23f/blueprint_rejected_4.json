@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "repair-policy-decision-engine",
+  "title": "Repair the Policy Decision Engine",
+  "scenario": "A backend developer is chasing inconsistent authorization decisions and a CPU spike in an internal Rust policy service. The container contains a deliberately messy Rust workspace, a SQLite policy catalog with several years of accumulated changes, request fixtures, and a source-less native policy primitive used by the production deployment. The service currently gives plausible answers on the small fixture but becomes both subtly wrong and unusably slow on a populated catalog.",
+  "instruction_draft": "Can you get `policyctl evaluate` back into shape? It must produce the correct decision for every input request according to the policy catalog and the deployed policy primitive, preserve the input order and the documented JSONL output fields, and leave the database unchanged; on the supplied and generated catalogs it also needs to sustain at least 25000 decisions per second in a release build. Please keep the existing command-line interface working, including `--db`, `--requests`, `--output`, and `--tenant`, and make the fix general rather than special-casing the fixture.",
+  "requirements": [
+   "`policyctl evaluate` must continue accepting `--db`, `--requests`, `--output`, and `--tenant` with their existing meanings.",
+   "For every request, the output must contain the documented decision, policy identifier, reason code, and normalized subject fields, with exactly one JSON object per input line.",
+   "Output records must remain in the same order as the input request records.",
+   "Decisions must match the deployed policy primitive and the policy catalog semantics for all supplied and verify-time-generated inputs, including historical policy changes, tenant isolation, deny precedence, wildcard resources, and malformed-but-accepted identifiers.",
+   "Evaluation must not modify the SQLite database, its journal, or its policy tables.",
+   "The implementation must sustain at least 25000 decisions per second in a release build on the verifier's generated workload.",
+   "The command-line behavior and output format must remain compatible with the existing sample scripts and fixtures.",
+   "The solution must work for fresh catalogs and request sets generated from hidden seeds rather than relying on the checked-in fixture."
+  ],
+  "environment": [
+   "A Docker image based on `python:3.13-slim-bookworm` installs pinned Debian packages including Rust/Cargo, SQLite, binutils, and profiling utilities; no network is needed at runtime.",
+   "The workspace is an in-house Rust application of roughly 1600 lines split across a CLI, SQLite catalog layer, request parser, policy evaluator, output writer, and benchmark harness, with unrelated logging and configuration code mixed in.",
+   "`policyctl evaluate` reads a SQLite database containing tenants, subjects, resource patterns, policy revisions, policy clauses, and archived revisions, then evaluates JSONL requests.",
+   "`tools/mkcase` deterministically creates large catalogs and request files from a seed. Hidden verification invokes it with seeds not present in the repository and scales the result to tens of thousands of requests.",
+   "`fixtures/` contains a small apparently-correct catalog, a few request files, and expected JSONL output. It does not exercise all historical and identifier cases.",
+   "`native/libpolicy_ref.so` is a compiled, source-less reference primitive with a small C ABI and a header describing calls and buffer ownership. It canonicalizes subject/resource components and evaluates a compact clause representation; its behavior is observable through the shipped probe utility but its implementation is not provided.",
+   "`docs/catalog-format.md` and `docs/output-format.md` describe the schema and JSONL contract, but the interaction between revision selection, canonicalization, and deny precedence must be inferred from the existing service, probe behavior, and data.",
+   "The planted implementation has several interacting defects: it chooses revisions using a non-total timestamp cursor, applies tenant fallback during a join, has an incomplete in-Rust approximation of the native canonicalizer, performs per-request SQLite lookups, and uses a cache whose key omits one policy dimension. The defects are arranged so that the sample passes while populated histories expose them.",
+   "A checked-in benchmark command records throughput and SQLite statement counts, but verification uses independent generated cases and does not inspect source text."
+  ],
+  "internal_hint": "The intended investigation starts by running the sample, then generating progressively larger seeded cases while comparing `policyctl` with the shipped probe/reference runner. Differential probes reveal that canonicalization is not simple lowercase trimming: separators, escaped bytes, and malformed UTF-8-compatible byte sequences affect both the subject key and resource match. SQLite tracing shows that the evaluator repeatedly re-queries revisions and clauses and that the timestamp cursor skips same-timestamp revisions after an archive/reinstate sequence. The robust fix is to model revision selection by the catalog's sequence/order semantics, isolate tenant data, use the native primitive (or a behaviorally equivalent implementation learned through probes) consistently, and build an immutable in-memory snapshot per evaluation invocation. Batch-load indexed tables once, evaluate requests against that snapshot, retain a cache key containing tenant, subject canonical form, resource canonical form, action, and selected revision, and benchmark while checking byte-for-byte output against the reference. A skilled solution needs experiments and differential testing rather than merely reading the obvious evaluator function.",
+  "trap": "A shallow repair that fixes the visible timestamp comparison or adds an index passes the fixture and may appear fast, but hidden histories contain multiple revisions sharing timestamps, archive/reinstate cycles, cross-tenant identifiers, and rare canonicalization bytes. A solution that calls the reference primitive once per request can be exact but fails the throughput threshold; a cache keyed only by subject or resource becomes wrong when actions or revisions differ. Sampling a few rows also misses the rare malformed identifiers and the data-dependent fallback path.",
+  "tests": [
+   "A compatibility test runs the supplied sample commands and checks that every JSONL record has the documented fields, stable input order, and the expected values; this checks the instruction sentences about preserving the CLI, output format, and order.",
+   "A correctness test creates fresh SQLite catalogs and request files with `tools/mkcase` from several hidden seeds, runs `policyctl evaluate --db ... --requests ... --output ...`, and compares every decision, policy identifier, reason code, and normalized subject to an independent reference runner using the deployed native primitive; this checks the sentence requiring correct results on generated inputs.",
+   "The generated cases include same-timestamp revisions, archived and reinstated policies, wildcard and escaped resource patterns, malformed-but-accepted identifiers, overlapping allow/deny clauses, and requests from tenants with similarly named subjects; this checks the explicit semantic correctness requirement and tenant isolation.",
+   "A read-only test snapshots the database bytes and SQLite schema/data hashes before and after evaluation and fails if any journal, policy row, or catalog state changes; this checks the no-mutation requirement.",
+   "A scale test generates a catalog with thousands of tenants, hundreds of thousands of policy/clause rows, and at least 50000 requests, runs a release build on one CPU, and requires at least 25000 decisions per second while also comparing the complete output with the reference; this checks the stated quantitative threshold and prevents an exact-but-per-request-database-call solution.",
+   "A query-count test traces SQLite calls on a generated case and rejects implementations whose work grows proportionally with the number of requests; this checks the observable large-scale behavior implied by the throughput requirement.",
+   "A fresh-seed test changes both catalog contents and request ordering at verification time and checks that no fixture-specific assumptions affect output; this checks the generality requirement."
+  ],
+  "verifier_knob": {
+   "name": "minimum_decisions_per_second",
+   "value": "25000",
+   "effect": "Raising the threshold forces a more complete snapshot/index and batching refactor and makes per-request native or SQLite calls fail; lowering it permits slower but still correct implementations and reduces performance pressure."
+  },
+  "expected_failure_modes": [
+   "The agent fixes a visible revision-order bug but does not reproduce the native canonicalization behavior on rare identifiers.",
+   "The agent implements policy semantics correctly for one tenant but allows fallback or cache entries to cross tenant boundaries.",
+   "The agent uses a timestamp-only cursor or assumes timestamps are unique, silently dropping revisions in generated histories.",
+   "The agent preserves correctness by querying SQLite or the opaque primitive for every request and misses the throughput threshold.",
+   "The agent builds an incomplete cache key, causing decisions to depend on earlier requests in the stream.",
+   "The agent validates only the small checked-in fixture and never generates histories with same-time revisions, archives, or malformed identifiers.",
+   "The agent changes output ordering while parallelizing evaluation, or mutates the database while attempting to create temporary indexes.",
+   "The agent reverse engineers only common ASCII cases of the native primitive and fails hidden escaped-byte or separator cases."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "systems-debugging",
+  "tags": [
+   "rust",
+   "sqlite",
+   "reverse-engineering",
+   "performance",
+   "policy-engine",
+   "hidden-seeds"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `pwd && find . -maxdepth 2 -type f | sort`",
+   "2. `cargo test --workspace`",
+   "3. `cargo build --release`",
+   "4. Run the documented sample `policyctl evaluate` command and inspect its JSONL output.",
+   "5. `sed -n '1,240p' docs/catalog-format.md; sed -n '1,200p' docs/output-format.md`",
+   "6. `rg -n \"evaluate|revision|archive|tenant|canonical|cache|sqlite\" src tools`",
+   "7. Read the CLI, request parser, evaluator, catalog layer, and output writer.",
+   "8. Inspect the SQLite schema and representative fixture rows with `sqlite3`.",
+   "9. Run `tools/mkcase` for a small seed and evaluate the generated case.",
+   "10. Locate and run the shipped reference/probe utility on representative subjects, resources, malformed identifiers, and escaped separators.",
+   "11. Read `native/policy_ref.h` and inspect the existing FFI wrapper and buffer ownership.",
+   "12. Enable SQLite tracing for one generated run and confirm repeated revision/clause queries.",
+   "13. Compare the service and reference outputs to isolate canonicalization, revision-order, tenant, and precedence mismatches.",
+   "14. Determine the catalog's total revision/archive/reinstate ordering semantics from schema, fixtures, and probe cases.",
+   "15. Replace timestamp-cursor revision selection with deterministic sequence/order-based selection over an immutable catalog snapshot.",
+   "16. Remove tenant fallback and ensure every lookup is explicitly tenant-scoped.",
+   "17. Batch-load tenants, subjects, policies, clauses, patterns, and revision metadata once per invocation into indexed in-memory structures.",
+   "18. Implement or consistently invoke a behaviorally equivalent native canonicalizer, including separators, escaped bytes, and malformed accepted identifiers.",
+   "19. Implement wildcard matching and allow/deny precedence against the selected revision.",
+   "20. Replace the incomplete cache with a key containing tenant, canonical subject, canonical resource, action, and selected revision.",
+   "21. Preserve request order while evaluating and emit exactly the documented fields and one object per input line.",
+   "22. Ensure evaluation opens SQLite read-only and performs no writes, temporary indexes, or journal changes.",
+   "23. `cargo fmt --all && cargo test --workspace`",
+   "24. Run sample compatibility checks and byte-for-byte comparisons against expected output.",
+   "25. Generate several hidden-like seeds, compare complete output with the native reference runner, and vary request ordering.",
+   "26. Build release and run the supplied benchmark while checking throughput and SQLite statement counts.",
+   "27. Run the 50000-request scale case on one CPU, inspect memory use, and fix any remaining hot paths.",
+   "28. Re-run read-only database hashes, generated differential tests, and release benchmarks after the final changes."
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 5,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The opaque native primitive may expose behavior that cannot be reconstructed reliably from the available probes; hidden malformed byte cases could therefore make an otherwise reasonable implementation fail without a complete behavioral specification.",
+   "A fixed 25000 decisions-per-second threshold on a shared or differently provisioned verifier can be noisy, especially if process startup, JSON output, filesystem caching, or the reference comparison is included in the measured interval.",
+   "The requirement that evaluation leave the journal unchanged may be sensitive to SQLite version, locking mode, WAL state, or external tooling that opens the database rather than to actual application mutation.",
+   "The independent reference runner, probe utility, generated-case format, and exact benchmark measurement procedure are not explicitly specified, so missing or inconsistent tooling would make failures invalid.",
+   "The phrase 'normalized subject fields' and the exact revision sequence/order semantics could remain ambiguous if the cited documentation, fixtures, and probe behavior do not fully determine them."
+  ],
+  "verdict": "accept",
+  "reasons": "The end state and observable contracts are unusually well specified, and the generated differential, immutability, query-count, and throughput checks should reject fixture-specific or shallow repairs. Solving it requires coordinated investigation of an opaque primitive, historical catalog semantics, tenant isolation, batching, and caching; the plausible path is about 28 commands rather than a quick source-only patch. It is challenging and realistic, though the under-an-hour solvability claim is marginal and the benchmark/reference tooling needs careful stabilization.",
+  "fixes": [
+   "Provide a small executable reference-runner contract and a documented batch or behavioral specification for the native primitive, including representative malformed-byte cases, so correctness is not dependent on guessing an opaque implementation.",
+   "Define the benchmark timing boundary, warm-up policy, CPU pinning, filesystem conditions, output handling, and acceptable variance; use repeated runs or a robust percentile rather than one noisy threshold.",
+   "State the catalog's revision total-order rule and the exact normalized output schema explicitly in the documentation instead of requiring those semantics to be inferred from probes.",
+   "Specify the database read-only setup and whether journal/WAL files are included in the immutability snapshot, and ensure the verifier controls SQLite version and connection mode.",
+   "Add a check that generated cases and the reference runner are always present and validate their schema before running performance tests."
+  ],
+  "accepted": true
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-6c6f79cc88e4",
+     "verdict": "distinct",
+     "reason": "It concerns state-independent HTTP route classification and request hardening, not evaluating historical tenant-scoped policies from a SQLite catalog."
+    },
+    {
+     "ref_id": "ours/official-3a04e2577db1-m",
+     "verdict": "distinct",
+     "reason": "It authorizes and safely handles arbitrary SQLite SQL statements using a SQL policy extension, whereas this task evaluates policy requests and catalog semantics."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576-m",
+     "verdict": "same",
+     "reason": "Both require high-throughput, order-preserving evaluation of tenant-isolated historical SQLite policies with matching precedence, revisions, intervals, and canonical decision output."
+    },
+    {
+     "ref_id": "ours/official-3a04e2577db1",
+     "verdict": "distinct",
+     "reason": "Despite shared SQLite, CLI, ordering, and throughput concerns, that task is a SQL statement authorization gate rather than a policy-catalog decision engine."
+    },
+    {
+     "ref_id": "ours/official-a111d7f89576",
+     "verdict": "same",
+     "reason": "It is the same underlying policy-audit evaluation problem over SQLite requests and historical revisions, differing mainly in command details and output conventions."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-6c6f79cc88e4",
+     0.384
+    ],
+    [
+     "ours/official-3a04e2577db1-m",
+     0.304
+    ],
+    [
+     "ours/official-a111d7f89576-m",
+     0.274
+    ],
+    [
+     "ours/official-3a04e2577db1",
+     0.26
+    ],
+    [
+     "ours/official-a111d7f89576",
+     0.233
+    ]
+   ],
+   "cost_usd": 0.0010454
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0042378
+}

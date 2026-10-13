@@ -1,0 +1,177 @@
+{
+ "blueprint": {
+  "slug": "deploy-kmer-assembly-endpoint",
+  "title": "Deploy the K-mer Assembly Endpoint",
+  "scenario": "An on-call SRE has been paged because the in-container Helix genomics service reports that its assembly worker is unhealthy during a sequencing run. The container contains a Python API, a telemetry sidecar, a SQLite state store, migrations, and an unfinished assembly feature; the health alert is caused by stale telemetry and is not the component that needs repair.",
+  "instruction_draft": "Add and deploy the Helix k-mer assembly feature on port 8080: `POST /v1/assemble` must accept `{sample_id,k,start,reads}` where every read is a DNA string of length `k`, treat reads as directed de-Bruijn multigraph edges from their `(k-1)` prefix to suffix including duplicate reads, and for a valid graph return and persist the deterministic Euler trail that uses every read exactly once, beginning at `start`, by consuming each vertex's outgoing edges in reverse lexicographic order with Hierholzer's algorithm and reversing the resulting walk. Reject malformed, disconnected, or degree-invalid inputs with HTTP 422 without creating an assembly, and for successful requests write the sequence, edge count, SHA-256, and audit record to the existing SQLite state and FASTA output locations documented in the container.",
+  "requirements": [
+   "The service must listen on port 8080 after deployment.",
+   "The service must expose POST /v1/assemble.",
+   "The request format must be JSON with sample_id, k, start, and reads fields.",
+   "Every read must be interpreted as a DNA string of exactly length k.",
+   "Each read must create one directed multigraph edge from its (k-1)-character prefix to its (k-1)-character suffix.",
+   "Duplicate reads must remain distinct edge instances and all instances must be consumed.",
+   "A valid assembly must begin at the supplied start vertex.",
+   "A valid assembly must use every edge exactly once.",
+   "The traversal must use Hierholzer's algorithm, selecting each vertex's available outgoing edges in reverse lexicographic order before reversing the completed walk.",
+   "The response must contain the assembled sequence, edge count, and SHA-256 digest.",
+   "Malformed, disconnected, or degree-invalid graphs must receive HTTP 422.",
+   "Rejected requests must not create an assembly state row or output file.",
+   "Successful requests must persist the sequence, edge count, and SHA-256 in the existing SQLite assembly state.",
+   "Successful requests must create the documented FASTA output for the sample.",
+   "Successful requests must append the documented audit record."
+  ],
+  "environment": [
+   "Build from python:3.13-slim-bookworm with pinned apt and pip dependencies and no network requirement at runtime.",
+   "Create an approximately 1,200-line in-house Python service under /opt/helix with an API process on port 8080, a telemetry process on port 9090, a supervisor, configuration files, migrations, and unrelated sample-processing code.",
+   "Provide an existing SQLite database at /var/lib/helix/state.sqlite with assembly and audit tables, plus the migration and repository layers used by the API.",
+   "Provide the existing FASTA destination directory at /var/lib/helix/assemblies and document its filename and audit conventions in /opt/helix/docs/assembly-contract.md.",
+   "Include a visible but unfinished assembly route that returns a generic 501 response and a worker module with plausible graph helpers that do not implement the required traversal.",
+   "Include a seeded telemetry lag that makes the supervisor health endpoint report the assembly worker as unhealthy even though the API process is serving requests; fixing the health alarm is unnecessary.",
+   "Include generated fixture data and ordinary operational logs containing valid and invalid k-mer graphs, but do not provide a reproduction of the actual hidden failure cases.",
+   "The verifier must be able to restart the service and submit fresh generated requests without relying on wall-clock time, randomness, or external services."
+  ],
+  "internal_hint": "Investigate the service entrypoint, route registration, SQLite migration, repository code, and FASTA writer rather than trusting the health alert; the telemetry sidecar deliberately reports stale worker state. Implement the missing route and persistence path, then validate DNA length/alphabet, start membership, weak connectivity over nonzero-degree vertices, and Euler degree conditions before constructing a directed multigraph with edge multiplicity. The important algorithm is a deterministic reverse-lexicographic Hierholzer traversal: sort each adjacency list descending, pop from the end, append the start vertex's characters plus the final vertex character, and compute the digest over the exact UTF-8 sequence before writing the transaction, FASTA file, and audit row. Exercise repeated parallel edges, branching graphs, shuffled input order, and invalid graphs before restarting the API.",
+  "trap": "A shallow implementation often greedily follows the largest next k-mer without backtracking, uses a set and loses duplicate edges, or returns the unreversed Hierholzer stack; simple non-branching examples still pass. Other likely partial fixes validate only degree counts, allowing disconnected components, or write the FASTA file before the database transaction, which fails hidden rejection and persistence checks.",
+  "tests": [
+   "Check that port 8080 accepts POST /v1/assemble and returns the documented JSON fields.",
+   "Generate valid linear Euler trails with thousands of edges, shuffled read order, branching vertices, and repeated identical reads; compare the returned sequence, edge count, and SHA-256 with the deterministic reference traversal.",
+   "Generate Eulerian circuits and verify the supplied start vertex is honored and that the produced sequence has exactly the expected vertex-walk length.",
+   "Generate malformed JSON, non-DNA reads, wrong read lengths, missing starts, disconnected graphs, and degree-invalid graphs; require HTTP 422 and verify no assembly row, audit row, or FASTA file is created.",
+   "Inspect the SQLite assembly row for sample_id, exact sequence, edge count, digest, and successful status.",
+   "Inspect the FASTA output at the documented path for the exact sample identifier and assembled sequence with valid line formatting.",
+   "Inspect the audit table for one successful assembly event with the expected sample identifier, edge count, and digest.",
+   "Submit the same sample twice and verify the documented idempotent replacement behavior rather than duplicate conflicting state.",
+   "Restart the in-container services and repeat requests to ensure the feature is actually deployed and state survives process restarts."
+  ],
+  "verifier_knob": {
+   "name": "hidden_graph_count_and_edge_scale",
+   "value": "24 generated graphs, 8 invalid cases, and up to 4,000 directed edges per valid graph",
+   "effect": "Raising it increases the chance of exposing greedy traversal, lost parallel-edge, disconnected-component, transaction-order, and input-order bugs; lowering it permits shallow implementations to pass small hand-shaped examples."
+  },
+  "expected_failure_modes": [
+   "The agent follows the misleading supervisor health alert and spends the available time repairing telemetry instead of implementing the route.",
+   "The agent reads the visible stub and writes a short greedy walk that fails when an early lexical choice strands unused edges.",
+   "The agent represents adjacency as a set or dictionary of destinations and silently drops duplicate k-mers.",
+   "The agent forgets to reverse the Hierholzer vertex stack or appends the final character incorrectly.",
+   "The agent checks local degree balance but not weak connectivity, accepting graphs with an unused disconnected component.",
+   "The agent implements the algorithm but misses one of the repository, FASTA, audit, or transactional state requirements.",
+   "The agent verifies only the supplied fixtures and does not generate branching and repeated-edge cases that distinguish a correct multigraph traversal from a plausible one."
+  ],
+  "predicted_pass_rate": 0.36,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "python",
+   "de-bruijn-graph",
+   "eulerian-traversal",
+   "constraint-satisfaction",
+   "state-check",
+   "service-deployment"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "List the container files and locate /opt/helix, entrypoints, migrations, and documentation.",
+   "Read the API entrypoint, route registration, and current 501 assembly handler.",
+   "Read the unfinished worker and graph helper modules.",
+   "Read assembly-contract.md for response, SQLite, FASTA, and audit conventions.",
+   "Inspect the migration/schema, repository layer, and existing transaction helpers.",
+   "Inspect the FASTA writer, audit writer, supervisor configuration, and service startup scripts.",
+   "Start or inspect the running services and confirm the API process and port 8080.",
+   "Implement multigraph construction with duplicate edge instances and deterministic Hierholzer traversal.",
+   "Add validation for JSON shape, DNA alphabet, exact lengths, start membership, connectivity, and Euler degree conditions.",
+   "Replace the stub route and register it at POST /v1/assemble.",
+   "Implement the documented SQLite, FASTA, and audit persistence with idempotent sample replacement.",
+   "Run a generated branching graph with shuffled reads and duplicate reads; compare sequence and digest to a reference implementation.",
+   "Run circuit, malformed, disconnected, and degree-invalid cases and inspect that no rejected state or file is created.",
+   "Submit the same sample twice and inspect replacement and audit behavior.",
+   "Restart the supervisor/API and repeat a successful request to verify deployment and persistence.",
+   "Inspect final database rows, FASTA contents, audit rows, and service status."
+  ],
+  "speedrun_commands": 16,
+  "scores": {
+   "clarity": 3,
+   "solvability": 4,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction says to consume edges in reverse lexicographic order, while the internal hint says to sort adjacency lists descending and pop from the end; those produce opposite consumption orders and can yield different valid trails.",
+   "The exact response field names, FASTA filename, audit schema, and idempotent replacement semantics are delegated to container documentation that is not included in the blueprint, so tests must match the shipped documentation exactly.",
+   "The requirement that rejected requests create no assembly row is ambiguous when a sample_id already has a prior successful row; replacement and rollback behavior should be explicitly defined.",
+   "SQLite and filesystem writes cannot be made fully atomic without a stated recovery protocol, so persistence tests should not assume atomicity across process crashes unless failure injection is specified.",
+   "Malformed JSON normally produces framework-dependent 400 responses, so requiring 422 needs an explicit application-level error contract."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is mostly well specified and realistically testable, but the traversal-order wording is internally contradictory and several persistence/error contracts depend on unstated container details. More importantly, the source layout and internal hint make the intended fix discoverable in roughly 16 commands, so the measured genuine difficulty is at most 2 and the score average is below the acceptance threshold.",
+  "fixes": [
+   "Replace the order wording with an exact rule such as: sort each adjacency list in descending lexicographic order, pop from the end, and therefore consume the lexicographically smallest available edge first; use the same rule in the reference verifier.",
+   "State the exact response JSON keys, error body, status behavior for malformed JSON, FASTA filename convention, audit columns, and duplicate sample replacement semantics in the blueprint or fixed contract.",
+   "Define whether a rejected request for an existing sample must preserve the prior successful state or remove all state, and test that behavior explicitly.",
+   "Specify the intended filesystem/database failure and recovery semantics, or limit verification to successful and validation-rejection paths.",
+   "Increase genuine difficulty by hiding the relevant implementation details or requiring diagnosis of a less directly exposed integration defect, while retaining generated adversarial graphs and persistence checks."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/dna-assembly",
+     "verdict": "distinct",
+     "reason": "The candidate implements and deploys a deterministic de-Bruijn-graph Euler-trail assembly API, whereas the reference designs PCR primers for Golden Gate plasmid assembly."
+    },
+    {
+     "ref_id": "ours/official-936e7746aeaa",
+     "verdict": "distinct",
+     "reason": "The candidate repairs a genomics assembly HTTP endpoint, while the reference repairs a line-oriented statistics daemon over Mosaic capsules."
+    },
+    {
+     "ref_id": "ours/official-ce30ab52c4d1",
+     "verdict": "distinct",
+     "reason": "The candidate performs graph-based DNA read assembly and persistence, whereas the reference restores campaign event ingestion, attribution, and reporting semantics."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34-m",
+     "verdict": "distinct",
+     "reason": "The candidate deploys a de-Bruijn assembly service, while the reference implements transactional segment recovery and a key-value replay service."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234-m",
+     "verdict": "distinct",
+     "reason": "The candidate validates and assembles DNA reads via Euler traversal, whereas the reference repairs a time-windowed metric ingestion, querying, checkpoint, and recovery service."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/dna-assembly",
+     0.115
+    ],
+    [
+     "ours/official-936e7746aeaa",
+     0.107
+    ],
+    [
+     "ours/official-ce30ab52c4d1",
+     0.106
+    ],
+    [
+     "ours/official-ea89cb64bf34-m",
+     0.096
+    ],
+    [
+     "ours/official-e05a846f6234-m",
+     0.094
+    ]
+   ],
+   "cost_usd": 0.0008301999999999999
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0033667999999999997
+}

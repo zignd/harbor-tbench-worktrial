@@ -1,0 +1,171 @@
+{
+ "blueprint": {
+  "slug": "repair-atlas-index-deployment",
+  "title": "Repair and deploy the Atlas spatial index",
+  "scenario": "You maintain Atlas, an open-source JavaScript package that builds a searchable spatial index from sharded delivery-record data. A recent large-scale refactor introduced a regression in the ingest, reconciliation, page-packing, and query stages; the container contains the roughly 1,500-line package, sample shards, interrupted build artifacts, deployment configuration, and diagnostic fixtures needed to investigate it.",
+  "instruction_draft": "Repair and deploy Atlas as `/usr/local/bin/atlas-index`, with `build INPUT_DIR OUTPUT_DIR` and `query OUTPUT_DIR TENANT LONGITUDE LATITUDE RADIUS` commands that return the correct current records and publish only complete indexes while safely recovering from an interrupted build. On fresh verify-time datasets and queries, achieve at least 99.7% query recall with no more than 0.3% false-positive records, while preserving the documented JSON output format.",
+  "requirements": [
+   "Install a working executable at `/usr/local/bin/atlas-index`.",
+   "Support `atlas-index build INPUT_DIR OUTPUT_DIR`.",
+   "Support `atlas-index query OUTPUT_DIR TENANT LONGITUDE LATITUDE RADIUS`.",
+   "Queries must return the correct current records for the requested tenant and geographic radius.",
+   "A build interrupted at any stage must leave no apparently complete but unusable published index and a subsequent build must safely recover or restart without corrupting the result.",
+   "The deployed implementation must preserve the documented JSON output format.",
+   "Across fresh verify-time datasets and queries, query recall must be at least 99.7%.",
+   "Across fresh verify-time datasets and queries, false-positive returned records must be no more than 0.3%."
+  ],
+  "environment": [
+   "The Dockerfile is based on `python:3.13-slim-bookworm`, installs pinned Debian Node.js tooling and pinned Python helper packages without network access at verification time, and runs on one CPU with 2 GB RAM.",
+   "The repository contains approximately 1,500 lines of JavaScript split across a CLI, shard scanner, streaming record parser, revision reconciler, coordinate normalizer, spatial bucketer, external sorter, binary page packer, query decoder, deployment wrapper, and unrelated maintenance utilities.",
+   "The input format is newline-delimited JSON shards containing tenant, entity, revision, operation, longitude, latitude, and payload fields; fixtures include quoted payload strings, duplicate entities across shards, tombstones, records near the longitude wrap boundary, and shards whose records are not globally ordered.",
+   "The build is intentionally staged: scan and parse shards, reconcile current entity state, normalize and bucket coordinates, externally sort bucket contents, then pack searchable pages and atomically publish a manifest.",
+   "Sample data and a visible smoke-test query exercise ordinary positive longitudes, one tenant, ordered revisions, and records that fit within a single packed page.",
+   "The planted regression combines a parser that mishandles escaped JSON embedded in shard lines, reconciliation that assumes entity IDs are globally unique and revisions are scalar, coordinate/page boundary handling that only works for ordinary longitudes and page-aligned bases, and deployment recovery that can mistake a stale stage directory for a valid published artifact.",
+   "A deterministic failure-injection switch and prior interrupted-build directories are included so recovery behavior can be exercised without relying on wall-clock timing.",
+   "A local reference-data generator used only by verification creates larger hidden datasets with thousands of records, rare boundary cases, late revisions and deletes, multiple tenants, shuffled shards, and queries concentrated around sparse buckets."
+  ],
+  "internal_hint": "Investigate by running the supplied smoke tests, inspecting stage manifests and binary pages, and generating small adversarial inputs rather than reading every source file. The key invariant is that live identity and revision ordering are tenant-scoped and use the format's composite revision ordering; tombstones participate in that ordering, and only the newest state survives. Then fix the staged pipeline so JSONL records are parsed without lossy splitting, longitude normalization and radius coverage are consistent across the wrap boundary, page delta bases reset exactly where the packer says they do, and the query decoder filters candidates by actual distance rather than bucket membership. Make each stage write a checksum/complete marker, ignore incomplete stale output, and rename the fully verified manifest into place only after all dependent stages finish. Validate with shuffled multi-shard data, forced failures at each stage, page-boundary records, and generated queries before installing the wrapper.",
+  "trap": "A shallow repair that passes the visible smoke test can use entity ID alone, treat revisions as ordinary integers, accept every record in a neighboring bucket, or trust any existing manifest under the output directory. Those choices appear correct for the ordered single-tenant sample but lose records or return stale and geographically distant records on hidden multi-tenant, wrap-boundary, shuffled, tombstone, and interrupted-build inputs; a parser-only patch also leaves the compounded packing and recovery errors intact.",
+  "tests": [
+   "The deployment test runs `/usr/local/bin/atlas-index build` on a fresh generated input directory and verifies that the expected manifest and all dependent artifacts are atomically available.",
+   "The CLI contract test invokes `atlas-index query OUTPUT_DIR TENANT LONGITUDE LATITUDE RADIUS` and checks that output is valid documented JSON with the required record fields.",
+   "The hidden correctness test generates thousands of records across multiple tenants and shuffled shards, including escaped payloads, duplicate revisions, composite revision ties, tombstones, negative and wraparound longitudes, sparse buckets, and page boundaries; it compares query results with an independent reference implementation.",
+   "The metric test runs a seeded collection of hidden radius queries and requires at least 99.7% recall and no more than 0.3% false-positive records, as stated in the instruction.",
+   "The recovery test injects deterministic termination after each of the parse, reconcile, bucket, sort, and pack stages, reruns the build, and verifies that the final query results match a clean build and that no partial manifest is accepted.",
+   "The stale-artifact test places incomplete and checksum-mismatched stage directories beside an older valid output and verifies that a rebuild does not silently publish or query the corrupted artifacts.",
+   "The scale test uses fresh generated inputs substantially larger than the visible fixtures and checks that the process completes within the verifier's fixed resource budget rather than loading all shards and all duplicate revisions into an unbounded structure."
+  ],
+  "verifier_knob": {
+   "name": "query_recall_threshold",
+   "value": "99.7%",
+   "effect": "Raising the threshold makes boundary, reconciliation, and decoder corner cases less forgiving and requires a more complete implementation; lowering it allows partially correct bucket and revision handling to pass."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the obvious JSON parser issue after inspecting the smoke test but misses tenant-scoped identity and composite revision ordering.",
+   "The agent verifies only ordinary positive-longitude queries and therefore misses antimeridian coverage and negative-coordinate quantization errors.",
+   "The agent treats bucket membership as sufficient geographic filtering, producing too many false positives for sparse or large-radius boundary cases.",
+   "The agent repairs clean builds but does not model stage checksums, incomplete markers, or stale manifests, so failure-injection tests publish corrupted output.",
+   "The agent uses a global in-memory sort or retains every revision, exhausting the one-CPU/2-GB environment on generated shards.",
+   "The agent assumes packed page delta bases are global or page-local without checking the binary fixtures, causing errors only when records cross page boundaries.",
+   "The agent installs the package in the repository but fails to provide the required `/usr/local/bin/atlas-index` deployment entry point.",
+   "The agent stops after matching the visible sample and never probes shuffled shards, late deletes, escaped fields, or multiple tenants."
+  ],
+  "predicted_pass_rate": 0.24,
+  "difficulty": "hard",
+  "category": "data-processing",
+  "tags": [
+   "javascript",
+   "deployment",
+   "spatial-index",
+   "error-recovery",
+   "large-scale-refactoring"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "Run `pwd; find . -maxdepth 2 -type f | sort` to locate the package, fixtures, tests, and deployment files.",
+   "Read the README, package metadata, CLI entry point, and documented JSON examples.",
+   "Run the supplied smoke tests and the visible build/query workflow.",
+   "Search for stage names, manifest handling, failure injection, and atomic renames with `rg`.",
+   "Inspect the shard parser and record normalization code.",
+   "Inspect reconciliation and revision-comparison logic.",
+   "Inspect longitude bucketing, radius coverage, and query candidate filtering.",
+   "Inspect page packing and binary decoding around page boundaries.",
+   "Inspect deployment/recovery code and existing interrupted-build fixtures.",
+   "Create a tiny shuffled multi-tenant fixture with escaped payloads, tombstones, composite revisions, and wraparound coordinates.",
+   "Run that fixture against the unmodified implementation to isolate the visible failures.",
+   "Patch JSONL parsing and preserve escaped embedded JSON without lossy splitting.",
+   "Patch reconciliation to use tenant-scoped identities and the documented composite revision ordering, including tombstones.",
+   "Patch longitude normalization, wraparound bucket coverage, and exact-distance filtering in queries.",
+   "Patch page delta-base handling at the packer/decoder boundary.",
+   "Patch stage completion markers, checksums, stale-artifact rejection, and atomic final publication.",
+   "Run smoke tests, the adversarial fixture, and each deterministic failure-injection point, then rebuild and compare results.",
+   "Install or link the corrected CLI at `/usr/local/bin/atlas-index` and run the contract, generated-data, recovery, and scale tests."
+  ],
+  "speedrun_commands": 18,
+  "scores": {
+   "clarity": 4,
+   "solvability": 3,
+   "verifiability": 4,
+   "genuine_difficulty": 2,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The documented JSON output format and the exact composite revision ordering are referenced but not stated, so a solver may need to infer behavior that tests treat as contractual.",
+   "The requirement that all dependent artifacts be atomically available is ambiguous on filesystems where a multi-file publication cannot literally be atomic; the intended directory/manifest publication protocol should be specified.",
+   "The failure-injection switch, its accepted values, and whether an interrupted build must preserve or discard reusable stages are not defined in the instruction.",
+   "The one-CPU/2-GB scale budget lacks concrete input-size, runtime, and memory limits, making the scale test potentially environment-sensitive.",
+   "A 99.7% recall and 0.3% false-positive threshold can be flaky or statistically underpowered unless the hidden query count, boundary conventions, and metric definitions are fixed.",
+   "The under-one-hour solvability claim is questionable for a 1,500-line multi-stage system requiring parser, reconciliation, geometry, binary-format, recovery, and deployment changes."
+  ],
+  "verdict": "reject",
+  "reasons": "The task is realistic and mostly verifiable, but the stated regression is likely discoverable directly from the source and the proposed speedrun is about 18 commands, triggering the rubric's cap on genuine difficulty. It also leaves several behavioral contracts and resource-test details implicit, so the overall score fails the acceptance rule because genuine_difficulty is 2 and the average is below 3.6.",
+  "fixes": [
+   "Specify the JSON schema, composite revision comparison (including tie behavior), longitude/radius boundary conventions, and exact false-positive/recall calculation.",
+   "Define the failure-injection interface, stage reuse rules, checksum format, and the precise directory-rename publication invariant.",
+   "Publish concrete scale-test limits and deterministic query seeds, minimum query counts, and tolerance behavior for floating-point distance calculations.",
+   "Make the repository require deeper exploratory reasoning rather than exposing each planted defect plainly in source structure and fixtures, or add a nontrivial interaction that cannot be fixed by a short sequence of isolated patches.",
+   "Provide a documented local validation command that exercises the same recovery, generated-data, and scale semantics used by verification."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "terminal-bench-2-1/pypi-server",
+     "verdict": "distinct",
+     "reason": "This task repairs and deploys a spatial delivery-record index with geospatial queries and crash-safe publication, unlike the reference's Python package creation and local PyPI server setup."
+    },
+    {
+     "ref_id": "ours/official-37d13d3e2124-m",
+     "verdict": "distinct",
+     "reason": "Although both involve repairing data-processing pipelines and deterministic outputs, this task centers on spatial indexing, radius queries, and atomic index publication rather than validating and aggregating JSONL logs."
+    },
+    {
+     "ref_id": "ours/official-c7bfa2cec6f0",
+     "verdict": "distinct",
+     "reason": "The reference implements a stateful JSONL recovery protocol with binary frame decoding and statistical analysis, whereas this task repairs a geospatial index builder and query executable."
+    },
+    {
+     "ref_id": "ours/official-982469e29790",
+     "verdict": "distinct",
+     "reason": "The reference reconciles filesystem artifacts into a scanner-authoritative SQLite index and quarantine tree, while this task builds a tenant-scoped spatial index with geospatial recall and precision requirements."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "The reference rebuilds a security-focused SQLite event database with canonical address classification and revision handling, not a crash-safe spatial index for geographic delivery queries."
+    }
+   ],
+   "nearest": [
+    [
+     "terminal-bench-2-1/pypi-server",
+     0.108
+    ],
+    [
+     "ours/official-37d13d3e2124-m",
+     0.106
+    ],
+    [
+     "ours/official-c7bfa2cec6f0",
+     0.102
+    ],
+    [
+     "ours/official-982469e29790",
+     0.1
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.095
+    ]
+   ],
+   "cost_usd": 0.0008652
+  },
+  "novel": true
+ },
+ "cost_usd": 0.0033872
+}

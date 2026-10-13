@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+import sys,csv
+from fractions import Fraction
+from collections import OrderedDict
+H=['id','batch','account','group','src','dst','amount','num','den','split_id','part','total']
+O=['id','batch','account','group','dst','allocation']
+C={'USD','EUR','GBP'}; LIM=2**62
+def fail(m): raise ValueError(m)
+def num(s,n):
+ if not s or not s.lstrip('+-').isdigit(): fail('invalid '+n)
+ v=int(s)
+ if abs(v)>LIM: fail('overflow')
+ return v
+def main():
+ try:
+  rr=list(csv.reader(sys.stdin))
+  if not rr or rr[0]!=H: fail('invalid header')
+  xs=[]; sm={}
+  for ln,r in enumerate(rr[1:],2):
+   if len(r)!=12 or any(v.strip()!=v for v in r) or not any(r): fail('malformed record at line '+str(ln))
+   if any(not r[i] for i in range(6)): fail('missing field')
+   if r[4] not in C or r[5] not in C: fail('unknown currency')
+   a,n,d=num(r[6],'amount'),num(r[7],'numerator'),num(r[8],'denominator')
+   if n<=0 or d<=0: fail('invalid rate')
+   if abs(a*n)>LIM*LIM: fail('overflow')
+   sid=r[9]
+   if sid:
+    p,t=num(r[10],'part'),num(r[11],'total')
+    if p<1 or t<1 or p>t: fail('invalid split')
+    meta=(tuple(r[1:6]),n,d,t)
+    if sid in sm and sm[sid][0]!=meta: fail('inconsistent split metadata')
+    sm.setdefault(sid,(meta,set()))[1].add(p)
+   elif r[10] or r[11]: fail('inconsistent split metadata')
+   xs.append((r[0],r[1],r[2],r[3],r[5],Fraction(a*n,d),ln))
+  for meta,ps in sm.values():
+   if ps!=set(range(1,meta[3]+1)): fail('incomplete split')
+  gs=OrderedDict()
+  for x in xs: gs.setdefault(x[1:4]+(x[4],),[]).append(x)
+  out={}
+  for ls in gs.values():
+   total=sum((x[5] for x in ls),Fraction()); lo=total.numerator//total.denominator; f=total-Fraction(lo)
+   target=lo+(f>Fraction(1,2) or (f==Fraction(1,2) and lo%2))
+   base=[x[5].numerator//x[5].denominator for x in ls]; rem=[x[5]-b for x,b in zip(ls,base)]
+   k=int(target-sum(base))
+   order=sorted(range(len(ls)),key=lambda i:((-rem[i] if k>0 else rem[i]),ls[i][6]))
+   for i in order[:abs(k)]: base[i]+=1 if k>0 else -1
+   for x,v in zip(ls,base): out[x[6]]=v
+  w=csv.writer(sys.stdout,lineterminator='\n'); w.writerow(O)
+  for x in xs: w.writerow([x[0],x[1],x[2],x[3],x[4],out[x[6]]])
+  return 0
+ except Exception as e:
+  print('reconcile-pack: '+str(e),file=sys.stderr); return 2
+if __name__=='__main__': sys.exit(main())

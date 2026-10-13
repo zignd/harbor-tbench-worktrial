@@ -1,0 +1,190 @@
+{
+ "blueprint": {
+  "slug": "replay-sealed-event-journal",
+  "title": "Repair the Sealed Event Journal Replay",
+  "scenario": "A security analyst's daily blocked-event totals stopped adding up after a journal format upgrade. The container contains an SQLite-backed replay utility, a small collection of journal fragments, signing material, an opaque frame-inspection helper, and several unrelated reporting components; some fragments contain hostile or damaged records intended to exercise recovery behavior.",
+  "instruction_draft": "Repair `/opt/case/bin/replay.sh`, then use it to rebuild `/opt/case/out/replayed.db` and `/opt/case/out/summary.json` from `/opt/case/inbox/journal.db`. The replay must authenticate every frame, recover valid streams despite interleaving, reordering, duplicates, malformed frames, and unrelated corrupt streams, and must never execute or interpolate any journal content as shell or SQL. A frame is acceptable only when it has the documented schema, a valid MAC under the key for its tenant, a valid sequence/previous-digest relationship or an authenticated checkpoint, and is not a replay or fork; valid frames from other streams must still be retained after a rejected frame.\n\nThe rebuilt database must contain exactly one row for every accepted event, with its original tenant, stream, sequence, event type, and signed integer amount, and no rejected event may affect data or totals. Produce a deterministic JSON summary containing accepted and rejected counts, rejection counts by reason, and exact per-tenant event counts and decimal totals. The implementation must handle the supplied data and verify-time-generated corpora of at least 50,000 frames in under 8 seconds on one CPU, use bounded memory, preserve idempotence when run twice, and exit nonzero without replacing the prior output if input or authentication metadata is unusable.",
+  "requirements": [
+   "Repair `/opt/case/bin/replay.sh`.",
+   "Read `/opt/case/inbox/journal.db` and write `/opt/case/out/replayed.db` and `/opt/case/out/summary.json`.",
+   "Authenticate every frame using the tenant key and the documented canonical frame representation.",
+   "Accept only frames with the documented schema, valid MAC, valid sequence and previous-digest relationship or authenticated checkpoint, and no replay or fork.",
+   "Recover valid streams despite interleaving, out-of-order frames, duplicates, malformed frames, and corruption in unrelated streams.",
+   "Reject malformed, unauthenticated, replayed, forked, and otherwise invalid frames without allowing them to affect stored events or totals.",
+   "Never execute or interpolate journal content as shell code or SQL.",
+   "Store exactly one row for every accepted event with its original tenant, stream, sequence, event type, and signed integer amount.",
+   "Produce deterministic JSON with accepted and rejected counts, rejection counts by reason, and exact per-tenant event counts and decimal totals.",
+   "Use bounded memory and process at least 50,000 frames in under 8 seconds on one CPU.",
+   "Be idempotent when run twice on the same input.",
+   "Exit nonzero and leave the prior output intact when input or authentication metadata is unusable."
+  ],
+  "environment": [
+   "The Docker image is based on `python:3.13-slim-bookworm` with pinned SQLite, OpenSSL, Bash, and compiler packages and no network access.",
+   "`/opt/case/bin/replay.sh` is an existing Bash program with several plausible but incomplete replay, aggregation, and atomic-output paths.",
+   "`/opt/case/bin/frame-inspect` is a compiled opaque helper that describes frame fields, canonicalization, checkpoint encoding, and reason-code conventions; its source is not present.",
+   "`/opt/case/inbox/journal.db` contains frame fragments, tenant key metadata, checkpoint anchors, and a small visible corpus containing both ordinary valid frames and obvious failures.",
+   "`/opt/case/out/` contains an old valid database and summary that must remain untouched on fatal setup failure.",
+   "The frame format includes tenant and stream identifiers, signed sequence numbers, event type, signed decimal amount, previous digest, checkpoint metadata, and a MAC; valid streams may arrive in any row order and may be interleaved.",
+   "The seeded environment contains roughly 1,400 lines across the replay script, SQLite schema/reporting helpers, frame-inspection wrapper, fixture generator, and unrelated operational utilities.",
+   "Some planted defects involve state keyed too coarsely, retry handling, canonicalization of empty and escaped fields, signed-number boundaries, SQLite quoting, and non-atomic replacement; the visible fixtures do not cover all of them."
+  ],
+  "internal_hint": "First inspect the schema, helper behavior, fixture generator, and existing output rather than trusting the replay script. Use the opaque frame-inspector on boundary examples and instrument a copy of the pipeline to determine canonical bytes, checkpoint anchors, and the distinction between a duplicate, a gap, a fork, and an invalid predecessor. The reliable solution parses fields without shell evaluation, authenticates before state mutation, keeps independent per-tenant/per-stream state, buffers or incrementally resolves out-of-order frames, treats authenticated checkpoints as recovery roots, records a rejected frame only once, and uses parameterized SQLite writes in batched transactions. Fix aggregation with exact decimal-string arithmetic or a safe SQLite representation, create a temporary database and atomically rename it only after all fatal checks pass, and benchmark a large generated corpus. The difficulty is primarily substantial construction and behavior that only appears after state has accumulated across many streams; it is not visible by reading one defect.",
+  "trap": "A shallow solution usually verifies only the visible ordered examples, keys state by tenant instead of tenant plus stream, or sorts all frames in memory and accepts a chain after one locally valid predecessor. Such a solution passes simple samples but incorrectly accepts forged forks after a duplicate, loses valid events following a corrupt stream, mishandles escaped empty fields or negative 64-bit amounts, double-counts retries, overflows totals, or exceeds the performance bar on the hidden corpus.",
+  "tests": [
+   "A clean-fixture test invokes the repaired script and checks that `/opt/case/out/replayed.db` has exactly the accepted seeded events and that `/opt/case/out/summary.json` has deterministic counts and totals; this checks the requirement to rebuild both named outputs and store exactly one accepted row.",
+   "A hidden adversarial-corpus test generates at least 50,000 frames across many tenants and streams with valid out-of-order interleaving, retries, malformed rows, bad MACs, forged predecessors, forks, sequence-boundary values, empty escaped fields, and signed amount boundaries; this checks authentication, schema validation, stream recovery, rejection isolation, and exact aggregation.",
+   "A differential test compares the database rows and summary against an independent reference replay for freshly generated corpora, including valid frames after invalid frames and valid streams sharing tenants; this checks that no rejected frame affects state and that stream state is not keyed too coarsely.",
+   "A security test places SQL metacharacters, shell metacharacters, newlines, Unicode, and very long values in authenticated and unauthenticated fields and checks that no command is executed, no SQL injection changes schema or rows, and benign authenticated records are preserved; this checks the no-evaluation requirement.",
+   "A numerical test generates amounts near signed 64-bit limits and totals requiring more than signed 64-bit range, then compares decimal totals exactly; this checks the exact-total requirement.",
+   "An idempotence test runs the command twice against the same input and compares database contents, summary bytes, and row counts; this checks deterministic replay and duplicate handling.",
+   "A recovery test corrupts one input database or removes authentication metadata, seeds a prior output, and checks for nonzero exit status with the prior database and summary byte-for-byte unchanged; this checks fatal-error atomicity.",
+   "A performance test runs a fresh 50,000-to-200,000-frame corpus on one CPU and fails if processing exceeds 8 seconds or memory grows proportionally to the entire corpus; this checks the stated performance and bounded-memory requirements."
+  ],
+  "verifier_knob": {
+   "name": "adversarial_corpus_size_and_coverage",
+   "value": "160000 generated frames across 96 streams, with approximately 20% reordered or retried frames, 12% malformed or unauthenticated frames, 4% forks/gaps, and rare escaping, checkpoint, and numeric-boundary cases",
+   "effect": "Lowering the value permits shallow implementations that pass visible fixtures or use slow per-row subprocesses; raising corpus size, stream count, reorder depth, and rare-case frequency exposes incorrect accumulated state, memory-heavy sorting, quadratic duplicate checks, and incomplete rejection logic."
+  },
+  "expected_failure_modes": [
+   "The agent fixes an obvious SQL quoting issue but does not reconstruct the authenticated stream algorithm.",
+   "The agent assumes input order is stream order and silently rejects or misattributes valid out-of-order frames.",
+   "The agent treats a duplicate as a predecessor, thereby accepting a later forged fork.",
+   "The agent uses one state slot per tenant, causing cross-stream contamination when streams interleave.",
+   "The agent validates MACs over a reconstructed string rather than the documented canonical bytes, especially for empty, escaped, or Unicode fields.",
+   "The agent uses Bash or SQLite integer arithmetic and loses negative-boundary values or totals beyond 64-bit range.",
+   "The agent materializes and repeatedly sorts the whole corpus, passing small samples but failing the performance or memory test.",
+   "The agent writes directly to the required output paths and leaves partially replaced results after a fatal input or key error.",
+   "The agent counts rejected records in aggregates or stores an event before authentication and cannot undo the resulting side effects.",
+   "The agent relies on the visible corpus and misses rare valid checkpoint recovery, malformed-frame resynchronization, or malicious field contents."
+  ],
+  "predicted_pass_rate": 0.22,
+  "difficulty": "hard",
+  "category": "security",
+  "tags": [
+   "bash",
+   "sqlite",
+   "stream-replay",
+   "adversarial-corpus",
+   "error-recovery",
+   "performance"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "1. `find /opt/case -maxdepth 3 -type f -printf '%p\\n' | sort`",
+   "2. `sed -n '1,260p' /opt/case/bin/replay.sh`",
+   "3. `sqlite3 /opt/case/inbox/journal.db '.schema'`",
+   "4. `sqlite3 /opt/case/inbox/journal.db '.tables'`",
+   "5. Inspect the existing output schema and contents with `sqlite3` and `jq`.",
+   "6. Run `/opt/case/bin/frame-inspect --help` and inspect its wrapper and supported modes.",
+   "7. Query representative valid, malformed, duplicate, forked, checkpoint, and escaped rows from the input database.",
+   "8. Feed boundary rows through `frame-inspect` to determine field parsing, canonical bytes, MAC verification, checkpoints, and reason codes.",
+   "9. Inspect the fixture generator and reporting/schema helpers for hidden format and output conventions.",
+   "10. Run the unmodified replay once to establish baseline failures and side effects.",
+   "11. Trace the existing script's SQL and shell interpolation paths and identify all state, retry, and atomic-output defects.",
+   "12. Derive the independent state key and transition rules for each tenant/stream, including checkpoint recovery and invalid predecessors.",
+   "13. Implement a safe parser that treats all database fields as data and validates schema and signed numeric boundaries before state mutation.",
+   "14. Implement canonical serialization and MAC verification using the helper-derived rules and tenant key metadata.",
+   "15. Implement per-tenant/per-stream buffering or incremental resolution for out-of-order frames, duplicates, gaps, forks, and rejected predecessors.",
+   "16. Ensure rejected frames are counted once and cannot mutate stream state, events, or aggregates.",
+   "17. Implement exact decimal-string aggregation without Bash or SQLite integer overflow.",
+   "18. Implement parameterized batched SQLite writes with exactly one row per accepted event.",
+   "19. Implement deterministic rejection counts, tenant ordering, event ordering, and JSON serialization.",
+   "20. Write to a temporary database and summary, perform all fatal validation first, then atomically replace both required outputs.",
+   "21. Run the clean fixture and compare rows and summary with the expected values.",
+   "22. Exercise shell metacharacters, SQL metacharacters, Unicode, newlines, long fields, empty escaped fields, and invalid MACs.",
+   "23. Exercise shared tenants, multiple streams, retries, forks, checkpoints, negative 64-bit boundaries, and totals beyond 64-bit range.",
+   "24. Run the command twice and compare database contents, row counts, and summary bytes.",
+   "25. Corrupt the input or remove key metadata and verify nonzero exit with byte-identical prior outputs.",
+   "26. Generate and replay progressively larger corpora, inspect memory behavior, and benchmark on one CPU.",
+   "27. Compare generated results against an independent reference implementation and fix any stream-order or rejection discrepancies.",
+   "28. Run the final clean, adversarial, recovery, idempotence, and performance checks."
+  ],
+  "speedrun_commands": 28,
+  "scores": {
+   "clarity": 3,
+   "solvability": 2,
+   "verifiability": 3,
+   "genuine_difficulty": 5,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The instruction refers to a documented schema and canonical representation, but the blueprint does not specify whether the opaque helper exposes enough information to reconstruct all semantics, especially invalid-predecessor, fork, duplicate, and checkpoint rules.",
+   "The required output database schema, summary JSON schema, ordering rules, and exact rejection-reason taxonomy are not explicitly defined; relying on conventions discoverable from unrelated files makes failures potentially ambiguous.",
+   "The bounded-memory requirement is not given a measurable limit, and a test that infers proportional memory growth from process measurements can be noisy and environment-dependent.",
+   "An 8-second limit on 160,000 frames under a one-CPU container may be flaky without a fixed hardware baseline and a precise measurement protocol.",
+   "The phrase 'every frame' conflicts slightly with malformed frames that may not contain enough fields to authenticate, unless the intended behavior for such frames is explicitly defined.",
+   "The under-an-hour solvability target is unrealistic for reconstructing an undocumented authenticated replay protocol, implementing recovery and exact arithmetic, and meeting atomicity and performance requirements from an opaque helper."
+  ],
+  "verdict": "reject",
+  "reasons": "The task has substantial and realistic adversarial depth, but a correct implementation is unlikely to be solvable in under an hour: the speedrun requires roughly 28 meaningful investigation and implementation steps before reliable verification. Several externally important semantics and output contracts are only discoverable indirectly, while memory and timing checks are insufficiently normalized. Since solvability scores below 3 and the resulting average is below 3.6, this blueprint should be rejected as written.",
+  "fixes": [
+   "Provide an explicit format specification covering field grammar, canonical bytes, key metadata, checkpoint encoding, transition rules, and every rejection reason.",
+   "Specify the exact output database schema, summary JSON schema, deterministic ordering, and duplicate-counting semantics.",
+   "Ship a small reference decoder or a documented library API rather than requiring reverse engineering of an opaque helper.",
+   "Reduce the scope or allow substantially more time; alternatively provide a tested replay-state skeleton and focus the task on repairing selected defects.",
+   "Define a quantitative memory limit and a reproducible benchmark environment, with a timing tolerance appropriate for shared CI hardware.",
+   "Clarify how malformed or structurally incomplete frames are classified when authentication is impossible."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": false,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-e05a846f6234",
+     "verdict": "distinct",
+     "reason": "This repairs an authenticated journal-chain replay and aggregation pipeline, whereas the reference repairs a stateful weighted-percentile service with event-time windows and recovery."
+    },
+    {
+     "ref_id": "ours/official-33004981f7b0",
+     "verdict": "distinct",
+     "reason": "Although both process hostile authenticated frames deterministically, this task reconstructs chained tenant event streams while the reference decrypts settlement batches and reconciles adjustments against bank records."
+    },
+    {
+     "ref_id": "ours/official-e05a846f6234-m",
+     "verdict": "distinct",
+     "reason": "The candidate validates and reconstructs independently chained journal streams, rather than implementing the reference's online metric ingestion, checkpointing, lateness policy, and percentile queries."
+    },
+    {
+     "ref_id": "ours/official-9cbb677d2a2f",
+     "verdict": "variant",
+     "reason": "Both are deterministic repairs of replay utilities that read SQLite-backed event data and materialize canonical output while preserving auditability, though their validation and domain-state rules differ substantially."
+    },
+    {
+     "ref_id": "ours/official-8e10e57d4d79",
+     "verdict": "distinct",
+     "reason": "This is an offline authenticated journal reconstruction and aggregation task, not a network deployment problem involving TCP framing, service health, reconnects, and delivery guarantees."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-e05a846f6234",
+     0.254
+    ],
+    [
+     "ours/official-33004981f7b0",
+     0.229
+    ],
+    [
+     "ours/official-e05a846f6234-m",
+     0.212
+    ],
+    [
+     "ours/official-9cbb677d2a2f",
+     0.204
+    ],
+    [
+     "ours/official-8e10e57d4d79",
+     0.201
+    ]
+   ],
+   "cost_usd": 0.0013357999999999998
+  },
+  "novel": false
+ },
+ "cost_usd": 0.0040868
+}

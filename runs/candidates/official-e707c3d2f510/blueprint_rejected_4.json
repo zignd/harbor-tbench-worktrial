@@ -1,0 +1,182 @@
+{
+ "blueprint": {
+  "slug": "repair-haplotype-phase-worker",
+  "title": "Repair the Haplotype Phase Worker",
+  "scenario": "An on-call SRE has been paged because the overnight variant-analysis queue is growing and the phase API intermittently reports 503 responses. The container runs a small Python API, a background worker, a SQLite job catalog, and an opaque alignment-replay helper; the missing production feature is the worker that converts aligned reads and variant evidence into deterministic diploid haplotype blocks.",
+  "instruction_draft": "Implement and enable the haplotype-phase job so that every accepted manifest produces the documented phased-block JSON and VCF-like output, persists the completed job and per-variant results in the existing SQLite state, and remains correct after worker restarts. Results must satisfy the repository's documented read-likelihood, diploid-consistency, block-boundary, confidence, and deterministic tie-breaking rules on newly generated manifests, including malformed and duplicated reads.",
+  "requirements": [
+   "The existing phase API must accept every valid manifest in the documented request format and eventually mark its job completed rather than leaving it queued or returning a worker 503.",
+   "For each completed job, write the documented phased-block JSON and VCF-like artifact at the configured output paths, with the required sample, block, variant, allele, phase-set, likelihood, and confidence fields.",
+   "Persist one completed job row and the documented per-variant result rows in the existing SQLite database, with idempotent results when the same job is retried or the worker is restarted.",
+   "For every input read, apply the documented alignment, base-quality, mapping-quality, duplicate-read, and malformed-read rules before calculating evidence.",
+   "Choose diploid haplotypes according to the documented read-likelihood and constraint objective, including consistency of all variants within a phase block and the documented handling of contradictory or insufficient evidence.",
+   "Split phase blocks exactly according to the documented connectivity and maximum-gap rules, and emit deterministic phase-set identifiers independent of worker scheduling.",
+   "Emit the documented confidence and unphased/ambiguous markers for low-information and tied solutions instead of selecting an arbitrary phase.",
+   "Produce byte-for-byte deterministic artifacts and database results for identical manifests, including deterministic ordering and tie-breaking.",
+   "Remain operational across a worker restart and correctly recover queued or in-progress jobs without duplicating output rows or corrupting the state database."
+  ],
+  "environment": [
+   "A Docker image based on python:3.13-slim-bookworm with pinned standard Python dependencies, one CPU, and 2 GB RAM.",
+   "A supervisor-launched Python HTTP API on localhost:8080, a separate background phase worker, and a small health/metrics service in the same container.",
+   "Approximately 1,400 lines of authored Python across the API, queue, SQLite repository, manifest validator, artifact writer, metrics endpoint, and unrelated report code; the phase solver is intentionally incomplete rather than isolated in a tiny file.",
+   "A repository documentation file describing the manifest schema, aligned-read representation, base and mapping quality likelihood model, duplicate and malformed-read policy, graph connectivity and block-gap rules, phase objective, ambiguity threshold, confidence calculation, output schemas, and tie-breaking order.",
+   "Seed manifests, logs, a partially populated SQLite database, and generated-looking output artifacts from prior runs. The visible examples contain mostly clean reads and do not exercise contradictory alleles, duplicate observations, long gaps, or exact likelihood ties.",
+   "An opaque compiled alignment-replay helper shipped without source. It replays deterministic read batches into the API and occasionally emits supplementary, clipped, duplicated, or malformed records; its behavior is discoverable through its protocol and logs but not by reading an implementation.",
+   "The worker currently acknowledges jobs before all evidence has been normalized, mishandles at least one history-dependent queue/retry path, and lacks the general constrained phasing implementation. The API's visible 503 symptom is caused by worker recovery failures, while the final scientific errors require exercising the replayed data.",
+   "A fixed seed and generator utility used by verification to create fresh manifests containing thousands of reads, disconnected and barely connected variant components, contradictory observations, duplicate records, quality extremes, and tie cases."
+  ],
+  "internal_hint": "Investigate service logs, the queue database, and the replay protocol rather than assuming the HTTP listener is at fault. Run the existing seed jobs and instrument the worker around normalization, graph construction, retry recovery, and artifact commits; the important failures only appear after duplicate and malformed records accumulate across retries. Implement the documented pipeline: normalize and deterministically filter reads, accumulate quality-weighted allele and pair evidence, construct connected variant components with the exact gap rule, solve each component's two-color phase assignment under the documented likelihood and ambiguity constraints, derive confidence and phase sets, and commit artifacts plus SQLite rows transactionally. Fix acknowledgement/recovery so a crash before commit leaves a replayable job and a crash after commit is idempotent, then exercise the opaque replayer and generated adversarial manifests before declaring the queue healthy.",
+  "trap": "A shallow solution can make the sample job and health check pass by selecting the locally strongest allele pair, ignoring duplicate/supplementary records, or writing output before the database transaction. It fails hidden manifests containing a weak but globally supported phase edge, disconnected components, exact ties, quality-zero observations, and retry histories; it also fails restart tests through duplicated rows, nondeterministic phase-set IDs, or a permanently stuck job.",
+  "tests": [
+   "Submit several verify-time generated manifests through the documented API and check that every valid job reaches completed state with the required response fields; this tests the requirement that accepted jobs do not remain queued or fail with worker 503s.",
+   "Inspect the configured output directory and parse each generated phased-block JSON and VCF-like artifact, checking all required sample, block, variant, allele, phase-set, likelihood, and confidence fields; this tests the artifact requirement.",
+   "Compare every phased block and per-variant result against an independent deterministic reference implementation on fresh generated reads, including disconnected components, long gaps, contradictory evidence, and low-information sites; this tests normalization, objective, block boundaries, and ambiguity behavior.",
+   "Check SQLite job and result tables after each run for exactly one completed job and the expected per-variant rows, then repeat the same submission; this tests persistence and idempotency.",
+   "Inject replay batches containing duplicates, supplementary/clipped alignments, malformed records, and quality extremes and compare results with the reference after normalization; this tests the documented evidence rules rather than only clean examples.",
+   "Generate manifests with equal-scoring phase orientations and verify the documented unphased marker or deterministic tie result, including byte-for-byte artifact comparison across repeated runs; this tests ambiguity and tie-breaking.",
+   "Kill the worker at deterministic queue/replay checkpoints, restart the supervised services, and verify that jobs resume or are recognized as committed without duplicate rows or corrupted artifacts; this tests transactional recovery and restart behavior.",
+   "Run a scale fixture with thousands of reads and hundreds of variants under the container limits and check completion plus reference-equivalent results; this tests that the implementation is a real general solver rather than a sample-specific patch."
+  ],
+  "verifier_knob": {
+   "name": "independent_state_properties",
+   "value": "8",
+   "effect": "Increasing this adds independent checks for API completion, normalized evidence, exact haplotype choices, block segmentation, confidence fields, artifact bytes, SQLite idempotency, and restart recovery, making partial implementations fail; lowering it to 3 or 4 permits solutions that only produce plausible sample output."
+  },
+  "expected_failure_modes": [
+   "The agent fixes the visible 503 or queue retry path without implementing globally consistent read phasing.",
+   "The agent implements greedy per-variant allele selection, which passes clean seed data but fails pairwise phase evidence and contradictory-read cases.",
+   "The agent overlooks duplicate and supplementary-read normalization, causing history-dependent likelihood changes.",
+   "The agent uses floating-point iteration or unordered sets without the documented deterministic tie-breaking, producing unstable phase orientation or phase-set IDs.",
+   "The agent writes artifacts and database rows in separate operations, leaving duplicate or half-completed jobs after a forced restart.",
+   "The agent treats every low-confidence tie as a forced phase, or marks every contradiction unphased, both of which fail hidden confidence and ambiguity cases.",
+   "The agent verifies only the supplied fixtures and never exercises the opaque replay helper or generated malformed and adversarial inputs.",
+   "The agent's solver is asymptotically too slow on the thousands-of-reads scale fixture or consumes excessive memory by retaining all raw replay records."
+  ],
+  "predicted_pass_rate": 0.28,
+  "difficulty": "hard",
+  "category": "scientific-computing",
+  "tags": [
+   "python",
+   "haplotype-phasing",
+   "constraint-satisfaction",
+   "sqlite",
+   "service-recovery",
+   "determinism"
+  ]
+ },
+ "accepted": false,
+ "review": {
+  "speedrun": [
+   "pwd; find . -maxdepth 2 -type f | sort",
+   "cat the repository documentation and manifest/schema files",
+   "inspect pyproject, dependency pins, and supervisor configuration",
+   "grep for API routes, queue states, worker entrypoints, and TODOs",
+   "inspect the SQLite schema, repository methods, and migration/setup code",
+   "inspect the manifest validator and artifact writer",
+   "inspect the incomplete phase worker and solver code",
+   "inspect health, metrics, logging, and retry/recovery paths",
+   "start the supervised services and query health/status endpoints",
+   "submit a supplied seed manifest and capture its job ID",
+   "inspect worker logs and corresponding queue/database rows",
+   "run the seed job and compare its artifacts with documented examples",
+   "discover the opaque replay helper protocol from its command usage and logs",
+   "run a replay batch containing duplicates and malformed records",
+   "trace acknowledgement, normalization, commit, and retry behavior",
+   "implement deterministic read normalization and duplicate/supplementary filtering",
+   "implement quality-weighted allele and pair evidence accumulation",
+   "implement connectivity, maximum-gap block construction, and deterministic ordering",
+   "implement diploid component optimization, ambiguity handling, and confidence calculation",
+   "implement deterministic phase-set IDs and complete JSON/VCF-like artifact generation",
+   "make artifact/database completion and retry handling transactional or recoverable",
+   "fix startup recovery for queued and in-progress jobs with idempotent result inserts",
+   "run generated contradictory, disconnected, tie, and quality-extreme manifests",
+   "kill and restart the worker at replay checkpoints, then inspect rows and artifacts",
+   "compare outputs with the verification reference and repeat for byte identity",
+   "run the thousands-of-reads scale fixture under the container resource limits"
+  ],
+  "speedrun_commands": 26,
+  "scores": {
+   "clarity": 4,
+   "solvability": 2,
+   "verifiability": 4,
+   "genuine_difficulty": 4,
+   "realism": 4
+  },
+  "invalid_failure_risks": [
+   "The exact repository documentation is not included in the blueprint, so requirements such as the likelihood formula, ambiguity threshold, confidence formula, and maximum-gap boundary could be underspecified or internally inconsistent.",
+   "Crash tests that depend on precise queue or replay checkpoints may be flaky unless deterministic kill hooks and checkpoint semantics are exposed.",
+   "Requiring artifacts and SQLite rows to appear atomically is not directly achievable across independent filesystem and SQLite transactions unless the documented recovery protocol defines a manifest/commit marker.",
+   "A byte-for-byte comparison of SQLite results is invalid if it includes nondeterministic internal fields, timestamps, rowids, or implementation-dependent serialization rather than documented logical columns.",
+   "The independent reference implementation could encode different malformed-read, duplicate, or tie behavior from the repository documentation, making a correct implementation fail.",
+   "The opaque helper may be difficult to exercise reliably in verification if its protocol, executable compatibility, or resource behavior is not fully pinned."
+  ],
+  "verdict": "reject",
+  "reasons": "The requirements are mostly clear and the verification plan is strong, but implementing a general constrained phaser, deterministic artifact pipeline, and crash-safe recovery across a 1,400-line service is not realistically solvable in under an hour. The 26-step speedrun is substantially beyond a focused repair, so solvability falls below the acceptance threshold even though the difficulty is genuine rather than superficial.",
+  "fixes": [
+   "Reduce the task to a narrowly scoped worker and repository interface, with unrelated report/API code already stabilized.",
+   "Provide an executable reference oracle or a compact formal specification containing exact likelihood, confidence, ambiguity, block-gap, and serialization rules.",
+   "Expose deterministic replay and worker-crash checkpoints, and define the filesystem/database commit and recovery protocol explicitly.",
+   "Split service recovery and scientific phasing into separate tasks, or provide a partially implemented solver with only one or two missing algorithmic components.",
+   "Include a smoke-test command and a representative adversarial fixture so the core failure can be reproduced without reverse-engineering the opaque helper."
+  ],
+  "accepted": false
+ },
+ "novelty": {
+  "lexical_flags": [],
+  "judge": {
+   "novel": true,
+   "verdicts": [
+    {
+     "ref_id": "ours/official-073b0a97c3b3",
+     "verdict": "distinct",
+     "reason": "The candidate implements a genomic haplotype-phasing worker and artifact pipeline, whereas the reference repairs canary health evaluation and rollback state."
+    },
+    {
+     "ref_id": "ours/official-cd259cd6c51d",
+     "verdict": "distinct",
+     "reason": "The candidate solves diploid read-evidence phasing with persistent job results, while the reference packages and validates dependency-selected release artifacts."
+    },
+    {
+     "ref_id": "ours/official-1112cdbd9938-m",
+     "verdict": "distinct",
+     "reason": "Although both use SQLite and deterministic ingestion, the candidate computes haplotype blocks in a worker, whereas the reference rebuilds an event index with validation, revisions, and rejection handling."
+    },
+    {
+     "ref_id": "ours/official-936e7746aeaa",
+     "verdict": "distinct",
+     "reason": "The reference is a columnar-capsule statistics query daemon, not a background genomic phasing worker with read-likelihood and block constraints."
+    },
+    {
+     "ref_id": "ours/official-ea89cb64bf34",
+     "verdict": "distinct",
+     "reason": "Despite shared restart recovery and deterministic persistence concerns, the reference reconstructs a generic transactional key-value/event store, while the candidate performs domain-specific haplotype inference and phased artifact generation."
+    }
+   ],
+   "nearest": [
+    [
+     "ours/official-073b0a97c3b3",
+     0.128
+    ],
+    [
+     "ours/official-cd259cd6c51d",
+     0.128
+    ],
+    [
+     "ours/official-1112cdbd9938-m",
+     0.123
+    ],
+    [
+     "ours/official-936e7746aeaa",
+     0.119
+    ],
+    [
+     "ours/official-ea89cb64bf34",
+     0.113
+    ]
+   ],
+   "cost_usd": 0.000884
+  },
+  "novel": true
+ },
+ "cost_usd": 0.003398
+}

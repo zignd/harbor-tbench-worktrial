@@ -1,0 +1,68 @@
+{
+ "slug": "global-settlement-reconciliation",
+ "title": "Repair Global Settlement Reconciliation",
+ "scenario": "A finance-ops engineer is investigating a reconciliation service that compares posted ledger events with processor settlement events stored in SQLite. The container contains a small Python service, SQL access layer, streaming JSON protocol, audit logs, Prometheus-style metrics, and a missing reconciliation component that the service currently cannot load.\n\nThe service must produce a deterministic reconciliation report for each account and currency, even when event histories contain superseded or voided records and many individually plausible matches. The supplied fixture is intentionally unrepresentative; verification creates new SQLite databases from a hidden seed and exercises the service through its normal command-line interface.",
+ "instruction_draft": "Repair the service under `/opt/settlement-recon` and make `/opt/settlement-recon/bin/reconcile` produce the required report when invoked as `reconcile --db PATH --out PATH --window-ns N`. For each ID in the latest event version, retain only records whose latest state is `posted`; a later version must supersede every earlier version, and voided or otherwise non-posted latest records must not participate. A bank settlement is eligible only when account, currency, and integer amount match exactly and its event timestamp is no earlier than the ledger timestamp and no more than `N` nanoseconds later.\n\nAssign eligible ledger and bank records globally: maximize the number of assignments, then minimize the sum of settlement-minus-ledger timestamp deltas, then minimize the sum of `(1 + zero-based ledger-ID rank) * (1 + zero-based bank-ID rank)`, where ranks are in Unicode lexicographic ID order. Each record may be used once. Write canonical JSON containing every bank ID in Unicode lexicographic order, its assigned ledger ID or null, the delta or null, and summary counts and amount totals; repeated runs on the same database must be byte-for-byte identical. Preserve the existing JSON-lines health endpoint and update its reconciliation counters so that processed, matched, unmatched, and candidate-edge counts describe the report actually written.",
+ "requirements": [
+  "Provide an executable `/opt/settlement-recon/bin/reconcile` accepting `--db PATH --out PATH --window-ns N`.",
+  "Read the SQLite event tables through the service's existing SQL access layer.",
+  "For each record ID, use only its greatest version and exclude it when that latest state is not `posted`.",
+  "Require exact account, currency, and integer amount equality for an eligible pair.",
+  "Require settlement timestamp minus ledger timestamp to be in the inclusive range zero through `N` nanoseconds.",
+  "Produce a global one-to-one assignment maximizing the number of matched records.",
+  "Among maximum-cardinality assignments, minimize the total timestamp delta.",
+  "Among assignments tied on the first two objectives, minimize the stated rank-product sum using Unicode lexicographic ID ranks.",
+  "Include every bank ID in Unicode lexicographic order, with its ledger ID and delta when matched and null fields when unmatched.",
+  "Include deterministic summary counts and integer amount totals in the JSON report.",
+  "Make identical invocations produce byte-for-byte identical output without relying on wall-clock time or randomness.",
+  "Keep the existing JSON-lines health endpoint functioning and report processed, matched, unmatched, and candidate-edge metrics consistent with the generated report."
+ ],
+ "environment": [
+  "A Docker image based on `python:3.13-slim-bookworm` with pinned SQLite/Python dependencies, one CPU, and 2 GB RAM.",
+  "The `/opt/settlement-recon` tree contains roughly 1,300 lines across a CLI, SQLite repository, JSON protocol server, metrics exporter, configuration loader, fixtures, and unrelated operational utilities.",
+  "The SQLite schema contains `ledger_events(record_id, version, state, account, currency, amount, event_ns)` and `bank_events(record_id, version, state, account, currency, amount, event_ns)`; fixture histories include duplicate versions, out-of-order event timestamps, supersessions, and voids.",
+  "The service's normal path performs SQL extraction and then imports a deliberately absent or stubbed Python reconciliation component; the surrounding code and README document the command, report schema, event semantics, and health JSON-lines protocol.",
+  "A small sample database and service logs are present, including candidate-count and timing messages; the sample has no equal-cost competing maximum matchings and therefore does not expose the canonical tie-break requirement.",
+  "A Prometheus-text metrics snapshot and a health endpoint are included so the repaired component must integrate with the existing observability path rather than merely calculate an isolated answer.",
+  "Verification replaces the sample database with freshly generated databases and invokes the installed CLI, not source inspection."
+ ],
+ "internal_hint": "The resolution path is to inspect the entrypoint, README, SQL repository, logs, and health protocol, run the broken command, and trace the missing import and report contract. The SQL stage must use a window function or equivalent greatest-version grouping separately for both event tables before filtering latest state. The missing component requires building a global bipartite optimizer: partition candidates by account/currency/amount, construct timestamp-window edges, and use a deterministic maximum-cardinality minimum-cost flow or equivalent algorithm. Encode the timestamp objective ahead of the rank-product objective with an integer scale larger than the maximum possible rank-product sum, while retaining stable Unicode ID ordering. Recompute report and metrics from the final flow, not from greedy intermediate choices. The genuine difficulty is substantial construction plus domain reasoning: the important failure only appears on generated histories and adversarial competing edges, not by reading a single visible defect.",
+ "trap": "A shallow solution selects the nearest eligible ledger row for each bank row, or performs greedy matching after sorting by timestamp. That passes the fixture and many random-looking cases but loses cardinality or total cost when one scarce ledger row competes with several alternatives. Other plausible failures include selecting the newest timestamp instead of the greatest version, treating a future settlement as eligible, using floating-point costs, or implementing a local tie-break that disagrees with the global rank-product objective.",
+ "tests": [
+  "A smoke test invokes the required CLI on the supplied fixture and checks the complete JSON report, command-line interface, and output-file creation; this corresponds to the requirement to provide the executable command and canonical report.",
+  "Generated-history tests create fresh SQLite databases with multiple versions per ID, arbitrary insertion order, out-of-order timestamps, and latest voided states, then compare the report with a reference greatest-version computation; this checks the stated latest-posted semantics.",
+  "Generated eligibility tests vary accounts, currencies, signed integer amounts, timestamps exactly at zero and exactly at the window boundary, and just outside the boundary; this checks exact field equality and the inclusive time window.",
+  "Fuzzed matching tests generate hundreds of ledger and bank records with duplicated amounts and dense or sparse candidate graphs, compute a reference maximum-cardinality minimum-cost assignment, and compare every assignment and summary field; this checks all three global optimization objectives.",
+  "Tie-case tests deliberately generate multiple maximum assignments with equal timestamp cost and compare the rank-product canonical choice using Unicode IDs, including IDs whose byte ordering differs from Unicode lexicographic ordering.",
+  "Determinism tests run the CLI repeatedly with shuffled SQL insertion order and compare output bytes and parsed reports; this checks the stated byte-for-byte repeatability requirement.",
+  "Large generated cases check that the implementation completes within the service timeout and does not materialize an exponential set of matchings; this checks that the non-trivial component is an actual scalable optimizer.",
+  "Health-protocol tests send JSON-lines requests through the existing endpoint after reconciliation and compare processed, matched, unmatched, and candidate-edge counters with the reference report; this checks observability integration.",
+  "Negative and empty-case tests cover no posted records, all records voided, no candidates, duplicate IDs across versions, and zero amounts, checking valid canonical JSON and zero-consistent summaries."
+ ],
+ "verifier_knob": {
+  "name": "hidden_seed_instances",
+  "value": "Generate 35-60 fresh databases per verification run, with 100-1200 IDs per side, 2-8 historical versions per ID, 8-35% duplicate amount groups, and a mixture of sparse, dense, and equal-cost candidate graphs.",
+  "effect": "Lowering the count or graph variety lets greedy, fixture-specialized, or partially correct implementations pass. Raising it exposes version-selection errors, boundary mistakes, non-global matching, Unicode tie-break errors, and poor asymptotic implementations while increasing reference-computation and service runtime."
+ },
+ "expected_failure_modes": [
+  "Implementing greedy nearest-time matching instead of global maximum-cardinality optimization.",
+  "Using a maximum matching but neglecting the minimum-delta or rank-product secondary objectives.",
+  "Encoding lexicographic or timestamp costs with floating point or an insufficient integer scale.",
+  "Grouping by latest event timestamp rather than greatest version, or filtering states before selecting the latest version.",
+  "Accidentally allowing negative timestamp deltas or excluding an exactly-on-boundary settlement.",
+  "Relying on SQLite insertion order, Python hash iteration, or unordered graph traversal for tie resolution.",
+  "Building the optimizer correctly but failing to wire it into the existing SQL/JSON-lines service and metrics path.",
+  "Passing visible examples while timing out or producing incorrect results on dense generated graphs."
+ ],
+ "predicted_pass_rate": 0.32,
+ "difficulty": "hard",
+ "category": "algorithmic-sql",
+ "tags": [
+  "sqlite",
+  "min-cost-flow",
+  "reconciliation",
+  "event-history",
+  "determinism",
+  "metrics"
+ ]
+}

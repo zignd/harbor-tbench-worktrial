@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 22:05 -03:00 · Verified presenter notes and README links; fixed a stale note
+- Checked all 11 slides carry substantive presenter notes (all do) and that every file reference in `docs/result/README.md` resolves (all do; the one flagged `calibration.json` is descriptive prose, not a link).
+- **Caught a stale presenter note:** slide 6 said "Three landed in band for this solver", which contradicts the audited count of one approved task. The slide body was already labelled "historical candidate records, not approvals", but the spoken note did not carry that caveat — exactly the kind of drift a presenter would read out loud. Rewritten to say three were labelled learnable in the ledger but only one survives the audit, and to point at the audited number.
+- Extended the stretch-goals note with the rubric-overfitting caveat (3/4 of our packages vs 0/6 human-written reference tasks).
+
 ### 21:50 -03:00 · Report was missing a required section: training and benchmark implications
 - Mechanically checked `docs/result/report.md` against every element item 9 of the finish plan enumerates. **One required element was missing**: implications for training and benchmark use. Added as section 13, with the tail renumbered (14 reproduction, 15 references, 16 appendices).
 - The section is grounded in measured results rather than generic advice: a pass count is meaningless without its solver and settings (the approved task measured 5/5 and 3/5 in different batches); most of the pool is unusable without curation (0, 0, 4, 5, 5); our rubric must not be used to rank tasks (3/4 generated vs 0/6 human-written); the measured failure labels (`partial_implementation`, `weak_verification`) are the actual training targets; curriculum value peaks near p~0.35, which is also where this pipeline misses most; and self-judging means no naturalness claim should be made from these packages.

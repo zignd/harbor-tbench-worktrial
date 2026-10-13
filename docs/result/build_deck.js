@@ -106,7 +106,7 @@ cards(s, [{ big: D.batch.records, label: "records" },
   { big: D.batch.invalid, label: "invalid" }]);
 s.addText("Bimodal, as predicted. Historical candidate records, not approvals - most sit outside the 1-3/5 band.",
   { x: 0.5, y: 3.6, w: 9, h: 0.7, fontSize: 15, color: C.text2, isTextBox: true, margin: 0, valign: "top" });
-notes(s, "22 records: 12 fresh, 10 recalibrated copies. Three landed in band for this solver.");
+notes(s, "Be careful here: these are the historical candidate records, not approvals. The ledger shows three candidates labelled learnable, but after the audit only ONE task is approved - the other two were re-measured and fell outside the band. Slide 8 has the audited number.");
 
 // 7 audit
 s = lightTitle("The audit that changed the story");
@@ -141,7 +141,7 @@ s.addTable([[{ text: "Goal", options: { bold: true } }, { text: "Result", option
   .concat(rows.map(r => [{ text: r[0] }, { text: r[1] }])),
   { x: 0.5, y: 1.4, w: 9, fontSize: 14, color: "0F1B2A", border: { type: "solid", color: "CCCCCC", pt: 0.5 },
     colW: [3.0, 6.0] });
-notes(s, "Two goals solid, one exercised with a negative result, one partial — reported honestly.");
+notes(s, "A and C are solid; B is a measured negative (13 tuning experiments, none reached the band); D is partial, and note the rubric-overfitting caveat - it passes 3 of our packages and 0 of 6 human-written reference tasks, so never quote it as general task quality.");
 
 // 10 cost
 s = lightTitle("Cost and time");

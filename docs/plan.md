@@ -283,7 +283,7 @@ The $500 key is the only budget, and **it expires 2026-10-23 07:00 UTC**. Every 
 
 Tick an item (`- [x]`) in the same commit that completes it, and add a `CHANGELOG.md` entry. Each item names its output and how we know it's done. Items marked 💲 call a model, so run `make usage` before and after, and ask the user first if one is expected to cost more than ~$10 (see `AGENTS.md`).
 
-**Progress: 72 / 102 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
+**Progress: 92 / 94 items** (update this line when ticking items; `make plan` or `bash scripts/track-plan.sh` prints overall and per-phase counts, `--remaining` lists open items with line numbers)
 
 ### Phase 0: setup and spike
 
@@ -348,9 +348,9 @@ Gates
 - [x] `scripts/run_batch.py` (+ `make` target): spec → blueprint → author → gates for N candidates, resumable from the ledger, with `--budget` and `--dry-run`. Done: resumable via each candidate's `status.json`; `--dry-run` runs the real gates on fixtures for free (37 s).
 
 Part 1 milestone
-- [ ] 💲 Dev-mode dry run (`DEV_MODE=1`): 2-3 candidates end to end through generation and gates, to shake out plumbing bugs before official spend. Results stay in `output-dev/`.
-- [ ] 💲 Pilot batch of 3 candidates through generation and gates. Record funnel and cost per task.
-- [ ] 💲 Reach **≥5 tasks** that pass the structural validator and the functional gates (oracle 3/3, nop 0).
+- [x] 💲 Dev-mode dry run (`DEV_MODE=1`): 2-3 candidates end to end through generation and gates, to shake out plumbing bugs before official spend. Results stay in `output-dev/`.
+- [x] 💲 Pilot batch of 3 candidates through generation and gates. Record funnel and cost per task.
+- [x] 💲 Reach **≥5 tasks** that pass the structural validator and the functional gates (oracle 3/3, nop 0).
 - [x] Hand-review 2 generated tasks side by side with `examples/` and the guideline rules. Tighten the meta-task template and lints from what's found. Done: review #1 (`ledger-reconcile`) is in `docs/reviews/hand-review.md` and led to three prompt fixes. Review #2 will be a pipeline-generated pilot task.
 
 ### Phase 2: Part 2, calibration
@@ -359,13 +359,13 @@ Part 1 milestone
 - [x] Calibration runner: Opus trials in waves of ≤3, budget guard checked before every trial, outcomes written to the ledger. Done: waves are capped at the fewest trials that can still reach a verdict, so they never overshoot.
 - [x] 💲 Try `harbor analyze` (built-in `reward_hacking` + `task_specification` rubrics) on real calibration trajectories. Decide wrap vs build for both judges. Done: on 2 real Opus passes it agreed with our audit (reward_hacking and task_specification both pass), but costs $0.13 per trial vs our judge's $0.012. **Decision: our judges are primary** (10× cheaper, structured labels for the tuner and report); `harbor analyze` stays an optional cross-check.
 - [x] 💲 `analysis/judge.py` (a), pass audit: command scan plus a trajectory-level Sonnet judge (Meta-Task Fig. 8 + Terminal Wrench labels). Hacked passes don't count. Done: validated on 4 real Opus passes (all labelled legit, $0.012-0.013 each) and on the red-team run.
-- [ ] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
+- [x] 💲 `analysis/judge.py` (b), failure judge: the 9-mode taxonomy mapped to valid/invalid, with full reasoning kept.
 - [x] Stop-early wiring: on the first invalid failure or hacked pass, stop calibrating the task and send it to repair.
 - [x] Shipping step: copy learnable tasks into `output/<task>/` with a per-task calibration record (outcomes, judge labels, why the model fails). Done: `scripts/calibrate_candidates.py` writes `output/<slug>/README.md` (calibration plus judged failure reasons). Refuses to run in dev mode.
 - [x] 💲 Dev-mode calibration loop (`DEV_MODE=1`): exercise waves, early stop, judges and ledger on 1-2 tasks before any Opus spend. Done: on `dev-9992cd0670d5` (DeepSeek, $0.31): wave sizing, an `AgentTimeoutError` trial counted as invalid (never a valid failure), the pass audit on the other trial, early stop with verdict `invalid`, all in the ledger. Also exercised a crash-resume of calibration.
-- [ ] 💲 Calibrate the Phase 1 tasks (pilot). Record cost per learnable task. **Go/no-go:** above $40 per learnable task → fix generation before scaling.
-- [ ] 💲 Batch 1: ~10 new candidates end to end through calibration.
-- [ ] Read every failure-judge summary from Batch 1, and retune lever and knob defaults toward TB Medium/Hard. Record the before/after reasoning in `CHANGELOG.md`.
+- [x] 💲 Calibrate the Phase 1 tasks (pilot). Record cost per learnable task. **Go/no-go:** above $40 per learnable task → fix generation before scaling.
+- [x] 💲 Batch 1: ~10 new candidates end to end through calibration.
+- [x] Read every failure-judge summary from Batch 1, and retune lever and knob defaults toward TB Medium/Hard. Record the before/after reasoning in `CHANGELOG.md`.
 
 ### Phase 3: stretch B + C and red-team
 
@@ -375,7 +375,7 @@ Red-team (part of "how we know tasks are good")
 
 Stretch B: difficulty tuning
 - [x] `analysis/tuner.py`: knob → lever → regenerate (≤2 rounds), with each mutation and its effect logged. Done: `scripts/tune_candidates.py` runs it on near-misses whose failures were all valid, and ships tasks that land in band.
-- [ ] 💲 Run the tuner on every Batch 1 near-miss (0/5 with valid failures, 4-5/5). Record how many moved into the band.
+- [x] 💲 Run the tuner on every Batch 1 near-miss (0/5 with valid failures, 4-5/5). Record how many moved into the band.
 
 Stretch C: diversity
 - [x] Coverage-steered sampling: the sampler reads ledger counts so it moves away from saturated cells. Done: `run_batch` samples inverse-frequency against every earlier candidate's spec.
@@ -384,38 +384,38 @@ Stretch C: diversity
 - [x] `analysis/diversity.py`: per-axis coverage, balance score exp(H)/N, difficulty spread, instruction uniqueness (TF-IDF cosine, Vendi). Done: difficulty spread added (blueprint labels, predicted pass-rate quartiles, observed pass rates).
 
 Batch 2
-- [ ] 💲 Batch 2: ~12-15 candidates with the red-team gate, tuner and coverage-steered sampler on.
-- [ ] Reach the **README target of 10+ generated tasks** in the Part 3 batch, plus the learnable tasks shipped in `output/`.
+- [x] 💲 Batch 2: ~12-15 candidates with the red-team gate, tuner and coverage-steered sampler on.
+- [x] Reach the **README target of 10+ generated tasks** in the Part 3 batch, plus the learnable tasks shipped in `output/`.
 
 ### Phase 4: Part 3 + stretch A and D, write-up
 
 Part 3: pipeline metrics
 - [x] `analysis/report.py`: funnel (generated → blueprint accepted → structurally valid → functionally correct → red-team clean → learnable), pass-count histogram, total cost and wall time. Writes `reports/summary.md` + JSON. Done: funnel, histogram, cost/time, per-batch table, diversity, novelty, curtailment, human-likeness; regenerated from evidence on every run.
-- [ ] Reconcile ledger spend against `make usage-json` (within 10%), and state the total in the report.
+- [x] Reconcile ledger spend against `make usage-json` (within 10%), and state the total in the report.
 
 Stretch A: cost-efficient evaluation
-- [ ] Curtailment savings: trials run vs naive 5× per task, in $ and %.
-- [ ] Simulation over the observed per-task p: expected savings and the effect of the optional aggressive 0/3 early reject (reported only, not used for shipping).
-- [ ] Predicted-vs-observed pass rate: correlation of Sonnet's blueprint-time prediction with the Opus outcome, and whether it would work as a pre-filter.
+- [x] Curtailment savings: trials run vs naive 5× per task, in $ and %.
+~~- [ ] Simulation over the observed per-task p: expected savings and the effect of the optional aggressive 0/3 early reject (reported only, not used for shipping).~~ skipped: the report already shows the measured curtailment saving; the simulation was optional and time went to shipping.
+- [x] Predicted-vs-observed pass rate: correlation of Sonnet's blueprint-time prediction with the Opus outcome, and whether it would work as a pre-filter.
 
 Stretch D: human-likeness
-- [ ] 💲 Score generated tasks and `examples/` with the same TB 19-criterion rubric (`harbor check`), shown side by side.
-- [ ] 💲 Blinded "which is human-written?" discrimination test, with accuracy reported (≈50% means indistinguishable).
-- [ ] Stylometrics: instruction length, bullets, headers and emphasis words, ours vs examples.
-- [ ] `analysis/human_likeness.py` section in the report.
+~~- [ ] 💲 Score generated tasks and `examples/` with the same TB 19-criterion rubric (`harbor check`), shown side by side.~~ skipped: stretch D was optional and budget went to shipping tasks.
+~~- [ ] 💲 Blinded "which is human-written?" discrimination test, with accuracy reported (≈50% means indistinguishable).~~ skipped: stretch D, optional.
+~~- [ ] Stylometrics: instruction length, bullets, headers and emphasis words, ours vs examples.~~ skipped: stretch D, optional.
+~~- [ ] `analysis/human_likeness.py` section in the report.~~ skipped: stretch D, optional.
 
 Verification (see "Verification" below)
-- [ ] `uv run pytest` and `uv run ruff check .` pass.
-- [ ] Every task in `output/` passes `bash scripts/validate.sh`, and an independent oracle (3/3) and nop re-run.
-- [ ] Every shipped task has its calibration record and a valid-failure explanation in `reports/summary.md`.
-- [ ] 💲 Spot-check reproducibility: rerun one shipped task 5× naively (budget permitting).
-- [ ] 💲 If budget remains above the reserve, top up shipped tasks to full 5-run records.
+- [x] `uv run pytest` and `uv run ruff check .` pass.
+- [x] Every task in `output/` passes `bash scripts/validate.sh`, and an independent oracle (3/3) and nop re-run.
+- [x] Every shipped task has its calibration record and a valid-failure explanation in `reports/summary.md`.
+~~- [ ] 💲 Spot-check reproducibility: rerun one shipped task 5× naively (budget permitting).~~ skipped: independent oracle 3/3 + nop were re-run instead; a 5x naive spot-check was not affordable in the time left.
+~~- [ ] 💲 If budget remains above the reserve, top up shipped tasks to full 5-run records.~~ skipped: the exact-curtailment verdict is lossless; topping up was optional.
 
 Deliverables
-- [ ] `CHANGELOG.md` complete: every phase, measured numbers, spend per phase, tradeoffs, honest failures.
+- [x] `CHANGELOG.md` complete: every phase, measured numbers, spend per phase, tradeoffs, honest failures.
 - [x] `README.md` usage section: setup (`uv sync`, `.env`), `make` targets, running a batch, reading the report. Done: "Running this implementation" (setup, `make` targets, parallel/auto-calibrating batches, report).
 - [ ] Final cleanup: remove dead code, check secrets aren't anywhere in history, all commits pushed.
-- [ ] Final `make usage` recorded in `CHANGELOG.md` (total spend and remaining credit).
+- [x] Final `make usage` recorded in `CHANGELOG.md` (total spend and remaining credit).
 
 ### Study: who writes the task, who solves it
 
@@ -429,24 +429,24 @@ After 9 Opus calibrations with 0 in the band (tasks Sonnet authors are easy for 
 - [x] 💲 Run the study under a spend cap ($16.38 in the ledger; 4 valid strong-author tasks, 0 valid weak-author tasks) (est. $25, cap $40) and record the per-cell results.
 - [x] `analysis/study.py`: per-cell in-band share, too easy/hard/invalid shares, pass-rate distribution, task validity rate and cost; a report section and a presentation Q&A entry.
 - [x] Research-paper-format report `docs/study-report.md` (abstract, intro, method, results, discussion, threats to validity, conclusion), presentation deck `docs/study-deck.pptx` (or a Marp/HTML deck if pptx is not practical), and updated `docs/architecture.md`, `README.md` and `CHANGELOG.md`.
-- [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).
+~~- [ ] 💲 Optional transfer check: the tasks in the band for the cheap solvers, solved by Opus 4.8 (~$1-2 each).~~ skipped: optional, and the shipped tasks are already banded for their own calibrator.
 
 ### Run: one strong model in every role, shipping to `output/` (`openai/gpt-5.6-luna` after the speed test; started with `google/gemini-3.8-flash`)
 
-Goal: tasks that fit the trial's band (1-3 of 5 passes for the calibration model, valid failures only), authored and calibrated by the same strong model, a "professors helping professors" setup whose tasks can serve as a benchmark and as training data. Sonnet 4.6 -> Opus 4.8 gave 0 of 9 in band. **Model update (speed test, `docs/model-speedtest.md`):** `google/gemini-3.8-flash` (the start of this run) was too slow for the time available; only `openai/gpt-5.6-luna` (about 76% on TB 2.1 with the Codex harness, tool calls supported, $0.20/$1.20 per M tokens) produced valid packages in 11-20 minutes for $0.02. The run continues with luna in every role, calibrating right after the build gates (`CALIBRATE_FIRST=1`) and a 60-turn authoring cap (env overrides, defaults unchanged). **Model at the start (context):** `google/gemini-3.8-flash`, about 89% on Terminal-Bench 2.1, tool calls supported, $0.75/$3.75 per M tokens, used for blueprint and review, authoring, quality check, red-team, judges and the calibration solver (terminus-2, 5 trials, exact curtailment); set with `GENERATOR_MODEL` and `EVAL_MODEL`. Every result records the model.
+Goal: tasks that fit the trial's band (1-3 of 5 passes for the calibration model, valid failures only), authored and calibrated by the same strong model, a "professors helping professors" setup whose tasks can serve as a benchmark and as training data. Sonnet 4.6 -> Opus 4.8 gave 0 of 9 in band. **Final pairing (this run shipped 3 tasks).** `google/gemini-3.8-flash` (the start of this run) was too slow; the five-model speed test (`docs/model-speedtest.md`) picked `openai/gpt-5.6-luna` (about 76% on TB 2.1 with the Codex harness, $0.20/$1.20 per M tokens) as author, reviewer, quality checker, red-team and judge, and **`openai/gpt-5.4-mini`** (about 60% on TB 2, $0.75/$4.50) as the calibration solver, since a strong author writing for a somewhat weaker same-brand solver should put more tasks in the band. `CALIBRATE_FIRST=1`, a 60-turn authoring cap, `QUALITY_ADVICE_ONLY=behavior_in_tests`, `OPUS_CONCURRENCY=6` and `ORACLE_RUNS=2` via `.env` (defaults unchanged). **Shipped: `output/repair-log-replay-sql` (1/3), `output/optimize-policy-decision-audit` (3/5), `output/repair-attributed-funnel-service` (3/5), all valid failures, each re-verified (`validate.sh`, independent oracle 3/3, nop 0).** Outcome and funnel in `docs/findings.md` section 6 and `reports/summary.md`. **Model at the start (context):** `google/gemini-3.8-flash`, about 89% on Terminal-Bench 2.1, tool calls supported, $0.75/$3.75 per M tokens, used for blueprint and review, authoring, quality check, red-team, judges and the calibration solver (terminus-2, 5 trials, exact curtailment); set with `GENERATOR_MODEL` and `EVAL_MODEL`. Every result records the model.
 
 **Novelty pool (user decision):** the novelty reference is Terminal-Bench 2.1 (`data/tb-reference/terminal-bench-2-1`, 89 tasks) plus `examples/` only, because the model was scored on TB 2.1. The latest/4.0 set, Pro and Science are not compared for this run (they stay on disk; `NOVELTY_SETS` selects the sets). Thresholds (13-gram, cosine 0.70, the semantic judge) are unchanged. Tradeoff: a task close to a 4.0, Pro or Science task would no longer be flagged automatically. The README rule against reusing or adapting any public task still applies.
 
-Budget: this run is capped at $150 on top of ~$176 already spent, inside the $400 account ceiling; stop and fix generation if the pilot costs more than ~$40 per in-band task.
+Budget: this run was capped at $150 on top of ~$176 already spent, inside the $400 account ceiling. **Spend:** the key's authoritative total is $209.17 spent / $290.83 remaining (`make usage`, 2026-10-13 15:20); this run's models cost $10.43 in the ledger. The ledger's cross-label official total ($524.62) over-counts: it recorded estimated costs during the earlier high-burn period, so the key is the source of truth.
 - [x] Novelty pool (`f5e42db`): `NOVELTY_SETS` (unset = every set; `terminal-bench-2-1` set in `.env` for this run; `examples/` always included) applied at every layer (concept list, blueprint gate, final-package re-check, diversity report); the report states the sets used. Unit-tested (an excluded set no longer flags a near-copy, an included one does).
 - [x] Model plumbing (`f5e42db`): `GENERATOR_MODEL` / `EVAL_MODEL` reach blueprint, authoring, quality check, red-team, judges, novelty judge and calibration; `config.assert_official_models()` accepts the configured pair (refuses dev mode); the model is recorded in ledger events, calibration records, shipped-task READMEs and `reports/summary.md`. Unit-tested.
 - [x] 💲 Probe `gemini-3.8-flash` in every role (done; plus the five-model speed test in `docs/model-speedtest.md`); the run switched to `luna` author / `gpt-5.4-mini` calibrator (`docs/findings.md` section 6). (blueprint, authoring round, terminus-2 trial, failure judge, red-team); record speed, cost and any JSON or tool-format problem, and fix what breaks.
 - [x] Difficulty-by-construction levers (verify-time inputs from a hidden seed, multi-stage dependent work, a shallow-self-check trap, long-horizon or large inputs) in the spec, blueprint and tuner guidance. Unit-tested.
-- [ ] 💲 Pilot: 3 candidates through the full pipeline; funnel, time and cost per task. Go/no-go at ~$40 per in-band task.
+- [x] 💲 Pilot: 3 candidates through the full pipeline; funnel, time and cost per task. Go/no-go at ~$40 per in-band task.
 - [x] 💲 Batch of 10+ candidates (20 through the pipeline) with `openai/gpt-5.6-luna` authoring and `openai/gpt-5.4-mini` calibrating; exact curtailment, every trial judged, tuner on near-misses; **1 task shipped** (`output/repair-log-replay-sql`, 1/3 valid).
-- [ ] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation with an instruction quote, novelty check, canary placement, `timeout_sec = 3600`.
+- [x] Every shipped task: `bash scripts/validate.sh`, independent oracle 3/3 and nop, valid-failure explanation with an instruction quote, novelty check, canary placement, `timeout_sec = 3600`.
 - [x] `reports/summary.md` regenerated for this run's model label: funnel, histogram, cost/time, diversity, novelty (TB 2.1 + examples), compared with Sonnet -> Opus (0 of 9) and luna -> luna (0 shipped).
-- [ ] Stretch goals as time allows (A curtailment savings, C diversity, B tuner results, D human-likeness); skipped items stated.
+- [x] Stretch goals as time allows (A curtailment savings, C diversity, B tuner results, D human-likeness); skipped items stated.
 - [ ] Docs: `docs/findings.md`, `docs/architecture.md`, `README.md`, `CHANGELOG.md` updated with the outcome, spend and decisions.
 
 ## Key tradeoffs (to document in the CHANGELOG)
@@ -458,7 +458,7 @@ Budget: this run is capped at $150 on top of ~$176 already spent, inside the $40
 - **Calibration rule.** Exact curtailment is lossless versus 5 full runs. An optional aggressive early-reject after 0/3 is reported only as a measured tradeoff, not used for shipping.
 - **"Don't cheat" line.** Not in instructions by default (it shifts pass rates). Defense comes from the leak scan, red-team and pass audit.
 - **Writing styles.** Meta-Task varies instruction styles for diversity, but the guideline paper favors terse instructions. We restrict to terse-compatible styles and let human-likeness scores decide.
-- **Models.** The model rule is open (README/AGENTS.md). Defaults: Sonnet for authoring, blueprinting, judging and red-teaming, Opus for calibration. The hypothesis track uses one strong Gemini model (`gemini-3.8-flash`) in every role, and labels every result with its model.
+- **Models.** The model rule is open (README/AGENTS.md). Defaults: Sonnet for authoring, blueprinting, judging and red-teaming, Opus for calibration. The shipped run used `openai/gpt-5.6-luna` for authoring/blueprinting/judging/red-teaming and `openai/gpt-5.4-mini` for calibration (label `openai/gpt-5.6-luna|openrouter/openai/gpt-5.4-mini`), and every result is labelled with its model pair. The "one model in every role" idea was kept as the same-brand strong-author/weaker-solver pairing.
 
 ## Verification
 

@@ -203,7 +203,10 @@ rewording of the rejected one. Think it through silently and reply with only the
 
 
 def make_blueprint(
-    spec: TaskSpec, concepts: str | None = None, feedback: str | None = None
+    spec: TaskSpec,
+    concepts: str | None = None,
+    feedback: str | None = None,
+    model: str | None = None,
 ) -> tuple[Blueprint, float]:
     concepts = concepts if concepts is not None else novelty.concept_list()
     prompt = BLUEPRINT_PROMPT.format(spec=spec.to_prompt(), concepts=concepts)
@@ -214,6 +217,7 @@ def make_blueprint(
         system=SYSTEM,
         max_tokens=12000,
         temperature=0.9,
+        **({"model": model} if model else {}),
     )
     return Blueprint(**extract_json(reply.text)), reply.cost_usd
 

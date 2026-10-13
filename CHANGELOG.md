@@ -2,6 +2,13 @@
 
 What we did, why, and the design tradeoffs. Newest first. Each entry is stamped `### HH:MM ±HH:MM · Title` under its `## YYYY-MM-DD` day: local time with its UTC offset, taken from when the change was committed. Spend figures come from `make usage` (OpenRouter `/api/v1/key`).
 
+## 2026-10-13
+
+### 02:08 -03:00 · Study harness: scripts/study.py and analysis/study.py (exploratory)
+- **What:** `scripts/study.py` runs the who-writes/who-solves study (weak = `deepseek/deepseek-v4.1-flash`, strong = `deepseek/deepseek-v4-pro`): `gap` (both solvers on the 5 pilot packages), `run` (each author writes a task from the same spec, free gates only, then 5 terminus-2 trials per solver with failures judged by Sonnet 4.6). Resumable, events tagged `study`, outputs under `runs/study/`, never shipped or counted in the funnel. `analysis/study.py` aggregates the per-cell metrics; `make_blueprint` takes an optional `model`.
+- **Spend limits:** study cap $40 (estimate ~$25), and the account never passes $400 of $500 (user limit; `ACCOUNT_CEILING_USD`). Before this entry: $139.58 spent on the key.
+- 143 tests pass.
+
 ## 2026-10-12
 
 ### 01:43 -03:00 · The reasoning behind the study: who writes the task, who solves it

@@ -4,6 +4,34 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:15 -0300 · The audit tooling is verified from a clone, and generated prose is checked against generated data
+
+- **Defect 12: the final audit manifest contradicted itself.** `docs/result/verification.json` carried
+  `output_packages_note` stating "approved_tasks stays empty because none lands in the 1-3/5 band" -
+  while `approved_tasks` listed `optimize-policy-decision-audit`, approved at 3/5. It was a frozen
+  leftover from before the approval, in the single most authoritative file in the submission, and nothing
+  re-derived it. The note is now generated from the approved list.
+- **Defect 13 (found while fixing 12, and a joke, but real): `audit_all.sh` needed `.env`.** `.env` is
+  deliberately never committed, so the audit passed locally and **failed for anyone who cloned the repo**.
+  This is the same defect class that was found and fixed earlier the same day in the task verification,
+  reappearing in the tool written to verify that fix. Three checks now read committed records only - the
+  model pair comes from the package's own calibration/verification files and is cross-checked against the
+  manifest - so the audit needs no credentials at all.
+- New `scripts/audit_clone_tools.py` proves it rather than asserting it: it clones the committed revision,
+  runs the audit inside the clone with `uv sync` and no `.env`, and records per-check verdicts to
+  `evidence/clone-audit.json`. Recorded result: **17/17 green, `.env` absent**. `overall_status` now
+  requires this, so the manifest cannot be `passed` without it.
+- `make lint` grew from 18 to 22 consistency checks: manifest prose must name what the manifest approves,
+  approved tasks must be published and must not also be quarantined, and the clone-safety run must be
+  recorded. Each new guard was confirmed by **negative control** (mutate the manifest to recreate the
+  defect, confirm `make lint` fails) - a check that cannot fail is the same mistake one level up.
+- New `tests/test_verification_tooling.py` (7 tests) fails if any audit script regains a credential
+  dependency, and covers the verdict parser whose first version matched zero checks because `ok` is
+  printed with three spaces and `FAIL` with one.
+- Tradeoff: `audit_all.sh` re-runs the unit tests, so the audit is slower than the checks it wraps. Kept,
+  because a reviewer running one command is worth more than the seconds.
+
+
 ### 22:05 -03:00 · Verification tooling is now clone-safe
 
 - `scripts/audit_all.sh` originally shelled out to `uv run --env-file .env`. `.env` is deliberately never

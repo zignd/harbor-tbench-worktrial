@@ -111,6 +111,11 @@ def main() -> int:
     )
     checks_ok = bool(tasks) and all(all(v for v in t["checks"].values()) for t in tasks)
     tests_ok = _passed("tests-final.log")
+    # Reconciliation figures come from the recorded evidence, never from literals in this file.
+    _recon_path = EVIDENCE / "reconciliation-final.json"
+    recon = json.loads(_recon_path.read_text()) if _recon_path.exists() else {}
+    LEDGER_TOTAL = recon.get("ledger_total_usd")
+    key_spend = recon.get("key_spend_now", _last_spend())
     requirements = {
         "1.1 structural validator": "achieved",
         "1.2 oracle 3/3 + nop 0": "achieved" if tasks else "partial",
@@ -125,12 +130,22 @@ def main() -> int:
         "D human-likeness": "partial",
         "spend reconciliation": "UNRESOLVED - measured gap (target not met)",
         "spend reconciliation detail": {
-            "ledger_total_usd": 545.64,
-            "key_spend_usd": None,
-            "residual_usd": 325.94,
-            "dominant_cause": "cache accounting; the historical era ran a 48.1% cache-hit rate and the "
-            "same tokens cost $617.45 uncached vs $380.61 cache-aware, a $236.84 swing",
-            "residual_after_cache_aware_correction_usd": 190.26,
+            # Every figure is read from the recorded reconciliation evidence rather than typed in, so
+            # the residual is always recomputable from the manifest's own fields.
+            "ledger_total_usd": LEDGER_TOTAL,
+            "key_spend_usd": key_spend,
+            "key_spend_source": "reconciliation-final.json (last conservative `make usage` snapshot)",
+            "residual_usd": round(LEDGER_TOTAL - key_spend, 2) if key_spend is not None else None,
+            "dominant_cause": "cache accounting; the historical era ran a "
+            f"{recon.get('historical_models', {}).get('cache_hit_rate', 0) * 100:.1f}% cache-hit rate and "
+            f"the same tokens cost "
+            f"${recon.get('historical_models', {}).get('recomputed_if_cache_billed_at_full_prompt_price')} "
+            f"uncached vs "
+            f"${recon.get('historical_models', {}).get('recomputed_cache_aware_from_retained_tokens')} "
+            f"cache-aware, a ${recon.get('swing_explained_by_cache_accounting_usd')} swing",
+            "residual_after_cache_aware_correction_usd": recon.get(
+                "residual_after_cache_aware_correction_usd"
+            ),
             "ruled_out": [
                 "shared key use by another project",
                 "retry/excluded double counting",
@@ -140,7 +155,7 @@ def main() -> int:
             "different credential during the API-base change; per-call credential IDs were "
             "never recorded, so it cannot be confirmed",
             "acceptance_target": "within 10%",
-            "acceptance_met": False,
+            "acceptance_met": bool(recon.get("acceptance_met")),
             "disposition": "the plan item is closed on its own stated alternative ('otherwise mark "
             "reconciliation unresolved and state the measured gap'), NOT as achieved",
             "evidence": "docs/result/evidence/reconciliation-final.json",

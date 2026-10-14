@@ -4,6 +4,25 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:20 -0300 · The manifest's spend residual was not recomputable from its own record
+
+- **Defect 15:** `docs/result/verification.json` recorded `key_spend_usd: null` next to a
+  `residual_usd` of 325.94, alongside a `dominant_cause` string with six hard-coded figures. The residual
+  was therefore a claim nobody could re-derive from the file that published it - in the most authoritative
+  document of the submission.
+- The whole reconciliation block is now derived from `evidence/reconciliation-final.json`: ledger total, key
+  spend, cache-hit rate, both recomputed token costs, the swing, the post-correction residual and
+  `acceptance_met` all come from the evidence, and the residual is computed. **The values are unchanged**
+  (545.64 / 219.6975 / 325.94 / 190.26 / false) - what changed is that they are now provably self-consistent
+  rather than transcribed, so the deck and report numbers still hold.
+- New `make lint` guard `manifest spend figures are recomputable`, confirmed by four negative controls:
+  tampered residual, tampered key spend, a null key spend (the original bug), and a mismatch against the
+  evidence file. **25/25 checks pass**; the report's stated count is itself checked against the real one.
+- Fifteen defects of the "proxy for evidence" class are now fixed and guarded. The last three were all in the
+  verification layer rather than the pipeline - which is the shape this risk takes once the thing being
+  measured is sound.
+
+
 ### 21:18 -0300 · Fresh-clone evidence is now hash-bound, and the stated check count cannot rot
 
 - **Gap: the fresh-clone record was never checked against the shipped packages.** `all_ok: true` only

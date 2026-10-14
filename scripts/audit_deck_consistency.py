@@ -20,6 +20,27 @@ def _load(p: Path, default=None):
     return json.loads(p.read_text()) if p.exists() else (default if default is not None else {})
 
 
+def _recon_is_derivable(ver: dict) -> bool:
+    """The reconciliation block must recompute its own residual, and match the evidence file."""
+    r = ver.get("requirements", {}).get("spend reconciliation detail", {})
+    led, key, resid = r.get("ledger_total_usd"), r.get("key_spend_usd"), r.get("residual_usd")
+    if led is None or key is None or resid is None:
+        return False
+    if abs((led - key) - resid) > 0.005:
+        return False
+    ev = Path("docs/result/evidence/reconciliation-final.json")
+    if not ev.exists():
+        return False
+    rec = json.loads(ev.read_text())
+    return (
+        rec.get("ledger_total_usd") == led
+        and rec.get("key_spend_now") == key
+        and rec.get("residual_after_cache_aware_correction_usd")
+        == r.get("residual_after_cache_aware_correction_usd")
+        and rec.get("acceptance_met") is r.get("acceptance_met")
+    )
+
+
 def main() -> int:
     deck = _load(RESULT / "deck_data.json")
     ver = _load(RESULT / "verification.json")
@@ -130,6 +151,8 @@ def main() -> int:
             == ver["fresh_clone"]["results"].get(t["task"], {}).get("package_hash")
             for t in ver["approved_tasks"]
         ),
+        # A residual you cannot recompute from the manifest's own fields is a claim, not a record.
+        "manifest spend figures are recomputable": _recon_is_derivable(ver),
         "manifest records the clone-safety run": ver.get("clone_audit", {}).get("all_ok") is True
         and ver.get("clone_audit", {}).get("env_file_present_in_clone") is False,
         "manifest status requires the clone-safety run": ver["overall_status"] == "passed",

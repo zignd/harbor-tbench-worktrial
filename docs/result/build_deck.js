@@ -141,9 +141,9 @@ function light(title) {
 // ── 5. Candidate batch — bar chart ────────────────────────────────────────
 {
   const s = light("The pool is bimodal. Most tasks miss the band.");
-  s.addChart(pres.charts.bar, [{
+  s.addChart(pres.charts.BAR, [{
     name: "Candidates",
-    labels: ["Learnable", "Too easy", "Too hard", "Invalid"],
+    labels: ["Learnable (label)", "Too easy", "Too hard", "Invalid"],
     values: [D.batch.learnable, D.batch.too_easy, D.batch.too_hard, D.batch.invalid],
   }], {
     x: 0.4, y: 1.15, w: 5.4, h: 3.7,
@@ -167,17 +167,18 @@ function light(title) {
     catAxisHidden: false,
   });
   const facts = [
-    { n: String(D.batch.records), l: "candidate records" },
+    { n: `${D.batch.labelled} / ${D.batch.records}`, l: "verdicts / candidate records" },
     { n: `${D.batch.fresh} / ${D.batch.reused}`, l: "fresh / reused" },
+    { n: String(D.batch.learnable_full_record), l: "in band, full 5-attempt record" },
     { n: "1", l: "approved after audit" },
   ];
   facts.forEach((f, i) => {
-    const y = 1.25 + i * 1.2;
-    card(s, 6.05, y, 3.45, 1.05, PANEL);
-    tb(s, f.n, { x: 6.2, y: y + 0.08, w: 3.15, h: 0.5, fontSize: 22, bold: true, fontFace: "Cambria", color: TEAL });
-    tb(s, f.l, { x: 6.2, y: y + 0.55, w: 3.15, h: 0.35, fontSize: 13, color: MUTED });
+    const y = 1.2 + i * 0.95;
+    card(s, 6.05, y, 3.45, 0.86, PANEL);
+    tb(s, f.n, { x: 6.2, y: y + 0.06, w: 3.15, h: 0.42, fontSize: 19, bold: true, fontFace: "Cambria", color: TEAL });
+    tb(s, f.l, { x: 6.2, y: y + 0.47, w: 3.15, h: 0.32, fontSize: 12, color: MUTED });
   });
-  notes(s, "Be careful: these are historical candidate records, not approvals. The ledger shows three labelled learnable; after the audit only ONE task is approved. Slide 7 has the audited number.");
+  notes(s, "Be careful: these are historical candidate records, not approvals. The ledger labels THREE candidates learnable, but re-deriving the distribution under the approval standard gives only TWO: one label rests on a curtailed 1/3, which is not a full 1-3/5 statement, and one full record ends in pipeline status failed. Neither is the approved task, which needed a repair and a second independent batch. After the audit ONE task is approved. Slide 7 has the audited number.");
 }
 
 // ── 6. Audit ──────────────────────────────────────────────────────────────
@@ -285,6 +286,53 @@ function light(title) {
     tb(s, n.d, { x: 3.2, y, w: 6.2, h: 0.7, fontSize: 16, color: WHITE, valign: "middle" });
   });
   notes(s, "Questions: how I would scale generation, harden the novelty check, and define learnable per solver.");
+}
+
+// ── 11. Architecture ──────────────────────────────────────────────────────
+{
+  const s = pres.addSlide();
+  s.background = { color: NAVY };
+  tb(s, "Architecture at a glance", {
+    x: 0.6, y: 0.4, w: 8.8, h: 0.7, fontSize: 28, bold: true, fontFace: "Cambria", color: WHITE,
+  });
+  tb(s, "spec → blueprint → author in a container → gates → calibration → ship", {
+    x: 0.6, y: 1.08, w: 8.8, h: 0.45, fontSize: 15, color: TEAL,
+  });
+  const arch = [
+    { k: "Gates before money", d: "structure → oracle/nop → quality; cheap flags stop a run before calibration spend" },
+    { k: "Verification", d: "oracle 3/3 · nop 0, plus a 16-criterion quality rubric, novelty and red-team" },
+    { k: "Difficulty", d: "hidden-seed inputs and multi-stage work; no stated wall-clock budgets, no answer-bearing files" },
+    { k: "Money", d: "cheap gates first; one trial ≈ $0.09, so curtailment pays for a second batch" },
+  ];
+  arch.forEach((a, i) => {
+    const x = 0.6 + (i % 2) * 4.5, y = 1.75 + Math.floor(i / 2) * 1.75;
+    card(s, x, y, 4.25, 1.55, PANEL);
+    tb(s, a.k, { x: x + 0.2, y: y + 0.12, w: 3.85, h: 0.35, fontSize: 15, bold: true, color: TEAL });
+    tb(s, a.d, { x: x + 0.2, y: y + 0.5, w: 3.85, h: 0.95, fontSize: 13, color: MUTED });
+  });
+  notes(s, "Two ideas carry the architecture. First, money only moves after the cheap gates pass, which is why one calibration trial costs about nine cents. Second, difficulty is built into the verifier - hidden-seed inputs at verify time, multi-stage dependent work - and never into a stated wall-clock budget, because that failure mode is environment-dependent and the rubric rejects it.");
+}
+
+// ── 12. Q&A ───────────────────────────────────────────────────────────────
+{
+  const s = pres.addSlide();
+  s.background = { color: NAVY };
+  tb(s, "Q&A you should be ready for", {
+    x: 0.6, y: 0.4, w: 8.8, h: 0.7, fontSize: 28, bold: true, fontFace: "Cambria", color: WHITE,
+  });
+  const qa = [
+    { q: "Is 1–3/5 just noise?", a: "A p=0.5 task lands in band 78% of the time, so verdicts are pooled: this task gives 7/10 = 0.70 across two independent batches." },
+    { q: "How do you know it wasn't a hack?", a: "Lint, leak scan, anti-cheating criteria, red-team and a command scan, then a pass audit that quotes the solver's own reasoning trace." },
+    { q: "Why did four fail and one pass?", a: "The pool is bimodal. The main lever that produced in-band results was also the one the rubric rejects." },
+    { q: "Would a stronger author help?", a: "A 2×2 study produced no in-band task at all: the weak author wrote 0 valid tasks of 7, and no cell cleared." },
+  ];
+  qa.forEach((it, i) => {
+    const x = 0.6 + (i % 2) * 4.5, y = 1.2 + Math.floor(i / 2) * 2.0;
+    card(s, x, y, 4.25, 1.8, PANEL);
+    tb(s, it.q, { x: x + 0.2, y: y + 0.12, w: 3.85, h: 0.5, fontSize: 15, bold: true, color: TEAL });
+    tb(s, it.a, { x: x + 0.2, y: y + 0.62, w: 3.85, h: 1.1, fontSize: 12.5, color: MUTED });
+  });
+  notes(s, "If asked about the band being arbitrary: the 1-3 of 5 rule is a wide window, and the response is the pre-registered pooling rule plus two independent batches, not a claim that 3/5 is a precise measurement. If asked about author strength: the study is the honest negative result - no cell produced an in-band task, so 'use a better author' is not supported by our data.");
 }
 
 (async () => {

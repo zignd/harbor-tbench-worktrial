@@ -20,6 +20,35 @@ def _load(p: Path, default=None):
     return json.loads(p.read_text()) if p.exists() else (default if default is not None else {})
 
 
+def _real_slide_counts() -> tuple[int, int]:
+    """Measure both decks from the artifacts themselves - no python-pptx, no claims."""
+    import zipfile
+
+    pptx = Path("docs/result/presentation.pptx")
+    with zipfile.ZipFile(pptx) as z:
+        n_pptx = sum(1 for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n))
+    html = Path("docs/result/presentation.html").read_text()
+    m = re.search(r"const S = (\[.*?\]);\n", html, re.DOTALL)
+    n_html = len(json.loads(m.group(1))) if m else 0
+    return n_pptx, n_html
+
+
+def _stated_slide_counts(ver: dict, report: str) -> tuple[int | None, int | None]:
+    """The counts the report and the manifest *claim*, which is what must be checked."""
+    m = re.search(r"\*\*(\d+) slides\*\* \(the goal asked", report)
+    stated_report = int(m.group(1)) if m else None
+    qa = ver.get("presentation_qa", {})
+    stated_manifest = qa.get("pptx_deck", {}).get("slides")
+    return stated_report, stated_manifest
+
+
+def _slide_counts_agree(ver: dict, report: str) -> bool:
+    """Both decks must really have the slide count the report and the manifest state."""
+    real_pptx, real_html = _real_slide_counts()
+    stated_report, stated_manifest = _stated_slide_counts(ver, report)
+    return real_pptx == real_html == stated_report == stated_manifest
+
+
 def _recon_is_derivable(ver: dict) -> bool:
     """The reconciliation block must recompute its own residual, and match the evidence file."""
     r = ver.get("requirements", {}).get("spend reconciliation detail", {})
@@ -151,7 +180,12 @@ def main() -> int:
             == ver["fresh_clone"]["results"].get(t["task"], {}).get("package_hash")
             for t in ver["approved_tasks"]
         ),
-        # A residual you cannot recompute from the manifest's own fields is a claim, not a record.
+        # A deck count is a measurement, not a claim: re-derive it from the files.
+        "report and manifest state the decks' real slide counts": _slide_counts_agree(ver, report),
+        "pptx QA evidence records a real inspection": ver.get("presentation_qa", {})
+        .get("pptx_deck", {})
+        .get("slides_inspected")
+        == ver.get("presentation_qa", {}).get("pptx_deck", {}).get("slides"),
         "manifest spend figures are recomputable": _recon_is_derivable(ver),
         "manifest records the clone-safety run": ver.get("clone_audit", {}).get("all_ok") is True
         and ver.get("clone_audit", {}).get("env_file_present_in_clone") is False,

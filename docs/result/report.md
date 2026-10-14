@@ -86,7 +86,22 @@ Every stage is a small function that records an append-only ledger event (`runs/
 22 candidate records for this model pair: **12 fresh generations**, **10 reuse-recalibrated copies** (`<id>-m`) of earlier packages re-run for the new calibration model. The reused copies are not independent generations; the report distinguishes them.
 
 ### 6.2 Outcome distribution (latest candidate calibration)
-`too_easy` 1, `too_hard` 6, `invalid` 7, `learnable` 3 — **bimodal**, consistent with Tmax's warning about pools without continuous difficulty control.
+By recorded verdict label: `too_easy` 1, `too_hard` 6, `invalid` 7, `learnable` 3 — **bimodal**, consistent with Tmax's warning about pools without continuous difficulty control.
+
+**Those labels are not the standard this submission approves by, and re-deriving the distribution under it changes the headline.** `scripts/audit_pool_distribution.py` recomputes every candidate from its recorded trials (evidence `pool-distribution.json`):
+
+| | count | note |
+|---|---|---|
+| Candidate records | **22** | 12 fresh + 10 reuse-recalibrated copies |
+| Records carrying a verdict | **17** | 5 never reached calibration (still building / rejected) |
+| Labelled `learnable` | 3 | the label count, which is what an earlier draft quoted |
+| **In band with a full 5-attempt record** | **2** | `official-a111d7f89576-m` (3/5), `official-ce30ab52c4d1-m` (3/5) |
+| Of those, pipeline status `failed` | **1** | `official-ce30ab52c4d1-m` |
+| **Approved and shipped** | **1** | `optimize-policy-decision-audit` |
+
+The gap between 3 and 2 is not a rounding difference. `official-cd259cd6c51d` is tagged `learnable` on the strength of **one pass in three judged attempts** — a curtailed record, which is precisely the defect this report uses to disqualify `repair-log-replay-sql` (1/3) in §6.3. Applying one standard to a package we reject and a different one to a package we count is exactly the inconsistency this audit exists to remove, so the label is not the claim: **two candidates hold a full in-band record, and one of those ended in `failed`.**
+
+Neither of the two is the approved task. `optimize-policy-decision-audit` reached the band only after a repair and a **second, independent** five-attempt batch (§7.1), so the pool's in-band count and the approved count are different quantities measured on different package versions — never to be added or substituted for one another.
 
 ### 6.3 Why the previous outputs were quarantined
 Four directories were previously placed in `output/`. A strict re-audit found:
@@ -101,7 +116,7 @@ All four were archived **unchanged** to `runs/audit-20261013/original-output/` a
 Two of the strongest candidates relied on a stated wall-clock performance budget ("under six seconds", "elapsed < 12", a 20-second dense-export time). The `harbor check` rubric correctly rejects these as **environment-dependent (invalid) failure modes**: a correct solution can fail under host load. This is the same tension the plan flags ("no hidden limits or timeouts"). Both tasks were repaired to remove the timing gate and keep a correctness/equivalence check on large inputs. Consequence: performance-based difficulty must be expressed deterministically (query-plan/operation checks) or dropped.
 
 ### 6.5 Yield
-Stage counts for the current package hash are in `reports/summary.md`. The in-band rate is low: of 17 calibrated candidates, 3 were learnable. Cost per in-band task was correspondingly high, so the plan's own go/no-go (~$40 per in-band task) was met only weakly. This is reported honestly rather than tuned away.
+Stage counts for the current package hash are in `reports/summary.md`. The in-band rate is low: of 17 candidates that carry a verdict, **2 hold a full five-attempt in-band record** (3 carry the label, §6.2), and only 1 of those survived the audit into `output/`. Cost per in-band task was correspondingly high, so the plan's own go/no-go (~$40 per in-band task) was met only weakly. This is reported honestly rather than tuned away.
 
 ---
 
@@ -193,9 +208,13 @@ advisory override was used to promote any of them.
 - `bash scripts/validate.sh <task>` for structure; independent `harbor run -a oracle -k 3` and `-a nop` for functional correctness.
 - **Fresh-clone verification (`scripts/audit_freshclone.py`, evidence `evidence/fresh-clone.json`):** the repository was cloned at committed revision `8cdd2f1` into a temporary directory and, from that clone alone, all five published packages passed `scripts/validate.sh`, **oracle 3/3** and **nop 0**. The clone has no `.env` (credentials are inherited from the process environment and are never committed), no embedded `.git` — four nested histories are committed as file contents plus `.bundle` files — and no pre-existing images. The evidence is **hash-bound to what is shipped now**: `overall_status` requires that each recorded `package_hash` still equals the shipped package's hash, so a green but stale fresh-clone record cannot pass. All five published packages match.
 - **The verification tooling is itself verified from a clone (`scripts/audit_clone_tools.py`, evidence `evidence/clone-audit.json`).** `bash scripts/audit_all.sh` re-derives every headline claim in this report and in the manifest — 17 checks, free, no Docker, non-zero on any failure. Because `.env` is deliberately never committed, a tool that read it would pass on the authoring machine and fail for a reviewer, so the tooling is run *inside* a clone of the committed revision, with `uv sync` and no `.env`: the recorded run is **17/17 green**. This property failed once and was found only by testing it (§12).
-- **Prose in the manifest is generated from the manifest's own data, and checked against it.** The audit manifest is generated, but its explanatory notes are prose and had rotted: it asserted `approved_tasks` was empty "because none lands in the 1-3/5 band" while listing one approved task at 3/5. The note is now derived from the approved list, and `make lint` (**25** consistency checks) fails if the note stops naming what the manifest actually approves, or if an approved task is missing from `output_packages` or appears in both the approved and quarantined lists.
+- **Prose in the manifest is generated from the manifest's own data, and checked against it.** The audit manifest is generated, but its explanatory notes are prose and had rotted: it asserted `approved_tasks` was empty "because none lands in the 1-3/5 band" while listing one approved task at 3/5. The note is now derived from the approved list, and `make lint` (**27** consistency checks) fails if the note stops naming what the manifest actually approves, or if an approved task is missing from `output_packages` or appears in both the approved and quarantined lists.
 - `scripts/check_repo_hygiene.sh`, wired into `make lint`, fails the build on any gitlink, tracked `.env`, committed API key, tracked run output, or file over 20 MB.
-- **Presentation QA (`evidence/presentation-qa.json`).** The 11-slide PPTX passes schema validation (no overflow, no out-of-bounds) and every slide was rendered to JPEG and visually inspected. The HTML deck was loaded from `file://` in a real browser and driven with the keyboard: `ArrowRight` walked the counter `1/11 → 11/11` in order, `ArrowLeft` and `Space` work, the deck clamps at both ends, and the page loads **zero external resources**, so it is genuinely offline.
+- **Presentation QA (`evidence/presentation-qa.json`), re-measured from the artifacts.** Both decks have **12 slides** (the goal asked for 10–12). The PPTX passes schema validation; every one of its 12 slides was rendered to JPEG and visually inspected. The HTML deck was driven in Chrome with real key presses: `ArrowRight` walked `1/12 → 12/12` in order, `ArrowLeft` and `Space` work, it clamps at both ends, exactly one slide is visible at a time, and it loads **zero external resources**.
+  Two real defects were found by looking at the renders rather than at the file:
+  - **The pool slide's bar chart rendered as nothing at all.** Root cause: pptxgenjs v4 renamed its chart constants to upper case, so `pres.charts.bar` was `undefined` and `addChart()` wrote a chart part containing axes with **no bar group and no series** — schema-valid, semantically empty, invisible in both LibreOffice and PowerPoint. `validate.py` reported "All validations PASSED" both before and after the fix, and a text dump of the deck showed every label and number present. Only rendering it caught this. Fixed with `pres.charts.BAR`.
+  - **The PPTX was missing two slides the HTML deck had** (Architecture, Q&A): the JS builder never wrote them, so the deck claimed 11 slides and actually had 10. Both are now present.
+  The earlier QA record claimed "11 slides, all 11 visually inspected" for both decks. Neither deck had 11 slides, and the inspection it described had not happened. `make lint` now re-derives the counts from the artifacts and fails if the report or the manifest states a different number.
 - Immutable approval: `output/<task>/calibration.json` + `verification.json` bound to a content hash of the task package; a directory is not approval (`analysis/package_evidence.py`, tests in `tests/test_package_evidence.py`).
 - Report provenance: current-package gate counts, model-pair isolation, hard-coded Opus labels removed, `approved_shipped` from immutable records (`analysis/report.py`).
 

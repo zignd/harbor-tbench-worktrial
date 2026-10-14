@@ -35,6 +35,7 @@ def build() -> dict:
         else {}
     )
     reconciliation = _load("reconciliation.json", {})
+    pool = _load("pool-distribution.json", {})
     verdicts = historical.get("latest_candidate_verdicts", {})
     examples = stylo.get("examples", {})
     generated = stylo.get("pre_audit_generated", {})
@@ -47,7 +48,13 @@ def build() -> dict:
             "novelty": "Terminal-Bench 2.1 (89 tasks) + examples/",
         },
         "batch": {
-            "records": 22,
+            # Derived, never typed: the pool distribution is recomputed from the recorded trials
+            # under the approval standard (five judged attempts, 1-3 honest passes).
+            "records": pool.get("candidate_records"),
+            "labelled": pool.get("candidates_with_a_calibration_label"),
+            "unlabelled": pool.get("candidates_without_any_calibration"),
+            "learnable_full_record": pool.get("n_in_band_by_approval_standard"),
+            "learnable_label_discrepancy": pool.get("discrepancy"),
             "fresh": historical.get("origins", {}).get("fresh"),
             "reused": historical.get("origins", {}).get("reused"),
             "verdicts": verdicts,
@@ -93,7 +100,7 @@ def slides(d: dict) -> list[str]:
     ci = f"{bl['wilson'][0]:.2f}-{bl['wilson'][1]:.2f}"
     mx = max(b["learnable"], b["too_easy"], b["too_hard"], b["invalid"], 1)
     bars = [
-        ("Learnable", b["learnable"], "var(--acc)"),
+        ("Learnable (label)", b["learnable"], "var(--acc)"),
         ("Too easy", b["too_easy"], "var(--warn)"),
         ("Too hard", b["too_hard"], "var(--bad)"),
         ("Invalid", b["invalid"], "#7a8b99"),
@@ -147,8 +154,13 @@ def slides(d: dict) -> list[str]:
         (
             "<h2>The pool is bimodal. Most tasks miss the band.</h2>"
             f"<div class='bars'>{bar_html}</div>"
-            f"<p class='mut'>{b['records']} records · {b['fresh']}/{b['reused']} fresh/reused · "
+            f"<p class='mut'>{b['labelled']} of {b['records']} records carry a verdict · "
+            f"{b['fresh']}/{b['reused']} fresh/reused · "
+            f"{b['learnable_full_record']} in band with a full 5-attempt record · "
             "<b>1 approved after audit</b></p>"
+            "<p class='mut'>Verdict <i>labels</i> overstate this: 3 candidates are tagged learnable, "
+            "but one is a curtailed 1/3 — not a full 1–3/5 statement — and one of the two full records "
+            "ends in pipeline status <i>failed</i>.</p>"
         ),
         (
             "<h2>The audit rejected four previously 'shipped' tasks</h2><div class='grid2'>"
@@ -194,7 +206,7 @@ def slides(d: dict) -> list[str]:
             "<div class='pipe'>spec &rarr; blueprint &rarr; author in a container &rarr; gates &rarr; calibration &rarr; ship</div>"
             "<div class='grid2'>"
             "<div class='card'><small>Gates before money</small><b>structure &rarr; oracle/nop &rarr; quality</b><p<|message|>"
-            "cheap flags stop runs before Opus is spent</p></div>"
+            "cheap flags stop a run before calibration spend</p></div>"
             "<div class='card'><small>Verification</small><b>oracle 3/3 &middot; nop 0</b><p<|message|>"
             "plus a 16-criterion quality rubric, novelty and red-team</p></div>"
             "<div class='card'><small>Difficulty</small><b>hidden seed &amp; multi-stage</b><p<|message|>"

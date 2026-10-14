@@ -4,6 +4,8 @@ UV_RUN := uv run --quiet --env-file .env
 
 .DEFAULT_GOAL := help
 
+PORT ?= 8120
+
 TB_REFERENCE_DIR := data/tb-reference
 
 .PHONY: help usage usage-json tb-reference test lint dry-run batch status watch deck
@@ -60,8 +62,10 @@ calibrate: ## Calibrate every gated candidate in one wave (wider than per-batch;
 dry-run: ## Run the batch pipeline with fixtures instead of model calls (free; real gates)
 	@uv run --quiet python -m scripts.run_batch --n 1 --dry-run
 
-deck: ## Rebuild the offline HTML presentation and its data (no external resources, no model calls)
+deck: ## Rebuild and serve the offline HTML presentation (no external resources, no model calls)
 	@uv run --quiet python -m docs.result.build_deck_data
+	@echo "Deck opened at http://127.0.0.1:$(PORT)/presentation.html (Ctrl-C to stop)"
+	@uv run --quiet python -m http.server --directory docs/result $(PORT)
 
 batch: ## Generate and gate N candidates (N=3 SEED=1 BUDGET=20); DEV_MODE=1 for cheap plumbing runs
 	@$(UV_RUN) python -m scripts.run_batch --n $(N) --seed $(SEED) --budget $(BUDGET)

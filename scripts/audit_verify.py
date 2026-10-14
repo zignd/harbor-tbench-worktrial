@@ -92,6 +92,17 @@ def main() -> int:
         and fresh_clone.get("all_ok")
         and all(fresh_clone["tasks"].get(t["task"], {}).get("ok") for t in tasks)
     )
+    # The audit tooling must itself be reproducible by a third party with no credentials: prove it
+    # from the recorded clone run rather than asserting it.
+    ca_path = EVIDENCE / "clone-audit.json"
+    clone_audit = json.loads(ca_path.read_text()) if ca_path.exists() else None
+    clone_audit_ok = bool(
+        clone_audit
+        and clone_audit.get("all_ok")
+        and clone_audit.get("env_file_present_in_clone") is False
+        and clone_audit.get("n_checks", 0) >= 16
+        and clone_audit.get("n_checks") == clone_audit.get("n_passed")
+    )
     checks_ok = bool(tasks) and all(all(v for v in t["checks"].values()) for t in tasks)
     tests_ok = _passed("tests-final.log")
     requirements = {
@@ -174,7 +185,11 @@ def main() -> int:
         )
 
     manifest = {
-        "overall_status": "passed" if (checks_ok and tests_ok and tasks and clone_ok) else "failed",
+        "overall_status": (
+            "passed"
+            if (checks_ok and tests_ok and tasks and clone_ok and clone_audit_ok)
+            else "failed"
+        ),
         "fresh_clone": {
             "performed": fresh_clone is not None,
             "all_ok": clone_ok,
@@ -188,6 +203,21 @@ def main() -> int:
                 "files, embedded .git metadata or pre-existing images are required"
             ),
         },
+        "clone_audit": {
+            "performed": clone_audit is not None,
+            "all_ok": clone_audit_ok,
+            "revision": (clone_audit or {}).get("revision"),
+            "env_file_present_in_clone": (clone_audit or {}).get("env_file_present_in_clone"),
+            "n_checks": (clone_audit or {}).get("n_checks"),
+            "n_passed": (clone_audit or {}).get("n_passed"),
+            "checks": (clone_audit or {}).get("checks"),
+            "evidence": "docs/result/evidence/clone-audit.json",
+            "note": (
+                "the audit tooling itself was run inside a clone of the committed revision with "
+                "`uv sync` and no .env; it reads committed records, not the live account, so a "
+                "reviewer can re-verify every headline claim without credentials"
+            ),
+        },
         "revision": revision,
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "models": MODEL_LABEL,
@@ -197,8 +227,14 @@ def main() -> int:
         "output_packages_note": (
             "Task packages placed in output/ for inspection. A directory is "
             "not an approval: each carries its own calibration and "
-            "verification record, and approved_tasks stays empty because "
-            "none lands in the 1-3/5 band."
+            "verification record, and only the "
+            + (
+                f"{len(tasks)} package(s) in approved_tasks land in the 1-3/5 band "
+                f"({', '.join(t['task'] for t in tasks)}). The other {len(published) - len(tasks)} are "
+                "published with their measured reason for non-approval."
+                if tasks
+                else "approved_tasks stays empty because none lands in the 1-3/5 band."
+            )
         ),
         "quarantined_candidates": [q for q in quarantined if q["task"] not in approved_names],
         "quarantined_note": (

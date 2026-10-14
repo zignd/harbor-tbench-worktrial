@@ -107,6 +107,22 @@ def main() -> int:
         .get("spend reconciliation detail", {})
         .get("acceptance_met")
         is False,
+        # Prose is generated too, so it can rot the same way data does. The manifest once carried a
+        # note claiming `approved_tasks` was empty while it listed one approved task; require the
+        # note to name whatever the manifest actually approves.
+        "manifest note agrees with manifest data": (
+            not ver["approved_tasks"]
+            and "stays empty" in ver["output_packages_note"]
+            or bool(ver["approved_tasks"])
+            and all(t["task"] in ver["output_packages_note"] for t in ver["approved_tasks"])
+            and "stays empty" not in ver["output_packages_note"]
+        ),
+        "every approved task is a published package, and appears in only one list": { t["task"] for t in ver["approved_tasks"]}
+        <= {t.get("task") or t.get("name") for t in ver["output_packages"]}
+        and not ({t["task"] for t in ver["approved_tasks"]} & {t["task"] for t in ver["quarantined_candidates"]}),
+        "manifest records the clone-safety run": ver.get("clone_audit", {}).get("all_ok") is True
+        and ver.get("clone_audit", {}).get("env_file_present_in_clone") is False,
+        "manifest status requires the clone-safety run": ver["overall_status"] == "passed",
     }
     if missing_modules:
         print(f"     missing: {missing_modules}")

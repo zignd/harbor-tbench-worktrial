@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:01 -03:00 · Presentation deck redesigned around diagrams
+- Replaced text-heavy slides with a 10-slide visual deck: a colour-coded 1-3/5 band diagram, a two-row pipeline flow, a bimodal candidate bar chart, a 5-trial PASS/FAIL strip for the approved task, and paired fact cards. Both `presentation.pptx` and the offline `presentation.html` are generated from the same `deck_data.json` (no external resources in the HTML build).
+- PPTX rendered with pptxgenjs and verified: 10 slides, presenter notes on every slide, valid zip, no unneeded media. HTML styling for the new blocks rebuilt so the diagrams render in-browser.
+- Notes: spent no model budget; HTML and PPTX continue to pass `scripts/audit_deck_consistency.py` (15/15) and `make lint`.
+
 ### 21:00 -03:00 · Fresh-clone verification re-run at the current revision
 - The fresh-clone check had last run at `9d0ece3`; **16 commits have landed since**. `git diff` shows `output/` itself was untouched, but "untouched" is an inference, not a verification, so I re-ran the check rather than relying on it.
 - Cloned `8cdd2f1` into a temporary directory and, from the clone alone: all five published packages pass `scripts/validate.sh`, **oracle 3/3** and **nop 0**. No `.env`, no embedded `.git`, no pre-existing images; credentials come from the process environment.

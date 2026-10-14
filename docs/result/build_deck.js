@@ -231,9 +231,9 @@ function light(title) {
 {
   const s = light("Stretch goals — measured, including negatives");
   const cells = [
-    { k: "A  cost", v: "26.5% of trials saved", d: "~$3.79 vs naive 5×. Invalid-run early stops credited with nothing." },
-    { k: "B  tuning", v: "not demonstrated", d: "13 hash-bound tuning experiments; 0 moved into the band." },
-    { k: "C  diversity", v: "TB 2.1 pool", d: "Coverage, duplication and novelty on 89 published tasks + examples/." },
+    { k: "A  cost", v: `${D.stretch.a_saved_pct}% of trials saved`, d: `~$${D.stretch.a_saved_usd.toFixed(2)} vs naive 5×. Invalid-run early stops credited with nothing.` },
+    { k: "B  tuning", v: "not demonstrated", d: `${D.stretch.b_experiments} hash-bound tuning experiments; 0 moved into the band.` },
+    { k: "C  diversity", v: `${D.stretch.c_set} pool`, d: `Coverage, duplication and novelty on ${D.stretch.c_published} published tasks + examples/.` },
     { k: "D  likeness", v: `blind ${acc}`, d: `95% CI ${ci0}-${ci1}. Rubric overfits: examples 0/6 vs generated 3/4.` },
   ];
   cells.forEach((c, i) => {
@@ -261,7 +261,7 @@ function light(title) {
     tb(s, it.n, { x, y: 1.6, w: 2.95, h: 0.9, align: "center", fontSize: 36, bold: true, fontFace: "Cambria", color: TEAL });
     tb(s, it.l, { x, y: 2.6, w: 2.95, h: 0.5, align: "center", fontSize: 14, color: MUTED });
   });
-  tb(s, "The ledger over-counts across scopes. The key is authoritative. Reconciliation is unresolved: cache accounting explains a $237 swing; a $190 residual remains.", {
+  tb(s, `The ledger over-counts across scopes. The key is authoritative. Reconciliation is unresolved: cache accounting explains a $${D.reconciliation.swing_usd.toFixed(0)} swing; a $${D.reconciliation.residual_usd.toFixed(0)} residual remains.`, {
     x: 0.5, y: 3.8, w: 9.0, h: 0.85, fontSize: 15, color: MUTED,
   });
   notes(s, "Wall-clock time is reported separately from summed stage time. Do not claim the ledger and the key agree.");
@@ -302,7 +302,7 @@ function light(title) {
     { k: "Gates before money", d: "structure → oracle/nop → quality; cheap flags stop a run before calibration spend" },
     { k: "Verification", d: "oracle 3/3 · nop 0, plus a 16-criterion quality rubric, novelty and red-team" },
     { k: "Difficulty", d: "hidden-seed inputs and multi-stage work; no stated wall-clock budgets, no answer-bearing files" },
-    { k: "Money", d: "cheap gates first; one trial ≈ $0.09, so curtailment pays for a second batch" },
+    { k: "Money", d: `cheap gates first; one trial ≈ $${D.stretch.a_trial_usd.toFixed(2)}, so curtailment pays for a second batch` },
   ];
   arch.forEach((a, i) => {
     const x = 0.6 + (i % 2) * 4.5, y = 1.75 + Math.floor(i / 2) * 1.75;

@@ -42,6 +42,35 @@ def _stated_slide_counts(ver: dict, report: str) -> tuple[int | None, int | None
     return stated_report, stated_manifest
 
 
+def _deck_stretch_is_derived(deck: dict, pair: dict, tuning: list) -> bool:
+    """The deck's stretch figures must be the evidence's, read through deck_data.json.
+
+    This used to grep build_deck.js for literal strings, which meant the *source* had to repeat
+    the numbers. It now checks the generated data both decks actually read, so a figure can only
+    reach a slide by coming from an evidence file.
+    """
+    st = deck.get("stretch", {})
+    return (
+        st.get("a_saved_pct") == pair.get("trials_saved_pct")
+        and st.get("b_experiments") == len(tuning)
+        and st.get("a_trial_usd") == pair.get("mean_cost_per_trial_usd")
+        and st.get("a_saved_usd") == pair.get("usd_saved_by_curtailment")
+    )
+
+
+def _no_typed_figures(js: str) -> bool:
+    """No currency amount with decimals and no percentage may be typed into the PPTX builder.
+
+    Both used to be: a hand-copied $12.48 and a hand-copied 26.5%, which is how two different totals
+    ended up under one label on two slides. Figures must come from deck_data.json, which is generated
+    from evidence. Integer constants that are genuinely constants ($500 key, 1-3/5) are unaffected.
+    """
+    body = "\n".join(
+        line for line in js.splitlines() if not re.match(r"\s*(x|y|w|h|fontSize|margin|paraSpace)", line)
+    )
+    return not re.search(r"\$\d+\.\d+|\d+\.\d+%", body)
+
+
 def _qa_matches_artifacts() -> bool:
     """Bind the QA record to the artifacts by hash, so it cannot describe an older deck."""
     import hashlib
@@ -172,14 +201,7 @@ def main() -> int:
         and "| **0** |" in report,
         "report rubric figures match evidence": f"{rubric.get('examples_mean_blocking')}" in report
         and f"{rubric.get('generated_mean_blocking')}" in report,
-        "deck stretch rows use the audited figures": all(
-            x in js
-            for x in (
-                f"{pair.get('trials_saved_pct')}%",
-                f"{len(tuning)} hash-bound tuning experiments",
-                f"examples {rubric.get('examples_pass_rate', 0) * 100:.0f}/6",
-            )
-        ),
+        "deck stretch rows use the audited figures": _deck_stretch_is_derived(deck, pair, tuning),
         "html deck lists the approved task": all(t["task"] in html for t in approved),
         "html deck loads no external resources": not re.search(r'(src|href)="https?://', html),
         "report stretch-C coverage matches evidence": f"{DIV.get('reuse_copies_excluded', {}).get('fresh_vendi')}"
@@ -225,6 +247,7 @@ def main() -> int:
         ),
         # A QA record must describe the deck that exists now, not one that has since changed.
         "presentation QA describes the decks that are committed": _qa_matches_artifacts(),
+        "PPTX builder quotes no hand-typed money or percentage": _no_typed_figures(js),
         "pptx QA evidence records a real inspection": ver.get("presentation_qa", {})
         .get("pptx_deck", {})
         .get("slides_inspected")

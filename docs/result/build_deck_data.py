@@ -44,6 +44,8 @@ def build() -> dict:
         else {}
     )
     reconciliation = _load("reconciliation.json", {})
+    curtail = _load("stretchA-curtailment.json", {})
+    recon = _load("reconciliation-final.json", {})
     pool = _load("pool-distribution.json", {})
     verdicts = historical.get("latest_candidate_verdicts", {})
     examples = stylo.get("examples", {})
@@ -100,6 +102,20 @@ def build() -> dict:
             )
             or reconciliation.get("per_scope", {}).get(f"official|{m_author}", {}).get("usd", 0.0),
             "this_run_ledger_scope": f"official|{m_author}|{m_cal}",
+        },
+        # Figures both decks quote, derived once so the PPTX and the HTML cannot disagree.
+        "stretch": {
+            "a_saved_pct": (curtail.get("current_pair") or {}).get("trials_saved_pct"),
+            "a_saved_usd": (curtail.get("current_pair") or {}).get("usd_saved_by_curtailment"),
+            "a_trial_usd": (curtail.get("current_pair") or {}).get("mean_cost_per_trial_usd"),
+            "b_experiments": len(_load("stretchB-tuning.json", [])),
+            "c_set": "TB 2.1",
+            "c_published": 89,
+        },
+        "reconciliation": {
+            "swing_usd": recon.get("swing_explained_by_cache_accounting_usd"),
+            "residual_usd": recon.get("residual_after_cache_aware_correction_usd"),
+            "acceptance_met": recon.get("acceptance_met"),
         },
         "approved_tasks": verification.get("approved_tasks", []),
         "output_packages": verification.get("output_packages", []),

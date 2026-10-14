@@ -4,6 +4,26 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:46 -0300 · The PPTX builder hand-typed six figures, and a check was rewarding the duplication
+
+- `build_deck.js` quoted **26.5%**, **$3.79**, **13** experiments, **89** tasks, a **$237** swing, a **$190**
+  residual and a **$0.09** trial as string literals, while `build_deck_data.py` derived the same figures from
+  evidence for the HTML deck. Two generators, one set of numbers, no link between them - which is how the
+  spend slide and the architecture slide came to disagree two turns ago. All of them now read
+  `deck_data.json`, which is generated from the evidence files.
+- **A check was enforcing the duplication.** `make lint` verified the stretch rows by grepping
+  `build_deck.js` for the literal strings `"26.5%"` and `"13 hash-bound tuning experiments"` - so the check
+  only passed *because* the numbers were hand-typed, and would have failed the moment they were derived.
+  Rewritten to verify the generated data instead, which is the property that actually matters.
+- `make lint` is now **30 consistency checks**, including `PPTX builder quotes no hand-typed money or
+  percentage`: no currency amount with decimals and no percentage may appear in the PPTX generator, so a
+  figure can only reach a slide by coming from an evidence file. Negative-controlled both ways - typing a
+  percentage or a money figure back in fails the build - as is the reworked stretch check, which fails if
+  `a_saved_pct` or `b_experiments` drifts from its evidence.
+- The rendered PPTX still shows exactly the same values (26.5%, $3.78, 13, 89, $237, $190, $0.09, $12.5);
+  what changed is that none of them is a literal anymore.
+
+
 ### 21:43 -0300 · Two more claims that were numbers someone typed rather than numbers we measured
 
 - **Defect 19: the deck mixed two ledger scopes.** The spend slide labelled **$16.47** "this pair's ledger",

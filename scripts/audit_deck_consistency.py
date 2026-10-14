@@ -42,6 +42,44 @@ def _stated_slide_counts(ver: dict, report: str) -> tuple[int | None, int | None
     return stated_report, stated_manifest
 
 
+def _qa_matches_artifacts() -> bool:
+    """Bind the QA record to the artifacts by hash, so it cannot describe an older deck."""
+    import hashlib
+
+    qa = _load(RESULT / "evidence/presentation-qa.json")
+    if not qa:
+        return False
+    for key, name in (("pptx_deck", "presentation.pptx"), ("html_deck", "presentation.html")):
+        path = RESULT / name
+        want = qa.get(key, {}).get("sha256")
+        if not want or not path.exists():
+            return False
+        if hashlib.sha256(path.read_bytes()).hexdigest() != want:
+            return False
+    return True
+
+
+def _deck_spend_is_derived(deck: dict, ver: dict) -> bool:
+    """The deck's run total must be the audited *pair* scope, read from evidence, not typed in.
+
+    The pair scope ($12.48) and the author-only scope ($16.47) are different totals; conflating them
+    puts two numbers under one label on two slides, which reads as a contradiction to an interviewer.
+    """
+    hist = Path("docs/result/evidence/historical-data.json")
+    if not hist.exists():
+        return False
+    scopes = (json.loads(hist.read_text()).get("ledger_scopes") or {})
+    pair = ver.get("models", "").replace("|", "|")
+    want = scopes.get(f"official|{pair}")
+    got = deck.get("spend", {}).get("this_run_ledger")
+    if not want or got is None:
+        return False
+    return (
+        abs(got - want.get("estimated_usd", -1)) < 0.005
+        and deck["spend"].get("this_run_ledger_scope") == f"official|{pair}"
+    )
+
+
 def _slide_counts_agree(ver: dict, report: str) -> bool:
     """Both decks must really have the slide count the report and the manifest state."""
     real_pptx, real_html = _real_slide_counts()
@@ -182,6 +220,11 @@ def main() -> int:
         ),
         # A deck count is a measurement, not a claim: re-derive it from the files.
         "report and manifest state the decks' real slide counts": _slide_counts_agree(ver, report),
+        "deck spend is the audited pair scope, not a typed-in number": _deck_spend_is_derived(
+            deck, ver
+        ),
+        # A QA record must describe the deck that exists now, not one that has since changed.
+        "presentation QA describes the decks that are committed": _qa_matches_artifacts(),
         "pptx QA evidence records a real inspection": ver.get("presentation_qa", {})
         .get("pptx_deck", {})
         .get("slides_inspected")

@@ -27,6 +27,15 @@ def _mean(rows: dict, key: str) -> float:
 
 def build() -> dict:
     historical = _load("historical-data.json", {})
+    # Read the model pair from the audited manifest rather than repeating the strings, so the spend
+    # scope key and the slide that names the models cannot drift apart.
+    _ver = (
+        json.loads((RESULT / "verification.json").read_text())
+        if (RESULT / "verification.json").exists()
+        else {}
+    )
+    m_author = (_ver.get("models") or "|").split("|")[0]
+    m_cal = (_ver.get("models") or "|").split("|")[-1]
     blind = _load("blind.json", {})
     stylo = _load("stylometrics.json", {})
     verification = (
@@ -82,9 +91,15 @@ def build() -> dict:
             "remaining": round(
                 500.0 - (verification.get("spend", {}).get("conservative_last_snapshot") or 0.0), 2
             ),
-            "this_run_ledger": reconciliation.get("per_scope", {})
-            .get("official|openai/gpt-5.6-luna", {})
-            .get("usd", 0.0),
+            # The *pair* scope, not the author-only scope: the two differ ($12.48 vs $16.47) and
+            # conflating them puts two different totals under the same label on two slides.
+            "this_run_ledger": (
+                (historical.get("ledger_scopes") or {})
+                .get(f"official|{m_author}|{m_cal}", {})
+                .get("estimated_usd")
+            )
+            or reconciliation.get("per_scope", {}).get(f"official|{m_author}", {}).get("usd", 0.0),
+            "this_run_ledger_scope": f"official|{m_author}|{m_cal}",
         },
         "approved_tasks": verification.get("approved_tasks", []),
         "output_packages": verification.get("output_packages", []),
@@ -211,8 +226,8 @@ def slides(d: dict) -> list[str]:
             "plus a 16-criterion quality rubric, novelty and red-team</p></div>"
             "<div class='card'><small>Difficulty</small><b>hidden seed &amp; multi-stage</b><p<|message|>"
             "no stated wall-clock budgets, no answer-bearing files</p></div>"
-            "<div class='card'><small>Money</small><b>$12.48 this run</b><p|"
-            "key total $219.70 of $500 &middot; reconciliation open</p></div></div>"
+            f"<div class='card'><small>Money</small><b>${d['spend']['this_run_ledger']:.2f} this pair</b><p|"
+            f"key total ${d['spend']['conservative']:.2f} of $500 &middot; reconciliation open</p></div></div>"
         ),
         (
             "<h2>Q&amp;A you should be ready for</h2><div class='grid2'>"

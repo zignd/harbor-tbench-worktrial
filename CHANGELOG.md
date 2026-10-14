@@ -4,6 +4,28 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:43 -0300 · Two more claims that were numbers someone typed rather than numbers we measured
+
+- **Defect 19: the deck mixed two ledger scopes.** The spend slide labelled **$16.47** "this pair's ledger",
+  but $16.47 is the author-model scope; the *pair* scope is **$12.48**, which a second slide carried as a
+  hand-typed string. Two totals, one label, on adjacent slides - which reads to an interviewer as a
+  contradiction. Both are now derived from `historical-data.json` by scope key (the model pair itself is read
+  from the manifest, so the scope key and the models slide cannot drift apart), the scope string is recorded in
+  `deck_data.json`, and `make lint` fails if the deck total is not the audited pair scope.
+- **Defect 20: a "verified" visual inspection of the wrong deck.** LibreOffice's headless conversion failed
+  silently, the stale PDF from the previous build survived, and the slide I read as proof of the spend fix still
+  showed the **old** value. Caught only by noticing the PDF's timestamp predated the deck. New
+  `scripts/render_deck.sh` empties its output directory, converts, and asserts the PDF is newer than the
+  `.pptx` before producing a single image.
+- The QA record is now **hash-bound to both decks** (`sha256` in `evidence/presentation-qa.json`), and
+  `make lint` fails if it describes a deck that has since changed - the general form of the stale-render trap.
+- Measured rather than asserted while I was in there: all **12** PPTX slides carry substantive presenter notes
+  (74-468 characters, none thin), and a scripted overflow sweep across all 12 HTML slides found one 3px
+  text-box overflow on slide 2 and no document-level horizontal overflow.
+- `make lint` is now **29 consistency checks**. The two new guards were negative-controlled: corrupting either
+  deck hash fails the build.
+
+
 ### 21:36 -0300 · The deck's headline chart never rendered, and the QA record described an inspection that did not happen
 
 - **Defect 16: the pool slide's bar chart rendered as nothing.** Root cause: **pptxgenjs v4 renamed its chart

@@ -120,10 +120,27 @@ def main() -> int:
         "every approved task is a published package, and appears in only one list": { t["task"] for t in ver["approved_tasks"]}
         <= {t.get("task") or t.get("name") for t in ver["output_packages"]}
         and not ({t["task"] for t in ver["approved_tasks"]} & {t["task"] for t in ver["quarantined_candidates"]}),
+        # A green fresh-clone record is worthless if the package was edited afterwards.
+        "fresh-clone evidence covers the packages as shipped now": ver.get("fresh_clone", {})
+        .get("hashes_match_shipped_packages")
+        is True
+        and ver.get("fresh_clone", {}).get("all_ok") is True
+        and all(
+            t["package_hash"]
+            == ver["fresh_clone"]["results"].get(t["task"], {}).get("package_hash")
+            for t in ver["approved_tasks"]
+        ),
         "manifest records the clone-safety run": ver.get("clone_audit", {}).get("all_ok") is True
         and ver.get("clone_audit", {}).get("env_file_present_in_clone") is False,
         "manifest status requires the clone-safety run": ver["overall_status"] == "passed",
     }
+    # The report states how many checks make lint runs. Compare after the dict is built, so the
+    # stated number is held to the real count instead of rotting as checks are added.
+    stated = re.search(r"\*\*(\d+)\*\* consistency checks", report)
+    checks["report's stated check count is the real one"] = bool(stated) and int(
+        stated.group(1)
+    ) == len(checks) + 1  # +1: this check is itself part of the total it is asserting
+
     if missing_modules:
         print(f"     missing: {missing_modules}")
     for name, ok in checks.items():

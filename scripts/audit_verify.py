@@ -87,10 +87,16 @@ def main() -> int:
     revision = rev.stdout.strip()
     clone_path = EVIDENCE / "fresh-clone.json"
     fresh_clone = json.loads(clone_path.read_text()) if clone_path.exists() else None
+    # all_ok alone is not enough: the evidence must cover the packages as they are shipped *now*.
+    # A later edit to a package would otherwise leave a green but stale fresh-clone record behind.
     clone_ok = bool(
         fresh_clone
         and fresh_clone.get("all_ok")
         and all(fresh_clone["tasks"].get(t["task"], {}).get("ok") for t in tasks)
+        and all(
+            (fresh_clone["tasks"].get(t["task"]) or {}).get("package_hash") == t["package_hash"]
+            for t in tasks
+        )
     )
     # The audit tooling must itself be reproducible by a third party with no credentials: prove it
     # from the recorded clone run rather than asserting it.
@@ -195,9 +201,18 @@ def main() -> int:
             "all_ok": clone_ok,
             "revision": (fresh_clone or {}).get("revision"),
             "results": {
-                k: {kk: v.get(kk) for kk in ("structure_ok", "oracle_rewards", "nop_rewards", "ok")}
+                k: {
+                    kk: v.get(kk)
+                    for kk in ("structure_ok", "oracle_rewards", "nop_rewards", "ok", "package_hash")
+                }
                 for k, v in ((fresh_clone or {}).get("tasks") or {}).items()
             },
+            "hashes_match_shipped_packages": bool(fresh_clone)
+            and all(
+                ((fresh_clone.get("tasks") or {}).get(t["task"]) or {}).get("package_hash")
+                == t["package_hash"]
+                for t in tasks
+            ),
             "note": (
                 "cloned from the committed revision into a temporary directory; no local host "
                 "files, embedded .git metadata or pre-existing images are required"

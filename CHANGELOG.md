@@ -4,6 +4,28 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:18 -0300 · Fresh-clone evidence is now hash-bound, and the stated check count cannot rot
+
+- **Gap: the fresh-clone record was never checked against the shipped packages.** `all_ok: true` only
+  proves the packages as they were at revision `8cdd2f1`. All five currently match by hash - verified - but
+  nothing enforced it, so a later edit to a package would have left a green, stale record behind.
+  `overall_status` now requires `package_hash` equality per approved task, and `make lint` fails if a
+  recorded hash drifts from the shipped one (confirmed by negative control, both failure modes).
+- The report states how many `make lint` checks run. That number was hard-coded prose, which is exactly the
+  thing that rots; it is now compared against the real count after the check dict is built, so adding a
+  check without updating the report fails the build. **24/24 pass.**
+- I wrote one guard that could not fail (a list-equality check made trivially true by an `or` clause on a
+  different universe of tasks) and one that referenced `checks` mid-construction. Both were caught by
+  negative control and reworked. A guard is only evidence if you have watched it fail.
+- **Disclosure:** commit `4c4e424` ("make deck now builds and serves the presentation locally", Makefile
+  only) appeared on `main` and on `origin/main` from outside this session. It is benign - `make deck` is not
+  on any audit path - so it is left untouched rather than rewritten, and recorded here instead. Its commit
+  body does not meet this repo's bullet-body convention.
+- **Unresolved:** one `make lint` run failed with ruff reporting "4 unsafe fixes available" while the tree
+  was otherwise unchanged; it did not reproduce in three consecutive runs and ruff reports clean. Cause
+  unknown, recorded rather than dismissed.
+
+
 ### 21:15 -0300 · The audit tooling is verified from a clone, and generated prose is checked against generated data
 
 - **Defect 12: the final audit manifest contradicted itself.** `docs/result/verification.json` carried

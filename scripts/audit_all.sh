@@ -6,6 +6,9 @@
 # Runs every check that backs the claims in docs/result/report.md and
 # docs/result/verification.json. Makes NO model calls and starts NO Docker builds, so it costs
 # nothing and is safe to run at any time. Exits non-zero if any check fails, so it can gate CI.
+#
+# Requires no credentials: it reads the committed records, not the live account, and works from a
+# fresh clone where .env (correctly) does not exist. `uv sync` first.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,8 +43,9 @@ done
 echo "== the audit manifest"
 check "manifest status is passed" \
   grep -Eq '"overall_status"[[:space:]]*:[[:space:]]*"passed"' docs/result/verification.json
+# These checks read the committed records only, so they work from a clean clone with no .env.
 check "exactly one approved task" \
-  uv run --env-file .env python -c "
+  uv run python -c "
 import json,sys
 d=json.load(open('docs/result/verification.json'))
 t=d['approved_tasks']
@@ -53,7 +57,7 @@ assert all(t[0]['checks'].values()), t[0]['checks']
 print(t[0]['task'], t[0]['package_hash'][:12], t[0]['calibration']['legit_passes'], 'of 5')
 "
 check "spend reconciliation is NOT claimed as met" \
-  uv run --env-file .env python -c "
+  uv run python -c "
 import json,sys
 d=json.load(open('docs/result/verification.json'))
 assert d['requirements']['spend reconciliation detail']['acceptance_met'] is False
@@ -62,17 +66,23 @@ print('unresolved, measured gap')
 
 echo "== the approved package itself"
 check "package hash matches its records" \
-  uv run --env-file .env python -c "
+  uv run python -c "
 from pathlib import Path
 import json
 from analysis.package_evidence import package_hash, approval_errors
-from generator.config import MODEL_LABEL
 t=next(p for p in sorted(Path('output').iterdir()) if p.is_dir()
        and json.loads((p/'verification.json').read_text()).get('status') == 'passed')
 cal=json.loads((t/'calibration.json').read_text())
-assert package_hash(t)==cal['package_hash']==json.loads((t/'verification.json').read_text())['package_hash']
-assert approval_errors(t,cal,MODEL_LABEL)==[], approval_errors(t,cal,MODEL_LABEL)
-print(t.name,'hash-bound, approval errors empty')
+ver=json.loads((t/'verification.json').read_text())
+man=json.load(open('docs/result/verification.json'))
+h=package_hash(t)
+assert h==cal['package_hash']==ver['package_hash'], (h, cal['package_hash'], ver['package_hash'])
+# The model label is taken from the package record and cross-checked against the audited manifest,
+# so this needs no ambient configuration and works from a clean clone.
+assert cal['models']==ver['models']==man['models'], (cal['models'], ver['models'], man['models'])
+errs=approval_errors(t, cal, cal['models'])
+assert errs==[], errs
+print(t.name, h[:12], 'hash-bound, model pair', cal['models'], ', approval errors empty')
 "
 check "fresh-clone verification passed" \
   uv run python -c "

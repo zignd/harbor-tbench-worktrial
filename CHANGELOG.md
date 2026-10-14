@@ -4,6 +4,18 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 22:05 -03:00 · Verification tooling is now clone-safe
+
+- `scripts/audit_all.sh` originally shelled out to `uv run --env-file .env`. `.env` is deliberately never
+  committed, so the script passed locally and **failed from a fresh clone** - the same defect class as the
+  earlier fresh-clone task verification, applied this time to the verification tool itself.
+- The three affected checks now read only committed records: the model pair is taken from the approved
+  package's own `calibration.json`/`verification.json` and cross-checked against `docs/result/verification.json`,
+  rather than against ambient `generator.config`. The check is self-contained, so a reviewer can run it with
+  no credentials at all.
+- Verified: a clean clone at HEAD runs all 16 checks green. `uv sync` first; the script never makes model
+  calls and never starts Docker.
+
 ### 21:40 -03:00 · One-command verification of the whole submission
 - Added `scripts/audit_all.sh`: 16 checks covering repo hygiene, lint, unit tests, deliverable presence, the manifest's status and approved-task shape, the approved package's hash binding, the fresh-clone result, deck/report consistency and the plan state. No model calls, no Docker, exits non-zero on failure, so it can gate CI or be run by a reviewer in seconds.
 - **It immediately caught a real inconsistency on first run:** `audit_ship` and `audit_publish` wrote two different schemas for `verification.json` - the shipper wrote `status` but not `approved`, the publisher wrote both. The shipped record was correct, but a consumer reading `approved` would have found nothing. Schemas are now aligned (both write `status`, `approved`, `verdict`, `judged_attempts`, `legit_passes`, `why_not_approved`, `approval_errors`), and the approved package was re-shipped so the committed record carries the full schema. `audit_all.sh` selects on `status`, which both writers set.

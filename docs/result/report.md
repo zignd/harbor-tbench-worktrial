@@ -521,6 +521,9 @@ Runs repository hygiene, lint, unit tests, deliverable presence, the manifest's 
 shape, the approved package's hash binding, the fresh-clone result, deck/report consistency and the plan
 state — 16 checks, exiting non-zero on any failure. Costs nothing and is safe to run at any time.
 
+It needs **no credentials**: it reads committed records rather than the live account, and it was verified to
+pass from a fresh clone of the audited revision where `.env` does not exist. Run `uv sync` first.
+
 ### Re-verify the approved task (no model calls, no new spend)
 
 ```bash

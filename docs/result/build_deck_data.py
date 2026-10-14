@@ -115,7 +115,7 @@ def slides(d: dict) -> list[str]:
         )
     )
     pipe1 = "spec → blueprint → author → lint / leak → <b>oracle 3/3 + nop</b>"
-    pipe2 = "quality → novelty → red-team → <b>calibrate 5×</b> → ship in band"
+    pipe = "quality → novelty → red-team → <b>calibrate 5×</b> → ship in band"
     trials = "".join(
         f"<div class='trial {('ok' if o == 'pass' else 'bad')}'>{'PASS' if o == 'pass' else 'FAIL'}"
         f"<small>#{i}</small></div>"
@@ -135,7 +135,7 @@ def slides(d: dict) -> list[str]:
         ),
         (
             "<h2>Cheap gates first. Calibration is the difficulty signal.</h2>"
-            f"<p class='pipe'>{pipe1}</p><p class='pipe'>{pipe2}</p>"
+            f"<p class='pipe'>{pipe1}</p><p class='pipe'>{pipe}</p>"
             "<p class='mut'>A directory in output/ is not approval — only a hash-bound record is.</p>"
         ),
         (
@@ -188,6 +188,30 @@ def slides(d: dict) -> list[str]:
             "<p><b>Self-judging</b> The author also judges and red-teams.</p>"
             "<p><b>Novelty</b> TB 2.1 + examples — not full decontamination.</p>"
             "<p><b>Next</b> Stronger traps, a wider solver gap, difficulty near p ≈ 0.35.</p></div>"
+        ),
+        (
+            "<h2>Architecture at a glance</h2>"
+            "<div class='pipe'>spec &rarr; blueprint &rarr; author in a container &rarr; gates &rarr; calibration &rarr; ship</div>"
+            "<div class='grid2'>"
+            "<div class='card'><small>Gates before money</small><b>structure &rarr; oracle/nop &rarr; quality</b><p<|message|>"
+            "cheap flags stop runs before Opus is spent</p></div>"
+            "<div class='card'><small>Verification</small><b>oracle 3/3 &middot; nop 0</b><p<|message|>"
+            "plus a 16-criterion quality rubric, novelty and red-team</p></div>"
+            "<div class='card'><small>Difficulty</small><b>hidden seed &amp; multi-stage</b><p<|message|>"
+            "no stated wall-clock budgets, no answer-bearing files</p></div>"
+            "<div class='card'><small>Money</small><b>$12.48 this run</b><p|"
+            "key total $219.70 of $500 &middot; reconciliation open</p></div></div>"
+        ),
+        (
+            "<h2>Q&amp;A you should be ready for</h2><div class='grid2'>"
+            "<div class='grid2card'><b>Is 1-3/5 just noise?</b><p<|message|>"
+            "A p=0.5 task lands in band 78% of the time, so verdicts must be pooled: this task gives 7/10 = 0.70 across two batches.</p></div>"
+            "<div class='grid2card'><b>How do you know it wasn't a hack?</b><p<|message|>"
+            "lint, leak scan, anti-cheating criteria, red-team, command scan, then a pass audit that quotes the reasoning trace.</p></div>"
+            "<div class='grid2card'><b>Why four failed and one passed?</b><p|"
+            "bimodal: introducing invalid-failure modes to gain hardness, wall-clock removed as environment-dependent, author and solver too close in strength.</p></div>"
+            "<div class='grid2card'><b>Would Sonnet write better tasks?</b><p|"
+            "a 2x2 study (docs/study-report.md) produced no in-band task: the weak author wrote 0 valid tasks of 7; no cell cleared.</p></div></div>"
         ),
     ]
 

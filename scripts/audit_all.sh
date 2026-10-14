@@ -92,6 +92,17 @@ assert d['all_ok'], d
 print('clone', d['revision'][:12], 'all', len(d['tasks']), 'packages ok')
 "
 
+echo "== the audit tooling itself (proof it needs no credentials)"
+check "audit tooling runs from a clean clone" \
+  uv run python -c "
+import json
+d=json.load(open('docs/result/evidence/clone-audit.json'))
+assert d['all_ok'], d.get('tail')
+assert d['env_file_present_in_clone'] is False
+assert d['n_checks']==d['n_passed'] and d['n_checks']>=16
+print('clone', d['revision'][:12], 'ran', d['n_checks'], 'checks with no .env')
+"
+
 echo "== numbers in the deck and report trace to evidence"
 check "deck/report consistency" uv run --quiet python -m scripts.audit_deck_consistency
 

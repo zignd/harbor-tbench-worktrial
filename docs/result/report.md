@@ -519,10 +519,22 @@ bash scripts/audit_all.sh
 
 Runs repository hygiene, lint, unit tests, deliverable presence, the manifest's status and approved-task
 shape, the approved package's hash binding, the fresh-clone result, deck/report consistency and the plan
-state — 16 checks, exiting non-zero on any failure. Costs nothing and is safe to run at any time.
+state, plus the recorded proof that the tooling itself runs from a clone with no `.env` — 17 checks,
+exiting non-zero on any failure. Costs nothing and is safe to run at any time.
 
-It needs **no credentials**: it reads committed records rather than the live account, and it was verified to
-pass from a fresh clone of the audited revision where `.env` does not exist. Run `uv sync` first.
+It needs **no credentials**: it reads committed records rather than the live account. That property is
+itself verified rather than asserted — `scripts/audit_clone_tools.py` clones the committed revision into a
+temporary directory, runs the audit *inside the clone* with `uv sync` and no `.env`, and records the
+per-check verdicts to `docs/result/evidence/clone-audit.json`. The recorded run is **16/16 green in a clone
+where `.env` is absent**.
+
+This check exists because it failed once. The first version of the audit shelled out to
+`uv run --env-file .env`; since `.env` is deliberately never committed, it passed on the authoring machine
+and failed for anyone else. The same defect class had already been found and fixed once that day for the
+task verification, and it reappeared in the tool written to verify that fix — which is the argument for
+testing the tests. Two regression guards now hold it: `tests/test_verification_tooling.py` fails if any
+audit script regains a credential dependency, and `audit_all.sh` asserts the recorded clone run was green
+with no `.env` present.
 
 ### Re-verify the approved task (no model calls, no new spend)
 

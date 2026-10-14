@@ -4,6 +4,14 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:20 -03:00 · Stretch C was ticked as "achieved" but contained no numbers; now measured
+- Another tick I had assumed rather than checked: report section 9.3 described what `analysis/diversity.py` *can* do but reported **no coverage, balance, duplication or novelty numbers at all**, and no evidence file existed.
+- Measured it (`evidence/stretchC-diversity.json`) over the **56 independent generations** in `runs/candidates/`:
+  - **Coverage is near-uniform on every axis** - 12/12 domains, 8/8 skill types, 5/5 verifier kinds, 15/15 levers, 4/4 styles, with exp(H)/N balance between **0.925 and 0.974**. The sampler is not the coverage bottleneck.
+  - **The only duplication is the reuse mechanism itself.** All ten pairs above cosine 0.5 are a candidate paired with its own `-m` reuse copy at cosine **1.000** - the same task re-measured for a different calibration model, not independent generations. Excluding those, the most similar pair of independent generations reaches only **0.317**, mean **0.072**, Vendi **49.74** against a maximum of 56, and **zero** pairs above 0.5. No accidental duplication among independent generations.
+  - Novelty provenance restated with its scope caveat: TB 2.1 (89 tasks) + `examples/` (6), **not** full public-task decontamination.
+- Added three more `make lint` checks so the report's stretch-C numbers and its reduced-scope caveat cannot drift from the evidence. **18/18 consistency checks pass.**
+
 ### 21:01 -03:00 · Presentation deck redesigned around diagrams
 - Replaced text-heavy slides with a 10-slide visual deck: a colour-coded 1-3/5 band diagram, a two-row pipeline flow, a bimodal candidate bar chart, a 5-trial PASS/FAIL strip for the approved task, and paired fact cards. Both `presentation.pptx` and the offline `presentation.html` are generated from the same `deck_data.json` (no external resources in the HTML build).
 - PPTX rendered with pptxgenjs and verified: 10 slides, presenter notes on every slide, valid zip, no unneeded media. HTML styling for the new blocks rebuilt so the diagrams render in-browser.

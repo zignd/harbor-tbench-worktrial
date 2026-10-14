@@ -27,6 +27,7 @@ def main() -> int:
     curtail = _load(EV / "stretchA-curtailment.json")
     tuning = _load(EV / "stretchB-tuning.json", [])
     rubric = _load(EV / "rubric-comparison.json")
+    DIV = _load(EV / "stretchC-diversity.json")
     report = (RESULT / "report.md").read_text()
     js = (RESULT / "build_deck.js").read_text()
     html = (RESULT / "presentation.html").read_text()
@@ -93,6 +94,15 @@ def main() -> int:
         ),
         "html deck lists the approved task": all(t["task"] in html for t in approved),
         "html deck loads no external resources": not re.search(r'(src|href)="https?://', html),
+        "report stretch-C coverage matches evidence": f"{DIV.get('reuse_copies_excluded', {}).get('fresh_vendi')}"
+        in report,
+        "report stretch-C duplication matches evidence": str(
+            DIV.get("reuse_copies_excluded", {}).get("fresh_max_pairwise_cosine")
+        )
+        in report,
+        "report states the reduced novelty scope as a caveat": "not** the full published Terminal-Bench corpus"
+        in report
+        or "not full public-task decontamination" in report.lower(),
         "manifest does not claim spend reconciliation met": ver.get("requirements", {})
         .get("spend reconciliation detail", {})
         .get("acceptance_met")

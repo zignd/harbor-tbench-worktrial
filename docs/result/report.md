@@ -276,8 +276,53 @@ unchanged. This is a measured negative result, recorded as *not demonstrated* ra
 and it is consistent with the bimodality in §7.2: the levers available without introducing an invalid
 failure mode move a task to one end or the other rather than onto the 1–3/5 plateau.
 
-### 9.3 C — Diversity
-`analysis/diversity.py` reports per-axis coverage and balance exp(H)/N, instruction uniqueness (TF-IDF cosine, Vendi) and novelty against the reference sets. Rejects per layer are recorded. **Caveat:** the automatic novelty check ran only against TB 2.1 + `examples/`, not the full published corpus; this is disclosed and is not full public-task decontamination.
+### 9.3 C — Diversity: coverage, duplication and novelty provenance
+
+Measured over the **56 independent generations** in `runs/candidates/` (evidence
+`stretchC-diversity.json`), plus the reference sets for novelty provenance.
+
+**Coverage is close to uniform across every sampled axis** (`analysis/diversity.py`; balance is
+exp(H)/N, where 1.0 is perfectly even):
+
+| axis | buckets covered | balance | most-used bucket |
+|---|---|---|---|
+| `domain` | 12/12 | 0.925 | data querying (SQL) (9) |
+| `skill_type` | 8/8 | 0.926 | systems (13) |
+| `verifier` | 5/5 | 0.943 | service_protocol (18) |
+| `levers` | 15/15 | 0.964 | hidden_invariant (14) |
+| `style` | 4/4 | 0.973 | casual (22) |
+| `language` | 8/8 | 0.974 | python (11) |
+| `fixture` | 7/7 | 0.974 | logs and metrics (12) |
+| `capabilities` | 11/11 | 0.986 | error recovery (16) |
+
+Every axis is fully covered — 12/12 domains, 8/8 skill types, 5/5 verifier kinds, 15/15 difficulty
+levers, 4/4 instruction styles — with balance between 0.93 and 0.99. **The sampler is not the
+bottleneck for coverage.**
+
+**Duplication: the only near-duplicates are the reuse mechanism itself.** Across all 66 instruction
+texts, ten pairs exceed cosine 0.5 — and every one is a candidate paired with its own `-m`
+reuse-recalibrated copy (cosine **1.000**, byte-identical instruction). Those are the same package
+re-measured for a different calibration model, not independent generations. Excluding them:
+
+| Statistic | All 66 texts | 56 fresh generations |
+|---|---|---|
+| Max pairwise cosine | 1.000 | **0.317** |
+| Mean pairwise cosine | 0.075 | 0.072 |
+| Vendi score | 51.7 | **49.74** |
+| Pairs at cosine ≥ 0.5 | 10 | **0** |
+
+The most similar pair of independent generations reaches only 0.317, and a Vendi
+score of 49.74 against a maximum of 56 indicates genuinely high diversity rather than many
+variants of a few templates. **No accidental duplication was found among independent generations.**
+
+**Novelty provenance.** Every candidate passed a two-stage check against **Terminal-Bench 2.1 (89
+tasks) plus `examples/` (6 tasks)**: an n-gram/lexical screen, then an LLM judgement comparing the
+candidate against its nearest neighbours. The approved task was re-checked on its final hash and judged
+**distinct** from its nearest analogue, `query-optimize`.
+
+> **Scope caveat, stated plainly.** TB 2.1 + `examples/` is a deliberately reduced reference set chosen
+> for this run. It is **not** the full published Terminal-Bench corpus, so this is **not** full
+> public-task decontamination, and nothing here should be quoted as if it were.
 
 ### 9.4 D — Human-likeness and rubric comparison
 

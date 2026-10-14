@@ -48,6 +48,12 @@ def main() -> int:
     (dest / "calibration.json").write_text(json.dumps(cal, indent=1) + "\n")
     (dest / "verification.json").write_text(json.dumps({
         "status": "passed",
+        "approved": True,
+        "verdict": cal.get("verdict"),
+        "judged_attempts": len([t for t in cal.get("trials", []) if t.get("outcome") in ("pass", "fail")]),
+        "legit_passes": cal.get("legit_passes"),
+        "why_not_approved": [],
+        "approval_errors": [],
         "package_hash": cal["package_hash"], "models": MODEL_LABEL,
         "author_model": MODEL, "calibration_model": EVAL_MODEL,
         "checks": checks, "source_task": str(task_dir),

@@ -4,6 +4,11 @@ What we did, why, and the design tradeoffs. Newest first. Each entry is stamped 
 
 ## 2026-10-13
 
+### 21:40 -03:00 · One-command verification of the whole submission
+- Added `scripts/audit_all.sh`: 16 checks covering repo hygiene, lint, unit tests, deliverable presence, the manifest's status and approved-task shape, the approved package's hash binding, the fresh-clone result, deck/report consistency and the plan state. No model calls, no Docker, exits non-zero on failure, so it can gate CI or be run by a reviewer in seconds.
+- **It immediately caught a real inconsistency on first run:** `audit_ship` and `audit_publish` wrote two different schemas for `verification.json` - the shipper wrote `status` but not `approved`, the publisher wrote both. The shipped record was correct, but a consumer reading `approved` would have found nothing. Schemas are now aligned (both write `status`, `approved`, `verdict`, `judged_attempts`, `legit_passes`, `why_not_approved`, `approval_errors`), and the approved package was re-shipped so the committed record carries the full schema. `audit_all.sh` selects on `status`, which both writers set.
+- The point is the method: the reviewer should not have to trust a summary. `bash scripts/audit_all.sh` re-derives every headline claim from committed evidence.
+
 ### 21:20 -03:00 · Stretch C was ticked as "achieved" but contained no numbers; now measured
 - Another tick I had assumed rather than checked: report section 9.3 described what `analysis/diversity.py` *can* do but reported **no coverage, balance, duplication or novelty numbers at all**, and no evidence file existed.
 - Measured it (`evidence/stretchC-diversity.json`) over the **56 independent generations** in `runs/candidates/`:

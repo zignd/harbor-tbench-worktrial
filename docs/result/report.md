@@ -511,6 +511,16 @@ cp .env.example .env            # set OPENROUTER_API_KEY
 make tb-reference               # optional; the run uses NOVELTY_SETS=terminal-bench-2-1
 ```
 
+### Verify the whole submission in one command (no model calls, no Docker)
+
+```bash
+bash scripts/audit_all.sh
+```
+
+Runs repository hygiene, lint, unit tests, deliverable presence, the manifest's status and approved-task
+shape, the approved package's hash binding, the fresh-clone result, deck/report consistency and the plan
+state — 16 checks, exiting non-zero on any failure. Costs nothing and is safe to run at any time.
+
 ### Re-verify the approved task (no model calls, no new spend)
 
 ```bash
